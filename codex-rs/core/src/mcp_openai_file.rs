@@ -443,7 +443,6 @@ async fn upload_staged_openai_file(
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +487,12 @@ mod tests {
         };
         assert!(validate_relative_file_path(&cwd, absolute).is_err());
         if cwd.infer_path_convention() == Some(PathConvention::Windows) {
-            for path in [r"..\secret.txt", r"nested\..\secret.txt", r"\secret.txt", "C:secret.txt"] {
+            for path in [
+                r"..\secret.txt",
+                r"nested\..\secret.txt",
+                r"\secret.txt",
+                "C:secret.txt",
+            ] {
                 assert!(validate_relative_file_path(&cwd, path).is_err(), "{path}");
             }
         }
@@ -512,7 +516,9 @@ mod tests {
         );
         budget.record_file(1).expect("exact limit is allowed");
         assert_eq!(budget.remaining_bytes(), 0);
-        budget.record_file(0).expect("empty files do not consume budget");
+        budget
+            .record_file(0)
+            .expect("empty files do not consume budget");
         assert!(budget.record_file(1).is_err());
         assert_eq!(budget.staged_bytes, OPENAI_FILE_UPLOAD_LIMIT_BYTES);
     }
@@ -536,7 +542,6 @@ mod tests {
 
         assert_eq!(rewritten, arguments);
     }
-
 
     #[tokio::test]
     async fn rewrite_rejects_oversized_file() {

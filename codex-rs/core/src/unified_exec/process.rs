@@ -148,7 +148,9 @@ impl RawOutputArtifactTask {
     }
 
     fn mark_output_gap(&mut self) {
-        if self.gap_recorded { return; }
+        if self.gap_recorded {
+            return;
+        }
         self.gap_recorded = true;
         if let Some(sender) = &self.sender {
             let _ = sender.send(None);
@@ -293,10 +295,7 @@ impl std::fmt::Debug for UnifiedExecProcess {
 }
 
 impl UnifiedExecProcess {
-    pub(super) fn hold_workspace_operation_until_exit(
-        &self,
-        permit: Arc<dyn Send + Sync>,
-    ) {
+    pub(super) fn hold_workspace_operation_until_exit(&self, permit: Arc<dyn Send + Sync>) {
         let mut state = self.state_rx.clone();
         // Spawn registration transfers ownership before the first cancellable
         // startup wait. A returned session handle or cancelled observer must not
@@ -382,18 +381,13 @@ impl UnifiedExecProcess {
         let _ = self.termination_owner.set(owner);
     }
 
-    pub(super) fn set_validation(
-        &self,
-        context: Option<crate::validation::CommandValidation>,
-    ) {
+    pub(super) fn set_validation(&self, context: Option<crate::validation::CommandValidation>) {
         if let Some(context) = context {
             let _ = self.validation.set(context);
         }
     }
 
-    pub(super) fn validation(
-        &self,
-    ) -> Option<crate::validation::CommandValidation> {
+    pub(super) fn validation(&self) -> Option<crate::validation::CommandValidation> {
         self.validation.get().cloned()
     }
 
@@ -616,7 +610,9 @@ impl UnifiedExecProcess {
     }
 
     #[cfg(test)]
-    pub(super) fn raw_output_artifact_owner_for_test(&self) -> Option<Arc<Mutex<RawOutputArtifact>>> {
+    pub(super) fn raw_output_artifact_owner_for_test(
+        &self,
+    ) -> Option<Arc<Mutex<RawOutputArtifact>>> {
         self.raw_output_artifact.clone()
     }
 
@@ -637,9 +633,8 @@ impl UnifiedExecProcess {
     pub(super) async fn snapshot_tool_output(&self, tty: bool) -> Arc<ProcessOutputSnapshot> {
         let mut snapshot = self.snapshot_completion_output().await;
         // A PTY merges streams; pipe-backed local and exec-server processes do not.
-        snapshot.streams_are_exact &= !tty
-            && self.output_is_closed()
-            && self.state_rx.borrow().failure_message.is_none();
+        snapshot.streams_are_exact &=
+            !tty && self.output_is_closed() && self.state_rx.borrow().failure_message.is_none();
         Arc::new(snapshot)
     }
 
@@ -801,12 +796,14 @@ impl UnifiedExecProcess {
             interrupt: running && interrupt,
             cancellation: running,
             polling: true,
-            observation: (silent_for_ms != 0).then_some(crate::tools::context::ExecSilenceObservation {
-                silent_for_ms,
-                reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
-                process_exited: !running,
-                termination_requested: self.termination_was_requested(),
-            }),
+            observation: (silent_for_ms != 0).then_some(
+                crate::tools::context::ExecSilenceObservation {
+                    silent_for_ms,
+                    reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
+                    process_exited: !running,
+                    termination_requested: self.termination_was_requested(),
+                },
+            ),
         }
     }
 
@@ -1139,8 +1136,12 @@ impl UnifiedExecProcess {
                             if let Some(task) = artifact_task.as_mut() {
                                 task.mark_output_gap();
                             }
-                            for buffer in [&output_buffer, &completion_output_buffer,
-                                &stdout_buffer, &stderr_buffer] {
+                            for buffer in [
+                                &output_buffer,
+                                &completion_output_buffer,
+                                &stdout_buffer,
+                                &stderr_buffer,
+                            ] {
                                 buffer.lock().await.record_lagged_chunks(1);
                             }
                         }
@@ -1178,10 +1179,7 @@ impl UnifiedExecProcess {
                             &bytes,
                         )
                         .await;
-                        let _ = output_tx.send(ProcessOutputChunk {
-                            stream,
-                            bytes,
-                        });
+                        let _ = output_tx.send(ProcessOutputChunk { stream, bytes });
                         output_notify.notify_waiters();
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
@@ -1213,11 +1211,17 @@ impl UnifiedExecProcess {
                 match event {
                     ExecProcessEvent::OutputGap { through_seq } => {
                         let skipped = through_seq.saturating_sub(last_seq);
-                        if skipped > 0 && let Some(task) = artifact_task.as_mut() {
+                        if skipped > 0
+                            && let Some(task) = artifact_task.as_mut()
+                        {
                             task.mark_output_gap();
                         }
-                        for buffer in [&output_buffer, &completion_output_buffer,
-                            &stdout_buffer, &stderr_buffer] {
+                        for buffer in [
+                            &output_buffer,
+                            &completion_output_buffer,
+                            &stdout_buffer,
+                            &stderr_buffer,
+                        ] {
                             buffer.lock().await.record_lagged_chunks(skipped);
                         }
                         last_seq = last_seq.max(through_seq);
@@ -1245,10 +1249,7 @@ impl UnifiedExecProcess {
                             &bytes,
                         )
                         .await;
-                        let _ = output_tx.send(ProcessOutputChunk {
-                            stream,
-                            bytes,
-                        });
+                        let _ = output_tx.send(ProcessOutputChunk { stream, bytes });
                         output_notify.notify_waiters();
                     }
                     ExecProcessEvent::Exited {

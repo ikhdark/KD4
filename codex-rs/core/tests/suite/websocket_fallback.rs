@@ -194,7 +194,6 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
     require_network!();
@@ -392,12 +391,20 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
     let completed = test.submit_turn_and_capture_completion("first").await?;
     assert_eq!(completed.error, None);
     let first_requests = server.received_requests().await.expect("captured requests");
-    assert_eq!(first_requests.iter().filter(|req| {
-        req.method == Method::GET && req.url.path().ends_with("/responses")
-    }).count(), 1);
-    assert_eq!(first_requests.iter().filter(|req| {
-        req.method == Method::POST && req.url.path().ends_with("/responses")
-    }).count(), 1);
+    assert_eq!(
+        first_requests
+            .iter()
+            .filter(|req| { req.method == Method::GET && req.url.path().ends_with("/responses") })
+            .count(),
+        1
+    );
+    assert_eq!(
+        first_requests
+            .iter()
+            .filter(|req| { req.method == Method::POST && req.url.path().ends_with("/responses") })
+            .count(),
+        1
+    );
     assert_eq!(response_mock.requests().len(), 1);
     let completed = test.submit_turn_and_capture_completion("second").await?;
     assert_eq!(completed.error, None);

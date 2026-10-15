@@ -108,7 +108,8 @@ fn normalize_newlines(text: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_unified_exec_preserves_closures_without_powershell_snapshot_replay() -> Result<()> {
+async fn windows_unified_exec_preserves_closures_without_powershell_snapshot_replay() -> Result<()>
+{
     let builder = test_codex().with_config(|config| {
         config
             .features
@@ -154,7 +155,10 @@ async fn windows_unified_exec_preserves_closures_without_powershell_snapshot_rep
     if snapshot_dir.exists() {
         let mut entries = fs::read_dir(snapshot_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
-            assert_ne!(entry.path().extension().and_then(|ext| ext.to_str()), Some("ps1"));
+            assert_ne!(
+                entry.path().extension().and_then(|ext| ext.to_str()),
+                Some("ps1")
+            );
         }
     }
 

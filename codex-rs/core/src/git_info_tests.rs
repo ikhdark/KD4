@@ -209,7 +209,10 @@ async fn test_recent_commits_orders_and_limits() {
     ] {
         fs::write(repo_path.join("file.txt"), contents).unwrap();
         let add = Command::new("git")
-            .envs([("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")])
+            .envs([
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+            ])
             .args(["add", "file.txt"])
             .current_dir(&repo_path)
             .output()
@@ -218,7 +221,10 @@ async fn test_recent_commits_orders_and_limits() {
         assert!(add.status.success(), "git add failed: {add:?}");
         let date = format!("{timestamp} +0000");
         let commit = Command::new("git")
-            .envs([("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")])
+            .envs([
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+            ])
             .args(["commit", "-m", subject])
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)

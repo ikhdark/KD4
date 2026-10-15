@@ -669,17 +669,29 @@ impl ApplyPatchHandler {
                             crate::tools::runtimes::apply_patch::patch_failure_kind(&parse_error),
                         )],
                     );
-                    let mismatch = match &parse_error {
-                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => Some(mismatch),
-                        _ => None,
+                    // A multi-conflict preflight carries the same typed
+                    // mismatches as a single one, so its retry receipt names
+                    // the observed source too instead of leaving the model to
+                    // re-read the file in a separate request.
+                    let mismatches: &[codex_apply_patch::PatchContextMismatch] = match &parse_error {
+                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => {
+                            std::slice::from_ref(mismatch)
+                        }
+                        codex_apply_patch::ApplyPatchError::MultiplePatchConflicts { mismatches, .. } => {
+                            mismatches
+                        }
+                        _ => &[],
                     };
-                    let observed_source = match &parse_error {
-                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => Some(serde_json::json!({
+                    let mismatch = mismatches.first();
+                    let observed_source = mismatch.map(|first| serde_json::json!({
+                        "path": first.canonical_path, "sha256": first.current_content_sha256,
+                        "hunk": first.hunk_ordinal, "chunk": first.chunk_ordinal,
+                        "conflicts": mismatches.iter().map(|mismatch| serde_json::json!({
                             "path": mismatch.canonical_path, "sha256": mismatch.current_content_sha256,
                             "hunk": mismatch.hunk_ordinal, "chunk": mismatch.chunk_ordinal,
-                        })),
-                        _ => None,
-                    };
+                            "kind": mismatch.kind,
+                        })).collect::<Vec<_>>(),
+                    }));
                     let retry = session.services.retained_patches.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .retain(&retained_input, &turn_environment.environment_id,
@@ -741,14 +753,19 @@ impl CoreToolRuntime for ApplyPatchHandler {
     fn native_addition_paths(&self, payload: &ToolPayload) -> Option<Vec<PathBuf>> {
         // Some(empty) identifies a mutator with no safe narrow footprint;
         // it must not be mistaken for a non-workspace parallel tool.
-        Some((|| {
-            let ToolPayload::Custom { input } = payload else { return None; };
-            let args = codex_apply_patch::parse_patch(input).ok()?;
-            if args.environment_id.is_some() {
-                return None;
-            }
-            native_addition_paths(&args.hunks)
-        })().unwrap_or_default())
+        Some(
+            (|| {
+                let ToolPayload::Custom { input } = payload else {
+                    return None;
+                };
+                let args = codex_apply_patch::parse_patch(input).ok()?;
+                if args.environment_id.is_some() {
+                    return None;
+                }
+                native_addition_paths(&args.hunks)
+            })()
+            .unwrap_or_default(),
+        )
     }
 
     fn waits_for_runtime_cancellation(&self) -> bool {
@@ -838,8 +855,13 @@ impl CoreToolRuntime for ApplyPatchHandler {
             let receipt = retained
                 .replace_after_hook(&retry.id, patch, &invocation.call_id)
                 .map_err(FunctionCallError::RespondToModel)?;
-            #[expect(clippy::expect_used, reason = "replace_after_hook returns the string patch_id created by retain")]
-            let id = receipt["patch_id"].as_str().expect("retained replacement id");
+            #[expect(
+                clippy::expect_used,
+                reason = "replace_after_hook returns the string patch_id created by retain"
+            )]
+            let id = receipt["patch_id"]
+                .as_str()
+                .expect("retained replacement id");
             invocation.payload = ToolPayload::Custom {
                 input: format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch"),
             };
@@ -899,10 +921,13 @@ fn native_addition_paths(hunks: &[Hunk]) -> Option<Vec<PathBuf>> {
     if hunks.is_empty() || hunks.len() > 64 {
         return None;
     }
-    hunks.iter().map(|hunk| match hunk {
-        Hunk::AddFile { path, .. } => Some(path.clone()),
-        _ => None,
-    }).collect()
+    hunks
+        .iter()
+        .map(|hunk| match hunk {
+            Hunk::AddFile { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // An admitted patch owns its filesystem operations, mutation evidence and diff
@@ -1046,7 +1071,8 @@ async fn run_owned_patch(
                     runtime.committed_delta(),
                     Some(req.turn_environment.environment_id.clone()),
                 )
-                .with_retry(retry).with_patch_mismatch(runtime.patch_mismatch()))
+                .with_retry(retry)
+                .with_patch_mismatch(runtime.patch_mismatch()))
             }
             Err(error) => Err(error),
         };

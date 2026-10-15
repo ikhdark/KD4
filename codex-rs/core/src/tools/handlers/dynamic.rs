@@ -165,9 +165,12 @@ impl DynamicToolHandler {
         // payload or the default code-mode result. Preserve a reported failure
         // in both consumers without replacing the client's multimodal evidence.
         if !success {
-            body.insert(0, FunctionCallOutputContentItem::InputText {
-                text: "Dynamic tool response has success=false.".to_string(),
-            });
+            body.insert(
+                0,
+                FunctionCallOutputContentItem::InputText {
+                    text: "Dynamic tool response has success=false.".to_string(),
+                },
+            );
         }
         Ok(boxed_tool_output(FunctionToolOutput::from_content(
             body,
@@ -208,9 +211,13 @@ async fn request_dynamic_tool(
                     return Err("dynamic tool originating turn is no longer active".to_string());
                 }
                 let mut ts = at.turn_state.lock().await;
-                ts.try_insert_pending_dynamic_tool(call_id.clone(), turn_context.sub_id.clone(), tx_response)
-                    .ok()
-                    .map(|()| Arc::clone(&at.turn_state))
+                ts.try_insert_pending_dynamic_tool(
+                    call_id.clone(),
+                    turn_context.sub_id.clone(),
+                    tx_response,
+                )
+                .ok()
+                .map(|()| Arc::clone(&at.turn_state))
             }
             None => None,
         }
@@ -336,16 +343,26 @@ mod tests {
     #[test]
     fn dynamic_search_preserves_namespace_sources() {
         let handler = DynamicToolHandler::new(&DynamicToolFunctionSpec {
-            name: "lookup".into(), description: "Look up a record".into(),
-            input_schema: serde_json::json!({"type":"object"}), defer_loading: true,
-        }).unwrap();
+            name: "lookup".into(),
+            description: "Look up a record".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            defer_loading: true,
+        })
+        .unwrap();
         for name in ["calendar", "documents"] {
-            let ToolSpec::Function(tool) = handler.spec() else { panic!("function") };
+            let ToolSpec::Function(tool) = handler.spec() else {
+                panic!("function")
+            };
             let registered = ToolSpec::Namespace(ResponsesApiNamespace {
-                name: name.into(), description: format!("Manage {name}"),
+                name: name.into(),
+                description: format!("Manage {name}"),
                 tools: vec![ResponsesApiNamespaceTool::Function(tool)],
             });
-            let source = handler.search_info_for_registered_spec(&registered).unwrap().source_info.unwrap();
+            let source = handler
+                .search_info_for_registered_spec(&registered)
+                .unwrap()
+                .source_info
+                .unwrap();
             assert_eq!(source.name, name);
             assert_eq!(source.description, Some(format!("Manage {name}")));
         }
@@ -449,7 +466,8 @@ mod tests {
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let event = events.recv().await.expect("event channel remains open");
-                if let codex_protocol::protocol::EventMsg::DynamicToolCallRequest(request) = event.msg
+                if let codex_protocol::protocol::EventMsg::DynamicToolCallRequest(request) =
+                    event.msg
                 {
                     break request;
                 }
@@ -652,9 +670,16 @@ mod tests {
         session
             .notify_dynamic_tool_response(&turn.sub_id, "same-dynamic", expected.clone())
             .await;
-        assert!(futures::poll!(&mut replacement).is_pending(), "old-turn reply must not consume the replacement waiter");
+        assert!(
+            futures::poll!(&mut replacement).is_pending(),
+            "old-turn reply must not consume the replacement waiter"
+        );
         session
-            .notify_dynamic_tool_response(&replacement_turn.sub_id, "same-dynamic", expected.clone())
+            .notify_dynamic_tool_response(
+                &replacement_turn.sub_id,
+                "same-dynamic",
+                expected.clone(),
+            )
             .await;
         assert_eq!(
             replacement
@@ -689,7 +714,9 @@ mod tests {
                     defer_loading: false,
                 })
                 .unwrap();
-                let payload = ToolPayload::Function { arguments: "{}".into() };
+                let payload = ToolPayload::Function {
+                    arguments: "{}".into(),
+                };
                 let mut call = Box::pin(handler.handle_call(ToolInvocation {
                     session: Arc::clone(&session),
                     step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -703,7 +730,9 @@ mod tests {
                 assert!(futures::poll!(call.as_mut()).is_pending());
                 let content_items = if with_content {
                     vec![
-                        DynamicToolCallOutputContentItem::InputText { text: "receipt 42".into() },
+                        DynamicToolCallOutputContentItem::InputText {
+                            text: "receipt 42".into(),
+                        },
                         DynamicToolCallOutputContentItem::InputImage {
                             image_url: "data:image/png;base64,AQID".into(),
                         },
@@ -711,28 +740,47 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                session.notify_dynamic_tool_response(
-                    &turn.sub_id,
-                    "result-probe",
-                    DynamicToolResponse { content_items, success },
-                ).await;
+                session
+                    .notify_dynamic_tool_response(
+                        &turn.sub_id,
+                        "result-probe",
+                        DynamicToolResponse {
+                            content_items,
+                            success,
+                        },
+                    )
+                    .await;
                 let result = tokio::time::timeout(std::time::Duration::from_secs(1), call)
-                    .await.unwrap().unwrap();
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let response = result.to_response_item("result-probe", &payload);
                 let wire = serde_json::to_value(response).unwrap();
                 assert_eq!(wire.to_string().contains("success=false"), !success);
-                assert_eq!(result.code_mode_result(&payload).to_string().contains("success=false"), !success);
+                assert_eq!(
+                    result
+                        .code_mode_result(&payload)
+                        .to_string()
+                        .contains("success=false"),
+                    !success
+                );
                 assert_eq!(result.success_for_logging(), success);
                 if with_content {
                     let items = wire["output"].as_array().expect("native multimodal output");
                     assert!(items.iter().any(|item| item["text"] == "receipt 42"));
-                    assert!(items.iter().any(|item| item["image_url"] == "data:image/png;base64,AQID"));
+                    assert!(
+                        items
+                            .iter()
+                            .any(|item| item["image_url"] == "data:image/png;base64,AQID")
+                    );
                 }
                 session.terminal_tasks.close();
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     session.terminal_tasks.wait(),
-                ).await.unwrap();
+                )
+                .await
+                .unwrap();
             }
         }
     }

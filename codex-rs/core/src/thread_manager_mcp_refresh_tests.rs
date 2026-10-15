@@ -152,18 +152,20 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
         .lock_pending_mcp_server_refresh_config()
         .await;
     // Block the second lock so cancellation happens after acquiring the first.
-    let mut pending = Box::pin(manager.queue_mcp_server_refreshes_atomically(
-        targets
-            .iter()
-            .map(|(thread, _)| {
-                (
-                    thread.thread_id,
-                    Arc::clone(&thread.thread),
-                    refresh_config("cancelled"),
-                )
-            })
-            .collect(),
-    ));
+    let mut pending = Box::pin(
+        manager.queue_mcp_server_refreshes_atomically(
+            targets
+                .iter()
+                .map(|(thread, _)| {
+                    (
+                        thread.thread_id,
+                        Arc::clone(&thread.thread),
+                        refresh_config("cancelled"),
+                    )
+                })
+                .collect(),
+        ),
+    );
     assert!(futures::poll!(&mut pending).is_pending());
     drop(pending);
     assert_eq!(*held, Some(Arc::new(targets[1].1.clone())));

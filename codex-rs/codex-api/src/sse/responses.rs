@@ -110,7 +110,8 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
                     continue;
                 }
                 state.after_cr = false;
-                let run = chunk[index..].iter()
+                let run = chunk[index..]
+                    .iter()
                     .position(|byte| matches!(byte, b'\r' | b'\n'))
                     .unwrap_or(chunk.len() - index);
                 if run > limit - state.bytes {
@@ -139,9 +140,12 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
             }
             if overflow {
                 state.finished = true;
-                return Some((Err(codex_client::TransportError::Build(format!(
-                    "SSE event exceeds the {limit}-byte framing limit"
-                ))), state));
+                return Some((
+                    Err(codex_client::TransportError::Build(format!(
+                        "SSE event exceeds the {limit}-byte framing limit"
+                    ))),
+                    state,
+                ));
             }
             state.since_yield += index;
             let chunk = state.pending.split_to(index);
@@ -160,7 +164,8 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
                 return Some((Ok(state.event.split().freeze()), state));
             }
         }
-    }).boxed()
+    })
+    .boxed()
 }
 
 pub fn spawn_response_stream(
@@ -231,7 +236,11 @@ async fn process_sse_with_metadata(
 
     loop {
         if Instant::now() >= progress_deadline {
-            let _ = tx_event.send(Err(ApiError::Stream("model progress timeout waiting for SSE".into()))).await;
+            let _ = tx_event
+                .send(Err(ApiError::Stream(
+                    "model progress timeout waiting for SSE".into(),
+                )))
+                .await;
             return;
         }
         let start = telemetry.as_ref().map(|_| Instant::now());
@@ -264,7 +273,10 @@ async fn process_sse_with_metadata(
                 let (error, outcome) = match e {
                     eventsource_stream::EventStreamError::Transport(
                         codex_client::TransportError::Build(message),
-                    ) => (ApiError::invalid_response(message), SseCleanupOutcome::ProtocolError),
+                    ) => (
+                        ApiError::invalid_response(message),
+                        SseCleanupOutcome::ProtocolError,
+                    ),
                     eventsource_stream::EventStreamError::Utf8(error)
                         if error.utf8_error().error_len().is_none() =>
                     {
@@ -287,7 +299,10 @@ async fn process_sse_with_metadata(
                         ApiError::invalid_response("invalid SSE framing"),
                         SseCleanupOutcome::ProtocolError,
                     ),
-                    error => (ApiError::Stream(error.to_string()), SseCleanupOutcome::TransportError),
+                    error => (
+                        ApiError::Stream(error.to_string()),
+                        SseCleanupOutcome::TransportError,
+                    ),
                 };
                 debug!("SSE Error: {error:#}");
                 let _ = tx_event.send(Err(error)).await;
@@ -430,17 +445,44 @@ mod tests {
         for separator in ["\n\n", "\r\r", "\r\n\r\n"] {
             let valid = format!("data: x{separator}").repeat(1000);
             for width in [1, 3, 64, valid.len()] {
-                let chunks = valid.as_bytes().chunks(width).map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
-                let received = bound_sse_events(futures::stream::iter(chunks).boxed(), 32).try_collect::<Vec<_>>().await.unwrap();
+                let chunks = valid
+                    .as_bytes()
+                    .chunks(width)
+                    .map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>();
+                let received = bound_sse_events(futures::stream::iter(chunks).boxed(), 32)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
                 // Empty CR lines are completed with LF for the streaming parser.
-                let expected = format!("data: x{}", if separator == "\r\r" { "\r\r\n" } else { separator });
+                let expected = format!(
+                    "data: x{}",
+                    if separator == "\r\r" {
+                        "\r\r\n"
+                    } else {
+                        separator
+                    }
+                );
                 assert_eq!(received.len(), 1000);
-                assert!(received.iter().all(|chunk| chunk.as_ref() == expected.as_bytes()));
+                assert!(
+                    received
+                        .iter()
+                        .all(|chunk| chunk.as_ref() == expected.as_bytes())
+                );
             }
         }
-        for payload in ["data: ".to_string() + &"x".repeat(33), "data:x\n".repeat(10)] {
-            let chunks = payload.bytes().map(|byte| Ok(bytes::Bytes::from(vec![byte]))).collect::<Vec<_>>();
-            let error = bound_sse_events(futures::stream::iter(chunks).boxed(), 32).try_collect::<Vec<_>>().await.unwrap_err();
+        for payload in [
+            "data: ".to_string() + &"x".repeat(33),
+            "data:x\n".repeat(10),
+        ] {
+            let chunks = payload
+                .bytes()
+                .map(|byte| Ok(bytes::Bytes::from(vec![byte])))
+                .collect::<Vec<_>>();
+            let error = bound_sse_events(futures::stream::iter(chunks).boxed(), 32)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("framing limit"));
         }
     }
@@ -498,7 +540,9 @@ mod tests {
     async fn progress_deadline_ignores_traffic_but_allows_productive_reasoning() {
         for productive in [false, true] {
             let source = stream::unfold(0, move |index| async move {
-                if index > 5 { return None; }
+                if index > 5 {
+                    return None;
+                }
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 let payload = if index == 5 {
                     json!({"type":"response.completed","response":{"id":"done"}})
@@ -563,34 +607,60 @@ mod tests {
     #[ignore = "manual local benchmark; timing is descriptive"]
     async fn transport_audit_benchmark() {
         for (name, payload) in [
-            ("delta", json!({"type":"response.output_text.delta","delta":"x".repeat(256)})),
-            ("item", json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(16384)}]}})),
-            ("metadata", json!({"type":"response.metadata","headers":{"openai-model":"test"}})),
+            (
+                "delta",
+                json!({"type":"response.output_text.delta","delta":"x".repeat(256)}),
+            ),
+            (
+                "item",
+                json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(16384)}]}}),
+            ),
+            (
+                "metadata",
+                json!({"type":"response.metadata","headers":{"openai-model":"test"}}),
+            ),
         ] {
             let frame = Bytes::from(format!("data: {payload}\n\n"));
-            let completed = Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n");
+            let completed = Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
+            );
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let chunks = stream::iter((0..1000).map(|_| Ok(frame.clone())).collect::<Vec<_>>())
                     .chain(stream::iter([Ok(completed.clone())]));
                 let (tx, mut rx) = mpsc::channel(16);
                 let start = std::time::Instant::now();
-                let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, Duration::from_secs(30), None));
+                let producer = tokio::spawn(process_sse(
+                    Box::pin(chunks),
+                    tx,
+                    Duration::from_secs(30),
+                    None,
+                ));
                 let mut terminal = false;
                 while let Some(event) = rx.recv().await {
-                    terminal |= matches!(event.expect("valid event"), ResponseEvent::Completed { .. });
+                    terminal |=
+                        matches!(event.expect("valid event"), ResponseEvent::Completed { .. });
                 }
                 producer.await.unwrap();
                 assert!(terminal);
                 samples.push(start.elapsed().as_micros());
             }
             samples.sort_unstable();
-            let result = format!("transport_audit {name}: frames=1000 bytes={} median_us={} samples_us={samples:?}\n", frame.len() * 1000, samples[3]);
+            let result = format!(
+                "transport_audit {name}: frames=1000 bytes={} median_us={} samples_us={samples:?}\n",
+                frame.len() * 1000,
+                samples[3]
+            );
             eprint!("{result}");
             if let Some(path) = std::env::var_os("KD4_TRANSPORT_BENCHMARK_OUTPUT") {
                 use std::io::Write;
-                std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
-                    .write_all(result.as_bytes()).unwrap();
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(result.as_bytes())
+                    .unwrap();
             }
         }
     }
@@ -601,23 +671,39 @@ mod tests {
     #[ignore = "manual local benchmark; timing is descriptive"]
     async fn transport_audit_coalesced_benchmark() {
         let first = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n";
-        let tail = format!("data: {{\"type\":\"future.event\",\"padding\":\"{}\"}}\n\n", "x".repeat(16 * 1024 * 1024));
+        let tail = format!(
+            "data: {{\"type\":\"future.event\",\"padding\":\"{}\"}}\n\n",
+            "x".repeat(16 * 1024 * 1024)
+        );
         let mut data = first.to_vec();
         data.extend_from_slice(tail.as_bytes());
         let mut samples = Vec::new();
         for _ in 0..7 {
-            let mut source = bound_sse_events(Box::pin(stream::iter([Ok(Bytes::from(data.clone()))])), MAX_SSE_EVENT_BYTES).eventsource();
+            let mut source = bound_sse_events(
+                Box::pin(stream::iter([Ok(Bytes::from(data.clone()))])),
+                MAX_SSE_EVENT_BYTES,
+            )
+            .eventsource();
             let start = std::time::Instant::now();
             assert!(source.next().await.unwrap().unwrap().data.contains("first"));
             samples.push(start.elapsed().as_micros());
         }
         samples.sort_unstable();
-        let result = format!("transport_audit coalesced_first_event: bytes={} median_us={} samples_us={samples:?}\n", data.len(), samples[3]);
+        let result = format!(
+            "transport_audit coalesced_first_event: bytes={} median_us={} samples_us={samples:?}\n",
+            data.len(),
+            samples[3]
+        );
         eprint!("{result}");
         if let Some(path) = std::env::var_os("KD4_TRANSPORT_BENCHMARK_OUTPUT") {
             use std::io::Write;
-            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
-                .write_all(result.as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(result.as_bytes())
+                .unwrap();
         }
     }
 
@@ -645,13 +731,24 @@ mod tests {
         let payload = "x".repeat(1024 * 1024);
         let frame = format!("event: delta\ndata: {payload}\n\n");
         let wire = format!("{frame}data: tail\n\n");
-        let chunks = wire.as_bytes().chunks(16384)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
+        let chunks = wire
+            .as_bytes()
+            .chunks(16384)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
         let framed = bound_sse_events(stream::iter(chunks).boxed(), MAX_SSE_EVENT_BYTES)
-            .try_collect::<Vec<_>>().await.unwrap();
-        assert_eq!(framed, vec![Bytes::from(frame), Bytes::from_static(b"data: tail\n\n")]);
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            framed,
+            vec![Bytes::from(frame), Bytes::from_static(b"data: tail\n\n")]
+        );
         let events = stream::iter(framed.into_iter().map(Ok::<_, TransportError>))
-            .eventsource().try_collect::<Vec<_>>().await.unwrap();
+            .eventsource()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, payload);
         assert_eq!(events[1].data, "tail");
@@ -661,11 +758,18 @@ mod tests {
     async fn sse_framing_preserves_split_utf8_multiline_and_cr_completion() {
         for ending in ["\n", "\r", "\r\n"] {
             let wire = format!("event: delta{ending}data: hé🙂{ending}data: world{ending}{ending}");
-            let chunks = wire.bytes().map(|byte| Ok(Bytes::from(vec![byte]))).collect::<Vec<_>>();
+            let chunks = wire
+                .bytes()
+                .map(|byte| Ok(Bytes::from(vec![byte])))
+                .collect::<Vec<_>>();
             // A complete event must not wait for EOF or the next network event.
             let source = stream::iter(chunks).chain(stream::pending());
             let mut events = bound_sse_events(source.boxed(), wire.len()).eventsource();
-            let event = timeout(idle_timeout(), events.next()).await.unwrap().unwrap().unwrap();
+            let event = timeout(idle_timeout(), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             assert_eq!(event.event, "delta");
             assert_eq!(event.data, "hé🙂\nworld");
         }
@@ -683,7 +787,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, idle_timeout(), None));
         tokio::task::yield_now().await;
-        assert!(consumed.load(Ordering::SeqCst) > 0, "producer must have started");
+        assert!(
+            consumed.load(Ordering::SeqCst) > 0,
+            "producer must have started"
+        );
         assert!(consumed.load(Ordering::SeqCst) < 4096);
         drop(rx);
         producer.await.unwrap();
@@ -696,13 +803,21 @@ mod tests {
             r#"{"type":"response.created","response":{"id":"same"}}"#,
             r#"{"type":"response.created","response":{"id":"same"}}"#,
             r#"{"type":"response.completed","response":{"id":"done"}}"#,
-        ].map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
+        ]
+        .map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
         let (tx, mut rx) = mpsc::channel(1);
         let producer = tokio::spawn(process_sse(
-            Box::pin(stream::iter(chunks)), tx, Duration::from_millis(30), None,
+            Box::pin(stream::iter(chunks)),
+            tx,
+            Duration::from_millis(30),
+            None,
         ));
         tokio::task::yield_now().await;
-        assert_eq!(rx.len(), 1, "producer must reach backpressure before time advances");
+        assert_eq!(
+            rx.len(),
+            1,
+            "producer must reach backpressure before time advances"
+        );
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
@@ -721,9 +836,19 @@ mod tests {
         impl SseTelemetry for Timings {
             fn on_sse_poll(
                 &self,
-                _: &Result<Option<Result<eventsource_stream::Event, eventsource_stream::EventStreamError<TransportError>>>, tokio::time::error::Elapsed>,
+                _: &Result<
+                    Option<
+                        Result<
+                            eventsource_stream::Event,
+                            eventsource_stream::EventStreamError<TransportError>,
+                        >,
+                    >,
+                    tokio::time::error::Elapsed,
+                >,
                 duration: Duration,
-            ) { self.polls.lock().unwrap().push(duration); }
+            ) {
+                self.polls.lock().unwrap().push(duration);
+            }
             fn on_sse_event(&self, _: &str, duration: Duration, _: Option<&dyn std::fmt::Display>) {
                 self.events.lock().unwrap().push(duration);
             }
@@ -731,12 +856,23 @@ mod tests {
         let telemetry = Arc::new(Timings::default());
         let chunks = stream::once(async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"))
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
+            ))
         });
         let (tx, mut rx) = mpsc::channel(2);
-        process_sse(Box::pin(chunks), tx, idle_timeout(), Some(telemetry.clone())).await;
+        process_sse(
+            Box::pin(chunks),
+            tx,
+            idle_timeout(),
+            Some(telemetry.clone()),
+        )
+        .await;
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
-        assert_eq!(*telemetry.polls.lock().unwrap(), vec![Duration::from_millis(50)]);
+        assert_eq!(
+            *telemetry.polls.lock().unwrap(),
+            vec![Duration::from_millis(50)]
+        );
         assert_eq!(*telemetry.events.lock().unwrap(), vec![Duration::ZERO]);
     }
 
@@ -864,9 +1000,9 @@ mod tests {
                 }
                 other => panic!("unexpected event for {case}: {other:?}"),
             }
-            assert!(!crate::api_bridge::map_api_error(
-                events.remove(0).unwrap_err(),
-            ).is_retryable());
+            assert!(
+                !crate::api_bridge::map_api_error(events.remove(0).unwrap_err(),).is_retryable()
+            );
         }
     }
 
@@ -1901,20 +2037,29 @@ mod tests {
     #[test]
     fn responses_stream_event_response_model_prefers_response_headers() {
         for (value, expected) in [
-            (json!({
-                "type": "response.metadata",
-                "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}
-            }), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)),
-            (json!({
-                "type": "response.created",
-                "headers": {"openai-model": "top-level-model"},
-                "response": {"id": "resp-1", "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}}
-            }), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)),
-            (json!({
-                "type": "response.created",
-                "headers": {"OpenAI-Model": ["fallback"]},
-                "response": {"headers": {"openai-model": 42}}
-            }), Some("fallback")),
+            (
+                json!({
+                    "type": "response.metadata",
+                    "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}
+                }),
+                Some(CYBER_RESTRICTED_MODEL_FOR_TESTS),
+            ),
+            (
+                json!({
+                    "type": "response.created",
+                    "headers": {"openai-model": "top-level-model"},
+                    "response": {"id": "resp-1", "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}}
+                }),
+                Some(CYBER_RESTRICTED_MODEL_FOR_TESTS),
+            ),
+            (
+                json!({
+                    "type": "response.created",
+                    "headers": {"OpenAI-Model": ["fallback"]},
+                    "response": {"headers": {"openai-model": 42}}
+                }),
+                Some("fallback"),
+            ),
             (json!({"type": "response.metadata", "headers": {}}), None),
         ] {
             let event = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
@@ -1927,7 +2072,15 @@ mod tests {
     fn responses_stream_event_model_verification_filters_metadata_values() {
         for (recommendations, recognized) in [
             (json!([TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]), true),
-            (json!([TRUSTED_ACCESS_FOR_CYBER_VERIFICATION, "unknown", 42, TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]), true),
+            (
+                json!([
+                    TRUSTED_ACCESS_FOR_CYBER_VERIFICATION,
+                    "unknown",
+                    42,
+                    TRUSTED_ACCESS_FOR_CYBER_VERIFICATION
+                ]),
+                true,
+            ),
             (json!(["unknown"]), false),
             (json!(TRUSTED_ACCESS_FOR_CYBER_VERIFICATION), false),
             (json!([]), false),
@@ -1963,33 +2116,50 @@ mod tests {
         impl SseTelemetry for TimingProbe {
             fn on_sse_poll(
                 &self,
-                _: &Result<Option<Result<eventsource_stream::Event,
-                    eventsource_stream::EventStreamError<TransportError>>>,
-                    tokio::time::error::Elapsed>,
+                _: &Result<
+                    Option<
+                        Result<
+                            eventsource_stream::Event,
+                            eventsource_stream::EventStreamError<TransportError>,
+                        >,
+                    >,
+                    tokio::time::error::Elapsed,
+                >,
                 duration: Duration,
             ) {
                 self.polls.lock().unwrap().push(duration);
             }
-            fn on_sse_event(&self, _: &str, duration: Duration,
-                _: Option<&dyn std::fmt::Display>) {
+            fn on_sse_event(&self, _: &str, duration: Duration, _: Option<&dyn std::fmt::Display>) {
                 self.events.lock().unwrap().push(duration);
             }
         }
         let timing = Arc::new(TimingProbe::default());
         let source = stream::once(async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"))
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
+            ))
         });
         let (tx, mut rx) = mpsc::channel(8);
-        process_sse(Box::pin(source), tx, Duration::from_secs(1), Some(timing.clone())).await;
-        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. }))));
+        process_sse(
+            Box::pin(source),
+            tx,
+            Duration::from_secs(1),
+            Some(timing.clone()),
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(ResponseEvent::Completed { .. }))
+        ));
         let poll_ms = timing.polls.lock().unwrap()[0].as_millis();
         let event_ms = timing.events.lock().unwrap()[0].as_millis();
 
         let frames = [
             b"data: {\"type\":\"response.created\",\"response\":{}}\n\n".as_slice(),
             b"data: {\"type\":\"response.created\",\"response\":{}}\n\n".as_slice(),
-            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"
+                .as_slice(),
         ];
         let (tx, mut rx) = mpsc::channel(1);
         let consumer = tokio::spawn(async move {
@@ -2000,30 +2170,54 @@ mod tests {
             }
             completed
         });
-        process_sse(Box::pin(stream::iter(frames.map(|f| Ok(Bytes::copy_from_slice(f))))),
-            tx, Duration::from_millis(50), None).await;
+        process_sse(
+            Box::pin(stream::iter(frames.map(|f| Ok(Bytes::copy_from_slice(f))))),
+            tx,
+            Duration::from_millis(50),
+            None,
+        )
+        .await;
         let completed = consumer.await.unwrap();
         let mut replayable = Vec::new();
-        for payload in ["{", r#"{"type":"response.output_item.done","item":{"type":"message"}}"#] {
+        for payload in [
+            "{",
+            r#"{"type":"response.output_item.done","item":{"type":"message"}}"#,
+        ] {
             let (tx, mut rx) = mpsc::channel(8);
-            process_sse(Box::pin(stream::iter([Ok(Bytes::from(format!("data: {payload}\n\n")))])),
-                tx, Duration::from_secs(1), None).await;
+            process_sse(
+                Box::pin(stream::iter([Ok(Bytes::from(format!(
+                    "data: {payload}\n\n"
+                )))])),
+                tx,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
             let error = rx.recv().await.unwrap().unwrap_err();
             replayable.push(crate::api_bridge::map_api_error(error).is_retryable());
         }
-        let result = format!("latency_edge sse: injected_wait_ms=50 poll_ms={poll_ms} event_ms={event_ms} backpressure_completed={completed} malformed_retryable={replayable:?}\n");
+        let result = format!(
+            "latency_edge sse: injected_wait_ms=50 poll_ms={poll_ms} event_ms={event_ms} backpressure_completed={completed} malformed_retryable={replayable:?}\n"
+        );
         eprint!("{result}");
         if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
             use std::io::Write;
-            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
-                .write_all(result.as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(result.as_bytes())
+                .unwrap();
         }
     }
 
     #[tokio::test]
     async fn permanent_framing_failures_do_not_replay_network_errors_still_can() {
         let framed = bound_sse_events(
-            Box::pin(stream::iter([Ok(Bytes::from_static(b"data: oversized\n\n"))])),
+            Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"data: oversized\n\n",
+            ))])),
             8,
         );
         for (source, retryable) in [
@@ -2037,15 +2231,19 @@ mod tests {
                 true,
             ),
             (
-                Box::pin(stream::iter([Err(TransportError::Network("connection reset".into()))]))
-                    as ByteStream,
+                Box::pin(stream::iter([Err(TransportError::Network(
+                    "connection reset".into(),
+                ))])) as ByteStream,
                 true,
             ),
         ] {
             let (tx, mut rx) = mpsc::channel(2);
             process_sse(source, tx, idle_timeout(), None).await;
             let error = rx.recv().await.unwrap().unwrap_err();
-            assert_eq!(crate::api_bridge::map_api_error(error).is_retryable(), retryable);
+            assert_eq!(
+                crate::api_bridge::map_api_error(error).is_retryable(),
+                retryable
+            );
             assert!(rx.recv().await.is_none());
         }
     }

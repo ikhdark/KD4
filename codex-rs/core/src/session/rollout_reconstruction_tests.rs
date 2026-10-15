@@ -31,7 +31,8 @@ async fn continuity_loader_gap_survives_rollback_without_preserving_turn_message
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("gap-rollback.jsonl");
     for boundaries in ["modern", "legacy", "eventless"] {
-        let mut quoted_gap = user_message("<rollout_reconstruction_gap>quoted text</rollout_reconstruction_gap>");
+        let mut quoted_gap =
+            user_message("<rollout_reconstruction_gap>quoted text</rollout_reconstruction_gap>");
         if let ResponseItem::Message { role, .. } = &mut quoted_gap {
             *role = "developer".into();
         }
@@ -51,25 +52,40 @@ async fn continuity_loader_gap_survives_rollback_without_preserving_turn_message
         items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
         )));
-        let clean = items.into_iter().map(|item| {
-            serde_json::to_string(&codex_protocol::protocol::RolloutLine {
-                timestamp: "2026-10-11T00:00:00Z".into(), item,
-            }).unwrap() + "\n"
-        }).collect::<String>();
+        let clean = items
+            .into_iter()
+            .map(|item| {
+                serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+                    timestamp: "2026-10-11T00:00:00Z".into(),
+                    item,
+                })
+                .unwrap()
+                    + "\n"
+            })
+            .collect::<String>();
         for damaged in [false, true] {
-            let bytes = if damaged { format!("malformed interior record\n{clean}") } else { clean.clone() };
+            let bytes = if damaged {
+                format!("malformed interior record\n{clean}")
+            } else {
+                clean.clone()
+            };
             std::fs::write(&path, bytes).unwrap();
             let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
             assert_eq!(errors, usize::from(damaged));
             let expected = if damaged {
-                let RolloutItem::ResponseItem(notice) = loaded.last().unwrap() else { panic!("loader notice") };
+                let RolloutItem::ResponseItem(notice) = loaded.last().unwrap() else {
+                    panic!("loader notice")
+                };
                 assert!(codex_rollout::is_rollout_reconstruction_notice(notice));
                 vec![notice.clone()]
             } else {
                 Vec::new()
             };
-            assert_eq!(Session::reconstruct_model_history_from_rollout(&loaded), expected,
-                "{boundaries}: rollback removes the turn, not global source integrity");
+            assert_eq!(
+                Session::reconstruct_model_history_from_rollout(&loaded),
+                expected,
+                "{boundaries}: rollback removes the turn, not global source integrity"
+            );
         }
     }
 }
@@ -81,7 +97,8 @@ async fn continuity_loader_gap_survives_checkpoints_with_reserved_origin() {
     let record = serde_json::to_string(&codex_protocol::protocol::RolloutLine {
         timestamp: "2026-10-11T00:00:00Z".into(),
         item: RolloutItem::ResponseItem(user_message("keep constraints")),
-    }).unwrap();
+    })
+    .unwrap();
     std::fs::write(&path, format!("{record}\nmalformed record\n")).unwrap();
     let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
     assert_eq!(errors, 1);
@@ -102,38 +119,65 @@ async fn continuity_loader_gap_survives_checkpoints_with_reserved_origin() {
         for _ in 0..3 {
             history.extend([quoted.clone(), provider.clone()]);
             // The integrity warning must also survive after a model has observed it.
-            history.push(assistant_message("lossy handoff without an integrity warning"));
+            history.push(assistant_message(
+                "lossy handoff without an integrity warning",
+            ));
             history = if local {
                 crate::compact::build_local_task_input_checkpoint(&history).0
             } else {
                 crate::compact::build_task_input_checkpoint(&history).0
             };
             assert_eq!(history.iter().filter(|item| **item == notice).count(), 1);
-            assert!(!history.contains(&quoted), "text alone cannot gain retention privilege");
-            assert!(!history.contains(&provider), "provider IDs cannot gain retention privilege");
+            assert!(
+                !history.contains(&quoted),
+                "text alone cannot gain retention privilege"
+            );
+            assert!(
+                !history.contains(&provider),
+                "provider IDs cannot gain retention privilege"
+            );
             let compacted = RolloutItem::Compacted(CompactedItem {
-                message: String::new(), replacement_history: Some(history.clone()),
-                window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+                message: String::new(),
+                replacement_history: Some(history.clone()),
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
             });
-            let replay: RolloutItem = serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
-            assert_eq!(Session::reconstruct_model_history_from_rollout(&[
-                replay.clone(),
-                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-                )),
-            ]), vec![notice.clone()], "checkpoint rollback must retain source uncertainty");
+            let replay: RolloutItem =
+                serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
+            assert_eq!(
+                Session::reconstruct_model_history_from_rollout(&[
+                    replay.clone(),
+                    RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+                    )),
+                ]),
+                vec![notice.clone()],
+                "checkpoint rollback must retain source uncertainty"
+            );
             history = Session::reconstruct_model_history_from_rollout(&[replay]);
             assert_eq!(history.iter().filter(|item| **item == notice).count(), 1);
         }
         // A new load may append a refreshed notice after a retained checkpoint.
         let (reloaded, _, _) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
-        let RolloutItem::ResponseItem(refreshed) = reloaded.last().unwrap() else { panic!("refreshed notice") };
+        let RolloutItem::ResponseItem(refreshed) = reloaded.last().unwrap() else {
+            panic!("refreshed notice")
+        };
         assert_ne!(refreshed.id(), notice.id());
-        let mut duplicated = history.into_iter().map(RolloutItem::ResponseItem).collect::<Vec<_>>();
+        let mut duplicated = history
+            .into_iter()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
         duplicated.push(RolloutItem::ResponseItem(refreshed.clone()));
         let rebuilt = Session::reconstruct_model_history_from_rollout(&duplicated);
-        assert_eq!(rebuilt.iter().filter(|item| codex_rollout::is_rollout_reconstruction_notice(item))
-            .collect::<Vec<_>>(), vec![refreshed]);
+        assert_eq!(
+            rebuilt
+                .iter()
+                .filter(|item| codex_rollout::is_rollout_reconstruction_notice(item))
+                .collect::<Vec<_>>(),
+            vec![refreshed]
+        );
     }
 }
 
@@ -174,27 +218,46 @@ fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
     ] {
         let mut history = vec![
             ResponseItem::FunctionCall {
-                id: None, name: "exec".into(), namespace: None,
-                arguments: "{}".into(), call_id: "resume-test".into(),
+                id: None,
+                name: "exec".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                call_id: "resume-test".into(),
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
-                id: None, call_id: "resume-test".into(),
+                id: None,
+                call_id: "resume-test".into(),
                 output: FunctionCallOutputPayload::from_text(text),
                 internal_chat_message_metadata_passthrough: None,
             },
         ];
         super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
-        let ResponseItem::Message { content, .. } = history.last().unwrap() else { unreachable!() };
-        let ContentItem::InputText { text } = &content[0] else { unreachable!() };
-        let evidence: serde_json::Value = serde_json::from_str(
-            text.lines().find(|line| line.starts_with('{')).unwrap(),
-        ).unwrap();
+        let ResponseItem::Message { content, .. } = history.last().unwrap() else {
+            unreachable!()
+        };
+        let ContentItem::InputText { text } = &content[0] else {
+            unreachable!()
+        };
+        let evidence: serde_json::Value =
+            serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
         assert_eq!(evidence["recorded_process_handles"][0]["session_id"], 42);
-        assert_eq!(evidence["recorded_process_handles"][0]["raw_output_artifact_id"], "saved");
-        assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            evidence["recorded_process_handles"][0]["raw_output_artifact_id"],
+            "saved"
+        );
+        assert_eq!(
+            evidence["recorded_process_handles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(evidence["recorded_process_handles"][1]["session_id"], 43);
-        assert_eq!(evidence["recorded_process_handles"][1]["raw_output_artifact_id"], "nested-saved");
+        assert_eq!(
+            evidence["recorded_process_handles"][1]["raw_output_artifact_id"],
+            "nested-saved"
+        );
     }
 }
 
@@ -202,26 +265,50 @@ fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
 async fn world_state_replay_uses_latest_reset_without_resurrecting_old_baselines() {
     let (session, turn) = make_session_and_context().await;
     for (reset, expected) in [
-        (RolloutItem::WorldState(WorldStateItem::full(json!({
-            "environment": {"status": "new", "cwd": "/new"}
-        }))), json!({"environment": {"status": "ready", "cwd": "/new"}})),
-        (RolloutItem::WorldState(WorldStateItem::full(json!([]))), json!(null)),
-        (RolloutItem::Compacted(CompactedItem {
-            message: String::new(), replacement_history: Some(Vec::new()),
-            window_number: Some(1), first_window_id: None,
-            previous_window_id: None, window_id: None,
-        }), json!(null)),
-    ] {
-        let items = completed_user_turn_rollout(accepted_context(turn.to_turn_context_item()), vec![
+        (
             RolloutItem::WorldState(WorldStateItem::full(json!({
-                "environment": {"status": "old", "cwd": "/old"}
+                "environment": {"status": "new", "cwd": "/new"}
             }))),
-            RolloutItem::WorldState(WorldStateItem::patch(json!({"environment": {"status": "obsolete"}}))),
-            reset,
-            RolloutItem::WorldState(WorldStateItem::patch(json!({"environment": {"status": "ready"}}))),
-        ]);
-        let result = session.reconstruct_history_from_rollout(&turn, &items).await;
-        assert_eq!(serde_json::to_value(result.world_state_baseline).unwrap(), expected);
+            json!({"environment": {"status": "ready", "cwd": "/new"}}),
+        ),
+        (
+            RolloutItem::WorldState(WorldStateItem::full(json!([]))),
+            json!(null),
+        ),
+        (
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(Vec::new()),
+                window_number: Some(1),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }),
+            json!(null),
+        ),
+    ] {
+        let items = completed_user_turn_rollout(
+            accepted_context(turn.to_turn_context_item()),
+            vec![
+                RolloutItem::WorldState(WorldStateItem::full(json!({
+                    "environment": {"status": "old", "cwd": "/old"}
+                }))),
+                RolloutItem::WorldState(WorldStateItem::patch(
+                    json!({"environment": {"status": "obsolete"}}),
+                )),
+                reset,
+                RolloutItem::WorldState(WorldStateItem::patch(
+                    json!({"environment": {"status": "ready"}}),
+                )),
+            ],
+        );
+        let result = session
+            .reconstruct_history_from_rollout(&turn, &items)
+            .await;
+        assert_eq!(
+            serde_json::to_value(result.world_state_baseline).unwrap(),
+            expected
+        );
     }
 }
 
@@ -380,33 +467,60 @@ fn checklist(step: &str) -> codex_protocol::plan_tool::UpdatePlanArgs {
 
 #[test]
 fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
-    let call = |id: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-        id: None, call_id: id.into(), name: "exec_command".into(), namespace: None,
-        arguments: json!({
-            "cmd": "SECRET_COMMAND", "token": "SECRET_TOKEN",
-            "environment_id": "remote-build", "workdir": "/workspace",
-            "target": "https://user:SECRET_PASSWORD@example.test/path?token=SECRET_QUERY"
-        }).to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    });
-    let output = |id: &str, text: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-        id: None, call_id: id.into(),
-        output: FunctionCallOutputPayload::from_text(text.into()),
-        internal_chat_message_metadata_passthrough: None,
-    });
-    let mut items = vec![call("settled"), output("settled", "success"), call("lost"),
-        output("lost", "Tool execution completed, but its full result could not be preserved for model delivery.")];
-    for index in 0..9 { items.push(call(&format!("pending-{index}"))); }
+    let call = |id: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            call_id: id.into(),
+            name: "exec_command".into(),
+            namespace: None,
+            arguments: json!({
+                "cmd": "SECRET_COMMAND", "token": "SECRET_TOKEN",
+                "environment_id": "remote-build", "workdir": "/workspace",
+                "target": "https://user:SECRET_PASSWORD@example.test/path?token=SECRET_QUERY"
+            })
+            .to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let output = |id: &str, text: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: id.into(),
+            output: FunctionCallOutputPayload::from_text(text.into()),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let mut items = vec![
+        call("settled"),
+        output("settled", "success"),
+        call("lost"),
+        output(
+            "lost",
+            "Tool execution completed, but its full result could not be preserved for model delivery.",
+        ),
+    ];
+    for index in 0..9 {
+        items.push(call(&format!("pending-{index}")));
+    }
     let mut history = Vec::new();
     super::rollout_reconstruction::append_unsettled_tool_recovery(&mut history, &items);
     let text = serde_json::to_string(&history).unwrap();
     assert!(!text.contains("SECRET"));
-    let ResponseItem::Message { content, .. } = &history[0] else { panic!("recovery message"); };
-    let ContentItem::InputText { text } = &content[0] else { panic!("recovery text"); };
+    let ResponseItem::Message { content, .. } = &history[0] else {
+        panic!("recovery message");
+    };
+    let ContentItem::InputText { text } = &content[0] else {
+        panic!("recovery text");
+    };
     let summary: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
     // Checked on the parsed page: inside the serialized history its quotes are escaped.
-    assert!(summary["operations"].as_array().unwrap().iter()
-        .all(|operation| operation["call_id"] != "settled"));
+    assert!(
+        summary["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|operation| operation["call_id"] != "settled")
+    );
     assert_eq!(summary["unresolved_count"], 10);
     assert_eq!(summary["omitted_count"], 2);
     assert_eq!(summary["operations"].as_array().unwrap().len(), 8);
@@ -415,12 +529,20 @@ fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
         assert_eq!(operation["cwd"], "/workspace");
         assert_eq!(operation["target"], "https://example.test");
     }
-    for text in ["durable result", "full result could not be preserved",
-        "Source says: Tool execution completed, but its full result could not be preserved for model delivery."] {
+    for text in [
+        "durable result",
+        "full result could not be preserved",
+        "Source says: Tool execution completed, but its full result could not be preserved for model delivery.",
+    ] {
         let mut history = Vec::new();
         super::rollout_reconstruction::append_unsettled_tool_recovery(
-            &mut history, &[call("returned"), output("returned", text)]);
-        assert!(history.is_empty(), "quoted content must not manufacture an unsettled call");
+            &mut history,
+            &[call("returned"), output("returned", text)],
+        );
+        assert!(
+            history.is_empty(),
+            "quoted content must not manufacture an unsettled call"
+        );
     }
 }
 
@@ -455,8 +577,7 @@ fn compaction_preserves_resume_boundary_before_reused_live_handle() {
     ]);
     // Remote compaction retains the previous handoff; local compaction does not.
     let remote = |items: &[ResponseItem]| crate::compact::build_task_input_checkpoint(items).0;
-    let local =
-        |items: &[ResponseItem]| crate::compact::build_local_task_input_checkpoint(items).0;
+    let local = |items: &[ResponseItem]| crate::compact::build_local_task_input_checkpoint(items).0;
     let builders: [&dyn Fn(&[ResponseItem]) -> Vec<ResponseItem>; 2] = [&remote, &local];
     for build in builders {
         let checkpoint = build(&source);
@@ -586,24 +707,30 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
                 "status": "in_progress",
                 "continues": [original_id],
             }],
-        }).to_string(),
+        })
+        .to_string(),
     };
-    PlanHandler.handle(ToolInvocation {
-        session: Arc::clone(&session),
-        step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
-        cancellation_token: Default::default(),
-        tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
-        call_id: "nested-plan-revision".into(),
-        tool_name: codex_tools::ToolName::plain("update_plan"),
-        source: ToolCallSource::CodeMode {
-            cell_id: "plan-cell".into(),
-            parent_call_id: Some("plan-exec".into()),
-            runtime_tool_call_id: "2".into(),
-            nested_deadline: None,
-            cancellation_cause: None,
-        },
-        payload: revision_payload,
-    }).await.unwrap();
+    PlanHandler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: Default::default(),
+            tracker: Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            call_id: "nested-plan-revision".into(),
+            tool_name: codex_tools::ToolName::plain("update_plan"),
+            source: ToolCallSource::CodeMode {
+                cell_id: "plan-cell".into(),
+                parent_call_id: Some("plan-exec".into()),
+                runtime_tool_call_id: "2".into(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            },
+            payload: revision_payload,
+        })
+        .await
+        .unwrap();
     session.flush_rollout().await.unwrap();
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
         .await
@@ -622,15 +749,35 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
         restored.services.plan_store.current_for_test().await,
         Some(expected.clone())
     );
-    let (_, lineage) = restored.services.plan_store.snapshot_with_lineage().await.unwrap();
-    assert_eq!(lineage.requirements[&original_id].text, original.plan[0].step);
+    let (_, lineage) = restored
+        .services
+        .plan_store
+        .snapshot_with_lineage()
+        .await
+        .unwrap();
+    assert_eq!(
+        lineage.requirements[&original_id].text,
+        original.plan[0].step
+    );
     let restored_step_id = lineage.step_id(&expected.plan[0].step);
-    assert_eq!(restored_step_id, original_id, "a renamed step keeps its identity after resume");
-    let mut obligations = vec![original_id, crate::plan_store::plan_step_id(&expected.plan[0].step)];
+    assert_eq!(
+        restored_step_id, original_id,
+        "a renamed step keeps its identity after resume"
+    );
+    let mut obligations = vec![
+        original_id,
+        crate::plan_store::plan_step_id(&expected.plan[0].step),
+    ];
     obligations.sort();
     assert_eq!(lineage.step_requirements[&restored_step_id], obligations);
-    assert!(restored.clone_history().await.raw_items().iter()
-        .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none()));
+    assert!(
+        restored
+            .clone_history()
+            .await
+            .raw_items()
+            .iter()
+            .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none())
+    );
     assert_eq!(
         restored.services.plan_store.update(expected).await.effect,
         crate::plan_store::PlanUpdateEffect::NoOp
@@ -643,14 +790,32 @@ async fn active_plan_output_cannot_replace_durable_lineage_on_resume() {
         let (session, turn) = make_session_and_context().await;
         let plan = checklist("current work");
         let mut lineage = crate::plan_store::PlanLineage::default();
-        lineage.requirements.insert("retired".into(), crate::plan_store::PlanRequirement {
-            text: "completed historical scope".into(),
-            status: codex_protocol::plan_tool::StepStatus::Completed,
-            superseded_reason: None,
-        });
-        session.services.plan_store.restore_with_lineage(Some(plan.clone()), Some(lineage)).await;
-        let (_, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
-        let revision = session.services.plan_store.execution_snapshot().await.unwrap().revision;
+        lineage.requirements.insert(
+            "retired".into(),
+            crate::plan_store::PlanRequirement {
+                text: "completed historical scope".into(),
+                status: codex_protocol::plan_tool::StepStatus::Completed,
+                superseded_reason: None,
+            },
+        );
+        session
+            .services
+            .plan_store
+            .restore_with_lineage(Some(plan.clone()), Some(lineage))
+            .await;
+        let (_, lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .unwrap();
+        let revision = session
+            .services
+            .plan_store
+            .execution_snapshot()
+            .await
+            .unwrap()
+            .revision;
         let durable = json!({"current_plan":plan,"lineage":lineage.compact_for_plan(&plan),
             "lineage_complete":true,"revision":revision});
         let active = json!({"current_plan":plan,"lineage":lineage.active_for_plan(&plan),
@@ -658,28 +823,60 @@ async fn active_plan_output_cannot_replace_durable_lineage_on_resume() {
         assert!(active["lineage"]["requirements"].get("retired").is_none());
         let records = vec![
             RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-                id: None, name: "update_plan".into(), namespace: None,
-                arguments: serde_json::to_string(&plan).unwrap(), call_id: "active-plan".into(),
+                id: None,
+                name: "update_plan".into(),
+                namespace: None,
+                arguments: serde_json::to_string(&plan).unwrap(),
+                call_id: "active-plan".into(),
                 internal_chat_message_metadata_passthrough: None,
             }),
             RolloutItem::ResponseItem(crate::plan_store::plan_snapshot_item(&durable)),
             RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-                id: None, call_id: "active-plan".into(),
+                id: None,
+                call_id: "active-plan".into(),
                 output: FunctionCallOutputPayload::from_text(active.to_string()),
                 internal_chat_message_metadata_passthrough: None,
             }),
         ];
         let rollout = if segmented {
             completed_user_turn_rollout(accepted_context(turn.to_turn_context_item()), records)
-        } else { records };
-        session.services.plan_store.restore_with_lineage(None, None).await;
-        session.apply_rollout_reconstruction(&turn, &rollout, false).await;
-        let (restored, restored_lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        } else {
+            records
+        };
+        session
+            .services
+            .plan_store
+            .restore_with_lineage(None, None)
+            .await;
+        session
+            .apply_rollout_reconstruction(&turn, &rollout, false)
+            .await;
+        let (restored, restored_lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .unwrap();
         assert_eq!(restored, plan);
         assert_eq!(restored_lineage, lineage);
-        assert_eq!(session.services.plan_store.execution_snapshot().await.unwrap().revision, revision);
-        assert!(session.clone_history().await.raw_items().iter()
-            .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none()));
+        assert_eq!(
+            session
+                .services
+                .plan_store
+                .execution_snapshot()
+                .await
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert!(
+            session
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none())
+        );
     }
 }
 
@@ -1079,7 +1276,11 @@ fn resume_invalidates_nested_process_handles_without_losing_failure_evidence() {
             panic!("expected resume guidance");
         };
         assert!(text.contains("Do not poll those old sessions"));
-        assert!(text.contains("Only durably retained terminal receipts may be recoverable through wait"));
+        assert!(
+            text.contains(
+                "Only durably retained terminal receipts may be recoverable through wait"
+            )
+        );
         assert!(text.contains("retain its recorded output and recovery references"));
         assert!(text.contains("does not establish"));
     }
@@ -1097,51 +1298,99 @@ fn resume_notice_lists_all_recorded_handles_and_preserves_artifact_references() 
     );
     let mut history = vec![
         ResponseItem::CustomToolCall {
-            id: None, name: "exec".into(), namespace: None, input: "retained invocation".into(),
-            call_id: "nested".into(), status: None, internal_chat_message_metadata_passthrough: None,
+            id: None,
+            name: "exec".into(),
+            namespace: None,
+            input: "retained invocation".into(),
+            call_id: "nested".into(),
+            status: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCallOutput {
-            id: None, call_id: "nested".into(), output: FunctionCallOutputPayload::from_text(body.to_string()),
-            name: None, internal_chat_message_metadata_passthrough: None,
+            id: None,
+            call_id: "nested".into(),
+            output: FunctionCallOutputPayload::from_text(body.to_string()),
+            name: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let original = history.clone();
     super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
     assert_eq!(&history[..2], original.as_slice());
-    let ResponseItem::Message { content, .. } = history.last().unwrap() else { panic!("missing notice") };
-    let [ContentItem::InputText { text }] = content.as_slice() else { panic!("missing text") };
-    let evidence: serde_json::Value = serde_json::from_str(text.lines()
-        .find(|line| line.starts_with('{')).unwrap()).unwrap();
-    assert_eq!(evidence, json!({
-        "recorded_process_handles": [
-            {"session_id":7,"raw_output_artifact_id":"first-output"},
-            {"session_id":8,"raw_output_artifact_id":"draining-output"},
-            {"session_id":9,"raw_output_artifact_id":"nested-output"},
-        ], "omitted_handle_count":0,
-    }));
+    let ResponseItem::Message { content, .. } = history.last().unwrap() else {
+        panic!("missing notice")
+    };
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("missing text")
+    };
+    let evidence: serde_json::Value =
+        serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(
+        evidence,
+        json!({
+            "recorded_process_handles": [
+                {"session_id":7,"raw_output_artifact_id":"first-output"},
+                {"session_id":8,"raw_output_artifact_id":"draining-output"},
+                {"session_id":9,"raw_output_artifact_id":"nested-output"},
+            ], "omitted_handle_count":0,
+        })
+    );
     assert!(text.contains("not a crash-time inventory"));
 }
 
 #[test]
 fn resume_notice_bounds_handle_evidence_and_reports_omissions() {
-    let states = (0..40).map(|id| json!({"tool":"exec_command", "session_id":id,
-        "raw_output_artifact_id":format!("output-{id}")})).collect::<Vec<_>>();
+    let states = (0..40)
+        .map(|id| {
+            json!({"tool":"exec_command", "session_id":id,
+        "raw_output_artifact_id":format!("output-{id}")})
+        })
+        .collect::<Vec<_>>();
     let mut history = vec![
-        ResponseItem::FunctionCall { id:None, name:"wait".into(), namespace:None,
-            arguments:"{}".into(), call_id:"many".into(), internal_chat_message_metadata_passthrough:None },
-        ResponseItem::FunctionCallOutput { id:None, call_id:"many".into(),
-            output:FunctionCallOutputPayload::from_text(json!({"nested_commands":states}).to_string()),
-            internal_chat_message_metadata_passthrough:None },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "wait".into(),
+            namespace: None,
+            arguments: "{}".into(),
+            call_id: "many".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "many".into(),
+            output: FunctionCallOutputPayload::from_text(
+                json!({"nested_commands":states}).to_string(),
+            ),
+            internal_chat_message_metadata_passthrough: None,
+        },
     ];
     super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
-    let ResponseItem::Message { content, .. } = history.last().unwrap() else { panic!("missing notice") };
-    let [ContentItem::InputText { text }] = content.as_slice() else { panic!("missing text") };
-    let evidence: serde_json::Value = serde_json::from_str(text.lines()
-        .find(|line| line.starts_with('{')).unwrap()).unwrap();
-    assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), 32);
+    let ResponseItem::Message { content, .. } = history.last().unwrap() else {
+        panic!("missing notice")
+    };
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("missing text")
+    };
+    let evidence: serde_json::Value =
+        serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(
+        evidence["recorded_process_handles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        32
+    );
     assert_eq!(evidence["omitted_handle_count"], 8);
-    for (id, handle) in evidence["recorded_process_handles"].as_array().unwrap().iter().enumerate() {
-        assert_eq!(handle, &json!({"session_id": id, "raw_output_artifact_id": format!("output-{id}")}));
+    for (id, handle) in evidence["recorded_process_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            handle,
+            &json!({"session_id": id, "raw_output_artifact_id": format!("output-{id}")})
+        );
     }
 }
 
@@ -1155,10 +1404,20 @@ fn resume_ignores_explicit_unrelated_receipt_owners() {
     ] {
         for body in [receipt.to_string(), format!("Script completed\n{receipt}")] {
             let mut history = vec![
-                ResponseItem::FunctionCall { id:None, name:"exec".into(), namespace:None,
-                    arguments:"{}".into(), call_id:"unrelated".into(), internal_chat_message_metadata_passthrough:None },
-                ResponseItem::FunctionCallOutput { id:None, call_id:"unrelated".into(),
-                    output:FunctionCallOutputPayload::from_text(body), internal_chat_message_metadata_passthrough:None },
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "exec".into(),
+                    namespace: None,
+                    arguments: "{}".into(),
+                    call_id: "unrelated".into(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "unrelated".into(),
+                    output: FunctionCallOutputPayload::from_text(body),
+                    internal_chat_message_metadata_passthrough: None,
+                },
             ];
             let original = history.clone();
             super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
@@ -1171,21 +1430,42 @@ fn resume_ignores_explicit_unrelated_receipt_owners() {
 fn current_command_receipts_invalidate_live_and_draining_handles_on_resume() {
     for exited in [false, true] {
         let output = crate::tools::context::ExecCommandToolOutput {
-            output_ranges:None, process_output:None, error:None, validation:None,
-            event_call_id:"receipt".into(), chunk_id:"chunk".into(), wall_time:std::time::Duration::ZERO,
-            raw_output:b"retained evidence".to_vec(),
-            truncation_policy:codex_utils_output_truncation::TruncationPolicy::Tokens(1000),
-            max_output_tokens:Some(1000), process_id:Some(7), session_capabilities:None,
-            exit_code:exited.then_some(0), process_exited:exited, search_no_match:false,
-            original_token_count:None, hook_command:None, raw_output_artifact:None,
-            repair_notice:None, pending_deferred_completions:Vec::new(),
+            output_ranges: None,
+            process_output: None,
+            error: None,
+            validation: None,
+            event_call_id: "receipt".into(),
+            chunk_id: "chunk".into(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: b"retained evidence".to_vec(),
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(1000),
+            max_output_tokens: Some(1000),
+            process_id: Some(7),
+            session_capabilities: None,
+            exit_code: exited.then_some(0),
+            process_exited: exited,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command: None,
+            raw_output_artifact: None,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
         };
         let mut history = vec![
-            ResponseItem::FunctionCall { id:None, name:"exec_command".into(), namespace:None,
-                arguments:"{}".into(), call_id:"receipt".into(), internal_chat_message_metadata_passthrough:None },
-            ResponseItem::FunctionCallOutput { id:None, call_id:"receipt".into(),
-                output:FunctionCallOutputPayload::from_text(output.response_text()),
-                internal_chat_message_metadata_passthrough:None },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                call_id: "receipt".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "receipt".into(),
+                output: FunctionCallOutputPayload::from_text(output.response_text()),
+                internal_chat_message_metadata_passthrough: None,
+            },
         ];
         super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
         assert_eq!(history.len(), 3);
@@ -1203,18 +1483,35 @@ async fn reloaded_process_handles_are_excluded_from_allocation() {
         "Running command session_id: 1003",
         "{\"session_id\":4294967296}",
     ];
-    let items = outputs.into_iter().map(|text| RolloutItem::ResponseItem(
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call".into(),
-            output: FunctionCallOutputPayload::from_text(text.to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        }
-    )).collect::<Vec<_>>();
+    let items = outputs
+        .into_iter()
+        .map(|text| {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "call".into(),
+                output: FunctionCallOutputPayload::from_text(text.to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            })
+        })
+        .collect::<Vec<_>>();
     let ids = super::rollout_reconstruction::historical_process_ids(&items);
-    assert_eq!(ids, std::collections::HashSet::from([1000, 1001, 1002, 1003]));
-    session.services.unified_exec_manager.exclude_process_ids(ids).await;
-    assert_eq!(session.services.unified_exec_manager.allocate_process_id().await, 1004);
+    assert_eq!(
+        ids,
+        std::collections::HashSet::from([1000, 1001, 1002, 1003])
+    );
+    session
+        .services
+        .unified_exec_manager
+        .exclude_process_ids(ids)
+        .await;
+    assert_eq!(
+        session
+            .services
+            .unified_exec_manager
+            .allocate_process_id()
+            .await,
+        1004
+    );
 }
 
 #[test]
@@ -2329,38 +2626,47 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
     );
 }
 
-
-
 #[tokio::test]
 async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
     let (session, turn_context) = make_session_and_context().await;
     let accepted = accepted_context(turn_context.to_turn_context_item());
     for (boundary, clears) in [
-        (RolloutItem::SamplingBoundary(SamplingBoundaryItem {
-            sampling_request_id: "request-new".to_string(),
-            physical_attempt_id: "attempt-new".to_string(),
-            turn_id: Some(turn_context.sub_id.clone()),
-            unresolved_context: false,
-            timing_checkpoint: None,
-        }), false),
-        (RolloutItem::SamplingBoundary(SamplingBoundaryItem {
-            sampling_request_id: "request-new".to_string(),
-            physical_attempt_id: "attempt-new".to_string(),
-            turn_id: Some(turn_context.sub_id.clone()),
-            unresolved_context: true,
-            timing_checkpoint: None,
-        }), true),
-        (RolloutItem::Compacted(CompactedItem {
-            message: String::new(),
-            replacement_history: Some(Vec::new()),
-            window_number: None,
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-        }), true),
+        (
+            RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+                sampling_request_id: "request-new".to_string(),
+                physical_attempt_id: "attempt-new".to_string(),
+                turn_id: Some(turn_context.sub_id.clone()),
+                unresolved_context: false,
+                timing_checkpoint: None,
+            }),
+            false,
+        ),
+        (
+            RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+                sampling_request_id: "request-new".to_string(),
+                physical_attempt_id: "attempt-new".to_string(),
+                turn_id: Some(turn_context.sub_id.clone()),
+                unresolved_context: true,
+                timing_checkpoint: None,
+            }),
+            true,
+        ),
+        (
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(Vec::new()),
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }),
+            true,
+        ),
     ] {
         let initial = completed_user_turn_rollout(accepted.clone(), Vec::new());
-        let before = session.reconstruct_history_from_rollout(&turn_context, &initial).await;
+        let before = session
+            .reconstruct_history_from_rollout(&turn_context, &initial)
+            .await;
         assert_eq!(
             serde_json::to_value(before.reference_context_item).unwrap(),
             serde_json::to_value(Some(&accepted)).unwrap(),
@@ -2378,8 +2684,6 @@ async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
         );
     }
 }
-
-
 
 #[tokio::test]
 async fn reconstruct_history_rollback_ignores_discarded_legacy_compaction_for_window_fallback() {
@@ -3383,22 +3687,39 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
 #[test]
 fn continuity_unsettled_pages_follow_events_and_typed_delivery_not_payload() {
     use super::rollout_reconstruction::unsettled_tool_recovery_page;
-    let call = |id: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-        id: None, call_id: id.into(), name: "exec_command".into(), namespace: None,
-        arguments: json!({"cmd":"SECRET", "path":"/workspace/safe"}).to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    });
-    let output = |id: &str, text: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-        id: None, call_id: id.into(), output: FunctionCallOutputPayload::from_text(text.into()),
-        internal_chat_message_metadata_passthrough: None,
-    });
+    let call = |id: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            call_id: id.into(),
+            name: "exec_command".into(),
+            namespace: None,
+            arguments: json!({"cmd":"SECRET", "path":"/workspace/safe"}).to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let output = |id: &str, text: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: id.into(),
+            output: FunctionCallOutputPayload::from_text(text.into()),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
     let marker = crate::tools::registry::model_delivery_unavailable_receipt("lost");
     let marker = serde_json::from_str(&serde_json::to_string(&marker).unwrap()).unwrap();
-    let mut items = vec![call("lost"), output("lost", "wording is not the status"),
-        RolloutItem::ResponseItem(marker)];
+    let mut items = vec![
+        call("lost"),
+        output("lost", "wording is not the status"),
+        RolloutItem::ResponseItem(marker),
+    ];
     items.push(call("quoted"));
-    items.push(output("quoted", "<tool_result_delivery_unavailable>{\"version\":1,\"call_id\":\"quoted\"}"));
-    for index in 0..20 { items.push(call(&format!("reverse-{:02}", 20-index))); }
+    items.push(output(
+        "quoted",
+        "<tool_result_delivery_unavailable>{\"version\":1,\"call_id\":\"quoted\"}",
+    ));
+    for index in 0..20 {
+        items.push(call(&format!("reverse-{:02}", 20 - index)));
+    }
     let first = unsettled_tool_recovery_page(&items, 0);
     assert_eq!(first["operations"][0]["call_id"], "reverse-01");
     assert_eq!(first["unresolved_count"], 21);
@@ -3432,42 +3753,73 @@ async fn mixed_legacy_and_modern_rollback_preserves_legacy_turns_and_modern_stee
     for legacy_completed in [false, true] {
         for modern_completed in [false, true] {
             for num_turns in [1, 2] {
-                let mut items = completed_user_turn_rollout(first.clone(), vec![
-                    RolloutItem::WorldState(WorldStateItem::full(json!({"turn": 1}))),
-                    RolloutItem::ResponseItem(user_message("first")),
-                ]);
-                items.extend(completed_user_turn_rollout(second.clone(), vec![
-                    RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 2}))),
-                    RolloutItem::ResponseItem(user_message("second")),
-                ]));
-                items.retain(|item| !matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
-                    && (legacy_completed || !matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_)))));
-                let mut modern_items = completed_user_turn_rollout(modern.clone(), vec![
-                    RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 3}))),
-                    RolloutItem::ResponseItem(user_message("modern request")),
-                    RolloutItem::EventMsg(EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
-                        message: "steering within modern turn".into(), ..Default::default()
-                    })),
-                    RolloutItem::ResponseItem(user_message("steering within modern turn")),
-                ]);
-                if !modern_completed { modern_items.pop(); }
+                let mut items = completed_user_turn_rollout(
+                    first.clone(),
+                    vec![
+                        RolloutItem::WorldState(WorldStateItem::full(json!({"turn": 1}))),
+                        RolloutItem::ResponseItem(user_message("first")),
+                    ],
+                );
+                items.extend(completed_user_turn_rollout(
+                    second.clone(),
+                    vec![
+                        RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 2}))),
+                        RolloutItem::ResponseItem(user_message("second")),
+                    ],
+                ));
+                items.retain(|item| {
+                    !matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+                        && (legacy_completed
+                            || !matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
+                });
+                let mut modern_items = completed_user_turn_rollout(
+                    modern.clone(),
+                    vec![
+                        RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 3}))),
+                        RolloutItem::ResponseItem(user_message("modern request")),
+                        RolloutItem::EventMsg(EventMsg::UserMessage(
+                            codex_protocol::protocol::UserMessageEvent {
+                                message: "steering within modern turn".into(),
+                                ..Default::default()
+                            },
+                        )),
+                        RolloutItem::ResponseItem(user_message("steering within modern turn")),
+                    ],
+                );
+                if !modern_completed {
+                    modern_items.pop();
+                }
                 items.extend(modern_items);
                 items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
                     codex_protocol::protocol::ThreadRolledBackEvent { num_turns },
                 )));
                 let started = std::time::Instant::now();
-                let rebuilt = session.reconstruct_history_from_rollout(&turn_context, &items).await;
+                let rebuilt = session
+                    .reconstruct_history_from_rollout(&turn_context, &items)
+                    .await;
                 eprintln!("mixed_rollback_elapsed={:?}", started.elapsed());
                 let (expected_history, expected_context, expected_world) = if num_turns == 2 {
                     (vec![user_message("first")], &first, json!({"turn": 1}))
                 } else {
-                    (vec![user_message("first"), user_message("second")], &second, json!({"turn": 2}))
+                    (
+                        vec![user_message("first"), user_message("second")],
+                        &second,
+                        json!({"turn": 2}),
+                    )
                 };
                 assert_eq!(rebuilt.history, expected_history);
-                assert_eq!(rebuilt.previous_turn_settings.unwrap().model, expected_context.model);
-                assert_eq!(serde_json::to_value(rebuilt.reference_context_item).unwrap(),
-                    serde_json::to_value(Some(expected_context)).unwrap());
-                assert_eq!(serde_json::to_value(rebuilt.world_state_baseline.unwrap()).unwrap(), expected_world);
+                assert_eq!(
+                    rebuilt.previous_turn_settings.unwrap().model,
+                    expected_context.model
+                );
+                assert_eq!(
+                    serde_json::to_value(rebuilt.reference_context_item).unwrap(),
+                    serde_json::to_value(Some(expected_context)).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(rebuilt.world_state_baseline.unwrap()).unwrap(),
+                    expected_world
+                );
             }
         }
     }

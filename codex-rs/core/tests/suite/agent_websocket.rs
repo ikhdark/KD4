@@ -445,7 +445,9 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     // The transport chain is the contract under test. Disable sandbox enforcement so a
     // policy rejection cannot terminalize the required shell tool before its output is sent.
-    let completed = test.submit_turn_and_capture_completion("run the echo command").await?;
+    let completed = test
+        .submit_turn_and_capture_completion("run the echo command")
+        .await?;
     assert_eq!(completed.error, None);
     assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
@@ -496,7 +498,13 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
         serde_json::from_value(output_item["output"].clone())?;
     let text = body.to_text().expect("text shell output");
     assert!(text.contains("Exit code: 0"), "{text}");
-    assert_eq!(text.split_once("Output:\n").expect("shell output envelope").1.trim(), "websocket");
+    assert_eq!(
+        text.split_once("Output:\n")
+            .expect("shell output envelope")
+            .1
+            .trim(),
+        "websocket"
+    );
 
     let handshake = server.single_handshake();
     assert_eq!(
@@ -507,8 +515,6 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     server.shutdown().await;
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Result<()> {

@@ -2,11 +2,11 @@ use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
-use sha2::Digest;
-use sha2::Sha256;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::context::ContextualUserFragment;
 use crate::context::InterAgentCompletionMessage;
@@ -65,12 +65,10 @@ pub(crate) fn inter_agent_completion_communication(
     status: &AgentStatus,
     receipt: Option<&str>,
 ) -> Option<InterAgentCommunication> {
-    let message = format_inter_agent_completion_message(
-        task_name.clone(), sender.clone(), status, receipt,
-    )?;
-    let mut communication = InterAgentCommunication::new(
-        sender, task_name, Vec::new(), message, false,
-    );
+    let message =
+        format_inter_agent_completion_message(task_name.clone(), sender.clone(), status, receipt)?;
+    let mut communication =
+        InterAgentCommunication::new(sender, task_name, Vec::new(), message, false);
     if let AgentStatus::Errored(error) = status {
         let mut digest = Sha256::new();
         // Hash the full error, not its bounded display. Length framing avoids
@@ -86,7 +84,8 @@ pub(crate) fn inter_agent_completion_communication(
             digest.update(part.as_bytes());
         }
         communication.id = Some(codex_protocol::ResponseItemId::from_server(format!(
-            "agent-error-{:x}", digest.finalize(),
+            "agent-error-{:x}",
+            digest.finalize(),
         )));
     }
     Some(communication)
@@ -138,7 +137,11 @@ pub(crate) fn format_inter_agent_completion_message(
         AgentStatus::NotFound => "Agent was not found.".to_string(),
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => return None,
     };
-    Some(InterAgentCompletionMessage::new(task_name, sender, payload).with_receipt(receipt).render())
+    Some(
+        InterAgentCompletionMessage::new(task_name, sender, payload)
+            .with_receipt(receipt)
+            .render(),
+    )
 }
 
 fn format_bounded_inter_agent_completion_message(
@@ -161,10 +164,13 @@ fn format_bounded_inter_agent_completion_message(
         let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
         let retrieval_guidance = if receipt.is_some() {
             "The full sealed receipt remains available at the exact receipt locator above; no automatic retrieval was performed."
-        } else { retrieval_guidance };
+        } else {
+            retrieval_guidance
+        };
         let payload = format!("{payload}\n\n{retrieval_guidance}");
-        let message =
-            InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).with_receipt(receipt).render();
+        let message = InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload)
+            .with_receipt(receipt)
+            .render();
         let message_tokens = approx_token_count(&message);
         if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
             return message;

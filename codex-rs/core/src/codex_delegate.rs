@@ -622,8 +622,7 @@ async fn handle_request_user_input(
         questions: event.questions,
         auto_resolution_ms: event.auto_resolution_ms,
     };
-    let response_fut =
-        parent_session.request_user_input(parent_ctx, call_id.clone(), args);
+    let response_fut = parent_session.request_user_input(parent_ctx, call_id.clone(), args);
     let response = await_user_input_with_cancel(
         response_fut,
         parent_session,
@@ -636,7 +635,11 @@ async fn handle_request_user_input(
     // Bound admission so a stalled child cannot hold delegate shutdown indefinitely.
     let _ = timeout(
         Duration::from_millis(500),
-        codex.submit(Op::UserInputAnswer { id, call_id: Some(call_id), response }),
+        codex.submit(Op::UserInputAnswer {
+            id,
+            call_id: Some(call_id),
+            response,
+        }),
     )
     .await;
 }

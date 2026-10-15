@@ -61,7 +61,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
             with read_rollout_snapshot(path) as snapshot:
                 result = analysis.analyze_snapshots([snapshot])
         self.assertEqual(result["recordCount"], 12)
-        self.assertEqual(result["startedTurnCount"], 6)
+        # Invalid clocks remove timing, not the recorded lifecycle identity.
+        self.assertEqual(result["startedTurnCount"], 7)
         self.assertEqual(result["completedTurnCount"], 4)
         self.assertEqual(result["timingSchemaVersions"], {"25": 1, "26": 1, "27": 2})
         self.assertEqual(
@@ -96,9 +97,9 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
             {
                 "invalidJsonLines": {"count": 1, "denominator": 12, "rate": 1 / 12},
                 "invalidTimestamps": {"count": 1, "denominator": 11, "rate": 1 / 11},
-                "incompleteTurns": {"count": 2, "denominator": 6, "rate": 1 / 3},
-                "supersededTurns": {"count": 1, "denominator": 6, "rate": 1 / 6},
-                "unterminatedTurns": {"count": 1, "denominator": 6, "rate": 1 / 6},
+                "incompleteTurns": {"count": 3, "denominator": 7, "rate": 3 / 7},
+                "supersededTurns": {"count": 2, "denominator": 7, "rate": 2 / 7},
+                "unterminatedTurns": {"count": 1, "denominator": 7, "rate": 1 / 7},
                 "abortedTurns": {"count": 0, "denominator": 4, "rate": 0},
                 "terminalWithoutStart": {"count": 0, "denominator": 4, "rate": 0},
                 "duplicateTerminalEvents": {"count": 0, "denominator": 4, "rate": 0},

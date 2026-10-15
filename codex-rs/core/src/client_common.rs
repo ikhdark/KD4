@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -198,6 +199,10 @@ pub struct Prompt {
 
     /// Whether the Responses API should strictly validate `output_schema`.
     pub output_schema_strict: bool,
+
+    /// Longest provider silence tolerated while waiting for response progress.
+    /// `None` keeps the provider's stream idle timeout. Never serialized.
+    pub(crate) stream_progress_timeout: Option<Duration>,
 }
 
 impl Default for Prompt {
@@ -219,6 +224,7 @@ impl Default for Prompt {
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,
+            stream_progress_timeout: None,
         }
     }
 }

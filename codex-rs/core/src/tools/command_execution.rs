@@ -99,8 +99,13 @@ impl SearchNarrowingAttempt {
 
 impl CommandAttemptKey {
     pub(crate) fn local_cwd(&self) -> Option<PathBuf> {
-        if self.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID { return None; }
-        codex_utils_path_uri::PathUri::parse(&self.cwd).ok()?.to_abs_path().ok()
+        if self.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID {
+            return None;
+        }
+        codex_utils_path_uri::PathUri::parse(&self.cwd)
+            .ok()?
+            .to_abs_path()
+            .ok()
             .map(|path| path.to_path_buf())
     }
 
@@ -317,7 +322,9 @@ impl CommandAttemptBlocked {
             }
             CommandAttemptBlockedReason::PersistedInputFailure(failure) => format!(
                 "Command suppressed: this exact input and execution context previously produced an input-determined `{}` rejection (fingerprint `{}`, exit code {}). This is a persisted failure receipt, not a fresh execution or filesystem observation. Correct the invocation before retrying.",
-                failure.proof.outcome_class(), self.fingerprint, failure.exit_code,
+                failure.proof.outcome_class(),
+                self.fingerprint,
+                failure.exit_code,
             ),
             CommandAttemptBlockedReason::SearchMiss => format!(
                 "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use read_file or list_files when available to revalidate current filesystem evidence when external state changed.",
@@ -632,9 +639,6 @@ impl CommandExecutionLedger {
             .map(|baseline| baseline.workspace_identity)
     }
 
-
-
-
     /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
     /// belongs to its original local cwd; another workspace must not seed it.
     pub(crate) async fn observe_workspace_baseline(
@@ -745,11 +749,18 @@ impl CommandExecutionLedger {
                     self.workspace_identity_capture_count
                         .fetch_add(1, Ordering::Relaxed);
                     match &self.workspace_cache {
-                        Some(cache) => cache
-                            .workspace_evidence_identity_with_attribution(&persistence.cwd)
+                        Some(cache) => {
+                            cache
+                                .workspace_evidence_identity_with_attribution(&persistence.cwd)
+                                .await
+                                .identity
+                        }
+                        None => {
+                            crate::git_workspace::capture_workspace_evidence_identity(
+                                &persistence.cwd,
+                            )
                             .await
-                            .identity,
-                        None => crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await,
+                        }
                     }
                 }
                 None => None,
@@ -770,7 +781,10 @@ impl CommandExecutionLedger {
                         serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes).ok()
                     })
                     .filter(|document| {
-                        matches!(document.schema_version, 3 | COMMAND_EXECUTION_CACHE_SCHEMA_VERSION)
+                        matches!(
+                            document.schema_version,
+                            3 | COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+                        )
                     }),
                 None => None,
             }
@@ -824,8 +838,14 @@ impl CommandExecutionLedger {
                         state.search.revision = state.search.revision.wrapping_add(1);
                     }
                 }
-                for (fingerprint, failure) in document.input_failures.into_iter().take(MAX_TRACKED_COMMANDS) {
-                    if let std::collections::btree_map::Entry::Vacant(entry) = state.retry.input_failures.entry(fingerprint) {
+                for (fingerprint, failure) in document
+                    .input_failures
+                    .into_iter()
+                    .take(MAX_TRACKED_COMMANDS)
+                {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        state.retry.input_failures.entry(fingerprint)
+                    {
                         entry.insert(failure);
                         state.retry.revision = state.retry.revision.wrapping_add(1);
                     }
@@ -834,8 +854,11 @@ impl CommandExecutionLedger {
                     state.retry.input_failures.pop_first();
                 }
                 if complete_document {
-                    state.persisted_revision =
-                        Some((document.workspace_identity, state.search.revision, state.retry.revision));
+                    state.persisted_revision = Some((
+                        document.workspace_identity,
+                        state.search.revision,
+                        state.retry.revision,
+                    ));
                 }
             }
         }
@@ -953,7 +976,10 @@ impl CommandExecutionLedger {
             entry.deterministic_failure = Some(
                 DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
             );
-            state.retry.input_failures.insert(key.fingerprint(), PersistedInputFailure { proof, exit_code });
+            state.retry.input_failures.insert(
+                key.fingerprint(),
+                PersistedInputFailure { proof, exit_code },
+            );
             while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
                 state.retry.input_failures.pop_first();
             }
@@ -1000,9 +1026,20 @@ impl CommandExecutionLedger {
             ));
         }
         // A reused transport ID must not recover an earlier execution's result.
-        state.process.completion_receipts.retain(|_, receipt| receipt.process_id != process_id);
-        let retained = state.process.completion_receipts.keys().copied().collect::<HashSet<_>>();
-        state.process.completion_receipt_order.retain(|id| retained.contains(id));
+        state
+            .process
+            .completion_receipts
+            .retain(|_, receipt| receipt.process_id != process_id);
+        let retained = state
+            .process
+            .completion_receipts
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        state
+            .process
+            .completion_receipt_order
+            .retain(|id| retained.contains(id));
         state.process.running.insert(
             process_id,
             RunningCommand {
@@ -1029,33 +1066,57 @@ impl CommandExecutionLedger {
     }
 
     pub(crate) async fn identical_running_process(
-        &self, key: &CommandAttemptKey,
+        &self,
+        key: &CommandAttemptKey,
     ) -> Option<(u32, CommandExecutionId)> {
         // An epoch alone cannot prove unchanged external inputs. Missing full
         // workspace evidence must not suppress a requested validation.
-        if !key.execution_context.contains_key("workspace_identity") { return None; }
+        if !key.execution_context.contains_key("workspace_identity") {
+            return None;
+        }
         let state = self.state.lock().await;
-        state.process.running.iter()
+        state
+            .process
+            .running
+            .iter()
             .filter(|(_, running)| running.key == *key && running.completed_exit_code.is_none())
             .min_by_key(|(id, _)| **id)
             .map(|(id, running)| (*id, running.execution_id))
     }
 
-    pub(crate) async fn completed_process_result(&self, process_id: u32, incarnation: uuid::Uuid) -> Option<serde_json::Value> {
+    pub(crate) async fn completed_process_result(
+        &self,
+        process_id: u32,
+        incarnation: uuid::Uuid,
+    ) -> Option<serde_json::Value> {
         let state = self.state.lock().await;
         if state.process.running.contains_key(&process_id) {
             return None;
         }
-        let (exit_code, artifact) = if let Some(pending) = state.process.pending_by_execution_id.values()
+        let (exit_code, artifact) = if let Some(pending) = state
+            .process
+            .pending_by_execution_id
+            .values()
             .find(|pending| pending.process_id == process_id)
         {
-            if pending.command.incarnation != incarnation { return None; }
-            (pending.command.completed_exit_code, &pending.command.artifact)
+            if pending.command.incarnation != incarnation {
+                return None;
+            }
+            (
+                pending.command.completed_exit_code,
+                &pending.command.artifact,
+            )
         } else {
-            let receipt = state.process.completion_receipt_order.iter().rev()
+            let receipt = state
+                .process
+                .completion_receipt_order
+                .iter()
+                .rev()
                 .filter_map(|id| state.process.completion_receipts.get(id))
                 .find(|receipt| receipt.process_id == process_id)?;
-            if receipt.incarnation != incarnation { return None; }
+            if receipt.incarnation != incarnation {
+                return None;
+            }
             (receipt.exit_code, &receipt.artifact)
         };
         let (artifact_id, bytes, error) = artifact.model_projection();
@@ -1067,11 +1128,18 @@ impl CommandExecutionLedger {
             "completion_recovered": true,
             "notice": "Process already completed and was cleaned up. Output is not replayed; recover the retained artifact when needed. Do not restart the command.",
         });
-        if let Some(id) = artifact_id { result["raw_output_artifact_id"] = id.to_string().into(); }
-        if let Some(bytes) = bytes { result["raw_output_artifact_bytes"] = bytes.into(); }
-        if let Some(error) = error { result["raw_output_artifact_error"] = error.into(); }
+        if let Some(id) = artifact_id {
+            result["raw_output_artifact_id"] = id.to_string().into();
+        }
+        if let Some(bytes) = bytes {
+            result["raw_output_artifact_bytes"] = bytes.into();
+        }
+        if let Some(error) = error {
+            result["raw_output_artifact_error"] = error.into();
+        }
         if let (Some(id), Some(bytes)) = (artifact_id, bytes) {
-            result["recovery_selector"] = serde_json::json!({"kind":"bytes", "start":0, "end":bytes.min(4096)});
+            result["recovery_selector"] =
+                serde_json::json!({"kind":"bytes", "start":0, "end":bytes.min(4096)});
             result["recovery"] = serde_json::json!({"tool":"read_tool_output", "arguments": {
                 "artifact_id":id.to_string(), "selectors":[{"kind":"bytes", "start":0, "end":bytes.min(4096)}]
             }});
@@ -1162,7 +1230,13 @@ impl CommandExecutionLedger {
             return;
         };
         let commit_guard = Arc::clone(&self.cache_persist).lock_owned().await;
-        let Some((workspace_identity, search_revision, retry_revision, search_misses, input_failures)) = ({
+        let Some((
+            workspace_identity,
+            search_revision,
+            retry_revision,
+            search_misses,
+            input_failures,
+        )) = ({
             let state = self.state.lock().await;
             state
                 .repository
@@ -1170,13 +1244,13 @@ impl CommandExecutionLedger {
                 .as_ref()
                 .filter(|(epoch, _)| *epoch == state.repository.epoch)
                 .filter(|(_, identity)| {
-                    state
-                        .persisted_revision
-                        .as_ref()
-                        .is_none_or(|(persisted, revision, retry_revision)| {
-                            persisted != identity || *revision != state.search.revision
+                    state.persisted_revision.as_ref().is_none_or(
+                        |(persisted, revision, retry_revision)| {
+                            persisted != identity
+                                || *revision != state.search.revision
                                 || *retry_revision != state.retry.revision
-                        })
+                        },
+                    )
                 })
                 .map(|(_, workspace_identity)| {
                     (
@@ -1187,7 +1261,8 @@ impl CommandExecutionLedger {
                         state.retry.input_failures.clone(),
                     )
                 })
-        }) else {
+        })
+        else {
             return;
         };
         let document = CommandExecutionCacheDocument {
@@ -1244,7 +1319,10 @@ impl CommandExecutionLedger {
                     .find(|pending| pending.process_id == process_id)
                 {
                     pending.command.artifact = artifact;
-                } else if let Some(receipt) = state.process.completion_receipts.values_mut()
+                } else if let Some(receipt) = state
+                    .process
+                    .completion_receipts
+                    .values_mut()
                     .find(|receipt| receipt.process_id == process_id)
                 {
                     receipt.artifact = artifact;
@@ -1677,7 +1755,12 @@ fn record_search_result_locked(
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
     // A fresh execution supersedes a cached diagnosis, even if it failed for a
     // different reason. Never promote an ordinary failure into semantic memory.
-    if state.retry.input_failures.remove(&key.fingerprint()).is_some() {
+    if state
+        .retry
+        .input_failures
+        .remove(&key.fingerprint())
+        .is_some()
+    {
         state.retry.revision = state.retry.revision.wrapping_add(1);
     }
     let entry = attempt_entry_locked(state, key);
@@ -1823,11 +1906,43 @@ mod tests {
     async fn verified_running_validation_reuse_requires_exact_workspace_and_attempt() {
         let ledger = CommandExecutionLedger::default();
         let original = key("cargo test -p app").with_workspace_identity(Some("revision-a"));
-        ledger.track_running_process(42, original.clone(), RawOutputArtifact::unavailable("fixture")).await.unwrap();
-        assert_eq!(ledger.identical_running_process(&original).await.map(|(id, _)| id), Some(42));
-        assert!(ledger.identical_running_process(&key("cargo test -p app")).await.is_none());
-        assert!(ledger.identical_running_process(&key("cargo test -p app").with_workspace_identity(Some("revision-b"))).await.is_none());
-        assert!(ledger.identical_running_process(&original.clone().with_environment_fingerprint("changed")).await.is_none());
+        ledger
+            .track_running_process(
+                42,
+                original.clone(),
+                RawOutputArtifact::unavailable("fixture"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .identical_running_process(&original)
+                .await
+                .map(|(id, _)| id),
+            Some(42)
+        );
+        assert!(
+            ledger
+                .identical_running_process(&key("cargo test -p app"))
+                .await
+                .is_none()
+        );
+        assert!(
+            ledger
+                .identical_running_process(
+                    &key("cargo test -p app").with_workspace_identity(Some("revision-b"))
+                )
+                .await
+                .is_none()
+        );
+        assert!(
+            ledger
+                .identical_running_process(
+                    &original.clone().with_environment_fingerprint("changed")
+                )
+                .await
+                .is_none()
+        );
         assert!(ledger.finish_running_process(42, Some(0)).await.accepted());
         assert!(ledger.identical_running_process(&original).await.is_none());
     }
@@ -2315,7 +2430,8 @@ mod tests {
         let repository = temp.path().join("repo");
         let home = temp.path().join("home");
         initialize_git_repository(&repository);
-        let ledger = CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
+        let ledger =
+            CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
         ledger.observe_repository_revision("turn-a", 0).await;
         let attempt_key = key("fails.exe").with_repository_epoch(1);
 
@@ -2361,20 +2477,39 @@ mod tests {
             .await
             .expect("repository revision change executes");
 
-        let resumed = CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
+        let resumed =
+            CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
         resumed.observe_repository_revision("turn-b", 0).await;
-        let blocked = resumed.begin_attempt(&attempt_key, false).await
+        let blocked = resumed
+            .begin_attempt(&attempt_key, false)
+            .await
             .expect_err("input-determined failure survives restart");
-        assert!(blocked.render_for_model().contains("persisted failure receipt"));
-        resumed.begin_attempt(
-            &attempt_key.clone().with_environment_fingerprint("changed-environment"), false,
-        ).await.expect("a different execution environment is not suppressed");
-        resumed.begin_attempt_with_freshness(&attempt_key, false, true).await.unwrap();
+        assert!(
+            blocked
+                .render_for_model()
+                .contains("persisted failure receipt")
+        );
+        resumed
+            .begin_attempt(
+                &attempt_key
+                    .clone()
+                    .with_environment_fingerprint("changed-environment"),
+                false,
+            )
+            .await
+            .expect("a different execution environment is not suppressed");
+        resumed
+            .begin_attempt_with_freshness(&attempt_key, false, true)
+            .await
+            .unwrap();
         resumed.record_exit(&attempt_key, 0).await;
         resumed.persist_cache_after_terminal().await;
-        let after_success = CommandExecutionLedger::load_or_new(home, "thread".into(), &repository).await;
+        let after_success =
+            CommandExecutionLedger::load_or_new(home, "thread".into(), &repository).await;
         after_success.observe_repository_revision("turn-c", 0).await;
-        after_success.begin_attempt(&attempt_key, false).await
+        after_success
+            .begin_attempt(&attempt_key, false)
+            .await
             .expect("fresh execution supersedes the persisted diagnosis");
     }
 
@@ -2414,28 +2549,45 @@ mod tests {
             let ledger = CommandExecutionLedger::default();
             let attempt = key("ordinary-command");
             ledger.begin_attempt(&attempt, false).await.unwrap();
-            ledger.record_input_state_determined_failure(
-                &attempt,
-                InputStateDetermined::ApplyPatchImplicitInvocation,
-                RawOutputArtifact::unavailable("prior closed proof"),
-                -1,
-            ).await;
+            ledger
+                .record_input_state_determined_failure(
+                    &attempt,
+                    InputStateDetermined::ApplyPatchImplicitInvocation,
+                    RawOutputArtifact::unavailable("prior closed proof"),
+                    -1,
+                )
+                .await;
             assert!(ledger.begin_attempt(&attempt, false).await.is_err());
-            ledger.begin_attempt_with_freshness(&attempt, false, true).await.unwrap();
+            ledger
+                .begin_attempt_with_freshness(&attempt, false, true)
+                .await
+                .unwrap();
             if background {
-                ledger.track_running_process(
-                    42, attempt.clone(), RawOutputArtifact::unavailable("fresh execution"),
-                ).await.unwrap();
+                ledger
+                    .track_running_process(
+                        42,
+                        attempt.clone(),
+                        RawOutputArtifact::unavailable("fresh execution"),
+                    )
+                    .await
+                    .unwrap();
                 assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
             } else {
                 ledger.record_exit(&attempt, 7).await;
             }
             // An observed ordinary failure is not the old pre-execution rejection.
             // The closed proof contract requires ordinary command failures to stay retryable.
-            ledger.begin_attempt(&attempt, false).await
+            ledger
+                .begin_attempt(&attempt, false)
+                .await
                 .expect("fresh ordinary failure supersedes the old diagnosis");
             let state = ledger.state.lock().await;
-            assert!(!state.retry.input_failures.contains_key(&attempt.fingerprint()));
+            assert!(
+                !state
+                    .retry
+                    .input_failures
+                    .contains_key(&attempt.fingerprint())
+            );
             assert_eq!(state.retry.attempts[&attempt].last_exit_code, Some(7));
         }
     }
@@ -2503,15 +2655,11 @@ mod tests {
             .expect("track running process");
 
         assert_eq!(
-            ledger
-                .mark_running_process_completed(42, 7)
-                .await,
+            ledger.mark_running_process_completed(42, 7).await,
             CompletionApplyResult::Applied
         );
         assert_eq!(
-            ledger
-                .mark_running_process_completed(42, 7)
-                .await,
+            ledger.mark_running_process_completed(42, 7).await,
             CompletionApplyResult::AlreadyApplied
         );
         assert!(ledger.running_process(42).await.is_none());
@@ -2575,18 +2723,43 @@ mod tests {
         );
         assert!(ledger.running_process(41).await.is_none());
         assert!(ledger.running_process(42).await.is_some());
-        assert!(ledger.completed_process_result(41, uuid::Uuid::new_v4()).await.is_none());
-        let recovered = ledger.completed_process_result(41, completed.incarnation).await.expect("terminal receipt");
+        assert!(
+            ledger
+                .completed_process_result(41, uuid::Uuid::new_v4())
+                .await
+                .is_none()
+        );
+        let recovered = ledger
+            .completed_process_result(41, completed.incarnation)
+            .await
+            .expect("terminal receipt");
         assert_eq!(recovered["exit_code"], 7);
         assert_eq!(recovered["process_exited"], true);
         assert_eq!(recovered["output_complete"], false);
-        assert!(ledger.completed_process_result(42, completed.incarnation).await.is_none());
-        assert!(ledger.completed_process_result(99, completed.incarnation).await.is_none());
+        assert!(
+            ledger
+                .completed_process_result(42, completed.incarnation)
+                .await
+                .is_none()
+        );
+        assert!(
+            ledger
+                .completed_process_result(99, completed.incarnation)
+                .await
+                .is_none()
+        );
         assert_eq!(ledger.consecutive_failures(&completed_key).await, 1);
         assert_eq!(ledger.consecutive_failures(&live_key).await, 0);
-        ledger.track_running_process(41, completed_key, RawOutputArtifact::unavailable("reused"))
-            .await.unwrap();
-        assert!(ledger.completed_process_result(41, completed.incarnation).await.is_none());
+        ledger
+            .track_running_process(41, completed_key, RawOutputArtifact::unavailable("reused"))
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .completed_process_result(41, completed.incarnation)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -2838,9 +3011,28 @@ mod tests {
         // One literal pattern containing the old identity delimiter is not
         // equivalent to two separate -e patterns. The real searches prove it.
         let commands = [
-            vec!["rg", "--no-config", "--no-ignore-global", "--no-ignore-parent", "-e", "needle\u{1e}-e\u{1e}other", "example.txt"],
-            vec!["rg", "--no-config", "--no-ignore-global", "--no-ignore-parent", "-e", "needle", "-e", "other", "example.txt"],
-        ].map(|args| args.into_iter().map(str::to_string).collect::<Vec<_>>());
+            vec![
+                "rg",
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "-e",
+                "needle\u{1e}-e\u{1e}other",
+                "example.txt",
+            ],
+            vec![
+                "rg",
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "-e",
+                "needle",
+                "-e",
+                "other",
+                "example.txt",
+            ],
+        ]
+        .map(|args| args.into_iter().map(str::to_string).collect::<Vec<_>>());
         let ledger = CommandExecutionLedger::default();
         for (index, command) in commands.iter().enumerate() {
             let actual = std::process::Command::new("rg")
@@ -2849,20 +3041,33 @@ mod tests {
                 .output()
                 .expect("run ripgrep");
             assert_eq!(actual.status.code(), Some(if index == 0 { 1 } else { 0 }));
-            assert_eq!(actual.stdout, if index == 0 { Vec::new() } else { b"needle\n".to_vec() });
+            assert_eq!(
+                actual.stdout,
+                if index == 0 {
+                    Vec::new()
+                } else {
+                    b"needle\n".to_vec()
+                }
+            );
             let mut search = classify_rg_search_narrowing(command, None, root, root)
                 .unwrap()
                 .expect("rg search");
             observe_rg_search_scope_state(&mut search).await;
             assert!(search.scope_state_identity.is_some());
-            let attempt = CommandAttemptKey::new(
-                "exec_command", "local", root.to_string_lossy(), command,
-            ).with_search_narrowing("turn-a", "repo-a", Some(search));
-            ledger.begin_attempt(&attempt, false).await
+            let attempt =
+                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), command)
+                    .with_search_narrowing("turn-a", "repo-a", Some(search));
+            ledger
+                .begin_attempt(&attempt, false)
+                .await
                 .expect("a different executable query must not inherit a cached miss");
-            ledger.record_exit(&attempt, actual.status.code().unwrap()).await;
+            ledger
+                .record_exit(&attempt, actual.status.code().unwrap())
+                .await;
             if index == 0 {
-                ledger.begin_attempt(&attempt, false).await
+                ledger
+                    .begin_attempt(&attempt, false)
+                    .await
                     .expect_err("the exact original miss must still be cached");
             }
         }
@@ -2877,9 +3082,22 @@ mod tests {
         let root = fixture.path();
         std::fs::create_dir_all(root.join("codex-rs/core/src/tools")).unwrap();
         let argv = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let narrow_command = argv(&["rg", "--no-ignore-global", "--no-ignore-parent", "-n", "needle with space", "codex-rs/core/src/tools"]);
-        let equivalent_command =
-            argv(&["rg", "--no-ignore-global", "--no-ignore-parent", "-n", "needle with space", "./codex-rs/core/src/tools"]);
+        let narrow_command = argv(&[
+            "rg",
+            "--no-ignore-global",
+            "--no-ignore-parent",
+            "-n",
+            "needle with space",
+            "codex-rs/core/src/tools",
+        ]);
+        let equivalent_command = argv(&[
+            "rg",
+            "--no-ignore-global",
+            "--no-ignore-parent",
+            "-n",
+            "needle with space",
+            "./codex-rs/core/src/tools",
+        ]);
         let broad_command = argv(&["rg", "-n", "needle with space", "."]);
         let classify = |command: &[String], shell| {
             classify_rg_search_narrowing(command, shell, root, root)
@@ -3044,7 +3262,9 @@ mod tests {
 
     #[tokio::test]
     async fn implicit_global_ignore_changes_never_replay_negative_searches() {
-        use crate::tools::handlers::command_search::{classify_rg_search_narrowing, observe_rg_search_scope_state};
+        use crate::tools::handlers::command_search::{
+            classify_rg_search_narrowing, observe_rg_search_scope_state,
+        };
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("repo");
         let home = fixture.path().join("home");
@@ -3055,10 +3275,21 @@ mod tests {
         std::fs::write(&ignore, "*.txt\n").unwrap();
         std::fs::write(root.join("src/input.txt"), "needle\n").unwrap();
         let command = ["rg", "needle", "src"].map(str::to_string).to_vec();
-        let run = || std::process::Command::new("rg").args(&command[1..]).current_dir(&root)
-            .env("HOME", &home).env("USERPROFILE", &home).env("XDG_CONFIG_HOME", home.join(".config"))
-            .env_remove("GIT_CONFIG_GLOBAL").env_remove("RIPGREP_CONFIG_PATH").output().unwrap();
-        let mut scope = classify_rg_search_narrowing(&command, None, &root, &root).unwrap().unwrap();
+        let run = || {
+            std::process::Command::new("rg")
+                .args(&command[1..])
+                .current_dir(&root)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("RIPGREP_CONFIG_PATH")
+                .output()
+                .unwrap()
+        };
+        let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
+            .unwrap()
+            .unwrap();
         observe_rg_search_scope_state(&mut scope).await;
         assert!(!scope.can_record_miss);
         assert!(scope.scope_state_identity.is_none());
@@ -3068,7 +3299,10 @@ mod tests {
         assert_eq!(run().status.code(), Some(1));
         ledger.record_exit(&key, 1).await;
         std::fs::write(&ignore, "").unwrap();
-        ledger.begin_attempt(&key, false).await.expect("default global ignore inputs are unproven");
+        ledger
+            .begin_attempt(&key, false)
+            .await
+            .expect("default global ignore inputs are unproven");
         assert_eq!(run().status.code(), Some(0));
     }
 
@@ -3078,18 +3312,36 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
         std::fs::create_dir(root.join("src")).unwrap();
-        std::fs::write(root.join("src/input.py"), "from pathlib import Path\nprint(Path('output.txt').read_text())\n").unwrap();
+        std::fs::write(
+            root.join("src/input.py"),
+            "from pathlib import Path\nprint(Path('output.txt').read_text())\n",
+        )
+        .unwrap();
         let python = if cfg!(windows) { "python" } else { "python3" };
-        for pre in [vec!["--pre".to_string(), python.to_string()], vec![format!("--pre={python}")]] {
-            let mut command = ["rg", "--no-ignore-global", "--no-ignore-parent"].map(str::to_string).to_vec();
+        for pre in [
+            vec!["--pre".to_string(), python.to_string()],
+            vec![format!("--pre={python}")],
+        ] {
+            let mut command = ["rg", "--no-ignore-global", "--no-ignore-parent"]
+                .map(str::to_string)
+                .to_vec();
             command.extend(pre);
             command.extend(["needle", "src"].map(str::to_string));
-            let scope = classify_rg_search_narrowing(&command, None, root, root).unwrap().unwrap();
+            let scope = classify_rg_search_narrowing(&command, None, root, root)
+                .unwrap()
+                .unwrap();
             assert!(!scope.can_record_miss);
-            let key = CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
-                .with_search_narrowing("turn", "repo", Some(scope));
-            let run = || std::process::Command::new("rg").args(&command[1..]).current_dir(root)
-                .env_remove("RIPGREP_CONFIG_PATH").output().unwrap();
+            let key =
+                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
+                    .with_search_narrowing("turn", "repo", Some(scope));
+            let run = || {
+                std::process::Command::new("rg")
+                    .args(&command[1..])
+                    .current_dir(root)
+                    .env_remove("RIPGREP_CONFIG_PATH")
+                    .output()
+                    .unwrap()
+            };
             std::fs::write(root.join("output.txt"), "absent").unwrap();
             assert_eq!(run().status.code(), Some(1));
             let ledger = CommandExecutionLedger::default();
@@ -3115,7 +3367,15 @@ mod tests {
             "RIPGREP_CONFIG_PATH".to_string(),
             config.to_string_lossy().into_owned(),
         )]);
-        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "."].map(str::to_string).to_vec();
+        let command = [
+            "rg",
+            "--no-ignore-global",
+            "--no-ignore-parent",
+            "needle",
+            ".",
+        ]
+        .map(str::to_string)
+        .to_vec();
         let attempt = async || {
             let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
                 .unwrap()
@@ -3161,7 +3421,15 @@ mod tests {
         initialize_git_repository(&repository);
         std::fs::create_dir(repository.join("src")).unwrap();
         std::fs::write(repository.join("src/lib.rs"), "original content").unwrap();
-        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"].map(str::to_string).to_vec();
+        let command = [
+            "rg",
+            "--no-ignore-global",
+            "--no-ignore-parent",
+            "needle",
+            "src",
+        ]
+        .map(str::to_string)
+        .to_vec();
         let search = async |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
             let mut scope = classify_rg_search_narrowing(&command, None, &repository, &repository)
                 .unwrap()
@@ -3430,16 +3698,34 @@ mod tests {
         initialize_git_repository(&repository);
         let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
         let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("home"), "shared-cache".into(), &repository,
-        ).await.with_workspace_cache(Arc::clone(&cache));
+            temp.path().join("home"),
+            "shared-cache".into(),
+            &repository,
+        )
+        .await
+        .with_workspace_cache(Arc::clone(&cache));
         ledger.observe_repository_revision("turn", 0).await;
-        let first = ledger.state.lock().await.repository.observed_workspace_identity.clone();
+        let first = ledger
+            .state
+            .lock()
+            .await
+            .repository
+            .observed_workspace_identity
+            .clone();
         let captures = cache.workspace_evidence_capture_count();
-        tokio::fs::write(repository.join("changed.txt"), b"changed").await.unwrap();
+        tokio::fs::write(repository.join("changed.txt"), b"changed")
+            .await
+            .unwrap();
         cache.note_host_workspace_mutation();
         ledger.observe_repository_revision("turn", 1).await;
         assert_eq!(cache.workspace_evidence_capture_count(), captures + 1);
-        let second = ledger.state.lock().await.repository.observed_workspace_identity.clone();
+        let second = ledger
+            .state
+            .lock()
+            .await
+            .repository
+            .observed_workspace_identity
+            .clone();
         assert!(first.is_some());
         assert!(second.is_some());
         assert_ne!(first.unwrap().1, second.unwrap().1);
@@ -3698,7 +3984,6 @@ mod tests {
                 .contains_key("active-call")
         );
     }
-
 
     #[tokio::test]
     async fn handler_finalization_before_exit_watcher_records_one_failure() {

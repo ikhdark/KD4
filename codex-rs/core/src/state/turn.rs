@@ -652,9 +652,14 @@ impl TurnState {
         call_id: String,
         tx: oneshot::Sender<RequestUserInputResponse>,
     ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
-        let count = self.user_input_request_counts.entry(key.clone()).or_default();
+        let count = self
+            .user_input_request_counts
+            .entry(key.clone())
+            .or_default();
         *count = count.saturating_add(1);
-        self.pending_user_input.insert(key, (call_id, tx)).map(|(_, tx)| tx)
+        self.pending_user_input
+            .insert(key, (call_id, tx))
+            .map(|(_, tx)| tx)
     }
 
     pub(crate) fn remove_pending_user_input(
@@ -674,7 +679,11 @@ impl TurnState {
             Some(call_id) => call_id == pending_id,
             None => self.user_input_request_counts.get(key) == Some(&1),
         };
-        if matches { self.remove_pending_user_input(key) } else { None }
+        if matches {
+            self.remove_pending_user_input(key)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn remove_closed_pending_user_input(&mut self, key: &str) {
@@ -756,8 +765,14 @@ impl TurnState {
         key: &str,
         turn_id: &str,
     ) -> Option<oneshot::Sender<DynamicToolResponse>> {
-        if self.pending_dynamic_tools.get(key).is_some_and(|(owner, _)| owner == turn_id) {
-            self.pending_dynamic_tools.remove(key).map(|(_, sender)| sender)
+        if self
+            .pending_dynamic_tools
+            .get(key)
+            .is_some_and(|(owner, _)| owner == turn_id)
+        {
+            self.pending_dynamic_tools
+                .remove(key)
+                .map(|(_, sender)| sender)
         } else {
             None
         }

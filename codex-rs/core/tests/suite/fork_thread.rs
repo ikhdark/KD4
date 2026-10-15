@@ -137,7 +137,10 @@ async fn fork_thread_twice_drops_to_first_message() {
         .expect("fork 2");
 
     let fork2_path = codex_fork2.rollout_path().expect("rollout path");
-    codex_fork2.flush_rollout().await.expect("flush second fork");
+    codex_fork2
+        .flush_rollout()
+        .await
+        .expect("flush second fork");
     let fork1_user_inputs = find_user_input_positions(&fork1_items);
     assert_eq!(fork1_user_inputs.len(), 1);
     let cut_last_on_fork1 = fork1_user_inputs[0];
@@ -159,7 +162,8 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
 
     let mut builder = test_codex();
     let test = builder.build(&server).await.expect("create conversation");
-    let completed = test.submit_turn_and_capture_completion("persist source history")
+    let completed = test
+        .submit_turn_and_capture_completion("persist source history")
         .await
         .expect("complete source turn");
     assert_eq!(completed.error, None);
@@ -206,7 +210,10 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
         )
         .await
         .expect("invalid restored capabilities must not make history inaccessible");
-    let warning = wait_for_event(&forked.thread, |event| matches!(event, EventMsg::Warning(_))).await;
+    let warning = wait_for_event(&forked.thread, |event| {
+        matches!(event, EventMsg::Warning(_))
+    })
+    .await;
     let EventMsg::Warning(warning) = warning else {
         unreachable!();
     };
@@ -218,12 +225,22 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
     );
     forked.thread.ensure_rollout_materialized().await;
     forked.thread.flush_rollout().await.expect("flush fork");
-    let items = read_rollout_items_with_session_meta(&forked.thread.rollout_path().expect("fork rollout")).await;
-    let tools = items.iter().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta) => Some(meta.meta.dynamic_tools.clone().unwrap_or_default()),
-        _ => None,
-    }).expect("fork session metadata");
-    assert!(tools.is_empty(), "invalid capability must be quarantined: {tools:?}");
+    let items =
+        read_rollout_items_with_session_meta(&forked.thread.rollout_path().expect("fork rollout"))
+            .await;
+    let tools = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => {
+                Some(meta.meta.dynamic_tools.clone().unwrap_or_default())
+            }
+            _ => None,
+        })
+        .expect("fork session metadata");
+    assert!(
+        tools.is_empty(),
+        "invalid capability must be quarantined: {tools:?}"
+    );
     let user_messages = items
         .iter()
         .filter_map(|item| match item {
@@ -374,8 +391,7 @@ fn assert_fork_rollout(actual: &[RolloutItem], expected_copied_prefix: &[Rollout
     // These forks retain the parent's settings. The recorder deduplicates the
     // identical authoritative child snapshot instead of appending another copy.
     pretty_assertions::assert_eq!(
-        serde_json::to_value(actual)
-            .expect("actual fork rollout prefix should serialize"),
+        serde_json::to_value(actual).expect("actual fork rollout prefix should serialize"),
         serde_json::to_value(expected_copied_prefix)
             .expect("expected fork rollout prefix should serialize")
     );
@@ -401,6 +417,11 @@ async fn read_rollout_items_with_session_meta(path: &std::path::Path) -> Vec<Rol
     let (items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(path)
         .await
         .expect(&read_message);
-    assert_eq!(parse_errors, 0, "invalid rollout records: {}", path.display());
+    assert_eq!(
+        parse_errors,
+        0,
+        "invalid rollout records: {}",
+        path.display()
+    );
     items
 }

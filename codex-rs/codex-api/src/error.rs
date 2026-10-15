@@ -40,6 +40,17 @@ pub enum ApiError {
     ServerOverloaded { retry_after: Option<RetryAfter> },
 }
 
+/// Marks a mid-response WebSocket close whose code invites another connection.
+///
+/// A server that closes with `1000`/`1001`/`1012`/`1013` is shedding load or
+/// restarting, not rejecting this request: the same request on a new socket
+/// normally succeeds. Only the close *code* distinguishes that from a rejection
+/// such as `1008`, and the code is lost once the frame is formatted, so the
+/// marker is attached at the close site. Rebuilding the stream costs one
+/// connection; abandoning WebSockets degrades every later request of the
+/// session, so the retry layer reconnects once before falling back.
+const RECONNECTABLE_CLOSE_MARKER: &str = " (reconnectable close)";
+
 impl ApiError {
     /// A complete frame violated the provider protocol; replay is not recovery.
     pub(crate) fn invalid_response(message: impl Into<String>) -> Self {
@@ -48,6 +59,65 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// True when this is a provider-silence timeout rather than a broken stream.
+    ///
+    /// Used to route the failure to the connection-recovery loop, which waits
+    /// with an exponential backoff and does not consume the bounded provider
+    /// retry budget (5 by default, 2 for compaction).
+    pub fn is_stream_idle_timeout(&self) -> bool {
+        matches!(self, Self::Stream(message) if is_stream_idle_timeout_message(message))
+    }
+
+    /// Builds the stream error for a mid-response close that invites a retry.
+    ///
+    /// `message` keeps the human-readable close code and reason; the marker is
+    /// appended so [`is_reconnectable_close_message`] can recover the decision
+    /// after the frame itself is gone.
+    pub fn reconnectable_close(message: impl std::fmt::Display) -> Self {
+        Self::Stream(format!("{message}{RECONNECTABLE_CLOSE_MARKER}"))
+    }
+}
+
+/// True when a stream-error message reports provider silence.
+///
+/// Separate from [`ApiError::is_stream_idle_timeout`] so a caller that has
+/// already destructured the variant can classify without rebuilding the error.
+pub fn is_stream_idle_timeout_message(message: &str) -> bool {
+    // Match the producer's complete envelope, never quoted provider text such
+    // as a policy-close reason that happens to mention a timeout.
+    matches!(
+        message,
+        "timeout waiting for websocket dispatch queue"
+            | "model progress timeout waiting for SSE"
+            | "model progress timeout waiting for websocket"
+    ) || [
+        "idle timeout waiting for SSE after ",
+        "idle timeout waiting for websocket after ",
+    ]
+    .iter()
+    .any(|prefix| {
+        message
+            .strip_prefix(prefix)
+            .and_then(|duration| duration.strip_suffix("ms"))
+            .is_some_and(|duration| {
+                !duration.is_empty() && duration.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
+
+/// True when a stream-error message reports a close that invites another
+/// connection, so the transport should be rebuilt before it is abandoned.
+pub fn is_reconnectable_close_message(message: &str) -> bool {
+    message.ends_with(RECONNECTABLE_CLOSE_MARKER)
+}
+
+/// Removes the routing marker so it never reaches a user-visible message.
+pub fn strip_reconnectable_close_marker(mut message: String) -> String {
+    if message.ends_with(RECONNECTABLE_CLOSE_MARKER) {
+        message.truncate(message.len() - RECONNECTABLE_CLOSE_MARKER.len());
+    }
+    message
 }
 
 impl From<RateLimitError> for ApiError {

@@ -285,13 +285,18 @@ impl RecoveryContinuationState {
         let ToolOutputSelector::Bytes { start, end } = &selector else {
             return selector;
         };
-        let remaining_end = self.output.results.iter().enumerate().find_map(|(index, owner)| {
-            if owner.continuation.as_ref() != Some(&selector) {
-                return None;
-            }
-            let range = self.output.results[self.result_owners[index]].canonical_range?;
-            (range.start <= *start && *end <= range.end).then_some(range.end)
-        });
+        let remaining_end = self
+            .output
+            .results
+            .iter()
+            .enumerate()
+            .find_map(|(index, owner)| {
+                if owner.continuation.as_ref() != Some(&selector) {
+                    return None;
+                }
+                let range = self.output.results[self.result_owners[index]].canonical_range?;
+                (range.start <= *start && *end <= range.end).then_some(range.end)
+            });
         match remaining_end {
             Some(end) => ToolOutputSelector::Bytes { start: *start, end },
             None => selector,
@@ -299,21 +304,24 @@ impl RecoveryContinuationState {
     }
 
     fn first_pending_selector(&self) -> Option<ToolOutputSelector> {
-        (self.initial_result_count..self.output.results.len()).rev()
-            .chain(0..self.initial_result_count).find_map(|index| {
-            let result = &self.output.results[index];
-            if selector_stop_reason(result.status).is_some() {
-                None
-            } else {
-                result.continuation.clone()
-            }
-        })
+        (self.initial_result_count..self.output.results.len())
+            .rev()
+            .chain(0..self.initial_result_count)
+            .find_map(|index| {
+                let result = &self.output.results[index];
+                if selector_stop_reason(result.status).is_some() {
+                    None
+                } else {
+                    result.continuation.clone()
+                }
+            })
     }
 
     fn next_step(&self) -> ContinuationStep {
         // Drain an unfinished child before advancing its parent's next range.
         // Otherwise a bounded child can leave a gap ahead of later source bytes.
-        for result_index in (self.initial_result_count..self.output.results.len()).rev()
+        for result_index in (self.initial_result_count..self.output.results.len())
+            .rev()
             .chain(0..self.initial_result_count)
         {
             let result = &self.output.results[result_index];
@@ -327,15 +335,15 @@ impl RecoveryContinuationState {
             };
             // A search continuation is another requested page, not an unfinished
             // fragment of the requested page. Preserve the caller's max_results.
-            if result.status == ToolOutputSelectorStatus::Ok
-                && selector.is_search()
-            {
+            if result.status == ToolOutputSelectorStatus::Ok && selector.is_search() {
                 continue;
             }
             if let ToolOutputSelector::Bytes { start, end } = selector
-                && self.output.unavailable_ranges.iter().any(|range| {
-                    *start < range.end && range.start < *end
-                })
+                && self
+                    .output
+                    .unavailable_ranges
+                    .iter()
+                    .any(|range| *start < range.end && range.start < *end)
             {
                 return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
             }
@@ -368,9 +376,7 @@ impl RecoveryContinuationState {
         {
             return Err(ContinuationStopReason::IdentityDrift);
         }
-        if page.results.len() != 1
-            || &page.results[0].selector != selector
-        {
+        if page.results.len() != 1 || &page.results[0].selector != selector {
             return Err(ContinuationStopReason::IncompleteOwnerResult);
         }
         let selector_failed = selector_stop_reason(page.results[0].status).is_some();
@@ -406,10 +412,10 @@ impl RecoveryContinuationState {
         ));
         self.output.results.extend(page.results);
         self.output.complete = self.output.results.iter().all(|result| {
-                result.status == ToolOutputSelectorStatus::Ok
-                    && result.complete
-                    && (result.selector.is_search() || result.continuation.is_none())
-            });
+            result.status == ToolOutputSelectorStatus::Ok
+                && result.complete
+                && (result.selector.is_search() || result.continuation.is_none())
+        });
         self.refresh_reconstruction();
         if self.projected_size(None).tokens() > self.token_ceiling {
             // Roll back only this page rather than copying every accumulated
@@ -670,7 +676,8 @@ impl RecoveryContinuationState {
             size = size.add_delimited(cost.serialized);
             count += 1;
             any_success |= result.status == ToolOutputSelectorStatus::Ok;
-            all_selections_complete &= result.status == ToolOutputSelectorStatus::Ok && result.complete;
+            all_selections_complete &=
+                result.status == ToolOutputSelectorStatus::Ok && result.complete;
             complete &= result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
                 && (result.selector.is_search() || result.continuation.is_none());
@@ -687,7 +694,8 @@ impl RecoveryContinuationState {
         } else {
             "\"failed\""
         };
-        size = size.subtract_delimited(TokenCountEstimate::new("\"failed\""))
+        size = size
+            .subtract_delimited(TokenCountEstimate::new("\"failed\""))
             .add_delimited(TokenCountEstimate::new(status));
         if let Some(stop) = stop {
             size = size
@@ -730,8 +738,10 @@ fn merge_adjacent_recovery_pages(results: &mut Vec<ToolOutputSelectorResult>) {
         if let Some(previous) = merged.last_mut()
             && previous.status == ToolOutputSelectorStatus::Ok
             && page.status == ToolOutputSelectorStatus::Ok
-            && previous.complete && page.complete
-            && previous.continuation.is_none() && page.continuation.is_none()
+            && previous.complete
+            && page.complete
+            && previous.continuation.is_none()
+            && page.continuation.is_none()
             && matches!(previous.selector, ToolOutputSelector::Bytes { .. })
             && matches!(page.selector, ToolOutputSelector::Bytes { .. })
             && let (Some(left), Some(right)) = (previous.canonical_range, page.canonical_range)
@@ -739,8 +749,12 @@ fn merge_adjacent_recovery_pages(results: &mut Vec<ToolOutputSelectorResult>) {
             && let (Some(text), Some(next)) = (&mut previous.text, &page.text)
         {
             text.push_str(next);
-            previous.canonical_range = Some(codex_tools::CanonicalByteRange::new(left.start, right.end));
-            previous.selector = ToolOutputSelector::Bytes { start: left.start, end: right.end };
+            previous.canonical_range =
+                Some(codex_tools::CanonicalByteRange::new(left.start, right.end));
+            previous.selector = ToolOutputSelector::Bytes {
+                start: left.start,
+                end: right.end,
+            };
             previous.exact_bytes = Some(right.end - left.start);
             previous.child_selectors.clear();
             previous.subdivision_plan = None;
@@ -1049,9 +1063,13 @@ async fn handle_read_tool_output(
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
     let max_bytes = if code_mode_recovery
-        && args.max_bytes.is_some_and(|bytes| bytes > READ_TOOL_OUTPUT_MAX_BYTES)
+        && args
+            .max_bytes
+            .is_some_and(|bytes| bytes > READ_TOOL_OUTPUT_MAX_BYTES)
     {
-        args.max_bytes.unwrap_or_default().min(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
+        args.max_bytes
+            .unwrap_or_default()
+            .min(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
     } else {
         resolved_max_bytes(args.max_bytes)?
     };
@@ -1077,17 +1095,28 @@ async fn handle_read_tool_output(
         invocation.step_context.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
         &args.artifact_id,
-    ).await.map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    )
+    .await
+    .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
     let transaction = drain_recovery_snapshot_with_byte_limit(
-        &snapshot, selectors, token_ceiling, max_bytes, &invocation.cancellation_token,
-    ).await
+        &snapshot,
+        selectors,
+        token_ceiling,
+        max_bytes,
+        &invocation.cancellation_token,
+    )
+    .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
     let DrainedRecoveryTransaction {
         output,
         drained_continuation_pages,
         continuation_stop,
     } = transaction;
-    invocation.step_context.turn.turn_timing_state.record_tool_output_artifact_reread();
+    invocation
+        .step_context
+        .turn
+        .turn_timing_state
+        .record_tool_output_artifact_reread();
     // Typed overflow reports an incomplete selection without losing retained
     // evidence. Recovery bypasses recursive spilling, so no retruncation occurs.
     // This is an explicit tool invocation, even when wrapped in model-authored
@@ -1106,36 +1135,66 @@ async fn handle_read_tool_output(
         drained_continuation_pages,
     );
     let successful = recovery_call_succeeded(&output, continuation_stop.as_ref());
-    let evidence = output.delivered_evidence().map(|identity| serde_json::json!({
-        "source": "artifact",
-        "scope": output.artifact_id,
-        "identity": identity,
-    }));
+    let evidence = output.delivered_evidence().map(|identity| {
+        serde_json::json!({
+            "source": "artifact",
+            "scope": output.artifact_id,
+            "identity": identity,
+        })
+    });
     if evidence.is_some() {
-        let selectors = output.delivered_ranges().into_iter()
+        let selectors = output
+            .delivered_ranges()
+            .into_iter()
             .map(|(start, end)| serde_json::json!({"kind": "bytes", "start": start, "end": end}))
             .collect();
-        invocation.session
-            .record_tool_history_recovery(args.artifact_id.clone(), invocation.call_id.clone(), selectors).await;
+        invocation
+            .session
+            .record_tool_history_recovery(
+                args.artifact_id.clone(),
+                invocation.call_id.clone(),
+                selectors,
+            )
+            .await;
     }
     let completed_inspection = if output.capture_complete {
         let coordinator = invocation.session.services.agent_control.task_coordinator();
         if let (Some(binding), Some(store)) = (
-            coordinator.binding_for_turn(&invocation.step_context.turn), coordinator.store(),
+            coordinator.binding_for_turn(&invocation.step_context.turn),
+            coordinator.store(),
         ) {
-            invocation.session.completed_source_inspection(
-                &args.artifact_id, output.canonical_bytes, &output.canonical_sha256, binding.attempt_id,
-            ).await.map(|(call_id, source)| (store, call_id, source,
-                output.canonical_sha256.clone(), output.canonical_bytes))
-        } else { None }
-    } else { None };
+            invocation
+                .session
+                .completed_source_inspection(
+                    &args.artifact_id,
+                    output.canonical_bytes,
+                    &output.canonical_sha256,
+                    binding.attempt_id,
+                )
+                .await
+                .map(|(call_id, source)| {
+                    (
+                        store,
+                        call_id,
+                        source,
+                        output.canonical_sha256.clone(),
+                        output.canonical_bytes,
+                    )
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
     if let Some((store, call_id, source, sha256, bytes)) = completed_inspection {
-        match store.record_source_inspection(
-            source.start, call_id, sha256, bytes,
-        ).await {
+        match store
+            .record_source_inspection(source.start, call_id, sha256, bytes)
+            .await
+        {
             Ok(reference) => output["criterion_evidence"] = serde_json::json!(reference),
             Err(error) => output["inspection_proof_error"] = serde_json::json!(error.to_string()),
         }
@@ -1149,7 +1208,10 @@ async fn handle_read_tool_output(
 // Pagination is a successful bounded read, not a terminal selection failure.
 // Keep selection completeness and the continuation owner's remaining selectors
 // intact; cancellation, missing bytes and invalid siblings still fail the call.
-fn recovery_call_succeeded(output: &ReadToolOutputResult, stop: Option<&RecoveryContinuationStopV1>) -> bool {
+fn recovery_call_succeeded(
+    output: &ReadToolOutputResult,
+    stop: Option<&RecoveryContinuationStopV1>,
+) -> bool {
     if stop.is_some_and(|stop| stop.reason != ContinuationStopReason::Budget) {
         return false;
     }
@@ -1158,19 +1220,32 @@ fn recovery_call_succeeded(output: &ReadToolOutputResult, stop: Option<&Recovery
     }
     output.unavailable_ranges.is_empty()
         && !output.results.is_empty()
-        && stop.is_some_and(|stop| stop.reason == ContinuationStopReason::Budget
-            && stop.resumable && (stop.selector.is_some() || !stop.page_selectors.is_empty()))
-        && output.results.iter().all(|result| matches!(result.status,
-            ToolOutputSelectorStatus::Ok | ToolOutputSelectorStatus::SelectorTooLarge
-                | ToolOutputSelectorStatus::AggregateOmitted))
+        && stop.is_some_and(|stop| {
+            stop.reason == ContinuationStopReason::Budget
+                && stop.resumable
+                && (stop.selector.is_some() || !stop.page_selectors.is_empty())
+        })
+        && output.results.iter().all(|result| {
+            matches!(
+                result.status,
+                ToolOutputSelectorStatus::Ok
+                    | ToolOutputSelectorStatus::SelectorTooLarge
+                    | ToolOutputSelectorStatus::AggregateOmitted
+            )
+        })
 }
 
-fn recovery_tool_output(output: Value, successful: bool, evidence: Option<Value>) -> JsonToolOutput {
+fn recovery_tool_output(
+    output: Value,
+    successful: bool,
+    evidence: Option<Value>,
+) -> JsonToolOutput {
     let projected = codex_code_mode::model_visible_tool_result(
-        &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME), &output,
+        &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME),
+        &output,
     );
-    let mut result = JsonToolOutput::with_success(output, Some(successful))
-        .with_code_mode_failure_as_data();
+    let mut result =
+        JsonToolOutput::with_success(output, Some(successful)).with_code_mode_failure_as_data();
     if let Some(projected) = projected {
         result = result.with_model_value(projected);
     }
@@ -1181,18 +1256,24 @@ fn recovery_tool_output(output: Value, successful: bool, evidence: Option<Value>
             );
         }
     } else {
-        let errors = result.value()["results"].as_array().into_iter().flatten()
+        let errors = result.value()["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .filter(|result| result["status"] != "ok" || result["complete"] == false)
-            .map(|result| serde_json::json!({
-                "selector": result["selector"], "status": result["status"],
-                "complete": result["complete"], "message": result["message"],
-            }))
+            .map(|result| {
+                serde_json::json!({
+                    "selector": result["selector"], "status": result["status"],
+                    "complete": result["complete"], "message": result["message"],
+                })
+            })
             .collect::<Vec<_>>();
-        let mut signal = crate::tools::context::semantic_failure_sampling_signal(serde_json::json!({
-            "artifact": result.value()["canonical_sha256"],
-            "errors": errors,
-            "continuation_stop": result.value()["continuation_stop"],
-        }));
+        let mut signal =
+            crate::tools::context::semantic_failure_sampling_signal(serde_json::json!({
+                "artifact": result.value()["canonical_sha256"],
+                "errors": errors,
+                "continuation_stop": result.value()["continuation_stop"],
+            }));
         // Partial recovery has two independent facts: delivered source bytes
         // and unresolved selections. Neither may erase the other.
         if let Some(signal) = signal.as_object_mut() {
@@ -1269,18 +1350,24 @@ async fn drain_recovery_snapshot_with_byte_limit(
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     loop {
         let result = drain_recovery_snapshot_with_source_budget(
-            snapshot, selectors.clone(), token_ceiling, max_bytes, cancellation_token,
-        ).await?;
+            snapshot,
+            selectors.clone(),
+            token_ceiling,
+            max_bytes,
+            cancellation_token,
+        )
+        .await?;
         let envelope_bytes = recovery_envelope(&result.output, result.continuation_stop.as_ref())
             .and_then(|value| serde_json::to_vec(&value))
-            .map_err(|error| ReadToolOutputError::Io(error.to_string()))?.len();
+            .map_err(|error| ReadToolOutputError::Io(error.to_string()))?
+            .len();
         if envelope_bytes <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES {
             return Ok(result);
         }
         // Refit against the same authenticated snapshot, never rerun or reread
         // the producer. Preserve the selector engine's exact ranges/continuation.
-        let smaller = token_ceiling.saturating_mul(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
-            / envelope_bytes.max(1);
+        let smaller =
+            token_ceiling.saturating_mul(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES) / envelope_bytes.max(1);
         if smaller >= token_ceiling || smaller < 256 {
             return Err(ReadToolOutputError::InvalidRange(
                 "recovery metadata exceeds the serialized payload budget".to_string(),
@@ -1298,8 +1385,13 @@ async fn drain_recovery_snapshot(
     cancellation_token: &CancellationToken,
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     drain_recovery_snapshot_with_source_budget(
-        snapshot, selectors, token_ceiling, usize::MAX, cancellation_token,
-    ).await
+        snapshot,
+        selectors,
+        token_ceiling,
+        usize::MAX,
+        cancellation_token,
+    )
+    .await
 }
 
 // Source bytes and envelope metadata have independent budgets. Turn an exact
@@ -1309,33 +1401,54 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
     let mut remaining = max_bytes as u64;
     let mut delivered_hydration = Vec::<(u64, u64)>::new();
     for result in &mut output.results {
-        if result.status != ToolOutputSelectorStatus::Ok { continue; }
-        if result.selector.is_search() && let Some(value) = result.value.as_mut() {
+        if result.status != ToolOutputSelectorStatus::Ok {
+            continue;
+        }
+        if result.selector.is_search()
+            && let Some(value) = result.value.as_mut()
+        {
             // Match coordinates are metadata, not source bytes. Keep their exact
             // context selectors when hydration cannot fit; retrying the same
             // search at the same byte cap would otherwise never make progress.
             let mut omitted = false;
             if let Some(ranges) = value["hydrated_ranges"].as_array_mut() {
                 ranges.retain(|range| {
-                    let available = range["shared"] != true || range["canonical_range"]["start"].as_u64()
-                        .zip(range["canonical_range"]["end"].as_u64())
-                        .is_some_and(|(start, end)| delivered_hydration.iter()
-                            .any(|&(left, right)| left <= start && end <= right));
+                    let available = range["shared"] != true
+                        || range["canonical_range"]["start"]
+                            .as_u64()
+                            .zip(range["canonical_range"]["end"].as_u64())
+                            .is_some_and(|(start, end)| {
+                                delivered_hydration
+                                    .iter()
+                                    .any(|&(left, right)| left <= start && end <= right)
+                            });
                     omitted |= !available;
                     available
                 });
-                let bytes = ranges.iter().filter_map(|range| {
-                    if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
-                    range["canonical_range"]["end"].as_u64()?.checked_sub(range["canonical_range"]["start"].as_u64()?)
-                }).sum::<u64>();
+                let bytes = ranges
+                    .iter()
+                    .filter_map(|range| {
+                        if !range["text"].is_string() && !range["data_base64"].is_string() {
+                            return None;
+                        }
+                        range["canonical_range"]["end"]
+                            .as_u64()?
+                            .checked_sub(range["canonical_range"]["start"].as_u64()?)
+                    })
+                    .sum::<u64>();
                 if bytes > remaining {
                     ranges.clear();
                     omitted = true;
                 } else {
                     remaining -= bytes;
                     delivered_hydration.extend(ranges.iter().filter_map(|range| {
-                        if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
-                        Some((range["canonical_range"]["start"].as_u64()?, range["canonical_range"]["end"].as_u64()?))
+                        if !range["text"].is_string() && !range["data_base64"].is_string() {
+                            return None;
+                        }
+                        Some((
+                            range["canonical_range"]["start"].as_u64()?,
+                            range["canonical_range"]["end"].as_u64()?,
+                        ))
                     }));
                 }
             }
@@ -1349,14 +1462,31 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
             }
             continue;
         }
-        let bytes = result.canonical_range.filter(|_| result.text.is_some()
-            || result.data_base64.is_some() || result.value.is_some())
+        let bytes = result
+            .canonical_range
+            .filter(|_| {
+                result.text.is_some() || result.data_base64.is_some() || result.value.is_some()
+            })
             .map_or(0, |range| range.end - range.start)
-            .saturating_add(result.value.as_ref().and_then(|value| value["hydrated_ranges"].as_array())
-                .map_or(0, |ranges| ranges.iter().filter_map(|range| {
-                    if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
-                    range["canonical_range"]["end"].as_u64()?.checked_sub(range["canonical_range"]["start"].as_u64()?)
-                }).sum::<u64>()));
+            .saturating_add(
+                result
+                    .value
+                    .as_ref()
+                    .and_then(|value| value["hydrated_ranges"].as_array())
+                    .map_or(0, |ranges| {
+                        ranges
+                            .iter()
+                            .filter_map(|range| {
+                                if !range["text"].is_string() && !range["data_base64"].is_string() {
+                                    return None;
+                                }
+                                range["canonical_range"]["end"]
+                                    .as_u64()?
+                                    .checked_sub(range["canonical_range"]["start"].as_u64()?)
+                            })
+                            .sum::<u64>()
+                    }),
+            );
         if bytes <= remaining {
             remaining -= bytes;
             continue;
@@ -1371,7 +1501,8 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
         result.continuation = Some(result.canonical_range.map_or_else(
             || result.selector.clone(),
             |range| ToolOutputSelector::Bytes {
-                start: range.start, end: range.start.saturating_add(remaining.max(1)).min(range.end),
+                start: range.start,
+                end: range.start.saturating_add(remaining.max(1)).min(range.end),
             },
         ));
         result.message = Some("Exact selection exceeds the remaining source-byte budget; continue with the unconsumed byte range.".into());
@@ -1391,9 +1522,7 @@ async fn drain_recovery_snapshot_with_source_budget(
     );
     let mut complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
     bound_recovery_source_bytes(&mut complete_output, max_bytes);
-    if complete_output.complete
-        && recovery_envelope_fits(&complete_output, None, token_ceiling)
-    {
+    if complete_output.complete && recovery_envelope_fits(&complete_output, None, token_ceiling) {
         return Ok(RecoveryContinuationState::new(complete_output, token_ceiling).finish());
     }
     // Reserve stop metadata, including caller-supplied selectors. Byte continuations
@@ -1429,7 +1558,12 @@ async fn drain_recovery_snapshot_with_source_budget(
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let delivered = state.output.delivered_ranges().iter().map(|(start, end)| end - start).sum::<u64>();
+        let delivered = state
+            .output
+            .delivered_ranges()
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<u64>();
         let remaining = (max_bytes as u64).saturating_sub(delivered);
         if remaining == 0 {
             state.record_stop(ContinuationStopReason::Budget, Some(selector));
@@ -1440,7 +1574,8 @@ async fn drain_recovery_snapshot_with_source_budget(
         {
             *end = start.saturating_add(remaining);
             state.output.results[result_index].continuation = Some(selector.clone());
-            state.result_costs[result_index] = RecoveryResultCost::new(&state.output.results[result_index]);
+            state.result_costs[result_index] =
+                RecoveryResultCost::new(&state.output.results[result_index]);
         }
         let page = if let Some(page) = state.cached_page(&selector) {
             Ok(page)
@@ -1450,9 +1585,7 @@ async fn drain_recovery_snapshot_with_source_budget(
                 state.record_stop(ContinuationStopReason::Budget, Some(selector));
                 break;
             }
-            snapshot
-                .select(vec![selector.clone()], ceiling)
-                .await
+            snapshot.select(vec![selector.clone()], ceiling).await
         };
         if cancellation_token.is_cancelled() {
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
@@ -1467,7 +1600,10 @@ async fn drain_recovery_snapshot_with_source_budget(
         };
         bound_recovery_source_bytes(&mut page, usize::try_from(remaining).unwrap_or(usize::MAX));
         if page.delivered_ranges().is_empty()
-            && page.results.iter().any(|result| result.continuation.as_ref() == Some(&selector))
+            && page
+                .results
+                .iter()
+                .any(|result| result.continuation.as_ref() == Some(&selector))
         {
             state.record_stop(ContinuationStopReason::Budget, Some(selector));
             break;
@@ -1480,9 +1616,10 @@ async fn drain_recovery_snapshot_with_source_budget(
     // Only incomplete reads need a page directory. Reserving it before draining
     // would consume the retry-avoidance margin on nearly complete selections.
     if token_ceiling >= 2_000
-        && state.continuation_stop.as_ref().is_some_and(|stop| {
-            stop.reason == ContinuationStopReason::Budget
-        })
+        && state
+            .continuation_stop
+            .as_ref()
+            .is_some_and(|stop| stop.reason == ContinuationStopReason::Budget)
     {
         state.token_ceiling = token_ceiling.saturating_sub(256);
     }
@@ -1491,11 +1628,20 @@ async fn drain_recovery_snapshot_with_source_budget(
         && stop.reason == ContinuationStopReason::Budget
         && let Some(ToolOutputSelector::Bytes { start, end }) = &stop.selector
     {
-        stop.page_selectors = snapshot.page_selectors(*start, *end, token_ceiling.saturating_sub(1_000));
+        stop.page_selectors =
+            snapshot.page_selectors(*start, *end, token_ceiling.saturating_sub(1_000));
     }
-    while !recovery_envelope_fits(&result.output, result.continuation_stop.as_ref(), token_ceiling) {
-        let Some(stop) = result.continuation_stop.as_mut() else { break };
-        if stop.page_selectors.pop().is_none() { break; }
+    while !recovery_envelope_fits(
+        &result.output,
+        result.continuation_stop.as_ref(),
+        token_ceiling,
+    ) {
+        let Some(stop) = result.continuation_stop.as_mut() else {
+            break;
+        };
+        if stop.page_selectors.pop().is_none() {
+            break;
+        }
     }
     if !recovery_envelope_fits(
         &result.output,
@@ -1632,19 +1778,17 @@ fn resolved_line_range(args: &ReadToolOutputArgs) -> Result<(usize, usize), Func
 
 fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallError> {
     match max_bytes {
-        Some(0) => {
-            Err(FunctionCallError::RespondToModel(format!(
-                "max_bytes must be between 1 and {READ_TOOL_OUTPUT_MAX_BYTES}"
-            )))
-        }
+        Some(0) => Err(FunctionCallError::RespondToModel(format!(
+            "max_bytes must be between 1 and {READ_TOOL_OUTPUT_MAX_BYTES}"
+        ))),
         Some(max_bytes) => Ok(max_bytes.min(READ_TOOL_OUTPUT_MAX_BYTES)),
         None => Ok(READ_TOOL_OUTPUT_MAX_BYTES),
     }
 }
 
 #[cfg(test)]
-#[path = "read_tool_output_tests.rs"]
-mod tests;
-#[cfg(test)]
 #[path = "read_tool_output_paging_tests.rs"]
 mod paging_regressions;
+#[cfg(test)]
+#[path = "read_tool_output_tests.rs"]
+mod tests;

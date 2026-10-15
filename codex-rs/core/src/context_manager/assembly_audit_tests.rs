@@ -37,7 +37,10 @@ fn assembly_audit_merge_matches_reverse_insertion_for_sparse_and_dense_history()
             let mut actual = original.clone();
             insert_items_after(&mut actual, insertions);
             assert_eq!(actual, expected, "count={count}, mask={mask}");
-            assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap());
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
         }
     }
 }
@@ -61,8 +64,10 @@ fn assembly_audit_missing_outputs_preserve_order_and_are_idempotent() {
     assert_eq!(items.len(), 6);
     for (index, pair) in items.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(pair[0], call(index));
-        assert!(matches!(&pair[1], ResponseItem::FunctionCallOutput { call_id, output, .. }
-            if call_id == &format!("call-{index}") && output == &FunctionCallOutputPayload::from_text(MISSING_TOOL_RESULT.to_string())));
+        assert!(
+            matches!(&pair[1], ResponseItem::FunctionCallOutput { call_id, output, .. }
+            if call_id == &format!("call-{index}") && output == &FunctionCallOutputPayload::from_text(MISSING_TOOL_RESULT.to_string()))
+        );
     }
     let expected = items.clone();
     ensure_call_outputs_present(&mut items);
@@ -77,17 +82,17 @@ fn assembly_audit_image_receipts_preserve_order_and_are_idempotent() {
     assert_eq!(items.len(), 5);
     assert_eq!(items[2], ResponseItem::Other);
     for index in [0, 3] {
-        assert!(matches!(&items[index], ResponseItem::ImageGenerationCall { result, .. } if result.is_empty()));
-        assert!(matches!(&items[index + 1], ResponseItem::Message { role, content, .. }
+        assert!(
+            matches!(&items[index], ResponseItem::ImageGenerationCall { result, .. } if result.is_empty())
+        );
+        assert!(
+            matches!(&items[index + 1], ResponseItem::Message { role, content, .. }
             if role == "developer" && content == &vec![ContentItem::InputText {
                 text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
-            }]));
+            }])
+        );
     }
     let expected = items.clone();
     strip_images_when_unsupported(&[InputModality::Text], &mut items);
     assert_eq!(items, expected);
 }
-
-
-
-

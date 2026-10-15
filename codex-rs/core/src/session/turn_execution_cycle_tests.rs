@@ -63,8 +63,14 @@ fn uncertain_workspace_changes_preserve_cache_freshness_but_do_not_credit_progre
     for index in 0..3 {
         let mut baseline = control.baselines(tracker.current_mutation_revision());
         baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
-        tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None,
-            crate::turn_diff_tracker::CommandMutation::Uncertain);
+        tracker.record_exec_command_end_with_mutation_at(
+            &[],
+            0,
+            false,
+            "",
+            None,
+            crate::turn_diff_tracker::CommandMutation::Uncertain,
+        );
         let state = SamplingRequestSettledState {
             mutation_revision: tracker.current_mutation_revision(),
             attributed_mutation_revision: tracker.attributed_mutation_revision(),
@@ -75,25 +81,45 @@ fn uncertain_workspace_changes_preserve_cache_freshness_but_do_not_credit_progre
         source(&collector, "same-file");
         let progress = control.observe_progress(&baseline, &collector, &state);
         assert!(!progress.contains(&TurnTimingProgressKind::WorkspaceMutation));
-        if index > 0 { assert!(progress.is_empty()); }
+        if index > 0 {
+            assert!(progress.is_empty());
+        }
         let decision = control.evaluate_convergence(&baseline, &collector, &state);
         assert_eq!(decision.directive.is_some(), index > 0);
     }
     let mut baseline = control.baselines(tracker.current_mutation_revision());
     baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
-    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None,
+    tracker.record_exec_command_end_with_mutation_at(
+        &[],
+        0,
+        false,
+        "",
+        None,
         crate::turn_diff_tracker::CommandMutation::KnownMutation {
-            paths: Some([std::path::PathBuf::from("changed.rs")].into_iter().collect()),
-        });
+            paths: Some(
+                [std::path::PathBuf::from("changed.rs")]
+                    .into_iter()
+                    .collect(),
+            ),
+        },
+    );
     let state = SamplingRequestSettledState {
         mutation_revision: tracker.current_mutation_revision(),
         attributed_mutation_revision: tracker.attributed_mutation_revision(),
         tool_exposure_revision: 0,
     };
     let collector = control.collector(&baseline);
-    assert!(control.observe_progress(&baseline, &collector, &state)
-        .contains(&TurnTimingProgressKind::WorkspaceMutation));
-    assert!(control.evaluate_convergence(&baseline, &collector, &state).directive.is_none());
+    assert!(
+        control
+            .observe_progress(&baseline, &collector, &state)
+            .contains(&TurnTimingProgressKind::WorkspaceMutation)
+    );
+    assert!(
+        control
+            .evaluate_convergence(&baseline, &collector, &state)
+            .directive
+            .is_none()
+    );
 }
 
 #[test]
@@ -399,7 +425,9 @@ fn settled_analysis_shares_cycles_and_unknown_results_between_consumers() {
                 ToolOutputOutcome::Failure,
                 Some(json!({"failure_signature": "bad-plan"})),
             ),
-            "unknown" => { collector.register_tool_call(); }
+            "unknown" => {
+                collector.register_tool_call();
+            }
             _ => {}
         }
         let expected = collector.deterministic_cycle();
@@ -408,10 +436,17 @@ fn settled_analysis_shares_cycles_and_unknown_results_between_consumers() {
         control.evaluate_convergence_with_analysis(&baselines, &analysis, &settled(0));
         assert_eq!(analysis.cycle.get(), Some(&expected));
         let request = control.continuation_generation_request_with_analysis(
-            &baselines, &analysis, &settled(0), false,
+            &baselines,
+            &analysis,
+            &settled(0),
+            false,
         );
-        assert_eq!(request.failure_fingerprint,
-            expected.as_ref().and_then(|cycle| cycle.failure_fingerprint.clone()));
+        assert_eq!(
+            request.failure_fingerprint,
+            expected
+                .as_ref()
+                .and_then(|cycle| cycle.failure_fingerprint.clone())
+        );
         assert_eq!(analysis.cycle.get(), Some(&expected));
         drop(analysis);
 
@@ -420,7 +455,10 @@ fn settled_analysis_shares_cycles_and_unknown_results_between_consumers() {
         source(&collector, "later-file");
         let later = collector.analyze_settled_request();
         assert!(later.cycle.get().is_none());
-        assert_eq!(later.deterministic_cycle().cloned(), collector.deterministic_cycle());
+        assert_eq!(
+            later.deterministic_cycle().cloned(),
+            collector.deterministic_cycle()
+        );
     }
 }
 
@@ -434,7 +472,10 @@ fn settled_analysis_stays_lazy_when_convergence_returns_before_cycle_analysis() 
     control.evaluate_convergence_with_analysis(&baselines, &analysis, &settled(1));
     assert!(analysis.cycle.get().is_none());
     control.continuation_generation_request_with_analysis(
-        &baselines, &analysis, &settled(1), false,
+        &baselines,
+        &analysis,
+        &settled(1),
+        false,
     );
     assert_eq!(analysis.cycle.get(), Some(&collector.deterministic_cycle()));
 }
@@ -449,8 +490,13 @@ fn evidence_digest_is_reused_until_observed_evidence_changes() {
         let baselines = control.baselines(0);
         let collector = control.collector(&baselines);
         if failed {
-            record(&collector, "update_plan", "{}", ToolOutputOutcome::Failure,
-                Some(json!({"failure_signature": "bad-plan"})));
+            record(
+                &collector,
+                "update_plan",
+                "{}",
+                ToolOutputOutcome::Failure,
+                Some(json!({"failure_signature": "bad-plan"})),
+            );
         } else {
             source(&collector, "file");
         }
@@ -458,19 +504,32 @@ fn evidence_digest_is_reused_until_observed_evidence_changes() {
         assert!(control.evidence_fingerprint.get().is_none());
         let changed = control.baselines(0);
         assert_ne!(baselines.evidence_fingerprint, changed.evidence_fingerprint);
-        let expected = format!("{:x}", Sha256::digest(serde_json::to_vec(&(
-            &control.budget_progress_evidence, &control.delivered_coverage,
-        )).unwrap()));
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &control.budget_progress_evidence,
+                    &control.delivered_coverage,
+                ))
+                .unwrap()
+            )
+        );
         assert_eq!(changed.evidence_fingerprint, expected);
         assert_eq!(control.evidence_fingerprint.get(), Some(&expected));
         control.observe_progress(&baselines, &collector, &settled(0));
         assert_eq!(control.evidence_fingerprint.get(), Some(&expected));
         let revised = control.baselines_with_tool_exposure_revision(1, 2);
         assert_eq!(revised.evidence_fingerprint, expected);
-        assert_ne!(revised.relevant_state_fingerprint(), changed.relevant_state_fingerprint());
+        assert_ne!(
+            revised.relevant_state_fingerprint(),
+            changed.relevant_state_fingerprint()
+        );
         control.accepted_user_input();
         assert_eq!(control.evidence_fingerprint.get(), Some(&expected));
-        assert_ne!(control.baselines(0).relevant_state_fingerprint(), changed.relevant_state_fingerprint());
+        assert_ne!(
+            control.baselines(0).relevant_state_fingerprint(),
+            changed.relevant_state_fingerprint()
+        );
     }
     assert_eq!(initial.relevant_state_fingerprint(), initial_identity);
 }
@@ -481,20 +540,35 @@ fn evidence_digest_invalidates_for_alias_coverage_even_without_novel_bytes() {
     let evidence = json!({"source": "read_file", "scope": "file", "identity": {
         "sha256": "hash", "ranges": [[0, 4]], "values": []
     }});
-    assert_eq!(control.observe_delivered_coverage(&evidence, None), Some(true));
+    assert_eq!(
+        control.observe_delivered_coverage(&evidence, None),
+        Some(true)
+    );
     let before = control.baselines(0);
-    assert_eq!(control.observe_delivered_coverage(&evidence, Some("artifact")), Some(false));
+    assert_eq!(
+        control.observe_delivered_coverage(&evidence, Some("artifact")),
+        Some(false)
+    );
     assert!(control.evidence_fingerprint.get().is_none());
     let aliased = control.baselines(0);
     assert_ne!(before.evidence_fingerprint, aliased.evidence_fingerprint);
     let recovery = json!({"source": "artifact", "scope": "artifact", "identity": {
         "sha256": "hash", "ranges": [[4, 8]], "values": []
     }});
-    assert_eq!(control.observe_delivered_coverage(&recovery, None), Some(true));
+    assert_eq!(
+        control.observe_delivered_coverage(&recovery, None),
+        Some(true)
+    );
     assert!(control.evidence_fingerprint.get().is_none());
-    assert_ne!(control.baselines(0).evidence_fingerprint, aliased.evidence_fingerprint);
+    assert_ne!(
+        control.baselines(0).evidence_fingerprint,
+        aliased.evidence_fingerprint
+    );
     let covered = json!({"source": "read_file", "scope": "file", "identity": {
         "sha256": "hash", "ranges": [[0, 8]], "values": []
     }});
-    assert_eq!(control.observe_delivered_coverage(&covered, None), Some(false));
+    assert_eq!(
+        control.observe_delivered_coverage(&covered, None),
+        Some(false)
+    );
 }

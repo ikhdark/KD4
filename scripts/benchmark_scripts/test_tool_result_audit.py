@@ -464,7 +464,7 @@ class ToolResultAuditTest(unittest.TestCase):
     def test_checkpoint_requests_without_identity_are_not_silently_merged(self):
         with self.assertRaisesRegex(ValueError, "missing samplingRequestId"):
             execution_context_audit([(1, {"type": "sampling_boundary", "payload": {
-                "timing_checkpoint": {"timing": {"modelRequests": [{"generationIndex": 0}]}}
+                "timing_checkpoint": {"timing": {"modelRequests": [{"outputTokens": 1}]}}
             }}, 0)])
 
     def test_usage_reconciliation_does_not_confuse_visible_and_reasoning_or_missing_data(self):
@@ -713,6 +713,81 @@ class ToolResultAuditTest(unittest.TestCase):
             self.assertEqual(summary["terminal_truncation"]["tool_output_truncations"], 0)
             self.assertEqual(summary["terminal_truncation"]["induced_continuations"], 0)
             self.assertEqual(summary["totals"]["truncation_marker_results"], 1)
+
+
+class RequestUsageAuditTest(unittest.TestCase):
+    @staticmethod
+    def records(usages, *, terminal=True, turn_id="t", request_id="r"):
+        requests = [{"samplingRequestId": request_id, "generationIndex": index,
+                     "completedMs": index + 1, "tokenUsage": usage}
+                    for index, usage in enumerate(usages)]
+        timing = {"modelRequests": requests}
+        row = ({"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": turn_id, "timing": timing}}
+            if terminal else {"type": "sampling_boundary", "payload": {
+                "timing_checkpoint": {"turn_id": turn_id, "timing": timing}}})
+        return [(1, row, 0)]
+
+    def test_cross_generation_usage_counts_once_without_dropping_timing(self):
+        from scripts.benchmark_scripts.tool_result_audit import execution_timings
+
+        usage = {"inputTokens": 10, "cachedInputTokens": 4,
+                 "visibleOutputTokens": 3, "reasoningTokens": 2, "totalTokens": 15}
+        cumulative = {"input_tokens": 10, "cached_input_tokens": 4,
+                      "output_tokens": 5, "reasoning_output_tokens": 2, "total_tokens": 15}
+        for terminal in (False, True):
+            for usages in ([usage, usage], [None, usage], [usage, None],
+                           [{"inputTokens": 10}, usage]):
+                with self.subTest(terminal=terminal, usages=usages):
+                    records = self.records(usages, terminal=terminal)
+                    records.append((2, {"type": "event_msg", "payload": {
+                        "type": "token_count", "info": {"total_token_usage": cumulative}}}, 0))
+                    original = copy.deepcopy(records)
+                    report = execution_context_audit(records)
+                    self.assertEqual(report["provider_usage_totals"], usage)
+                    self.assertEqual(report["provider_uncached_input_tokens"], 6)
+                    self.assertEqual(report["provider_usage_reconciliation"]["status"], "matched")
+                    self.assertEqual(report["coverage"]["requests_with_usage"], 1)
+                    self.assertEqual(report["coverage"]["requests_without_usage"], 0)
+                    self.assertEqual(report["coverage"]["deduplicated_usage_records"], 1)
+                    self.assertEqual([r["generation"] for r in report["turns"][0]["rounds"]], [0, 1])
+                    self.assertEqual(execution_timings(records)[0]["modelRequests"],
+                                     [{"samplingRequestId": "r", "generationIndex": i,
+                                       "completedMs": i + 1, "tokenUsage": tokens}
+                                      if tokens is not None else
+                                      {"samplingRequestId": "r", "generationIndex": i, "completedMs": i + 1}
+                                      for i, tokens in enumerate(usages)])
+                    self.assertEqual(records, original)
+
+    def test_usage_identity_is_turn_scoped_and_missing_ids_do_not_coalesce(self):
+        usage = {"inputTokens": 10, "cachedInputTokens": 4}
+        for records in (
+            self.records([usage], turn_id="first") + self.records([usage], turn_id="second"),
+            self.records([usage, usage], request_id=None),
+        ):
+            report = execution_context_audit(records)
+            self.assertEqual(report["provider_usage_totals"], {"inputTokens": 20, "cachedInputTokens": 8})
+            self.assertEqual(report["coverage"]["requests_with_usage"], 2)
+            self.assertEqual(report["coverage"]["deduplicated_usage_records"], 0)
+
+    def test_conflicting_cross_generation_usage_is_quarantined_in_every_order(self):
+        for order in itertools.permutations([10, 11, 10]):
+            records = self.records([{"inputTokens": value, "cachedInputTokens": 4}
+                                    for value in order])
+            # The same request ID in another turn is independent, not quarantined.
+            records += self.records([{"inputTokens": 7, "cachedInputTokens": 2}], turn_id="good")
+            report = execution_context_audit(records)
+            self.assertEqual(report["provider_usage_totals"], {"inputTokens": 7, "cachedInputTokens": 2})
+            self.assertIsNone(report["provider_uncached_input_tokens"])
+            self.assertEqual(report["coverage"]["requests_with_usage"], 1)
+            self.assertEqual(report["coverage"]["requests_without_usage"], 1)
+            reconciliation = report["provider_usage_reconciliation"]
+            self.assertEqual(reconciliation["status"], "conflicting_request_usage")
+            self.assertEqual(reconciliation["conflicting_requests"],
+                             [{"turn_id": "t", "sampling_request_id": "r"}])
+            self.assertEqual(reconciliation["request_minus_cumulative"], {})
+            self.assertEqual([r["provider_usage"]["inputTokens"]
+                              for r in report["turns"][0]["rounds"]], list(order))
 
 
 class CompactAuditReportTest(unittest.TestCase):

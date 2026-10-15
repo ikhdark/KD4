@@ -518,66 +518,66 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
     covered_attempts = 0
     invalid_usage_attempts = 0
     categorized_attempts = 0
+    component_counts = collections.Counter()
+    category_counts = collections.Counter()
+    category_denominators = collections.Counter()
+    category_pairs = collections.Counter()
+    matched_cache_input = matched_cached = 0
+    measured_blended = blended_requests = 0
+    invalid_categories = collections.Counter()
+    category_fields = (
+        "baseInstructions", "toolSchemas", "conversationHistory", "currentInput",
+        "repositoryContext", "skills", "otherInjectedContext", "logicalTotal",
+        "localInputEstimate", "repeatedUnchangedContext",
+    )
+    token_fields = ("inputTokens", "cachedInputTokens", "nonCachedInputTokens",
+                    "visibleOutputTokens", "reasoningTokens", "outputTokens", "totalTokens")
     for request in request_list:
         usage = request.get("tokenUsage")
-        if isinstance(usage, dict) and all(
-            type(usage.get(key)) is int and usage[key] >= 0
-            for key in (
-                "inputTokens",
-                "cachedInputTokens",
-                "visibleOutputTokens",
-                "reasoningTokens",
-            )
-        ):
-            input_tokens = max(0, int(usage.get("inputTokens", 0)))
-            cached_input_tokens = max(0, int(usage.get("cachedInputTokens", 0)))
-            visible_output_tokens = max(0, int(usage.get("visibleOutputTokens", 0)))
-            reasoning_tokens = max(0, int(usage.get("reasoningTokens", 0)))
-            expected_total = input_tokens + visible_output_tokens + reasoning_tokens
-            total_tokens = usage.get("totalTokens", expected_total)
-            coherent = cached_input_tokens <= input_tokens and all(
-                key not in usage or (type(usage[key]) is int and usage[key] == expected)
-                for key, expected in (
-                    ("totalTokens", expected_total),
-                    ("outputTokens", visible_output_tokens + reasoning_tokens),
-                    ("nonCachedInputTokens", input_tokens - cached_input_tokens),
-                )
-            )
-            covered_attempts += int(coherent)
-            invalid_usage_attempts += int(not coherent)
-            if type(total_tokens) is not int or total_tokens < 0:
-                total_tokens = expected_total
-        else:
-            invalid_usage_attempts += int(isinstance(usage, dict))
-            input_tokens = 0
-            cached_input_tokens = 0
-            output_tokens = max(0, int(request.get("outputTokens", 0)))
-            reasoning_tokens = max(0, int(request.get("reasoningOutputTokens", 0)))
-            visible_output_tokens = max(0, output_tokens - reasoning_tokens)
-            total_tokens = output_tokens
-        totals["inputTokens"] += input_tokens
-        totals["cachedInputTokens"] += min(input_tokens, cached_input_tokens)
-        totals["visibleOutputTokens"] += visible_output_tokens
-        totals["reasoningTokens"] += reasoning_tokens
-        totals["outputTokens"] += visible_output_tokens + reasoning_tokens
-        totals["totalTokens"] += total_tokens
+        normalized = _native_usage(usage)
+        values = normalized or {}
+        # The runtime also records visible output separately from total output.
+        if isinstance(usage, dict):
+            visible, reasoning = usage.get("visibleOutputTokens"), usage.get("reasoningTokens")
+            if all(type(v) is int and 0 <= v < 2**64 - 1 for v in (visible, reasoning)):
+                normalized = _native_usage({**usage, "outputTokens": usage.get("outputTokens", visible + reasoning)})
+                values = normalized or {}
+                if values.get("outputTokens") != visible + reasoning:
+                    values = {}
+        if not values and not isinstance(usage, dict):
+            values = _native_usage({
+                "outputTokens": request.get("outputTokens"),
+                "reasoningTokens": request.get("reasoningOutputTokens"),
+            }) or {}
+        complete = all(type(values.get(key)) is int for key in token_fields)
+        if all(type(values.get(key)) is int for key in ("nonCachedInputTokens", "outputTokens")):
+            measured_blended += values["nonCachedInputTokens"] + values["outputTokens"]
+            blended_requests += 1
+        if all(type(values.get(key)) is int for key in ("inputTokens", "cachedInputTokens")):
+            matched_cache_input += values["inputTokens"]
+            matched_cached += values["cachedInputTokens"]
+        covered_attempts += complete
+        invalid_usage_attempts += isinstance(usage, dict) and not complete
+        for key in token_fields:
+            value = values.get(key)
+            if type(value) is int:
+                totals[key] += value
+                component_counts[key] += 1
         categories = request.get("requestTokenCategories")
-        if isinstance(categories, dict) and type(categories.get("logicalTotal")) is int:
-            categorized_attempts += 1
-            for key in (
-                "baseInstructions",
-                "toolSchemas",
-                "conversationHistory",
-                "currentInput",
-                "repositoryContext",
-                "skills",
-                "otherInjectedContext",
-                "logicalTotal",
-                "localInputEstimate",
-                "repeatedUnchangedContext",
-            ):
-                if type(categories.get(key)) is int:
-                    prompt_categories[key] += max(0, categories[key])
+        if isinstance(categories, dict):
+            logical = categories.get("logicalTotal")
+            logical_valid = type(logical) is int and logical >= 0
+            categorized_attempts += logical_valid
+            for key in category_fields:
+                value = categories.get(key)
+                if type(value) is int and value >= 0:
+                    prompt_categories[key] += value
+                    category_counts[key] += 1
+                    if logical_valid:
+                        category_denominators[key] += logical
+                        category_pairs[key] += 1
+                elif value is not None:
+                    invalid_categories[key] += 1
 
     for key in (
         "inputTokens",
@@ -588,9 +588,7 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "totalTokens",
     ):
         totals[key] += 0
-    totals["nonCachedInputTokens"] = max(
-        0, totals["inputTokens"] - totals["cachedInputTokens"]
-    )
+    totals["nonCachedInputTokens"] += 0
     observed_blended_tokens = totals["nonCachedInputTokens"] + totals["outputTokens"]
     observed_billable_tokens = totals["inputTokens"] + totals["outputTokens"]
     input_tokens = totals["inputTokens"]
@@ -610,16 +608,23 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "complete": usage_complete,
         "providerTotals": dict(totals) if usage_complete else None,
         **{key: value if usage_complete else None for key, value in totals.items()},
-        "observedTotals": dict(totals),
+        "observedTotals": {key: value if component_counts[key] or not request_list else None for key, value in totals.items()},
+        "componentCoverage": {key: {"measuredRequests": component_counts[key],
+            "missingRequests": len(request_list) - component_counts[key],
+            "status": "complete" if component_counts[key] == len(request_list) and request_list else "partial" if component_counts[key] else "unavailable"}
+            for key in token_fields},
         "billableTokens": observed_billable_tokens if usage_complete else None,
-        "observedBillableTokens": observed_billable_tokens,
+        "observedBillableTokens": totals["totalTokens"] if component_counts["totalTokens"] else None,
         "billableDefinition": "provider_input_including_cached_plus_output",
         "blendedTokens": observed_blended_tokens if usage_complete else None,
-        "observedBlendedTokens": observed_blended_tokens,
+        "observedBlendedTokens": measured_blended if blended_requests else None,
         "blendedDefinition": "non_cached_input_plus_output",
         "promptCategoryAttempts": categorized_attempts,
         "promptCategories": dict(prompt_categories) if categorized_attempts else None,
         "promptCategoryBasis": "native_estimate",
+        "invalidPromptCategoryMeasurements": dict(invalid_categories),
+        "promptCategoryComponentCoverage": {key: {"measuredRequests": category_counts[key],
+            "missingRequests": len(request_list) - category_counts[key]} for key in category_fields},
         "promptCategoryScope": "sum of local logical-prompt estimates across requests; not provider usage or subscription cost",
         "promptCategoryCoverage": categorized_attempts / len(request_list)
         if request_list
@@ -660,10 +665,13 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
             {
                 "category": key,
                 "tokens": value,
-                "share": value / prompt_categories["logicalTotal"]
-                if prompt_categories["logicalTotal"]
+                "share": value / category_denominators[key]
+                if category_denominators[key] and category_counts[key] == categorized_attempts
+                and category_pairs[key] == category_counts[key]
+                and category_denominators[key] == prompt_categories["logicalTotal"]
                 else None,
-                "denominator": "covered_logical_prompt_estimate",
+                "denominator": "matched_logical_prompt_estimate",
+                "denominatorTokens": category_denominators[key],
             }
             for key, value in sorted(
                 prompt_categories.items(), key=lambda pair: pair[1], reverse=True
@@ -673,14 +681,13 @@ def _token_report(requests: Iterable[dict[str, Any]]) -> dict[str, Any]:
         ],
         "accountingNote": "Top-level totals require complete provider coverage. observedTotals retains partial provider counts and output-only fallbacks; absent input is unmeasured. Cached input and reasoning output are subsets.",
         "available": bool(
-            covered_attempts
-            or any("outputTokens" in request for request in request_list)
+            any(component_counts.values())
         ),
         "cacheShare": totals["cachedInputTokens"] / input_tokens
         if usage_complete and input_tokens
         else None,
-        "observedCacheShare": totals["cachedInputTokens"] / input_tokens
-        if covered_attempts and input_tokens
+        "observedCacheShare": matched_cached / matched_cache_input
+        if matched_cache_input
         else None,
     }
 
@@ -1559,30 +1566,43 @@ def _native_usage(usage: Any) -> dict[str, Any] | None:
             "reasoningTokens",
         ),
     }
-    counts = {
-        key: next(
-            (
-                usage[name]
-                for name in names
-                if type(usage.get(name)) is int and usage[name] >= 0
-            ),
-            None,
-        )
-        for key, names in fields.items()
-    }
-    if counts["inputTokens"] is None or counts["outputTokens"] is None:
+    counts = {}
+    for key, names in fields.items():
+        values = [usage[name] for name in names if usage.get(name) is not None]
+        if (any(type(value) is not int or not 0 <= value < 2**64 - 1 for value in values)
+                or values and any(value != values[0] for value in values[1:])):
+            counts[key] = None
+            continue
+        counts[key] = values[0] if values else None
+    if all(value is None for value in counts.values()):
         return None
-    counts["totalTokens"] = counts["inputTokens"] + counts["outputTokens"]
+    # Subsets outside their parent totals are contradictory evidence, not
+    # permission to clamp the remainder to zero and publish invented usage.
+    if (counts["inputTokens"] is not None and counts["cachedInputTokens"] is not None
+            and counts["cachedInputTokens"] > counts["inputTokens"]
+            or counts["outputTokens"] is not None and counts["reasoningTokens"] is not None
+            and counts["reasoningTokens"] > counts["outputTokens"]):
+        return None
+    counts["totalTokens"] = (counts["inputTokens"] + counts["outputTokens"]
+                             if counts["inputTokens"] is not None and counts["outputTokens"] is not None else None)
+    if counts["totalTokens"] is not None and any(name in usage and (type(usage[name]) is not int
+                             or usage[name] != counts["totalTokens"])
+           for name in ("totalTokens", "total_tokens")):
+        return None
     counts["nonCachedInputTokens"] = (
-        max(0, counts["inputTokens"] - counts["cachedInputTokens"])
-        if counts["cachedInputTokens"] is not None
+        counts["inputTokens"] - counts["cachedInputTokens"]
+        if counts["inputTokens"] is not None and counts["cachedInputTokens"] is not None
         else None
     )
     counts["visibleOutputTokens"] = (
-        max(0, counts["outputTokens"] - counts["reasoningTokens"])
-        if counts["reasoningTokens"] is not None
+        counts["outputTokens"] - counts["reasoningTokens"]
+        if counts["outputTokens"] is not None and counts["reasoningTokens"] is not None
         else None
     )
+    for key in ("nonCachedInputTokens", "visibleOutputTokens"):
+        if (key in usage and counts[key] is not None
+                and (type(usage[key]) is not int or usage[key] != counts[key])):
+            return None
     return counts
 
 
@@ -1794,6 +1814,10 @@ def analyze_runner_evidence(
         params = message.get("params", message.get("payload", message))
         if not isinstance(params, dict):
             continue
+        if (method != "event_msg" and params.get("type") in
+                ("task_started", "task_complete", "turn_aborted")):
+            # Response items cannot change lifecycle or the active-turn binding.
+            continue
         elapsed = row.get("elapsedMs")
         try:
             valid_elapsed = type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0
@@ -1834,8 +1858,9 @@ def analyze_runner_evidence(
         )
         active_turn_by_thread[thread_id] = active_turn
         turn_key = (thread_id, active_turn)
-        payload_type = params.get("type", "")
-        if method in ("turn/started", "turn.started") or payload_type == "task_started":
+        payload_type = params.get("type", "") if method == "event_msg" else ""
+        is_start = method in ("turn/started", "turn.started") or payload_type == "task_started"
+        if is_start:
             started_turns.add(turn_key)
             if thread_id not in observed_work_threads and thread_id in usage_by_thread:
                 usage_baselines[thread_id] = usage_by_thread[thread_id]
@@ -1868,7 +1893,17 @@ def analyze_runner_evidence(
                     }
                 )
         timing = params.get("timing", turn.get("timing"))
-        if isinstance(timing, dict):
+        is_terminal = method in ("turn/completed", "turn.completed") or payload_type in (
+            "task_complete", "turn_aborted"
+        )
+        if is_terminal:
+            if turn_key not in terminal_profiles.records:
+                # A terminal without timing cannot inherit interim measurements.
+                profiles.pop(turn_key, None)
+            terminal_profiles.add(turn_key, {"timing": timing, "status": terminal[turn_key],
+                                           "error": turn.get("error", params.get("error")),
+                                           "reason": turn.get("reason", params.get("reason"))})
+        if isinstance(timing, dict) and (is_start or is_terminal):
             observed_work_threads.add(thread_id)
             record = {
                 "timing": timing,
@@ -1878,8 +1913,7 @@ def analyze_runner_evidence(
                 "eventIndex": index,
             }
             if turn_key in terminal:
-                terminal_profiles.add(turn_key, record)
-                profiles[turn_key] = terminal_profiles.records[turn_key]
+                profiles.setdefault(turn_key, record)
             elif turn_key not in terminal_profiles.records:
                 profiles[turn_key] = record
         if include_tokens and method == "thread/tokenUsage/updated":
@@ -1893,15 +1927,16 @@ def analyze_runner_evidence(
                     }
         if include_tokens and method == "token_usage_record":
             counts = _native_usage(params.get("usage"))
-            if counts is not None and "total_tokens" in params["usage"]:
-                counts["totalTokens"] = params["usage"]["total_tokens"]
+            if counts is None and params.get("usage") is not None:
+                # Invalid receipts must not be overwritten as if usage were absent.
+                counts = {}
             response_requests[turn_key].append({
                 "_turnKey": turn_key,
                 "samplingRequestId": params.get("response_id"),
                 "tokenUsage": counts,
             })
             turn_counts = _native_usage(params.get("turn_token_usage"))
-            if turn_counts and turn_counts["totalTokens"] >= response_turn_totals.get(
+            if turn_counts and turn_counts["totalTokens"] is not None and turn_counts["totalTokens"] >= response_turn_totals.get(
                 turn_key, {}
             ).get("totalTokens", -1):
                 response_turn_totals[turn_key] = turn_counts
@@ -2109,8 +2144,8 @@ def analyze_runner_evidence(
 
     valid_profiles = [
         record
-        for record in profiles.values()
-        if record["exclusionReason"] is None
+        for key, record in profiles.items()
+        if key in terminal and record["exclusionReason"] is None
         and record["timing"].get("classificationComplete") is True
     ]
     runtime_profiles = [
@@ -2347,7 +2382,8 @@ def analyze_runner_evidence(
                 == set(usage_by_thread)
                 == set(usage_baselines)
                 and all(
-                    row[key] >= usage_baselines[thread][key]
+                    type(row.get(key)) is int and type(usage_baselines[thread].get(key)) is int
+                    and row[key] >= usage_baselines[thread][key]
                     for thread, row in usage_by_thread.items()
                     for key in ("inputTokens", "outputTokens")
                 )

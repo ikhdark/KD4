@@ -85,7 +85,10 @@ fn bad_request_transport_errors_publish_bad_request_events() {
 #[test]
 fn map_api_error_distinguishes_transport_stream_failures_from_provider_retries() {
     for (source, message) in [
-        (ApiError::Stream("websocket closed".to_string()), "websocket closed"),
+        (
+            ApiError::Stream("websocket closed".to_string()),
+            "websocket closed",
+        ),
         (
             ApiError::Transport(TransportError::Network("connection reset".to_string())),
             "connection reset",

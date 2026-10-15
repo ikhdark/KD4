@@ -163,16 +163,24 @@ fn plugin_install_elicitation_telemetry_metadata_requires_install_tool_suggestio
         None
     );
 
-    for key in ["codex_approval_kind", "suggest_type", "tool_type", "tool_id", "tool_name"] {
+    for key in [
+        "codex_approval_kind",
+        "suggest_type",
+        "tool_type",
+        "tool_id",
+        "tool_name",
+    ] {
         for replacement in [None, Some(json!("")), Some(json!("   ")), Some(json!(17))] {
             let mut malformed = event.clone();
             let EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                request: codex_protocol::approvals::ElicitationRequest::Form {
-                    meta: Some(Value::Object(meta)),
-                    ..
-                },
+                request:
+                    codex_protocol::approvals::ElicitationRequest::Form {
+                        meta: Some(Value::Object(meta)),
+                        ..
+                    },
                 ..
-            }) = &mut malformed else {
+            }) = &mut malformed
+            else {
                 panic!("expected form fixture");
             };
             if let Some(replacement) = replacement {

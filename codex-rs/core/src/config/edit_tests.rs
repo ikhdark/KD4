@@ -1195,11 +1195,13 @@ fn set_project_trust_preserves_inline_project_fields_on_disk() {
     // document with only the requested scalar changed, not the setter's output.
     let project_key = codex_config::loader::project_trust_key(&project);
     let quoted_key = serde_json::to_string(&project_key).expect("quote project key");
-    let initial = format!(r#"model = "retained"
+    let initial = format!(
+        r#"model = "retained"
 [projects]
 {quoted_key} = {{ trust_level = "untrusted", label = "keep", nested = {{ enabled = true }} }}
 "/other" = {{ trust_level = "untrusted", label = "untouched" }}
-"#);
+"#
+    );
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), &initial).expect("seed");
     // A trust edit must change only that setting, regardless of table syntax.
     let mut expected: TomlValue = toml::from_str(&initial).expect("parse fixture");
@@ -1229,12 +1231,19 @@ fn skill_toggle_preserves_inline_array_entries() {
         assert_eq!(parsed.skills.unwrap().config.len(), 2);
         std::fs::write(&path, initial).unwrap();
         ConfigEditsBuilder::new(home.path())
-            .with_edits([ConfigEdit::SetSkillConfigByName { name: "target".into(), enabled }])
-            .apply_blocking().unwrap();
+            .with_edits([ConfigEdit::SetSkillConfigByName {
+                name: "target".into(),
+                enabled,
+            }])
+            .apply_blocking()
+            .unwrap();
         let actual: TomlValue = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let mut expected: TomlValue = toml::from_str(initial).unwrap();
         if enabled {
-            expected["skills"]["config"].as_array_mut().unwrap().remove(0);
+            expected["skills"]["config"]
+                .as_array_mut()
+                .unwrap()
+                .remove(0);
         }
         assert_eq!(actual, expected, "enabled={enabled}");
     }

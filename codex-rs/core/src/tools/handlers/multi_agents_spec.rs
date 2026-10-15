@@ -204,9 +204,15 @@ pub fn create_send_message_tool() -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::string(Some(
-                "Relative or canonical task name to message (from spawn_agent).".to_string(),
+                "Relative or canonical task name to message, as `task_name` from spawn_agent."
+                    .to_string(),
             )),
         ),
+        // `spawn_agent` takes and returns this value under the name `task_name`,
+        // so a caller carrying that field forward is using this tool's own
+        // vocabulary. Accepting it avoids failing the whole cell, along with any
+        // unrelated work batched before the call, over a spelling.
+        ("task_name".to_string(), task_name_alias_schema()),
         (
             "message".to_string(),
             JsonSchema::string(Some(
@@ -236,7 +242,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::string(Some(
-                "Agent id or canonical task name to send a follow-up task to (from spawn_agent)."
+                "Agent id, or canonical task name as `task_name` from spawn_agent, to send a follow-up task to."
                     .to_string(),
             )),
         ),
@@ -766,6 +772,19 @@ fn spawn_agent_common_properties_v2(
     ])
 }
 
+/// Accepts the recipient under the name `spawn_agent` uses for the same value.
+///
+/// `spawn_agent` both takes and returns it as `task_name`, so carrying that
+/// field into `send_message` is a natural reading of this API rather than an
+/// invented argument. `additionalProperties: false` turned it into a hard
+/// failure of the entire exec cell, discarding any work the cell had already
+/// completed, so the alias is published instead of rejected.
+fn task_name_alias_schema() -> JsonSchema {
+    JsonSchema::string(Some(
+        "Alias for target, accepting spawn_agent's `task_name` directly.".to_string(),
+    ))
+}
+
 fn typed_assignment_schema() -> JsonSchema {
     let criterion = JsonSchema::object(
         BTreeMap::from([
@@ -1103,6 +1122,7 @@ The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Before delegating, identify useful work to do locally. Keep immediately blocking work local, give each agent a clear scope, and avoid duplicating delegated work. Review and integrate returned changes before treating the subtask as complete.
+Size each assignment to fit about two context windows of reading (roughly 2 MB of text). A spawned agent that fills more stops and reports its unread files or ranges; split larger scopes across agents or follow-up assignments.
 Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
 When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
 Launch authorized independent assignments in the same batch rather than awaiting each spawn in a loop. In exec, use Promise.allSettled for a bounded batch and retain every success and failure before proceeding; a failed sibling does not authorize respawning successful agents.

@@ -170,7 +170,10 @@ async fn responses_stream_includes_subagent_identity_headers(
         .expect("stream failed");
     let mut completed = false;
     while let Some(event) = stream.next().await {
-        if matches!(event.expect("response event must succeed"), ResponseEvent::Completed { .. }) {
+        if matches!(
+            event.expect("response event must succeed"),
+            ResponseEvent::Completed { .. }
+        ) {
             completed = true;
             break;
         }
@@ -310,7 +313,10 @@ async fn responses_includes_configured_reasoning_summary_for_supported_model() {
         .expect("stream failed");
     let mut completed = false;
     while let Some(event) = stream.next().await {
-        if matches!(event.expect("response event must succeed"), ResponseEvent::Completed { .. }) {
+        if matches!(
+            event.expect("response event must succeed"),
+            ResponseEvent::Completed { .. }
+        ) {
             completed = true;
             break;
         }

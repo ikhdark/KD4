@@ -46,7 +46,11 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
     let (content_opt, success) = req
         .function_call_output_content_and_success(call_id)
         .expect("function_call_output present");
-    assert_ne!(success, Some(false), "answered input must not report tool failure");
+    assert_ne!(
+        success,
+        Some(false),
+        "answered input must not report tool failure"
+    );
     content_opt.expect("function_call_output content present")
 }
 
@@ -172,7 +176,8 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
         .submit(Op::UserInputAnswer {
             id: request.turn_id.clone(),
             call_id: Some(request.call_id),
-            response: RequestUserInputResponse { disposition: None,
+            response: RequestUserInputResponse {
+                disposition: None,
                 answers,
                 interrupted: false,
             },
@@ -191,13 +196,24 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
 
     let follow_up = follow_up.single_request();
     let user_messages = follow_up.message_input_texts("user");
-    assert!(user_messages.iter().any(|text| text == "start the active turn"));
-    assert!(!user_messages.iter().any(|text| text.contains("this must not become steering input")));
+    assert!(
+        user_messages
+            .iter()
+            .any(|text| text == "start the active turn")
+    );
+    assert!(
+        !user_messages
+            .iter()
+            .any(|text| text.contains("this must not become steering input"))
+    );
     let answer: Value = serde_json::from_str(&call_output(&follow_up, call_id))?;
-    assert_eq!(answer, json!({
-        "answers": {"confirm_path": {"answers": ["yes"]}},
-        "interrupted": false
-    }));
+    assert_eq!(
+        answer,
+        json!({
+            "answers": {"confirm_path": {"answers": ["yes"]}},
+            "interrupted": false
+        })
+    );
 
     Ok(())
 }
@@ -328,7 +344,8 @@ async fn request_user_input_round_trip_for_mode(
             answers: vec!["yes".to_string()],
         },
     );
-    let response = RequestUserInputResponse { disposition: None,
+    let response = RequestUserInputResponse {
+        disposition: None,
         answers,
         interrupted: false,
     };

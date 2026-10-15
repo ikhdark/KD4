@@ -184,12 +184,16 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
     assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
     let first_developer = requests[0].message_input_texts("developer");
     let second_developer = requests[1].message_input_texts("developer");
-    assert!(first_developer.iter().any(|text| {
-        text.contains("Approval policy is `never`")
-    }));
-    assert!(!second_developer.iter().any(|text| {
-        text.contains("Approval policy is `never`")
-    }));
+    assert!(
+        first_developer
+            .iter()
+            .any(|text| { text.contains("Approval policy is `never`") })
+    );
+    assert!(
+        !second_developer
+            .iter()
+            .any(|text| { text.contains("Approval policy is `never`") })
+    );
     assert!(second_developer.iter().any(|text| {
         text.starts_with("<permissions instructions>") && text.contains("require_escalated")
     }));

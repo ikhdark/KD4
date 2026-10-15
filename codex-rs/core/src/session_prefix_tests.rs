@@ -14,36 +14,88 @@ fn error_completion_identity_preserves_producer_attempt_and_full_error() {
     let thread = codex_protocol::ThreadId::new();
     let make = |thread, sender: &str, receipt, error: &str| {
         inter_agent_completion_communication(
-            AgentPath::root(), AgentPath::try_from(sender).unwrap(), thread,
-            &AgentStatus::Errored(error.to_string()), receipt,
-        ).unwrap()
+            AgentPath::root(),
+            AgentPath::try_from(sender).unwrap(),
+            thread,
+            &AgentStatus::Errored(error.to_string()),
+            receipt,
+        )
+        .unwrap()
     };
     let original = make(thread, "/root/worker", Some("attempt-1"), "failed");
     assert!(original.id.is_some());
-    assert_eq!(original, make(thread, "/root/worker", Some("attempt-1"), "failed"));
+    assert_eq!(
+        original,
+        make(thread, "/root/worker", Some("attempt-1"), "failed")
+    );
     for changed in [
         make(thread, "/root/worker", Some("attempt-2"), "failed"),
         make(thread, "/root/other", Some("attempt-1"), "failed"),
-        make(codex_protocol::ThreadId::new(), "/root/worker", Some("attempt-1"), "failed"),
-        make(thread, "/root/worker", Some("attempt-1"), "different failure"),
+        make(
+            codex_protocol::ThreadId::new(),
+            "/root/worker",
+            Some("attempt-1"),
+            "failed",
+        ),
+        make(
+            thread,
+            "/root/worker",
+            Some("attempt-1"),
+            "different failure",
+        ),
     ] {
         assert_ne!(original.id, changed.id);
     }
     let long_error = "same prefix ".repeat(5_000);
     assert_ne!(
-        make(thread, "/root/worker", None, &format!("{long_error}cause-a")).id,
-        make(thread, "/root/worker", None, &format!("{long_error}cause-b")).id,
+        make(
+            thread,
+            "/root/worker",
+            None,
+            &format!("{long_error}cause-a")
+        )
+        .id,
+        make(
+            thread,
+            "/root/worker",
+            None,
+            &format!("{long_error}cause-b")
+        )
+        .id,
         "bounded displays must not alias distinct full errors",
     );
     let success = inter_agent_completion_communication(
-        AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), thread,
-        &AgentStatus::Completed(Some("done".into())), None,
-    ).unwrap();
-    let hidden_a = make(thread, "/root/worker", None, &format!("{long_error}cause-a{long_error}"));
-    let hidden_b = make(thread, "/root/worker", None, &format!("{long_error}cause-b{long_error}"));
-    assert_eq!(hidden_a.content, hidden_b.content, "the distinct causes must be outside the bounded display");
-    assert_ne!(hidden_a.id, hidden_b.id, "deduplication must use the full error, not its display");
-    assert!(success.id.is_none(), "successful follow-ups are not suppressed");
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").unwrap(),
+        thread,
+        &AgentStatus::Completed(Some("done".into())),
+        None,
+    )
+    .unwrap();
+    let hidden_a = make(
+        thread,
+        "/root/worker",
+        None,
+        &format!("{long_error}cause-a{long_error}"),
+    );
+    let hidden_b = make(
+        thread,
+        "/root/worker",
+        None,
+        &format!("{long_error}cause-b{long_error}"),
+    );
+    assert_eq!(
+        hidden_a.content, hidden_b.content,
+        "the distinct causes must be outside the bounded display"
+    );
+    assert_ne!(
+        hidden_a.id, hidden_b.id,
+        "deduplication must use the full error, not its display"
+    );
+    assert!(
+        success.id.is_none(),
+        "successful follow-ups are not suppressed"
+    );
 }
 
 #[test]

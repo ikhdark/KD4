@@ -104,15 +104,25 @@ pub(crate) fn parse(
             let mut ancestor = node.parent();
             while let Some(parent) = ancestor {
                 in_test_context |= test_contexts.get(&parent.id()).copied().unwrap_or(false);
-                if matches!(parent.kind(), "impl_item" | "trait_item" | "mod_item" | "function_item" | "class_definition" | "function_definition") {
+                if matches!(
+                    parent.kind(),
+                    "impl_item"
+                        | "trait_item"
+                        | "mod_item"
+                        | "function_item"
+                        | "class_definition"
+                        | "function_definition"
+                ) {
                     if rust && parent.has_error() {
                         // Qualifiers also depend on recovered owner syntax. Inspect
                         // only the header: another method's broken body must not
                         // taint this item's otherwise sound identity.
-                        let header_end = parent.child_by_field_name("body")
+                        let header_end = parent
+                            .child_by_field_name("body")
                             .map_or(parent.end_byte(), |body| body.start_byte());
                         let mut header_cursor = parent.walk();
-                        syntax_error |= parent.children(&mut header_cursor)
+                        syntax_error |= parent
+                            .children(&mut header_cursor)
                             .filter(|child| child.end_byte() <= header_end)
                             .any(|child| child.has_error() || child.is_missing());
                     }
@@ -125,23 +135,33 @@ pub(crate) fn parse(
                         if parent.kind() == "impl_item"
                             && let Some(trait_name) = parent.child_by_field_name("trait")
                         {
-                            qualifiers.push(format!("<{} as {}>",
-                                &source[owner.byte_range()], &source[trait_name.byte_range()]));
+                            qualifiers.push(format!(
+                                "<{} as {}>",
+                                &source[owner.byte_range()],
+                                &source[trait_name.byte_range()]
+                            ));
                             if kind == "fn" && trait_alias.is_none() {
                                 // Both the type and trait can contain generics;
                                 // recover the type from grammar nodes, not text.
                                 while owner.kind() == "generic_type" {
-                                    let Some(base) = owner.child_by_field_name("type") else { break; };
+                                    let Some(base) = owner.child_by_field_name("type") else {
+                                        break;
+                                    };
                                     owner = base;
                                 }
-                                trait_alias = Some((qualifiers.len() - 1, source[owner.byte_range()].to_owned()));
+                                trait_alias = Some((
+                                    qualifiers.len() - 1,
+                                    source[owner.byte_range()].to_owned(),
+                                ));
                             }
                             ancestor = parent.parent();
                             continue;
                         }
                         // `impl<T> Type<T>` is addressed as Type::method.
                         while owner.kind() == "generic_type" {
-                            let Some(base) = owner.child_by_field_name("type") else { break; };
+                            let Some(base) = owner.child_by_field_name("type") else {
+                                break;
+                            };
                             owner = base;
                         }
                         qualifiers.push(source[owner.byte_range()].to_owned());
@@ -161,10 +181,14 @@ pub(crate) fn parse(
             // selectable identity distinct from the type definition.
             qualifiers.push(if kind == "impl" {
                 match node.child_by_field_name("trait") {
-                    Some(trait_name) => format!("impl {} for {name}", &source[trait_name.byte_range()]),
+                    Some(trait_name) => {
+                        format!("impl {} for {name}", &source[trait_name.byte_range()])
+                    }
                     None => format!("impl {name}"),
                 }
-            } else { name.clone() });
+            } else {
+                name.clone()
+            });
             let qualified_name = qualifiers.join(if rust { "::" } else { "." });
             let mut start_line = node.start_position().row + 1;
             let mut is_test = (!rust
@@ -189,29 +213,32 @@ pub(crate) fn parse(
                         if let Some(attribute) = previous.named_child(0)
                             && let Some(path_node) = attribute.named_child(0)
                         {
-                                let attribute_path = &source[path_node.byte_range()];
-                                // cfg_attr can supply a path directly or through another
-                                // cfg_attr. Do not evaluate configuration in this parser.
-                                conditional_path |= attribute_path == "cfg_attr";
-                                is_test |= attribute_path.rsplit("::").next() == Some("test");
-                                // Known parameterized-test syntax, not macro expansion or
-                                // proof of active cfg, imported identity, or generated cases.
-                                is_test |= kind == "fn"
-                                    && !previous.has_error()
-                                    && matches!(attribute_path, "test_case" | "test_case::test_case");
-                                // Only an unconditional cfg(test) is proof of
-                                // test-only code; cfg(any(test, feature = ...)) is not.
-                                in_test_context |= attribute_path == "cfg"
-                                    && source[attribute.byte_range()].chars()
-                                        .filter(|ch| !ch.is_whitespace()).collect::<String>() == "cfg(test)";
-                                if kind == "mod"
-                                    && body.is_none()
-                                    && attribute_path == "path"
-                                    && let Some(value) = attribute.child_by_field_name("value")
-                                    && let Some(value) = rust_string_value(value, source)
-                                {
-                                    module_path = Some(value);
-                                }
+                            let attribute_path = &source[path_node.byte_range()];
+                            // cfg_attr can supply a path directly or through another
+                            // cfg_attr. Do not evaluate configuration in this parser.
+                            conditional_path |= attribute_path == "cfg_attr";
+                            is_test |= attribute_path.rsplit("::").next() == Some("test");
+                            // Known parameterized-test syntax, not macro expansion or
+                            // proof of active cfg, imported identity, or generated cases.
+                            is_test |= kind == "fn"
+                                && !previous.has_error()
+                                && matches!(attribute_path, "test_case" | "test_case::test_case");
+                            // Only an unconditional cfg(test) is proof of
+                            // test-only code; cfg(any(test, feature = ...)) is not.
+                            in_test_context |= attribute_path == "cfg"
+                                && source[attribute.byte_range()]
+                                    .chars()
+                                    .filter(|ch| !ch.is_whitespace())
+                                    .collect::<String>()
+                                    == "cfg(test)";
+                            if kind == "mod"
+                                && body.is_none()
+                                && attribute_path == "path"
+                                && let Some(value) = attribute.child_by_field_name("value")
+                                && let Some(value) = rust_string_value(value, source)
+                            {
+                                module_path = Some(value);
+                            }
                         }
                     } else {
                         let comment = &source[previous.byte_range()];
@@ -249,8 +276,17 @@ pub(crate) fn parse(
                 } else {
                     let name = name.trim_start_matches("r#");
                     for base in bases {
-                        linked_path_candidates.push(base.join(format!("{name}.rs")).to_string_lossy().into_owned());
-                        linked_path_candidates.push(base.join(name).join("mod.rs").to_string_lossy().into_owned());
+                        linked_path_candidates.push(
+                            base.join(format!("{name}.rs"))
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                        linked_path_candidates.push(
+                            base.join(name)
+                                .join("mod.rs")
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
                     }
                 }
             }
@@ -309,18 +345,27 @@ fn module_directories(
     let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
     let stem = path.file_stem()?.to_str()?;
     let mut bases = vec![(base.clone(), None)];
-    if stem != "mod" { bases.push((base, Some(stem))); }
+    if stem != "mod" {
+        bases.push((base, Some(stem)));
+    }
     let mut modules = Vec::new();
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
-        if parent.kind() == "mod_item" { modules.push(parent); }
+        if parent.kind() == "mod_item" {
+            modules.push(parent);
+        }
         ancestor = parent.parent();
     }
     for module in modules.into_iter().rev() {
         let mut override_path = None;
         let mut sibling = module.prev_named_sibling();
         while let Some(previous) = sibling {
-            if !matches!(previous.kind(), "attribute_item" | "line_comment" | "block_comment") { break; }
+            if !matches!(
+                previous.kind(),
+                "attribute_item" | "line_comment" | "block_comment"
+            ) {
+                break;
+            }
             if previous.kind() == "attribute_item"
                 && let Some(attribute) = previous.named_child(0)
                 && let Some(name) = attribute.named_child(0)
@@ -344,15 +389,21 @@ fn module_directories(
         } else {
             let name = module.child_by_field_name("name")?;
             for (base, pending_stem) in &mut bases {
-                if let Some(stem) = pending_stem.take() { base.push(stem); }
+                if let Some(stem) = pending_stem.take() {
+                    base.push(stem);
+                }
                 base.push(source[name.byte_range()].trim_start_matches("r#"));
             }
         }
     }
     let mut directories = Vec::new();
     for (mut base, pending_stem) in bases {
-        if conventional && let Some(stem) = pending_stem { base.push(stem); }
-        if !directories.contains(&base) { directories.push(base); }
+        if conventional && let Some(stem) = pending_stem {
+            base.push(stem);
+        }
+        if !directories.contains(&base) {
+            directories.push(base);
+        }
     }
     Some(directories)
 }
@@ -360,33 +411,51 @@ fn module_directories(
 // Decode only the string node selected by the grammar, never parse an attribute
 // a second time. Unsupported or malformed literals do not advertise a path.
 fn rust_string_value(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    if node.has_error() { return None; }
+    if node.has_error() {
+        return None;
+    }
     if node.kind() == "raw_string_literal" {
         return Some(source[node.named_child(0)?.byte_range()].to_owned());
     }
-    if node.kind() != "string_literal" { return None; }
-    let text = source[node.byte_range()].strip_prefix('"')?.strip_suffix('"')?;
+    if node.kind() != "string_literal" {
+        return None;
+    }
+    let text = source[node.byte_range()]
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
     let mut chars = text.chars().peekable();
     let mut value = String::new();
     while let Some(ch) = chars.next() {
-        if ch != '\\' { value.push(ch); continue; }
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
         value.push(match chars.next()? {
-            '\\' => '\\', '"' => '"', '\'' => '\'',
-            'n' => '\n', 'r' => '\r', 't' => '\t', '0' => '\0',
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
             'x' => {
                 let a = chars.next()?.to_digit(16)?;
                 let b = chars.next()?.to_digit(16)?;
                 let byte = a * 16 + b;
-                if byte > 127 { return None; }
+                if byte > 127 {
+                    return None;
+                }
                 char::from_u32(byte)?
             }
             'u' => {
-                if chars.next()? != '{' { return None; }
+                if chars.next()? != '{' {
+                    return None;
+                }
                 let mut digits = String::new();
                 loop {
                     match chars.next()? {
                         '}' => break,
-                        '_' => {},
+                        '_' => {}
                         ch if ch.is_ascii_hexdigit() => digits.push(ch),
                         _ => return None,
                     }
@@ -394,7 +463,9 @@ fn rust_string_value(node: tree_sitter::Node<'_>, source: &str) -> Option<String
                 char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?
             }
             '\n' | '\r' => {
-                while chars.peek().is_some_and(char::is_ascii_whitespace) { chars.next(); }
+                while chars.peek().is_some_and(char::is_ascii_whitespace) {
+                    chars.next();
+                }
                 continue;
             }
             _ => return None,
@@ -425,13 +496,19 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
         let import = item.kind == "use";
         if import {
             match import_ranges.last_mut().filter(|_| previous_was_import) {
-                Some(run) => { run.1 = item.end_line; run.2 += 1; }
+                Some(run) => {
+                    run.1 = item.end_line;
+                    run.2 += 1;
+                }
                 None => import_ranges.push((item.start_line, item.end_line, 1)),
             }
         }
         previous_was_import = import;
     }
-    let items = items.iter().filter(|item| item.kind != "use").collect::<Vec<_>>();
+    let items = items
+        .iter()
+        .filter(|item| item.kind != "use")
+        .collect::<Vec<_>>();
     // Fit ordinary outlines in one response instead of forcing a round trip
     // per handful of items. Larger outlines retain bounded directory pages.
     let mut start = 0;
@@ -447,7 +524,8 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
             end += 1;
         }
         let next = (end < items.len()).then(|| format!("outline:{end}"));
-        let mut value = json!({"items": &items[start..end], "total_items": items.len(), "next": next});
+        let mut value =
+            json!({"items": &items[start..end], "total_items": items.len(), "next": next});
         if start == 0 && !import_ranges.is_empty() {
             value["import_ranges"] = import_ranges.iter().take(16)
                 .map(|(start_line, end_line, count)| json!({"start_line": start_line, "end_line": end_line, "count": count}))
@@ -499,12 +577,24 @@ mod tests {
         let source = "struct S;\nimpl S {\n fn broken(&self) { let marker = ; }\n fn healthy(&self) {}\n}\nimpl S ??? {\n fn uncertain(&self) {}\n}\n";
         let parsed = items("src/lib.rs", source);
         for (name, expected_error) in [("broken", true), ("healthy", false), ("uncertain", true)] {
-            let item = parsed.iter().find(|item| item.kind == "fn" && item.name == name).unwrap();
+            let item = parsed
+                .iter()
+                .find(|item| item.kind == "fn" && item.name == name)
+                .unwrap();
             assert_eq!(item.syntax_error, expected_error, "{name}");
         }
-        let parsed = items("src/lib.rs", "struct Wrapper<T>(T);\n#[cfg(any())]\nimpl<T> Wrapper<T> where T: Clone { fn generic(&self) {} }\n");
-        assert!(!parsed.iter().find(|item| item.name == "generic").unwrap().syntax_error,
-            "valid cfg/generic syntax is not a parse error or proof of active compilation");
+        let parsed = items(
+            "src/lib.rs",
+            "struct Wrapper<T>(T);\n#[cfg(any())]\nimpl<T> Wrapper<T> where T: Clone { fn generic(&self) {} }\n",
+        );
+        assert!(
+            !parsed
+                .iter()
+                .find(|item| item.name == "generic")
+                .unwrap()
+                .syntax_error,
+            "valid cfg/generic syntax is not a parse error or proof of active compilation"
+        );
     }
 
     #[test]
@@ -534,16 +624,25 @@ mod tests {
             let source = format!("{attribute}\nmod child;\nfn broken(");
             let parsed = items("src/lib.rs", &source);
             let child = parsed.iter().find(|item| item.name == "child").unwrap();
-            assert_eq!(Path::new(child.linked_path.as_ref().unwrap()), Path::new("src").join(expected));
+            assert_eq!(
+                Path::new(child.linked_path.as_ref().unwrap()),
+                Path::new("src").join(expected)
+            );
             assert_eq!(child.start_line, 1);
         }
     }
 
     #[test]
     fn trait_impl_names_and_conventional_module_candidates_are_unambiguous() {
-        let parsed = items("src/lib.rs", "impl First for S { fn run() {} }\nimpl Second for S { fn run() {} }\n");
-        let names = parsed.iter().filter(|item| item.kind == "fn")
-            .map(|item| item.qualified_name.as_str()).collect::<Vec<_>>();
+        let parsed = items(
+            "src/lib.rs",
+            "impl First for S { fn run() {} }\nimpl Second for S { fn run() {} }\n",
+        );
+        let names = parsed
+            .iter()
+            .filter(|item| item.kind == "fn")
+            .map(|item| item.qualified_name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(names, ["<S as First>::run", "<S as Second>::run"]);
         // rustc accepts these non-mod.rs files as either crate roots or
         // conventional modules. Both directory contexts remain candidates.
@@ -552,18 +651,33 @@ mod tests {
             ("src/main.rs", "mod child;", &["src", "src/main"][..]),
             ("src/parent/mod.rs", "mod child;", &["src/parent"][..]),
             ("src/parent.rs", "mod child;", &["src", "src/parent"][..]),
-            ("src/parent.rs", "mod inline { mod child; }", &["src/inline", "src/parent/inline"][..]),
+            (
+                "src/parent.rs",
+                "mod inline { mod child; }",
+                &["src/inline", "src/parent/inline"][..],
+            ),
             ("src/lib.rs", "mod r#type;", &["src", "src/lib"][..]),
         ] {
             let parsed = items(path, source);
             let item = parsed.last().unwrap();
             let name = item.name.trim_start_matches("r#");
             assert!(item.linked_path.is_none());
-            let expected = bases.iter().flat_map(|base|
-                [Path::new(base).join(format!("{name}.rs")), Path::new(base).join(name).join("mod.rs")])
+            let expected = bases
+                .iter()
+                .flat_map(|base| {
+                    [
+                        Path::new(base).join(format!("{name}.rs")),
+                        Path::new(base).join(name).join("mod.rs"),
+                    ]
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(item.linked_path_candidates.iter().map(Path::new).collect::<Vec<_>>(),
-                expected);
+            assert_eq!(
+                item.linked_path_candidates
+                    .iter()
+                    .map(Path::new)
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
         let parsed = items("src/lib.rs", "#[path = \"elsewhere.rs\"]\nmod child;");
         assert!(parsed[0].linked_path.is_some());
@@ -579,16 +693,26 @@ mod tests {
             "#[cfg_attr(chosen, path = \"on\")]\n#[path = \"off\"]\nmod inline { #[path = \"leaf.rs\"] mod child; }",
         ] {
             let parsed = items("src/lib.rs", &format!("{source}\nfn after() {{}}"));
-            assert!(parsed.iter().any(|item| item.name == "after"),
-                "unresolved path metadata must not suppress source items");
+            assert!(
+                parsed.iter().any(|item| item.name == "after"),
+                "unresolved path metadata must not suppress source items"
+            );
             let child = parsed.iter().find(|item| item.name == "child").unwrap();
-            assert!(child.linked_path.is_none(),
-                "cfg_attr(path) on the leaf or an inline ancestor cannot establish one module path");
+            assert!(
+                child.linked_path.is_none(),
+                "cfg_attr(path) on the leaf or an inline ancestor cannot establish one module path"
+            );
             let outline = sections(&parsed);
             let child = outline.last().unwrap().value.as_ref().unwrap()["items"]
-                .as_array().unwrap().iter().find(|item| item["name"] == "child").unwrap();
-            assert!(child.get("linked_path").is_none(),
-                "unresolved paths must remain unresolved in consumer-visible outline metadata");
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "child")
+                .unwrap();
+            assert!(
+                child.get("linked_path").is_none(),
+                "unresolved paths must remain unresolved in consumer-visible outline metadata"
+            );
         }
     }
 
@@ -604,16 +728,29 @@ mod tests {
         for stem in ["entrypoint", "lib", "main"] {
             let parsed = items(&format!("src/{stem}.rs"), source);
             let child = parsed.iter().find(|item| item.name == "child").unwrap();
-            assert!(child.linked_path.is_none(), "file names do not establish crate-root identity");
-            for expected in ["src/inline/leaf.rs".to_owned(), format!("src/{stem}/inline/leaf.rs")] {
-                assert!(child.linked_path_candidates.iter().any(|candidate|
-                    Path::new(candidate) == Path::new(&expected)),
-                    "compiler-permitted source context must remain a candidate: {expected}");
+            assert!(
+                child.linked_path.is_none(),
+                "file names do not establish crate-root identity"
+            );
+            for expected in [
+                "src/inline/leaf.rs".to_owned(),
+                format!("src/{stem}/inline/leaf.rs"),
+            ] {
+                assert!(
+                    child
+                        .linked_path_candidates
+                        .iter()
+                        .any(|candidate| Path::new(candidate) == Path::new(&expected)),
+                    "compiler-permitted source context must remain a candidate: {expected}"
+                );
             }
         }
         let parsed = items("src/mod.rs", source);
         let child = parsed.iter().find(|item| item.name == "child").unwrap();
-        assert_eq!(child.linked_path.as_deref().map(Path::new), Some(Path::new("src/inline/leaf.rs")));
+        assert_eq!(
+            child.linked_path.as_deref().map(Path::new),
+            Some(Path::new("src/inline/leaf.rs"))
+        );
         assert!(child.linked_path_candidates.is_empty());
     }
 
@@ -632,13 +769,22 @@ mod tests {
 
     #[test]
     fn rust_test_context_does_not_relabel_helpers_as_tests() {
-        let parsed = items("a.rs", "#[cfg(test)]\nmod fixtures { fn helper() {} }\nmod tests { fn nested() {} }\nfn production() {}\n");
+        let parsed = items(
+            "a.rs",
+            "#[cfg(test)]\nmod fixtures { fn helper() {} }\nmod tests { fn nested() {} }\nfn production() {}\n",
+        );
         for name in ["helper", "nested"] {
             let item = parsed.iter().find(|item| item.name == name).unwrap();
             assert!(!item.is_test);
             assert!(item.in_test_context);
         }
-        assert!(!parsed.iter().find(|item| item.name == "production").unwrap().in_test_context);
+        assert!(
+            !parsed
+                .iter()
+                .find(|item| item.name == "production")
+                .unwrap()
+                .in_test_context
+        );
     }
 
     #[test]
@@ -683,17 +829,46 @@ mod tests {
         let source = "use a::A;\nuse b::B;\nfn first() {}\nmod m { use c::C; fn second() {} }\n";
         let parsed = items("a.rs", source);
         let sections = sections(&parsed);
-        let page = sections.iter().find(|section| section.id == "outline").unwrap().value.as_ref().unwrap();
+        let page = sections
+            .iter()
+            .find(|section| section.id == "outline")
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap();
         assert_eq!(
-            page["items"].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             ["first", "m", "second"]
         );
         assert_eq!(page["total_items"], 3);
-        assert_eq!(page["import_ranges"], json!([
-            {"start_line": 1, "end_line": 2, "count": 2}, {"start_line": 4, "end_line": 4, "count": 1}]));
+        assert_eq!(
+            page["import_ranges"],
+            json!([
+            {"start_line": 1, "end_line": 2, "count": 2}, {"start_line": 4, "end_line": 4, "count": 1}])
+        );
         // Import lines stay addressable for enclosing and search hydration.
-        assert_eq!(sections.iter().filter(|section| section.id.starts_with("code:")).count(), parsed.len());
+        assert_eq!(
+            sections
+                .iter()
+                .filter(|section| section.id.starts_with("code:"))
+                .count(),
+            parsed.len()
+        );
         let plain = super::sections(&items("a.rs", "fn only() {}\n"));
-        assert!(plain.last().unwrap().value.as_ref().unwrap().get("import_ranges").is_none());
+        assert!(
+            plain
+                .last()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .get("import_ranges")
+                .is_none()
+        );
     }
 }

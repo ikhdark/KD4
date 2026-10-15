@@ -197,7 +197,9 @@ impl ExecutorFileSystem for FailingFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(async move {
-            self.metadata_calls.stream_reads.fetch_add(1, Ordering::Relaxed);
+            self.metadata_calls
+                .stream_reads
+                .fetch_add(1, Ordering::Relaxed);
             let is_target = path.to_abs_path()? == self.path;
             match self.failure {
                 InjectedFailure::Read(kind) if is_target => {
@@ -417,7 +419,10 @@ fn repository_stable_context_identity_covers_sources_order_scope_and_content() {
     for changed in [&edited, &added, &removed, &reordered, &moved_source] {
         assert_ne!(identity, changed.stable_context_bundle(&cwd).identity);
     }
-    assert_ne!(identity, original.stable_context_bundle(&moved_cwd).identity);
+    assert_ne!(
+        identity,
+        original.stable_context_bundle(&moved_cwd).identity
+    );
 }
 
 #[test]
@@ -916,8 +921,18 @@ async fn omitted_multi_environment_paths_are_exact_and_overflow_is_recoverable()
     let tmp = tempfile::tempdir().unwrap();
     let config = make_config(&tmp, 1, None).await;
     let mut documents = vec![
-        ProjectDocOmission { environment_id:"local".into(), cwd:"C:/work".into(), path:"C:/work/AGENTS.md".into(), source_bytes:20 },
-        ProjectDocOmission { environment_id:"remote".into(), cwd:"/work".into(), path:"/work/AGENTS.override.md".into(), source_bytes:30 },
+        ProjectDocOmission {
+            environment_id: "local".into(),
+            cwd: "C:/work".into(),
+            path: "C:/work/AGENTS.md".into(),
+            source_bytes: 20,
+        },
+        ProjectDocOmission {
+            environment_id: "remote".into(),
+            cwd: "/work".into(),
+            path: "/work/AGENTS.override.md".into(),
+            source_bytes: 30,
+        },
     ];
     let owner = ProjectDocOmissionRecovery::new("instructions-test".into());
     let inline = owner.notice(&config, &documents).await;
@@ -925,20 +940,38 @@ async fn omitted_multi_environment_paths_are_exact_and_overflow_is_recoverable()
         assert!(inline.contains(&document.path));
         assert!(inline.contains(&document.environment_id));
     }
-    assert!(owner.cached.lock().await.is_none(), "inline lists must not create artifacts");
+    assert!(
+        owner.cached.lock().await.is_none(),
+        "inline lists must not create artifacts"
+    );
     documents.extend((0..12).map(|i| ProjectDocOmission {
-        environment_id:format!("remote-{i}"), cwd:"/work".into(), path:format!("/work/{i}/AGENTS.md"), source_bytes:1,
+        environment_id: format!("remote-{i}"),
+        cwd: "/work".into(),
+        path: format!("/work/{i}/AGENTS.md"),
+        source_bytes: 1,
     }));
     let notice = owner.notice(&config, &documents).await;
     assert!(notice.len() + 2 <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
-    let call: serde_json::Value = serde_json::from_str(notice.split("read_tool_output: ").nth(1).unwrap()).unwrap();
+    let call: serde_json::Value =
+        serde_json::from_str(notice.split("read_tool_output: ").nth(1).unwrap()).unwrap();
     let (result, _) = crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse(
-        config.codex_home.as_path(), "instructions-test", call["artifact_id"].as_str().unwrap(),
+        config.codex_home.as_path(),
+        "instructions-test",
+        call["artifact_id"].as_str().unwrap(),
         serde_json::from_value(call["selectors"].clone()).unwrap(),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     assert!(result.complete);
-    assert_eq!(result.results[0].value.as_ref().unwrap(), &serde_json::to_value(&documents).unwrap());
-    assert_eq!(owner.notice(&config, &documents).await, notice, "unchanged manifest reuses its artifact and prompt identity");
+    assert_eq!(
+        result.results[0].value.as_ref().unwrap(),
+        &serde_json::to_value(&documents).unwrap()
+    );
+    assert_eq!(
+        owner.notice(&config, &documents).await,
+        notice,
+        "unchanged manifest reuses its artifact and prompt identity"
+    );
 }
 
 #[test]
@@ -1062,8 +1095,12 @@ async fn read_agents_md_propagates_read_errors() {
         starting: Vec::new(),
     };
 
-    let load =
-        load_project_instructions(&config.config, /*user_instructions*/ None, &environments).await;
+    let load = load_project_instructions(
+        &config.config,
+        /*user_instructions*/ None,
+        &environments,
+    )
+    .await;
 
     assert!(
         !load.complete,
@@ -1093,8 +1130,12 @@ async fn read_agents_md_reports_files_removed_after_discovery() {
         starting: Vec::new(),
     };
 
-    let load =
-        load_project_instructions(&config.config, /*user_instructions*/ None, &environments).await;
+    let load = load_project_instructions(
+        &config.config,
+        /*user_instructions*/ None,
+        &environments,
+    )
+    .await;
 
     assert!(
         !load.complete,
@@ -2472,7 +2513,10 @@ async fn descendant_instructions_are_only_loaded_when_applicable() {
     fs::create_dir_all(&nested_dir).unwrap();
     fs::write(nested_dir.join("AGENTS.override.md"), "nested instructions").unwrap();
     let mut config = make_config(&repo, 4096, None).await;
-    let expected = rendered_project_doc(&PathUri::from_abs_path(&root_path.abs()), "root instructions");
+    let expected = rendered_project_doc(
+        &PathUri::from_abs_path(&root_path.abs()),
+        "root instructions",
+    );
     for _ in 0..2 {
         assert_eq!(get_user_instructions(&config).await, Some(expected.clone()));
     }
@@ -2490,20 +2534,40 @@ async fn applicable_instruction_loading_has_no_inventory_wait() {
     let path = root.path().join("AGENTS.md");
     fs::write(&path, "Readable primary policy: never modify X").unwrap();
     let cwd = AbsolutePathBuf::try_from(root.path().to_path_buf()).unwrap();
-    let config = ConfigBuilder::default().codex_home(root.path().to_path_buf())
-        .harness_overrides(crate::config::ConfigOverrides { cwd: Some(cwd.clone().into_path_buf()), ..Default::default() })
-        .build().await.unwrap();
+    let config = ConfigBuilder::default()
+        .codex_home(root.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(cwd.clone().into_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
 
     let discovery = ProjectInstructionsDiscovery {
         environments: vec![EnvironmentProjectInstructionsDiscovery {
-            environment_id: "local".to_string(), cwd: PathUri::from_abs_path(&cwd),
+            environment_id: "local".to_string(),
+            cwd: PathUri::from_abs_path(&cwd),
             filesystem: Arc::clone(&LOCAL_FS),
-            result: Ok(vec![ProjectDocCandidate { path: PathUri::from_abs_path(&AbsolutePathBuf::try_from(path).unwrap()), size: 42 }]),
+            result: Ok(vec![ProjectDocCandidate {
+                path: PathUri::from_abs_path(&AbsolutePathBuf::try_from(path).unwrap()),
+                size: 42,
+            }]),
         }],
     };
-    let loaded = tokio::time::timeout(std::time::Duration::from_millis(100),
-        load_project_instructions_from_discovery(&config, None, discovery, None)).await.unwrap();
-    assert!(loaded.loaded.unwrap().text().contains("Readable primary policy: never modify X"));
+    let loaded = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        load_project_instructions_from_discovery(&config, None, discovery, None),
+    )
+    .await
+    .unwrap();
+    assert!(
+        loaded
+            .loaded
+            .unwrap()
+            .text()
+            .contains("Readable primary policy: never modify X")
+    );
 }
 #[tokio::test]
 async fn failed_discovery_preserves_truncated_source_without_charging_generated_notices() {
@@ -2523,13 +2587,23 @@ async fn failed_discovery_preserves_truncated_source_without_charging_generated_
             environment_id: "local".to_string(),
             cwd: PathUri::from_abs_path(&config.cwd),
             filesystem: Arc::clone(&LOCAL_FS),
-            result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "discovery failed")),
+            result: Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "discovery failed",
+            )),
         }],
     };
     let retained = load_project_instructions_with_fallback(
-        &config.config, None, discovery, None,
-        Some((previous.loaded.as_ref().unwrap(), &previous.retained_sources)),
-    ).await;
+        &config.config,
+        None,
+        discovery,
+        None,
+        Some((
+            previous.loaded.as_ref().unwrap(),
+            &previous.retained_sources,
+        )),
+    )
+    .await;
     assert!(!retained.complete);
     assert_eq!(retained.loaded.unwrap().text(), expected);
     assert_eq!(retained.retained_sources.len(), 1);
@@ -2552,10 +2626,8 @@ async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
     let root_uri = PathUri::from_abs_path(&root_path.abs());
     let nearest_uri = PathUri::from_abs_path(&nearest_path.abs());
     let config = make_config(&primary, LIMIT, None).await;
-    let healthy_environments = resolved_local_environments([
-        ("primary", primary.abs()),
-        ("secondary", nested.abs()),
-    ]);
+    let healthy_environments =
+        resolved_local_environments([("primary", primary.abs()), ("secondary", nested.abs())]);
     let counts = Arc::new(MetadataCallCounts::default());
     let failing_fs: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
         path: nested.join(LOCAL_AGENTS_MD_FILENAME).abs(),
@@ -2578,29 +2650,36 @@ async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
     for nearest in ["NNNNN", "éNé", "€NN", "🦀N"] {
         fs::write(&primary_path, "a").unwrap();
         fs::write(&nearest_path, nearest).unwrap();
-        let previous = load_project_instructions(
-            &config.config, None, &healthy_environments,
-        ).await;
+        let previous = load_project_instructions(&config.config, None, &healthy_environments).await;
         assert!(previous.complete);
         assert_eq!(previous.retained_sources.len(), 3);
         for primary_len in 1..=12 {
             fs::write(&primary_path, "a".repeat(primary_len)).unwrap();
             let started = std::time::Instant::now();
-            let healthy = load_project_instructions(
-                &config.config, None, &healthy_environments,
-            ).await;
+            let healthy =
+                load_project_instructions(&config.config, None, &healthy_environments).await;
             healthy_elapsed += started.elapsed();
             assert!(healthy.complete);
             let started = std::time::Instant::now();
             let discovery = discover_project_instructions_with_markers(
-                Arc::new(config.config.clone()), &failed_environments, &markers,
-            ).await;
+                Arc::new(config.config.clone()),
+                &failed_environments,
+                &markers,
+            )
+            .await;
             assert!(discovery.environments[1].result.is_err());
             let metadata_before = counts.paths.lock().unwrap().len();
             let retained = load_project_instructions_with_fallback(
-                &config.config, None, discovery, None,
-                Some((previous.loaded.as_ref().unwrap(), &previous.retained_sources)),
-            ).await;
+                &config.config,
+                None,
+                discovery,
+                None,
+                Some((
+                    previous.loaded.as_ref().unwrap(),
+                    &previous.retained_sources,
+                )),
+            )
+            .await;
             fallback_elapsed += started.elapsed();
             cases += 1;
             assert!(!retained.complete);
@@ -2609,29 +2688,43 @@ async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
             assert_eq!(retained.loaded, healthy.loaded);
             let loaded = retained.loaded.as_ref().unwrap();
             assert!(loaded.text().len() <= project_doc_rendered_max_bytes(LIMIT));
-            assert!(retained.retained_sources.iter()
-                .map(|source| source.read.retained_data.len()).sum::<usize>() <= LIMIT);
+            assert!(
+                retained
+                    .retained_sources
+                    .iter()
+                    .map(|source| source.read.retained_data.len())
+                    .sum::<usize>()
+                    <= LIMIT
+            );
 
             // Independent oracle: keep the longest whole-character prefix of
             // the nearest source, then give any UTF-8 slack to the ancestor.
             let remaining = LIMIT.saturating_sub(primary_len);
-            let nearest_bytes = nearest.char_indices()
+            let nearest_bytes = nearest
+                .char_indices()
                 .map(|(offset, ch)| offset + ch.len_utf8())
                 .take_while(|end| *end <= remaining)
-                .last().unwrap_or(0);
+                .last()
+                .unwrap_or(0);
             let root_bytes = 5.min(remaining - nearest_bytes);
             for (path, bytes, contents) in [
                 (&root_uri, root_bytes, "AAAAA"),
                 (&nearest_uri, nearest_bytes, nearest),
             ] {
-                let source = retained.retained_sources.iter()
-                    .find(|source| &source.candidate.path == path).unwrap();
+                let source = retained
+                    .retained_sources
+                    .iter()
+                    .find(|source| &source.candidate.path == path)
+                    .unwrap();
                 assert_eq!(source.environment_id, "secondary");
                 assert_eq!(source.cwd, PathUri::from_abs_path(&nested.abs()));
                 assert_eq!(source.read.retained_data, contents.as_bytes()[..bytes]);
                 assert_eq!(source.read.original_bytes, 5);
-                let entry = loaded.entries.iter()
-                    .find(|entry| entry.provenance.path().as_ref() == Some(path)).unwrap();
+                let entry = loaded
+                    .entries
+                    .iter()
+                    .find(|entry| entry.provenance.path().as_ref() == Some(path))
+                    .unwrap();
                 if bytes < 5 {
                     assert!(entry.contents.contains(&format!(
                         "original byte count: 5; retained byte count: {bytes}; omitted byte count: {}",
@@ -2647,7 +2740,8 @@ async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
     // assertion or a claimed speedup; Cargo execution is needed for samples.
     eprintln!(
         "AGENTS discovery/load cases={cases} healthy_elapsed_us={} fallback_elapsed_us={}",
-        healthy_elapsed.as_micros(), fallback_elapsed.as_micros(),
+        healthy_elapsed.as_micros(),
+        fallback_elapsed.as_micros(),
     );
 }
 
@@ -2668,13 +2762,18 @@ async fn failed_discovery_shares_rendered_overhead_and_omission_budget() {
     for label_bytes in [1, 1024, 3072] {
         let ids = ["a".repeat(label_bytes), "b".repeat(label_bytes)];
         let discovery = |failed: bool| ProjectInstructionsDiscovery {
-            environments: ids.iter().enumerate().map(|(index, id)| {
-                EnvironmentProjectInstructionsDiscovery {
+            environments: ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| EnvironmentProjectInstructionsDiscovery {
                     environment_id: id.clone(),
                     cwd: cwd.clone(),
                     filesystem: Arc::clone(&LOCAL_FS),
                     result: if failed {
-                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "discovery failed"))
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "discovery failed",
+                        ))
                     } else {
                         Ok(if index == 0 {
                             candidates[..1].to_vec()
@@ -2682,32 +2781,54 @@ async fn failed_discovery_shares_rendered_overhead_and_omission_budget() {
                             candidates[1..].to_vec()
                         })
                     },
-                }
-            }).collect(),
+                })
+                .collect(),
         };
         config.project_doc_max_bytes = 8192;
         let previous = load_project_instructions_from_discovery(
-            &config.config, config.user_instructions.clone(), discovery(false), None,
-        ).await;
+            &config.config,
+            config.user_instructions.clone(),
+            discovery(false),
+            None,
+        )
+        .await;
         assert!(previous.complete);
         assert_eq!(previous.retained_sources.len(), candidates.len());
         for limit in [1, 2, 25] {
             config.project_doc_max_bytes = limit;
             let healthy = load_project_instructions_from_discovery(
-                &config.config, config.user_instructions.clone(), discovery(false), None,
-            ).await;
+                &config.config,
+                config.user_instructions.clone(),
+                discovery(false),
+                None,
+            )
+            .await;
             let retained = load_project_instructions_with_fallback(
-                &config.config, config.user_instructions.clone(), discovery(true), None,
-                Some((previous.loaded.as_ref().unwrap(), &previous.retained_sources)),
-            ).await;
+                &config.config,
+                config.user_instructions.clone(),
+                discovery(true),
+                None,
+                Some((
+                    previous.loaded.as_ref().unwrap(),
+                    &previous.retained_sources,
+                )),
+            )
+            .await;
             assert!(healthy.complete);
             assert!(!retained.complete);
             assert_eq!(retained.loaded, healthy.loaded);
             let text = retained.loaded.as_ref().unwrap().text();
-            assert!(text.len() <= "global instructions".len()
-                + project_doc_rendered_max_bytes(limit));
-            assert!(retained.retained_sources.iter()
-                .map(|source| source.read.retained_data.len()).sum::<usize>() <= limit);
+            assert!(
+                text.len() <= "global instructions".len() + project_doc_rendered_max_bytes(limit)
+            );
+            assert!(
+                retained
+                    .retained_sources
+                    .iter()
+                    .map(|source| source.read.retained_data.len())
+                    .sum::<usize>()
+                    <= limit
+            );
             if limit < candidates.len() || label_bytes == 3072 {
                 assert!(text.contains("Project docs omitted:"));
                 assert!(text.contains("manifest_sha256="));
@@ -2725,7 +2846,13 @@ async fn failed_discovery_requires_matching_accepted_source_identity() {
     let cwd = PathUri::from_abs_path(&config.cwd);
     let environments = resolved_local_environments([("local", config.cwd.clone())]);
     let previous = load_project_instructions(&config.config, None, &environments).await;
-    for case in ["environment", "cwd", "source_path", "missing_source", "healthy_empty"] {
+    for case in [
+        "environment",
+        "cwd",
+        "source_path",
+        "missing_source",
+        "healthy_empty",
+    ] {
         let mut sources = previous.retained_sources.clone();
         if case == "source_path" {
             sources[0].candidate.path = cwd.join("different.md").unwrap();
@@ -2734,20 +2861,36 @@ async fn failed_discovery_requires_matching_accepted_source_identity() {
         }
         let discovery = ProjectInstructionsDiscovery {
             environments: vec![EnvironmentProjectInstructionsDiscovery {
-                environment_id: if case == "environment" { "other" } else { "local" }.into(),
-                cwd: if case == "cwd" { cwd.join("other").unwrap() } else { cwd.clone() },
+                environment_id: if case == "environment" {
+                    "other"
+                } else {
+                    "local"
+                }
+                .into(),
+                cwd: if case == "cwd" {
+                    cwd.join("other").unwrap()
+                } else {
+                    cwd.clone()
+                },
                 filesystem: Arc::clone(&LOCAL_FS),
                 result: if case == "healthy_empty" {
                     Ok(Vec::new())
                 } else {
-                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "discovery failed"))
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "discovery failed",
+                    ))
                 },
             }],
         };
         let retained = load_project_instructions_with_fallback(
-            &config.config, None, discovery, None,
+            &config.config,
+            None,
+            discovery,
+            None,
             Some((previous.loaded.as_ref().unwrap(), &sources)),
-        ).await;
+        )
+        .await;
         assert_eq!(retained.complete, case == "healthy_empty");
         assert!(retained.loaded.is_none(), "case={case}");
         assert!(retained.retained_sources.is_empty(), "case={case}");

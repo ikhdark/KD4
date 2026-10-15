@@ -206,14 +206,28 @@ mod snapshot_deadline_tests {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let turn = Arc::new(turn);
-        let first = session.capture_step_context(Arc::clone(&turn)).await.unwrap();
-        first.seed_mcp_tool_snapshot_for_test(17, Vec::new(), true).await;
+        let first = session
+            .capture_step_context(Arc::clone(&turn))
+            .await
+            .unwrap();
+        first
+            .seed_mcp_tool_snapshot_for_test(17, Vec::new(), true)
+            .await;
         let next = session.capture_step_context(turn).await.unwrap();
-        assert!(std::ptr::eq(first.mcp_tool_snapshot().await, next.mcp_tool_snapshot().await));
+        assert!(std::ptr::eq(
+            first.mcp_tool_snapshot().await,
+            next.mcp_tool_snapshot().await
+        ));
         assert!(next.mcp_tool_snapshot().await.resources_available);
         let (_, other_turn) = crate::session::tests::make_session_and_context().await;
-        let other = session.capture_step_context(Arc::new(other_turn)).await.unwrap();
-        assert!(!Arc::ptr_eq(&first.mcp_tool_snapshot, &other.mcp_tool_snapshot));
+        let other = session
+            .capture_step_context(Arc::new(other_turn))
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.mcp_tool_snapshot,
+            &other.mcp_tool_snapshot
+        ));
     }
 
     #[tokio::test]

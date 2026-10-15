@@ -855,7 +855,10 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
     wait_for_event_match(internal_thread.thread.as_ref(), |event| match event {
         EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
             assert_eq!(event.error, None);
-            assert_eq!(event.last_agent_message.as_deref(), Some("internal subagent done"));
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("internal subagent done")
+            );
             Some(())
         }
         _ => None,
@@ -997,7 +1000,11 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
         })
         .with_config(|config| {
-            config.model_catalog.as_mut().expect("test catalog").models
+            config
+                .model_catalog
+                .as_mut()
+                .expect("test catalog")
+                .models
                 .retain(|model| model.slug == "gpt-5.5");
             config
                 .features
@@ -1074,12 +1081,18 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
         1,
         "the actual child generation must receive its own task exactly once"
     );
-    assert!(child_body["input"].as_array().expect("child input").iter().any(|item| {
-        item["role"] == "assistant"
-            && item["content"].as_array().is_some_and(|content| {
-                content.iter().any(|part| part["text"] == "seeded")
+    assert!(
+        child_body["input"]
+            .as_array()
+            .expect("child input")
+            .iter()
+            .any(|item| {
+                item["role"] == "assistant"
+                    && item["content"]
+                        .as_array()
+                        .is_some_and(|content| content.iter().any(|part| part["text"] == "seeded"))
             })
-    }));
+    );
     assert!(!body_contains(&child_request, SPAWN_CALL_ID));
 
     Ok(())
@@ -1309,10 +1322,14 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
         sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
             .await;
     };
-    assert!(child_request.body_json()["instructions"].as_str()
-        == Some("API-supplied base instruction sentinel.")
-        || child_request.message_input_texts("developer").iter()
-            .any(|text| text == "API-supplied base instruction sentinel."));
+    assert!(
+        child_request.body_json()["instructions"].as_str()
+            == Some("API-supplied base instruction sentinel.")
+            || child_request
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text == "API-supplied base instruction sentinel.")
+    );
     assert!(child_request.input().iter().any(|item| {
         item["role"] == "developer"
             && item["content"].as_array().is_some_and(|content| {
@@ -1626,10 +1643,14 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
     let receipt = text
         .strip_prefix("Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nReceipt: get_agent_task(")
         .expect("completion receipt");
-    let (assignment, receipt) = receipt.split_once(")\nProducer attempt: ").expect("receipt boundary");
+    let (assignment, receipt) = receipt
+        .split_once(")\nProducer attempt: ")
+        .expect("receipt boundary");
     let assignment: Value = serde_json::from_str(assignment)?;
     uuid::Uuid::parse_str(assignment["assignment_id"].as_str().expect("assignment ID"))?;
-    let (attempt, actual_payload) = receipt.split_once("\nPayload:\n").expect("payload boundary");
+    let (attempt, actual_payload) = receipt
+        .split_once("\nPayload:\n")
+        .expect("payload boundary");
     uuid::Uuid::parse_str(attempt)?;
     let capsule = child_request
         .requests()
@@ -1737,8 +1758,7 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     let deadline = Instant::now() + Duration::from_secs(2);
     let child_request = loop {
         if let Some(request) = child_request_log.requests().into_iter().find(|request| {
-            request.body_contains_text(CHILD_PROMPT)
-                && !request.body_contains_text(SPAWN_CALL_ID)
+            request.body_contains_text(CHILD_PROMPT) && !request.body_contains_text(SPAWN_CALL_ID)
         }) {
             break request;
         }

@@ -62,7 +62,8 @@ async fn continuity_user_authored_context_wrappers_remain_user_turns() {
         let history = session.clone_history().await;
         let item = history.raw_items().last().expect("recorded user input");
         // Origin survives the serialization boundary used by resume and fork.
-        let item: ResponseItem = serde_json::from_slice(&serde_json::to_vec(item).unwrap()).unwrap();
+        let item: ResponseItem =
+            serde_json::from_slice(&serde_json::to_vec(item).unwrap()).unwrap();
         let Some(TurnItem::UserMessage(user)) = parse_turn_item(&item) else {
             panic!("user-authored wrapper must remain a user request: {text}");
         };
@@ -73,7 +74,9 @@ async fn continuity_user_authored_context_wrappers_remain_user_turns() {
                 text_elements: Vec::new(),
             }]
         );
-        let rollout = vec![codex_protocol::protocol::RolloutItem::ResponseItem(item.clone())];
+        let rollout = vec![codex_protocol::protocol::RolloutItem::ResponseItem(
+            item.clone(),
+        )];
         assert_eq!(
             crate::thread_rollout_truncation::user_message_positions_in_rollout(&rollout),
             vec![0]
@@ -94,7 +97,10 @@ async fn continuity_user_authored_context_wrappers_remain_user_turns() {
         assert!(!omitted);
         assert_eq!(checkpoint, vec![without_turn_metadata]);
     }
-    assert!(matches!(parse_turn_item(&hook), Some(TurnItem::HookPrompt(_))));
+    assert!(matches!(
+        parse_turn_item(&hook),
+        Some(TurnItem::HookPrompt(_))
+    ));
 }
 
 #[test]
@@ -174,12 +180,18 @@ fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() 
 
 #[test]
 fn recognizes_skills_instructions_as_contextual_developer_content() {
-    for prefix in [SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG] {
+    for prefix in [
+        SKILLS_INSTRUCTIONS_OPEN_TAG,
+        SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG,
+    ] {
         let content = vec![ContentItem::InputText {
             text: format!("{prefix}\n## Skills"),
         }];
         assert!(is_contextual_dev_message_content(&content), "{prefix}");
-        assert!(!has_non_contextual_dev_message_content(&content), "{prefix}");
+        assert!(
+            !has_non_contextual_dev_message_content(&content),
+            "{prefix}"
+        );
     }
 }
 

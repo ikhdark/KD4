@@ -401,13 +401,56 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
         properties
             .get("target")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Relative or canonical task name to message (from spawn_agent).")
+        Some("Relative or canonical task name to message, as `task_name` from spawn_agent.")
+    );
+    // `spawn_agent` publishes this value as `task_name`, so preflight must admit
+    // that name instead of failing the whole exec cell around the call.
+    assert!(
+        properties.contains_key("task_name"),
+        "the recipient alias spawn_agent publishes must pass preflight"
     );
     assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["message".to_string()])
     );
     assert_eq!(output_schema, None);
+}
+
+/// The alias must be the same value `spawn_agent` names `task_name`, so the two
+/// tools cannot drift back into disagreeing about the recipient's field name.
+#[test]
+fn send_message_accepts_the_recipient_name_spawn_agent_publishes() {
+    let spawn_name = {
+        let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
+            create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+                available_models: Arc::new(vec![model_preset(
+                    "visible", /*show_in_picker*/ true,
+                )]),
+                agent_type_description: "role help".to_string(),
+                hide_agent_type_model_reasoning: false,
+                usage_hint_text: None,
+            })
+        else {
+            panic!("spawn_agent should be a function tool");
+        };
+        let properties = parameters
+            .properties
+            .as_ref()
+            .expect("spawn_agent should use object params");
+        assert!(properties.contains_key("task_name"));
+        "task_name"
+    };
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = create_send_message_tool() else {
+        panic!("send_message should be a function tool");
+    };
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("send_message should use object params");
+    assert!(
+        properties.contains_key(spawn_name),
+        "send_message must accept `{spawn_name}`, the name spawn_agent gives this value"
+    );
 }
 
 #[test]

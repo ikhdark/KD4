@@ -772,12 +772,21 @@ async fn successful_primary_refresh_is_not_hidden_by_secondary_failure() {
     let secondary_cwd = AbsolutePathBuf::try_from(secondary.path().to_path_buf()).unwrap();
     let secondary_fs = Arc::new(ControlledFileSystem::new(secondary_cwd.join("AGENTS.md")));
     let mut environments = environment_snapshot(&config.cwd, 1);
-    environments.turn_environments.push(TurnEnvironment::new("secondary".into(),
-        Arc::new(Environment::default_for_tests_with_filesystem(secondary_fs.clone())),
-        PathUri::from_abs_path(&secondary_cwd), None));
+    environments.turn_environments.push(TurnEnvironment::new(
+        "secondary".into(),
+        Arc::new(Environment::default_for_tests_with_filesystem(
+            secondary_fs.clone(),
+        )),
+        PathUri::from_abs_path(&secondary_cwd),
+        None,
+    ));
     let manager = AgentsMdManager::new(None);
     manager.refresh_and_observe(&config, &environments).await;
-    fs::write(primary.path().join("AGENTS.md"), "primary two: do not modify X").unwrap();
+    fs::write(
+        primary.path().join("AGENTS.md"),
+        "primary two: do not modify X",
+    )
+    .unwrap();
     secondary_fs.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
     let result = manager.refresh_and_observe(&config, &environments).await;
     let text = result.loaded.unwrap().text();
@@ -841,9 +850,15 @@ async fn a_failed_instruction_file_does_not_hide_a_sibling_change_or_deletion() 
     let mut config = config_for(&root).await;
     config.cwd = AbsolutePathBuf::from_absolute_path(&child).unwrap();
     let filesystem = Arc::new(ControlledFileSystem::new(
-        AbsolutePathBuf::from_absolute_path(&child_doc).unwrap()));
-    let environments = environment_snapshot_with_environment(&config.cwd, 1,
-        Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())));
+        AbsolutePathBuf::from_absolute_path(&child_doc).unwrap(),
+    ));
+    let environments = environment_snapshot_with_environment(
+        &config.cwd,
+        1,
+        Arc::new(Environment::default_for_tests_with_filesystem(
+            filesystem.clone(),
+        )),
+    );
     let manager = AgentsMdManager::new(None);
     manager.refresh_and_observe(&config, &environments).await;
     fs::write(&parent_doc, "parent new restriction").unwrap();
@@ -1034,9 +1049,16 @@ async fn survivability_failed_nearest_source_keeps_priority_under_parent_growth(
     let mut config = config_for(&root).await;
     config.project_doc_max_bytes = 1024;
     config.cwd = AbsolutePathBuf::from_absolute_path(&child).unwrap();
-    let filesystem = Arc::new(ControlledFileSystem::new(AbsolutePathBuf::from_absolute_path(&child_doc).unwrap()));
-    let environments = environment_snapshot_with_environment(&config.cwd, 1,
-        Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())));
+    let filesystem = Arc::new(ControlledFileSystem::new(
+        AbsolutePathBuf::from_absolute_path(&child_doc).unwrap(),
+    ));
+    let environments = environment_snapshot_with_environment(
+        &config.cwd,
+        1,
+        Arc::new(Environment::default_for_tests_with_filesystem(
+            filesystem.clone(),
+        )),
+    );
     let manager = AgentsMdManager::new(None);
     manager.refresh_and_observe(&config, &environments).await;
     fs::write(&parent_doc, "parent current ".repeat(1000)).unwrap();
@@ -1047,7 +1069,11 @@ async fn survivability_failed_nearest_source_keeps_priority_under_parent_growth(
     assert!(text.contains(&restriction));
     assert!(text.contains("parent current"));
     assert!(!text.contains("parent old"));
-    assert_eq!(filesystem.target_stream_calls(), 2, "one read per refresh; no retry");
+    assert_eq!(
+        filesystem.target_stream_calls(),
+        2,
+        "one read per refresh; no retry"
+    );
 }
 #[tokio::test]
 async fn failed_truncated_instruction_reads_preserve_source_counts_and_encoding_notice() {
@@ -1059,8 +1085,11 @@ async fn failed_truncated_instruction_reads_preserve_source_counts_and_encoding_
         config.project_doc_max_bytes = 4;
         let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
         let environments = environment_snapshot_with_environment(
-            &config.cwd, 1,
-            Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())),
+            &config.cwd,
+            1,
+            Arc::new(Environment::default_for_tests_with_filesystem(
+                filesystem.clone(),
+            )),
         );
         let manager = AgentsMdManager::new(None);
         let first = manager.refresh_and_observe(&config, &environments).await;
@@ -1078,7 +1107,8 @@ async fn failed_truncated_instruction_reads_preserve_source_counts_and_encoding_
         );
         assert_eq!(first.text(), expected);
         for _ in 0..2 {
-            filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+            filesystem
+                .set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
             let fallback = manager.refresh_and_observe(&config, &environments).await;
             assert_eq!(fallback.freshness, AgentsMdFreshness::CachedFallback);
             let retained = fallback.loaded.unwrap();
@@ -1088,8 +1118,12 @@ async fn failed_truncated_instruction_reads_preserve_source_counts_and_encoding_
         fs::write(&agents_path, "new!").unwrap();
         let recovered = manager.refresh_and_observe(&config, &environments).await;
         assert_eq!(recovered.freshness, AgentsMdFreshness::Refreshed);
-        assert_eq!(recovered.loaded.unwrap().text(), format!(
-            "## AGENTS.md instructions from {}\n\nnew!", agents_path.display(),
-        ));
+        assert_eq!(
+            recovered.loaded.unwrap().text(),
+            format!(
+                "## AGENTS.md instructions from {}\n\nnew!",
+                agents_path.display(),
+            )
+        );
     }
 }

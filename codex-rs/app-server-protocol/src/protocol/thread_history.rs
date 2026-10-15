@@ -211,7 +211,7 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
-    pending_agent_message_mirror: Option<ThreadItem>,
+    pending_legacy_item_mirror: Option<ThreadItem>,
     // Remember only removed wait identities so end-only legacy compatibility
     // cannot resurrect an operation that an explicit rollback discarded.
     rolled_back_wait_ids: std::collections::HashSet<String>,
@@ -232,7 +232,7 @@ impl ThreadHistoryBuilder {
             turns: Vec::new(),
             current_turn: None,
             next_item_index: 1,
-            pending_agent_message_mirror: None,
+            pending_legacy_item_mirror: None,
             rolled_back_wait_ids: std::collections::HashSet::new(),
             current_rollout_index: 0,
             next_rollout_index: 0,
@@ -326,14 +326,18 @@ impl ThreadHistoryBuilder {
     /// See `should_persist_event_msg` in `codex-rs/core/rollout/policy.rs`.
     pub fn handle_event(&mut self, event: &EventMsg) {
         // Core emits the legacy compatibility event immediately after its canonical item.
-        // Consume only that mirror; identical text on another item is still a new message.
-        if let Some(ThreadItem::AgentMessage { text, phase, .. }) =
-            self.pending_agent_message_mirror.take()
-            && let EventMsg::AgentMessage(payload) = event
-            && payload.message == text
-            && payload.phase == phase
-        {
-            return;
+        // Consume only that mirror; later messages and compactions remain distinct items.
+        if let Some(item) = self.pending_legacy_item_mirror.take() {
+            let is_mirror = match (&item, event) {
+                (ThreadItem::AgentMessage { text, phase, .. }, EventMsg::AgentMessage(payload)) => {
+                    payload.message == *text && payload.phase == *phase
+                }
+                (ThreadItem::ContextCompaction { .. }, EventMsg::ContextCompacted(_)) => true,
+                _ => false,
+            };
+            if is_mirror {
+                return;
+            }
         }
         match event {
             EventMsg::UserMessage(payload) => self.handle_user_message(payload),
@@ -621,17 +625,13 @@ impl ThreadHistoryBuilder {
         if matches!(
             &payload.item,
             codex_protocol::items::TurnItem::AgentMessage(_)
+                | codex_protocol::items::TurnItem::ContextCompaction(_)
         ) {
             let item = ThreadItem::from(payload.item.clone());
-            if matches!(&item, ThreadItem::AgentMessage { text, .. } if !text.is_empty()) {
+            if !matches!(&item, ThreadItem::AgentMessage { text, .. } if text.is_empty()) {
                 self.upsert_item_in_turn_id(&payload.turn_id, item.clone());
-                if self
-                    .current_turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.id == payload.turn_id)
-                    || self.turns.iter().any(|turn| turn.id == payload.turn_id)
-                {
-                    self.pending_agent_message_mirror = Some(item);
+                if self.contains_turn(&payload.turn_id) {
+                    self.pending_legacy_item_mirror = Some(item);
                 }
             }
         } else {
@@ -658,6 +658,7 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::CollabAgentToolCall(_)
             | codex_protocol::items::TurnItem::SubAgentActivity(_)
             | codex_protocol::items::TurnItem::Extension(_)
+            | codex_protocol::items::TurnItem::ContextCompaction(_)
             | codex_protocol::items::TurnItem::EnteredReviewMode(_)
             | codex_protocol::items::TurnItem::ExitedReviewMode(_) => true,
             codex_protocol::items::TurnItem::UserMessage(_)
@@ -667,8 +668,7 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
             | codex_protocol::items::TurnItem::FileChange(_)
-            | codex_protocol::items::TurnItem::McpToolCall(_)
-            | codex_protocol::items::TurnItem::ContextCompaction(_) => false,
+            | codex_protocol::items::TurnItem::McpToolCall(_) => false,
         };
 
         if should_upsert {
@@ -1207,7 +1207,16 @@ impl ThreadHistoryBuilder {
 
     fn handle_context_compacted(&mut self, _payload: &ContextCompactedEvent) {
         let id = self.next_item_id();
-        self.push_item_in_current_turn(ThreadItem::ContextCompaction { id });
+        // The deprecated ContextCompacted event carries no detail; v2 turn items
+        // populate these fields at the compaction site instead.
+        self.push_item_in_current_turn(ThreadItem::ContextCompaction {
+            id,
+            tokens_before: None,
+            tokens_after: None,
+            omitted_image_count: None,
+            retained_image_count: None,
+            omitted_text: None,
+        });
     }
 
     fn handle_entered_review_mode(
@@ -4380,6 +4389,142 @@ mod tests {
     }
 
     #[test]
+    fn compaction_metadata_survives_live_and_replayed_history_in_both_modes() {
+        use codex_protocol::items::ContextCompactionItem;
+        use codex_protocol::protocol::HasLegacyEvent;
+        use codex_protocol::protocol::ThreadHistoryMode;
+
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let started = EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            });
+            let mut live = ThreadHistoryBuilder::new();
+            live.handle_event(&started);
+            let mut persisted = vec![RolloutItem::EventMsg(started)];
+            let mut expected = Vec::new();
+            for (id, tokens_before, tokens_after, omitted_text) in [
+                ("compaction-a", 20_000, 12_000, true),
+                ("compaction-b", 18_000, 10_000, false),
+            ] {
+                live.handle_event(&EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: ThreadId::default(),
+                    turn_id: "turn-1".into(),
+                    started_at_ms: 0,
+                    item: CoreTurnItem::ContextCompaction(ContextCompactionItem {
+                        id: id.into(),
+                        ..ContextCompactionItem::new()
+                    }),
+                }));
+                let in_progress = live.active_turn_snapshot().unwrap();
+                assert_eq!(in_progress.items.len(), expected.len() + 1);
+                assert_eq!(
+                    in_progress.items.last(),
+                    Some(&ThreadItem::ContextCompaction {
+                        id: id.into(),
+                        tokens_before: None,
+                        tokens_after: None,
+                        omitted_image_count: None,
+                        retained_image_count: None,
+                        omitted_text: None,
+                    })
+                );
+                let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: ThreadId::default(),
+                    turn_id: "turn-1".into(),
+                    completed_at_ms: 1,
+                    item: CoreTurnItem::ContextCompaction(ContextCompactionItem {
+                        id: id.into(),
+                        tokens_before: Some(tokens_before),
+                        tokens_after: Some(tokens_after),
+                        omitted_image_count: Some(2),
+                        retained_image_count: Some(0),
+                        omitted_text: Some(omitted_text),
+                    }),
+                });
+                live.handle_event(&completed);
+                persisted.push(RolloutItem::EventMsg(completed.clone()));
+                for mirror in completed.as_legacy_events(false) {
+                    assert!(live.handle_event_with_changes(&mirror).is_empty());
+                    if matches!(history_mode, ThreadHistoryMode::Legacy) {
+                        persisted.push(RolloutItem::EventMsg(mirror));
+                    }
+                }
+                expected.push(ThreadItem::ContextCompaction {
+                    id: id.into(),
+                    tokens_before: Some(tokens_before),
+                    tokens_after: Some(tokens_after),
+                    omitted_image_count: Some(2),
+                    retained_image_count: Some(0),
+                    omitted_text: Some(omitted_text),
+                });
+                // Starting and completing one ID updates one item; another ID
+                // remains a separate compaction, even with identical image counts.
+                assert_eq!(live.active_turn_snapshot().unwrap().items, expected);
+            }
+            let turns = build_turns_from_rollout_items(&persisted);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].items, expected);
+            assert_eq!(live.finish()[0].items, expected);
+        }
+    }
+
+    #[test]
+    fn compaction_mirror_suppression_requires_adjacent_known_completion() {
+        let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::default(),
+            turn_id: "turn-1".into(),
+            completed_at_ms: 0,
+            item: CoreTurnItem::ContextCompaction(
+                codex_protocol::items::ContextCompactionItem {
+                    id: "compaction-a".into(),
+                    ..codex_protocol::items::ContextCompactionItem::new()
+                },
+            ),
+        });
+        let mirror = EventMsg::ContextCompacted(ContextCompactedEvent);
+        let legacy_item = ThreadItem::ContextCompaction {
+            id: "item-1".into(),
+            tokens_before: None,
+            tokens_after: None,
+            omitted_image_count: None,
+            retained_image_count: None,
+            omitted_text: None,
+        };
+        // A dropped canonical event for an unknown turn cannot swallow old history.
+        let mut unknown = ThreadHistoryBuilder::new();
+        unknown.handle_event(&completed);
+        unknown.handle_event(&mirror);
+        assert_eq!(unknown.finish()[0].items, vec![legacy_item.clone()]);
+
+        for intervening_event in [
+            None,
+            Some(EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                message: "another event".into(),
+            })),
+        ] {
+            let mut builder = ThreadHistoryBuilder::new();
+            wait_history_test_start_turn(&mut builder, "turn-1");
+            builder.handle_event(&completed);
+            if let Some(event) = intervening_event {
+                // An intervening event expires the pending mirror.
+                builder.handle_event(&event);
+            } else {
+                assert!(builder.handle_event_with_changes(&mirror).is_empty());
+            }
+            // After expiry or consumption, a standalone legacy marker is new.
+            builder.handle_event(&mirror);
+            let turns = builder.finish();
+            assert_eq!(turns[0].items.len(), 2);
+            assert_eq!(turns[0].items[0].id(), "compaction-a");
+            assert_eq!(turns[0].items[1], legacy_item);
+        }
+    }
+
+    #[test]
     fn context_compacted_event_appends_context_compaction_item() {
         let items = replay_events_in_one_turn(&[
             EventMsg::UserMessage(UserMessageEvent {
@@ -4397,7 +4542,12 @@ mod tests {
         assert_eq!(
             items[1],
             ThreadItem::ContextCompaction {
-                id: "item-2".into()
+                id: "item-2".into(),
+                tokens_before: None,
+                tokens_after: None,
+                omitted_image_count: None,
+                retained_image_count: None,
+                omitted_text: None,
             }
         );
     }

@@ -90,11 +90,16 @@ impl ExecProcess for DelayedSnapshotProcess {
         Box::pin(async move {
             tokio::time::sleep(self.read_delay).await;
             let index = after_seq.unwrap_or(0) as usize;
-            let chunks = self.output.get(index).map(|bytes| codex_exec_server::ProcessOutputChunk {
-                seq: index as u64 + 1,
-                stream: ExecOutputStream::Stdout,
-                chunk: bytes.clone().into(),
-            }).into_iter().collect();
+            let chunks = self
+                .output
+                .get(index)
+                .map(|bytes| codex_exec_server::ProcessOutputChunk {
+                    seq: index as u64 + 1,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: bytes.clone().into(),
+                })
+                .into_iter()
+                .collect();
             Ok(ReadResponse {
                 chunks,
                 next_seq: index as u64 + 2,
@@ -198,12 +203,19 @@ async fn remote_snapshot_drains_closed_pages_and_preserves_total_deadline() {
                 process_id: process.process_id.clone(),
                 argv: vec!["snapshot".to_string()],
                 cwd: PathUri::from_host_native_path(std::env::temp_dir()).unwrap(),
-                env_policy: None, env: HashMap::new(), tty: false, pipe_stdin: false,
-                arg0: None, sandbox: None, enforce_managed_network: false, managed_network: None,
+                env_policy: None,
+                env: HashMap::new(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
             },
             tokio::time::Instant::now() + Duration::from_secs(10),
             "test-shell",
-        ).await;
+        )
+        .await;
         if read_delay.is_zero() {
             assert_eq!(result.unwrap(), "firstsecond");
             assert_eq!(process.terminate_calls.load(Ordering::Acquire), 0);
@@ -222,7 +234,12 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
 
     // The peer replaces the external executor only. Capture, environment
     // selection, remote process ownership, and snapshot admission remain real.
-    for failure_kind in ["read_error", "process_failure", "output_overflow", "output_gap"] {
+    for failure_kind in [
+        "read_error",
+        "process_failure",
+        "output_overflow",
+        "output_gap",
+    ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let peer = tokio::spawn(async move {
@@ -273,10 +290,12 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
                                 Vec::new()
                             },
                             next_seq: 1,
-                            output_gap: (failure_kind == "output_gap").then_some(codex_exec_server::ProcessOutputGap {
-                                through_seq: 3,
-                                exit_seq: None,
-                            }),
+                            output_gap: (failure_kind == "output_gap").then_some(
+                                codex_exec_server::ProcessOutputGap {
+                                    through_seq: 3,
+                                    exit_seq: None,
+                                },
+                            ),
                             exited: false,
                             exit_code: None,
                             closed: false,
@@ -449,7 +468,10 @@ fn cmd_snapshot_formats_environment_as_replayable_batch() -> Result<()> {
         parse_cmd_snapshot_environment(&snapshot),
         Some(vec![
             ("CODEX_TEST".to_string(), "100%^value".to_string()),
-            ("CODEX_META".to_string(), "quoted\" & piped| angles<> parens()".to_string()),
+            (
+                "CODEX_META".to_string(),
+                "quoted\" & piped| angles<> parens()".to_string()
+            ),
         ])
     );
     Ok(())
@@ -539,7 +561,10 @@ async fn windows_cmd_snapshot_captures_validates_and_replays_environment() -> Re
         Some(override_value)
     );
     drop(snapshot_file);
-    assert!(!snapshot_path.exists(), "the final local owner removes its file");
+    assert!(
+        !snapshot_path.exists(),
+        "the final local owner removes its file"
+    );
     Ok(())
 }
 
@@ -654,12 +679,18 @@ async fn write_rollout_stub(codex_home: &Path, session_id: ThreadId) -> Result<P
     fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("rollout-2025-01-01T00-00-00-{session_id}.jsonl"));
     let metadata = codex_protocol::protocol::SessionMeta {
-        id: session_id, session_id: session_id.into(),
+        id: session_id,
+        session_id: session_id.into(),
         ..Default::default()
     };
-    fs::write(&path, serde_json::json!({
-        "timestamp": "2025-01-01T00:00:00Z", "type": "session_meta", "payload": metadata
-    }).to_string()).await?;
+    fs::write(
+        &path,
+        serde_json::json!({
+            "timestamp": "2025-01-01T00:00:00Z", "type": "session_meta", "payload": metadata
+        })
+        .to_string(),
+    )
+    .await?;
     Ok(path)
 }
 
@@ -680,9 +711,10 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
     let stale_session = ThreadId::new();
     let stale_snapshot = snapshot_dir.join(format!("{stale_session}.cmd"));
     let stale_rollout = write_rollout_stub(&codex_home, stale_session).await?;
-    std::fs::File::options().write(true).open(stale_rollout)?.set_modified(
-        SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(1),
-    )?;
+    std::fs::File::options()
+        .write(true)
+        .open(stale_rollout)?
+        .set_modified(SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(1))?;
     fs::write(&active_snapshot, "active without rollout").await?;
     fs::write(&stale_snapshot, "stale").await?;
 
@@ -696,8 +728,14 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
     assert_eq!(live_snapshot.exists(), true);
     assert_eq!(orphan_snapshot.exists(), false);
     assert_eq!(invalid_snapshot.exists(), false);
-    assert!(!stale_snapshot.exists(), "expired rollouts do not retain snapshots");
-    assert!(active_snapshot.exists(), "the active session is exempt even without a rollout");
+    assert!(
+        !stale_snapshot.exists(),
+        "expired rollouts do not retain snapshots"
+    );
+    assert!(
+        active_snapshot.exists(),
+        "the active session is exempt even without a rollout"
+    );
     Ok(())
 }
 
@@ -1243,21 +1281,30 @@ fn windows_snapshot_expired_ready_child_returns_before_owned_cleanup() -> Result
 
 #[tokio::test]
 async fn remote_snapshot_shutdown_waits_for_file_removal() -> Result<()> {
-    assert_remote_snapshot_shutdown(false, false).await
+    assert_remote_snapshot_shutdown(false, false, false).await
 }
 
 #[tokio::test]
 async fn inherited_remote_snapshot_survives_parent_shutdown_until_child_releases_it() -> Result<()>
 {
-    assert_remote_snapshot_shutdown(true, false).await
+    assert_remote_snapshot_shutdown(true, false, false).await
 }
 
 #[tokio::test]
 async fn remote_snapshot_removal_survives_bounded_shutdown_wait() -> Result<()> {
-    assert_remote_snapshot_shutdown(false, true).await
+    assert_remote_snapshot_shutdown(false, true, false).await
 }
 
-async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Result<()> {
+#[tokio::test]
+async fn child_shutdown_does_not_cancel_or_wait_for_parent_snapshot_write() -> Result<()> {
+    assert_remote_snapshot_shutdown(false, false, true).await
+}
+
+async fn assert_remote_snapshot_shutdown(
+    inherit: bool,
+    expire_wait: bool,
+    close_child_during_write: bool,
+) -> Result<()> {
     use crate::environment_selection::ThreadEnvironments;
     use crate::environment_selection::TurnEnvironmentSnapshot;
     use codex_exec_server::EnvironmentManager;
@@ -1271,6 +1318,8 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
     let address = listener.local_addr()?;
     let (remove_started, remove_observed) = tokio::sync::oneshot::channel();
     let (allow_remove, remove_allowed) = tokio::sync::oneshot::channel();
+    let (write_started, write_observed) = tokio::sync::oneshot::channel();
+    let (allow_write, write_allowed) = tokio::sync::oneshot::channel();
     let removals = Arc::new(AtomicUsize::new(0));
     let peer_removals = removals.clone();
     let peer = tokio::spawn(async move {
@@ -1278,6 +1327,8 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
         let mut websocket = tokio_tungstenite::accept_async(socket).await?;
         let mut remove_started = Some(remove_started);
         let mut remove_allowed = Some(remove_allowed);
+        let mut write_started = Some(write_started);
+        let mut write_allowed = Some(write_allowed);
         let mut published_path = None;
         let mut process_count = 0;
         while let Some(message) = websocket.next().await {
@@ -1320,6 +1371,14 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
                 "fs/writeFile" => {
                     assert!(published_path.is_none(), "publish once");
                     published_path = Some(request["params"]["path"].clone());
+                    if close_child_during_write {
+                        write_started
+                            .take()
+                            .context("one write")?
+                            .send(())
+                            .map_err(|_| anyhow!("write observer dropped"))?;
+                        write_allowed.take().context("one write permission")?.await?;
+                    }
                     json!({})
                 }
                 "fs/remove" => {
@@ -1393,7 +1452,38 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
         false,
     ));
     parent.update_selections(std::slice::from_ref(&selection));
+    let inherited_child = if inherit {
+        let starting = parent.snapshot_now().await;
+        assert_eq!(starting.starting.len(), 1);
+        Some(Arc::new(ThreadEnvironments::new(
+            manager.clone(),
+            shell.clone(),
+            ShellSnapshot::disabled(),
+            starting,
+            false,
+        )))
+    } else {
+        None
+    };
     let ready = timeout(Duration::from_secs(5), parent.snapshot()).await?;
+    if close_child_during_write {
+        timeout(Duration::from_secs(5), write_observed).await??;
+        let child = ThreadEnvironments::new(
+            manager.clone(),
+            shell.clone(),
+            ShellSnapshot::disabled(),
+            ready.clone(),
+            false,
+        );
+        child.shutdown();
+        timeout(Duration::from_secs(2), child.finish_shutdown())
+            .await
+            .context("child must not wait for the parent's blocked snapshot write")?;
+        assert_eq!(removals.load(Ordering::SeqCst), 0);
+        allow_write
+            .send(())
+            .map_err(|_| anyhow!("parent write was cancelled by child shutdown"))?;
+    }
     let file = timeout(
         Duration::from_secs(5),
         ready
@@ -1406,14 +1496,8 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
     .context("completed remote snapshot")?;
     assert!(file.contents().contains("SNAPSHOT_MARKER"));
     drop(file);
-    let owner = if inherit {
-        let child = Arc::new(ThreadEnvironments::new(
-            manager,
-            shell.clone(),
-            ShellSnapshot::disabled(),
-            ready,
-            false,
-        ));
+    let owner = if let Some(child) = inherited_child {
+        drop(ready);
         child.update_selections(std::slice::from_ref(&selection));
         parent.shutdown();
         timeout(Duration::from_secs(2), parent.finish_shutdown()).await?;
@@ -1550,9 +1634,14 @@ async fn local_snapshot_overflow_terminates_a_still_running_shell() -> Result<()
     let pid = {
         let events = events.lock().expect("snapshot observer lock");
         match events.as_slice() {
-            [SnapshotProcessEvent::Queued, SnapshotProcessEvent::Spawned(Some(created)), SnapshotProcessEvent::Resumed(resumed)]
-                if created == resumed => *created,
-            events => panic!("overflow must come from the actual running snapshot child: {events:?}"),
+            [
+                SnapshotProcessEvent::Queued,
+                SnapshotProcessEvent::Spawned(Some(created)),
+                SnapshotProcessEvent::Resumed(resumed),
+            ] if created == resumed => *created,
+            events => {
+                panic!("overflow must come from the actual running snapshot child: {events:?}")
+            }
         }
     };
     codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2)).await?;

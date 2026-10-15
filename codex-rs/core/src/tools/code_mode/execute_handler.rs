@@ -34,7 +34,10 @@ struct TimeoutCatalog {
     tools: Arc<[codex_code_mode::ToolDefinition]>,
 }
 
-fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usize) -> Result<String, serde_json::Value> {
+fn direct_delivery_text(
+    response: &codex_code_mode::RuntimeResponse,
+    limit: usize,
+) -> Result<String, serde_json::Value> {
     use codex_code_mode::FunctionCallOutputContentItem;
     let codex_code_mode::RuntimeResponse::Result {
         content_items,
@@ -44,8 +47,14 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
     } = response
     else {
         let category = match response {
-            codex_code_mode::RuntimeResponse::Result { error_text: Some(_), .. } => "runtime_error",
-            codex_code_mode::RuntimeResponse::Result { output_loss: Some(_), .. } => "output_loss",
+            codex_code_mode::RuntimeResponse::Result {
+                error_text: Some(_),
+                ..
+            } => "runtime_error",
+            codex_code_mode::RuntimeResponse::Result {
+                output_loss: Some(_),
+                ..
+            } => "output_loss",
             codex_code_mode::RuntimeResponse::Terminated { .. } => "terminated",
             _ => "cell_running",
         };
@@ -63,9 +72,13 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
                     ((scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
                         && rest.starts_with("//"))
                         || (scheme.eq_ignore_ascii_case("data")
-                            && rest.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")))
+                            && rest
+                                .get(..6)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")))
                 }) || std::path::Path::new(image_url).is_absolute();
-                if image_url.chars().any(|ch| ch.is_control() || matches!(ch, '<' | '>'))
+                if image_url
+                    .chars()
+                    .any(|ch| ch.is_control() || matches!(ch, '<' | '>'))
                     || !supported
                 {
                     return Err(serde_json::json!({"category":"unsupported_media"}));
@@ -75,7 +88,9 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
         }
     }
     let message = parts.join("\n");
-    if message.trim().is_empty() { return Err(serde_json::json!({"category":"empty_output"})); }
+    if message.trim().is_empty() {
+        return Err(serde_json::json!({"category":"empty_output"}));
+    }
     if codex_utils_output_truncation::model_token_count(&message) > limit {
         return Err(serde_json::json!({"category":"output_budget", "limit":limit}));
     }
@@ -91,37 +106,60 @@ pub(super) fn schema_validated_delivery(
     if let Some(schema) = schema {
         let value: serde_json::Value = serde_json::from_str(&text).map_err(|error|
             serde_json::json!({"category":"invalid_json", "line":error.line(), "column":error.column()}))?;
-        let validator = jsonschema::validator_for(schema).map_err(|_|
-            serde_json::json!({"category":"invalid_schema"}))?;
+        let validator = jsonschema::validator_for(schema)
+            .map_err(|_| serde_json::json!({"category":"invalid_schema"}))?;
         if let Err(error) = validator.validate(&value) {
-            let pointer = error.instance_path().as_str().chars().take(512).collect::<String>();
-            return Err(serde_json::json!({"category":"schema_mismatch", "instance_pointer":pointer}));
+            let pointer = error
+                .instance_path()
+                .as_str()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            return Err(
+                serde_json::json!({"category":"schema_mismatch", "instance_pointer":pointer}),
+            );
         }
     }
     Ok(text)
 }
 
-pub(super) fn attach_delivery_decision(output: &mut FunctionToolOutput, decision: Result<Option<String>, serde_json::Value>) {
+pub(super) fn attach_delivery_decision(
+    output: &mut FunctionToolOutput,
+    decision: Result<Option<String>, serde_json::Value>,
+) {
     let refusal = match decision {
         Ok(None) => return,
         Err(refusal) => refusal,
         Ok(Some(message)) => {
             if output.success != Some(true) {
                 serde_json::json!({"category":"failed_output"})
-            } else if output.essential_inline.contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY) {
+            } else if output
+                .essential_inline
+                .contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
+            {
                 serde_json::json!({"category":"output_truncated"})
-            } else if let Some(signal) = output.sampling_request_signal.as_mut().and_then(serde_json::Value::as_object_mut) {
+            } else if let Some(signal) = output
+                .sampling_request_signal
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 signal.insert("explicit_completion_message".into(), message.into());
                 return;
-            } else { serde_json::json!({"category":"completion_signal_unavailable"}) }
+            } else {
+                serde_json::json!({"category":"completion_signal_unavailable"})
+            }
         }
     };
-    output.essential_inline.insert("delivery_refused".into(), refusal.clone());
+    output
+        .essential_inline
+        .insert("delivery_refused".into(), refusal.clone());
     let item = codex_protocol::models::FunctionCallOutputContentItem::InputText {
         text: serde_json::json!({"delivery_refused":refusal}).to_string(),
     };
     output.body.push(item.clone());
-    if let Some(canonical) = &mut output.canonical_body { canonical.push(item); }
+    if let Some(canonical) = &mut output.canonical_body {
+        canonical.push(item);
+    }
 }
 
 /// Headroom added to the longest wait a nested tool can be asked to perform, so
@@ -267,10 +305,16 @@ impl CodeModeExecuteHandler {
         mcp_timeouts: &HashMap<ToolName, u64>,
         terminal_poll_ms: u64,
     ) -> Arc<[codex_code_mode::ToolDefinition]> {
-        let overrides = self.enabled_tools.iter().map(|tool| {
-            nested_tool_timeout_override(&tool.tool_name, mcp_timeouts, terminal_poll_ms)
-        }).collect::<Vec<_>>();
-        let mut cached = self.timeout_catalog.lock()
+        let overrides = self
+            .enabled_tools
+            .iter()
+            .map(|tool| {
+                nested_tool_timeout_override(&tool.tool_name, mcp_timeouts, terminal_poll_ms)
+            })
+            .collect::<Vec<_>>();
+        let mut cached = self
+            .timeout_catalog
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(catalog) = cached.as_ref()
             && catalog.overrides == overrides
@@ -279,12 +323,20 @@ impl CodeModeExecuteHandler {
         }
         // Publish one immutable catalog per effective timeout overlay. Active
         // cells retain their old snapshot; a changed timeout cannot mutate it.
-        let tools = self.enabled_tools.iter().zip(&overrides).map(|(tool, timeout)| {
-            let mut tool = tool.clone();
-            tool.default_timeout_ms = *timeout;
-            tool
-        }).collect::<Arc<[_]>>();
-        *cached = Some(TimeoutCatalog { overrides, tools: Arc::clone(&tools) });
+        let tools = self
+            .enabled_tools
+            .iter()
+            .zip(&overrides)
+            .map(|(tool, timeout)| {
+                let mut tool = tool.clone();
+                tool.default_timeout_ms = *timeout;
+                tool
+            })
+            .collect::<Arc<[_]>>();
+        *cached = Some(TimeoutCatalog {
+            overrides,
+            tools: Arc::clone(&tools),
+        });
         tools
     }
 
@@ -321,7 +373,10 @@ impl CodeModeExecuteHandler {
             .collect::<HashMap<_, _>>();
         let enabled_tools = self.catalog_with_timeouts(
             &mcp_timeouts,
-            session.services.unified_exec_manager.max_write_stdin_yield_time_ms(),
+            session
+                .services
+                .unified_exec_manager
+                .max_write_stdin_yield_time_ms(),
         );
         let exec = ExecContext { session, turn };
         let started_at = std::time::Instant::now();
@@ -331,8 +386,12 @@ impl CodeModeExecuteHandler {
             .code_mode_service
             .execute(codex_code_mode::ExecuteRequest {
                 state_path: args.persist.then(|| {
-                    exec.turn.config.codex_home.join("code-mode-state")
-                        .join(format!("{}.json", exec.session.thread_id)).to_path_buf()
+                    exec.turn
+                        .config
+                        .codex_home
+                        .join("code-mode-state")
+                        .join(format!("{}.json", exec.session.thread_id))
+                        .to_path_buf()
                 }),
                 tool_call_id: call_id.clone(),
                 enabled_tools,
@@ -352,15 +411,27 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .record_cell_parent_call_id(&cell_id, &call_id);
-        exec.session.services.code_mode_service.record_cell_turn(&cell_id, &exec.turn.sub_id);
-        exec.session.services.code_mode_service.record_output_budget(
-            &cell_id,
-            Some(args.max_output_tokens
-                .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-                .min(exec.turn.config.tool_output_token_limit
-                    .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL))
-                .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)),
-        );
+        exec.session
+            .services
+            .code_mode_service
+            .record_cell_turn(&cell_id, &exec.turn.sub_id);
+        exec.session
+            .services
+            .code_mode_service
+            .record_output_budget(
+                &cell_id,
+                Some(
+                    args.max_output_tokens
+                        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                        .min(
+                            exec.turn
+                                .config
+                                .tool_output_token_limit
+                                .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+                        )
+                        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+                ),
+            );
         // Establish cleanup ownership before queuing trace work.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
         emit_failed_code_mode_cell_item(
@@ -371,7 +442,8 @@ impl CodeModeExecuteHandler {
                 content_items: Vec::new(),
             },
             started_at,
-        ).await;
+        )
+        .await;
         let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();
         let code_cell_trace = exec
             .session
@@ -402,9 +474,10 @@ impl CodeModeExecuteHandler {
             .subscribe_code_mode_activity(turn_state.as_deref(), false)
             .await;
         if args.deliver && pending_activity.is_none() {
-            exec.session.services.code_mode_service.record_delivery_intent(
-                &cell_id, &exec.turn, activity_rx.clone(),
-            );
+            exec.session
+                .services
+                .code_mode_service
+                .record_delivery_intent(&cell_id, &exec.turn, activity_rx.clone());
         }
         // Consume the immediate initial observation before making the held
         // wait steerable. This clears the runtime's initial observer, so
@@ -438,7 +511,11 @@ impl CodeModeExecuteHandler {
                         .wait_for_decision(cell_id.clone())
                 },
                 &cancellation_token,
-                super::wait_handler::queued_input_activity(&exec, turn_state.as_deref(), activity_rx),
+                super::wait_handler::queued_input_activity(
+                    &exec,
+                    turn_state.as_deref(),
+                    activity_rx,
+                ),
                 "exec cancelled",
             )
             .await;
@@ -447,14 +524,18 @@ impl CodeModeExecuteHandler {
                 Err(error) if cancellation_token.is_cancelled() => {
                     super::wait_handler::OwnerHeldCodeModeWait {
                         exit: OwnerHeldCodeModeExit::Runtime(
-                            terminate_interrupted_cell(&exec, &cell_id).await
+                            terminate_interrupted_cell(&exec, &cell_id)
+                                .await
                                 .map_err(FunctionCallError::RespondToModel)?,
                         ),
                         drained_observations: error.drained_observations,
                     }
                 }
                 Err(error) => {
-                    record_internally_drained_waits(&exec, error.drained_observations.saturating_add(1));
+                    record_internally_drained_waits(
+                        &exec,
+                        error.drained_observations.saturating_add(1),
+                    );
                     return Err(FunctionCallError::RespondToModel(error.message));
                 }
             };
@@ -511,12 +592,19 @@ impl CodeModeExecuteHandler {
             _ = exec.session.services.elicitations.wait_until_clear() => {}
         }
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
-        exec.session.services.code_mode_service.flush_packet_retention(&cell_id).await;
-        let delivery = exec.session.services.code_mode_service.delivery_for_response(
-            &cell_id, &exec.turn, &response,
-        );
-        let mut output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
-            .map_err(FunctionCallError::RespondToModel)?;
+        exec.session
+            .services
+            .code_mode_service
+            .flush_packet_retention(&cell_id)
+            .await;
+        let delivery = exec
+            .session
+            .services
+            .code_mode_service
+            .delivery_for_response(&cell_id, &exec.turn, &response);
+        let mut output =
+            handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+                .map_err(FunctionCallError::RespondToModel)?;
         attach_delivery_decision(&mut output, delivery);
         if keep_dispatch_open {
             dispatch_lease.keep_open();
@@ -620,8 +708,10 @@ mod tests {
                 let cancellation = cancellation.clone();
                 async move {
                     if use_wait {
-                        let started = session.services.code_mode_service.execute(
-                            codex_code_mode::ExecuteRequest {
+                        let started = session
+                            .services
+                            .code_mode_service
+                            .execute(codex_code_mode::ExecuteRequest {
                                 state_path: None,
                                 tool_call_id: "outer".into(),
                                 enabled_tools: Vec::new().into(),
@@ -629,51 +719,97 @@ mod tests {
                                 yield_time_ms: None,
                                 max_output_tokens: None,
                                 default_tool_timeout_ms: None,
-                            },
-                        ).await.unwrap();
+                            })
+                            .await
+                            .unwrap();
                         let cell = started.cell_id.clone();
-                        session.services.code_mode_service.record_cell_parent_call_id(&cell, "outer");
-                        session.services.code_mode_service.mark_cell_ready_for_dispatch(&cell);
-                        assert!(matches!(started.initial_response().await.unwrap(),
-                            codex_code_mode::RuntimeResponse::ExplicitYield { .. }));
-                        super::super::wait_handler::CodeModeWaitHandler.handle(ToolInvocation {
-                            session,
-                            step_context: step,
-                            cancellation_token: cancellation,
-                            tracker: Arc::new(tokio::sync::Mutex::new(
-                                crate::turn_diff_tracker::TurnDiffTracker::new(),
-                            )),
-                            call_id: "wait".into(),
-                            tool_name: ToolName::plain(super::super::WAIT_TOOL_NAME),
-                            source: crate::tools::router::ToolCallSource::Direct,
-                            payload: ToolPayload::Function {
-                                arguments: serde_json::json!({"cell_id": cell.as_str()}).to_string(),
-                            },
-                        }).await.unwrap().log_preview()
+                        session
+                            .services
+                            .code_mode_service
+                            .record_cell_parent_call_id(&cell, "outer");
+                        session
+                            .services
+                            .code_mode_service
+                            .mark_cell_ready_for_dispatch(&cell);
+                        assert!(matches!(
+                            started.initial_response().await.unwrap(),
+                            codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+                        ));
+                        super::super::wait_handler::CodeModeWaitHandler
+                            .handle(ToolInvocation {
+                                session,
+                                step_context: step,
+                                cancellation_token: cancellation,
+                                tracker: Arc::new(tokio::sync::Mutex::new(
+                                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                                )),
+                                call_id: "wait".into(),
+                                tool_name: ToolName::plain(super::super::WAIT_TOOL_NAME),
+                                source: crate::tools::router::ToolCallSource::Direct,
+                                payload: ToolPayload::Function {
+                                    arguments: serde_json::json!({"cell_id": cell.as_str()})
+                                        .to_string(),
+                                },
+                            })
+                            .await
+                            .unwrap()
+                            .log_preview()
                     } else {
                         let handler = CodeModeExecuteHandler::new(
-                            super::super::execute_spec::create_code_mode_tool(true, false, &[], &[]),
-                            Vec::new(), Vec::new(),
-                        ).unwrap();
-                        let output = handler.execute(session, step, "exec".into(),
-                            "text('captured result');".into(), cancellation).await.unwrap();
+                            super::super::execute_spec::create_code_mode_tool(
+                                true,
+                                false,
+                                &[],
+                                &[],
+                            ),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .unwrap();
+                        let output = handler
+                            .execute(
+                                session,
+                                step,
+                                "exec".into(),
+                                "text('captured result');".into(),
+                                cancellation,
+                            )
+                            .await
+                            .unwrap();
                         boxed_tool_output(output).log_preview()
                     }
                 }
             });
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while !session.services.elicitations.has_waiters_for_test() {
-                    assert!(!pending.is_finished(), "handler must reach the final delivery gate");
+                    assert!(
+                        !pending.is_finished(),
+                        "handler must reach the final delivery gate"
+                    );
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("completed cell reaches elicitation gate");
+            })
+            .await
+            .expect("completed cell reaches elicitation gate");
             assert!(!pending.is_finished());
             cancellation.cancel();
             let output = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
-                .await.expect("cancellation releases delivery").unwrap();
+                .await
+                .expect("cancellation releases delivery")
+                .unwrap();
             assert!(output.contains("captured result"), "{output}");
-            assert_eq!(leases.active_count(), 1, "cancellation must not close the dialog");
-            assert!(!session.services.code_mode_service.dispatch_broker.has_waitable_cells());
+            assert_eq!(
+                leases.active_count(),
+                1,
+                "cancellation must not close the dialog"
+            );
+            assert!(
+                !session
+                    .services
+                    .code_mode_service
+                    .dispatch_broker
+                    .has_waitable_cells()
+            );
             leases.release(&lease);
             session.services.code_mode_service.shutdown().await.unwrap();
         }
@@ -689,14 +825,30 @@ mod tests {
             output_loss: None,
         };
         let schema = serde_json::json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false});
-        let json = response(vec![FunctionCallOutputContentItem::InputText { text: r#"{"count":2}"#.into() }]);
-        assert_eq!(schema_validated_delivery(&json, 100, Some(&schema)).as_deref(), Ok(r#"{"count":2}"#));
-        assert_eq!(schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"}))).unwrap_err()["category"], "schema_mismatch");
-        let image = response(vec![FunctionCallOutputContentItem::InputImage {
-            image_url: "https://example.com/result.png".into(), detail: None,
+        let json = response(vec![FunctionCallOutputContentItem::InputText {
+            text: r#"{"count":2}"#.into(),
         }]);
-        assert_eq!(schema_validated_delivery(&image, 100, None).as_deref(), Ok("![image](<https://example.com/result.png>)"));
-        assert_eq!(schema_validated_delivery(&image, 100, Some(&schema)).unwrap_err()["category"], "invalid_json");
+        assert_eq!(
+            schema_validated_delivery(&json, 100, Some(&schema)).as_deref(),
+            Ok(r#"{"count":2}"#)
+        );
+        assert_eq!(
+            schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"})))
+                .unwrap_err()["category"],
+            "schema_mismatch"
+        );
+        let image = response(vec![FunctionCallOutputContentItem::InputImage {
+            image_url: "https://example.com/result.png".into(),
+            detail: None,
+        }]);
+        assert_eq!(
+            schema_validated_delivery(&image, 100, None).as_deref(),
+            Ok("![image](<https://example.com/result.png>)")
+        );
+        assert_eq!(
+            schema_validated_delivery(&image, 100, Some(&schema)).unwrap_err()["category"],
+            "invalid_json"
+        );
         for image_url in [
             "javascript:alert(1)",
             "relative.png",
@@ -705,27 +857,57 @@ mod tests {
             "data:text/html,unsafe",
         ] {
             let image = response(vec![FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.into(), detail: None,
+                image_url: image_url.into(),
+                detail: None,
             }]);
-            assert_eq!(schema_validated_delivery(&image, 100, None).unwrap_err()["category"],
-                "unsupported_media", "{image_url:?}");
+            assert_eq!(
+                schema_validated_delivery(&image, 100, None).unwrap_err()["category"],
+                "unsupported_media",
+                "{image_url:?}"
+            );
         }
-        assert_eq!(schema_validated_delivery(&json, 0, None).unwrap_err()["category"], "output_budget");
-        assert_eq!(schema_validated_delivery(&response(Vec::new()), 100, None).unwrap_err()["category"], "empty_output");
-        let bad = response(vec![FunctionCallOutputContentItem::InputText { text:r#"{"count":"bad"}"#.into() }]);
-        assert_eq!(schema_validated_delivery(&bad, 100, Some(&schema)).unwrap_err()["instance_pointer"], "/count");
+        assert_eq!(
+            schema_validated_delivery(&json, 0, None).unwrap_err()["category"],
+            "output_budget"
+        );
+        assert_eq!(
+            schema_validated_delivery(&response(Vec::new()), 100, None).unwrap_err()["category"],
+            "empty_output"
+        );
+        let bad = response(vec![FunctionCallOutputContentItem::InputText {
+            text: r#"{"count":"bad"}"#.into(),
+        }]);
+        assert_eq!(
+            schema_validated_delivery(&bad, 100, Some(&schema)).unwrap_err()["instance_pointer"],
+            "/count"
+        );
         let mut output = FunctionToolOutput::from_text("partial".into(), Some(true))
             .with_sampling_request_signal(serde_json::json!({}));
-        output.essential_inline.insert(super::super::VISIBLE_OUTPUT_TRUNCATED_KEY.into(), true.into());
+        output.essential_inline.insert(
+            super::super::VISIBLE_OUTPUT_TRUNCATED_KEY.into(),
+            true.into(),
+        );
         attach_delivery_decision(&mut output, Ok(Some("must not deliver".into())));
-        assert_eq!(output.essential_inline["delivery_refused"]["category"], "output_truncated");
-        assert!(output.sampling_request_signal.unwrap().get("explicit_completion_message").is_none());
+        assert_eq!(
+            output.essential_inline["delivery_refused"]["category"],
+            "output_truncated"
+        );
+        assert!(
+            output
+                .sampling_request_signal
+                .unwrap()
+                .get("explicit_completion_message")
+                .is_none()
+        );
     }
 
     #[test]
     fn long_poll_timeout_does_not_extend_ordinary_nested_tools() {
         let timeouts = HashMap::from([(ToolName::plain("mcp_test"), 123_000)]);
-        assert_eq!(nested_tool_timeout_override(&ToolName::plain("shell_command"), &timeouts, 5_000), Some(315_000));
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("shell_command"), &timeouts, 5_000),
+            Some(315_000)
+        );
         assert_eq!(
             nested_tool_timeout_override(&ToolName::plain("read_file"), &timeouts, 300_000),
             None
@@ -760,7 +942,11 @@ mod tests {
         assert!(definition.input_schema.is_none());
         assert!(definition.output_schema.is_none());
         assert!(definition.description.contains("exec tool declaration:"));
-        assert!(!definition.description.contains("Authoritative input_schema"));
+        assert!(
+            !definition
+                .description
+                .contains("Authoritative input_schema")
+        );
         let first = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
         let same = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
         assert!(Arc::ptr_eq(&first, &same));
@@ -773,18 +959,42 @@ mod tests {
     #[test]
     fn cached_runtime_catalog_retains_contract_when_projection_fails() {
         let mut nested = crate::tools::handlers::shell_spec::create_write_stdin_tool();
-        let ToolSpec::Function(tool) = &mut nested else { panic!("function tool"); };
-        tool.parameters.properties.as_mut().unwrap().get_mut("chars").unwrap().description =
-            Some(format!("{}Only use an authorized handle.", "x".repeat(150_000)));
+        let ToolSpec::Function(tool) = &mut nested else {
+            panic!("function tool");
+        };
+        tool.parameters
+            .properties
+            .as_mut()
+            .unwrap()
+            .get_mut("chars")
+            .unwrap()
+            .description = Some(format!(
+            "{}Only use an authorized handle.",
+            "x".repeat(150_000)
+        ));
         let authoritative = serde_json::to_string(&tool.parameters).unwrap();
-        let handler = CodeModeExecuteHandler::new(nested.clone(), vec![nested], Vec::new()).unwrap();
+        let handler =
+            CodeModeExecuteHandler::new(nested.clone(), vec![nested], Vec::new()).unwrap();
         let definition = &handler.enabled_tools[0];
         assert!(definition.input_schema.is_none());
-        assert!(definition.description.contains("Authoritative input_schema"));
+        assert!(
+            definition
+                .description
+                .contains("Authoritative input_schema")
+        );
         // Value serialization uses a sorted map; compare JSON rather than order.
-        let raw = definition.description.split_once("```json\n").unwrap().1.split_once("\n```").unwrap().0;
-        assert_eq!(serde_json::from_str::<serde_json::Value>(raw).unwrap(),
-            serde_json::from_str::<serde_json::Value>(&authoritative).unwrap());
+        let raw = definition
+            .description
+            .split_once("```json\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&authoritative).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -860,7 +1070,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_code_cells_persist_ordered_initial_and_terminal_traces() -> anyhow::Result<()> {
+    async fn registered_code_cells_persist_ordered_initial_and_terminal_traces()
+    -> anyhow::Result<()> {
         use crate::session::step_context::StepContext;
         use crate::tools::context::ToolDispatchState;
         use crate::tools::router::ToolCall;
@@ -1009,8 +1220,9 @@ mod tests {
                 let state = Arc::new(ToolDispatchState::new());
                 assert!(state.try_admit());
                 let wait_payload = ToolPayload::Function {
-                    arguments: serde_json::json!({"cell_id":cell_id,"terminate":case == "terminated"})
-                        .to_string(),
+                    arguments:
+                        serde_json::json!({"cell_id":cell_id,"terminate":case == "terminated"})
+                            .to_string(),
                 };
                 let result = router
                     .dispatch_tool_call_with_terminal_outcome(
@@ -1090,7 +1302,8 @@ mod tests {
                                 ..
                             } if case == "completed" => content_items,
                             codex_code_mode::RuntimeResponse::ExplicitYield {
-                                content_items, ..
+                                content_items,
+                                ..
                             } if case != "completed" => content_items,
                             other => panic!("unexpected initial response: {other:?}"),
                         };
@@ -1124,18 +1337,17 @@ mod tests {
                         )?)?;
                         let response: codex_code_mode::RuntimeResponse =
                             serde_json::from_value(raw["response"].clone())?;
-                        let content_items =
-                            match response {
-                                codex_code_mode::RuntimeResponse::Result {
-                                    content_items,
-                                    error_text: None,
-                                    ..
-                                } if case != "terminated" => content_items,
-                                codex_code_mode::RuntimeResponse::Terminated {
-                                    content_items, ..
-                                } if case == "terminated" => content_items,
-                                other => panic!("unexpected terminal response: {other:?}"),
-                            };
+                        let content_items = match response {
+                            codex_code_mode::RuntimeResponse::Result {
+                                content_items,
+                                error_text: None,
+                                ..
+                            } if case != "terminated" => content_items,
+                            codex_code_mode::RuntimeResponse::Terminated {
+                                content_items, ..
+                            } if case == "terminated" => content_items,
+                            other => panic!("unexpected terminal response: {other:?}"),
+                        };
                         if case == "waited" {
                             yielded_trace_output.extend(content_items);
                         } else {

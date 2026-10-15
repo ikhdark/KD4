@@ -432,7 +432,9 @@ async fn deferred_executor_startup_case(explicit_environment: bool) -> Result<()
         .rev()
         .find(|text| text.contains("<environment_context>"))
         .expect("ready environment context");
-    assert!(active_environment.contains("This environment context replaces all previously provided environment context."));
+    assert!(active_environment.contains(
+        "This environment context replaces all previously provided environment context."
+    ));
     assert!(active_environment.contains("<shell>powershell</shell>"));
     assert!(!active_environment.contains("<status>starting</status>"));
 
@@ -623,15 +625,24 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
     let (wait_output, _) = requests[1]
         .function_call_output_content_and_success(wait_call_id)
         .context("wait_for_environment output should be present")?;
-    assert_eq!(
-        wait_output.as_deref(),
-        Some("Environment `remote` failed to start and is unavailable. Continue without it.")
-    );
+    let wait_output = wait_output.context("wait_for_environment output should be text")?;
+    // The startup cause follows the fixed prefix; its socket text varies by platform and port.
+    let cause = wait_output
+        .strip_prefix("Environment `remote` failed to start and is unavailable: ")
+        .context("wait_for_environment output should name the failed environment")?;
     assert!(
-        requests[1]
-            .message_input_texts("user")
-            .iter()
-            .any(|text| text.contains("status=\"unavailable\""))
+        cause.contains("exec-server"),
+        "startup cause must reach the model: {wait_output}"
+    );
+    // A failed startup stays selected under its own identity and is reported
+    // as failed rather than dropped as an unlisted environment.
+    let user_texts = requests[1].message_input_texts("user");
+    assert!(
+        user_texts.iter().any(|text| {
+            text.contains(&format!("<environment id=\"{REMOTE_ENVIRONMENT_ID}\">"))
+                && text.contains("<status>failed</status>")
+        }),
+        "{user_texts:?}"
     );
 
     Ok(())
@@ -722,7 +733,8 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
             call_id: Some(request.call_id),
-            response: RequestUserInputResponse { disposition: None,
+            response: RequestUserInputResponse {
+                disposition: None,
                 answers: HashMap::from([(
                     "continue".to_string(),
                     RequestUserInputAnswer {

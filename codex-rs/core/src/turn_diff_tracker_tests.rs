@@ -145,16 +145,30 @@ fn invalidation_retains_first_command_cause_in_warning() {
     let mut tracker = TurnDiffTracker::new();
     let command = vec!["python".to_string(), "λ".repeat(300)];
     tracker.record_command_invalidation_cause(
-        Some("call-1"), "exec_command", &command, &CommandMutation::Uncertain,
+        Some("call-1"),
+        "exec_command",
+        &command,
+        &CommandMutation::Uncertain,
     );
     tracker.record_exec_command_end_with_mutation_at(
-        &command, 1, false, "", None, CommandMutation::Uncertain,
+        &command,
+        1,
+        false,
+        "",
+        None,
+        CommandMutation::Uncertain,
     );
-    let first = tracker.first_invalidation_cause.clone().expect("first cause");
+    let first = tracker
+        .first_invalidation_cause
+        .clone()
+        .expect("first cause");
     assert_eq!(first["call_id"], "call-1");
     assert_eq!(first["tool"], "exec_command");
     assert_eq!(first["mutation_class"], "uncertain");
-    assert_eq!(first["command_prefix"].as_str().unwrap().chars().count(), 240);
+    assert_eq!(
+        first["command_prefix"].as_str().unwrap().chars().count(),
+        240
+    );
     tracker.record_unknown_mutation();
     assert_eq!(tracker.first_invalidation_cause.as_ref(), Some(&first));
     let warning = tracker.take_invalidation_warning().unwrap();
@@ -323,8 +337,6 @@ fn repository_validation_recipes_remain_observed_instead_of_assumed_read_only() 
     }
 }
 
-
-
 #[test]
 fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
     let mut tracker = TurnDiffTracker::new();
@@ -465,8 +477,16 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
         vec!["bash", "-lc", "rg ' > ' file"],
         vec!["bash", "-lc", "rg '>>' file"],
         vec!["pwsh", "-Command", "rg '>= 3|a=>b;&{}' file"],
-        vec!["pwsh", "-Command", "Select-String -Path file -Pattern \"a>b|c<d\""],
-        vec!["pwsh", "-Command", "Write-Output 'it''s > literal'; Get-Content file"],
+        vec![
+            "pwsh",
+            "-Command",
+            "Select-String -Path file -Pattern \"a>b|c<d\"",
+        ],
+        vec![
+            "pwsh",
+            "-Command",
+            "Write-Output 'it''s > literal'; Get-Content file",
+        ],
         vec!["git", "-ccolor.ui=false", "show", "HEAD"],
         vec!["git", "blame", "file"],
         vec!["git", "rev-list", "HEAD"],
@@ -485,10 +505,22 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
         vec!["bash", "-lc", "cargo fmt --check; touch out.txt"],
         vec!["pwsh", "-Command", "git show HEAD >out.txt"],
         vec!["pwsh", "-Command", "rg '>' file >out.txt"],
-        vec!["pwsh", "-Command", "Write-Output \"$(Set-Content out.txt changed)\""],
+        vec![
+            "pwsh",
+            "-Command",
+            "Write-Output \"$(Set-Content out.txt changed)\"",
+        ],
         vec!["pwsh", "-Command", "Write-Output 'unterminated >"],
-        vec!["pwsh", "-Command", "Write-Output \"text\u{201d}; Set-Content out.txt changed #\""],
-        vec!["pwsh", "-Command", "Write-Output @'\ntext\n'@; Set-Content out.txt changed"],
+        vec![
+            "pwsh",
+            "-Command",
+            "Write-Output \"text\u{201d}; Set-Content out.txt changed #\"",
+        ],
+        vec![
+            "pwsh",
+            "-Command",
+            "Write-Output @'\ntext\n'@; Set-Content out.txt changed",
+        ],
         vec![
             "pwsh",
             "-Command",
@@ -518,12 +550,17 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
     ]));
 }
 
-
-
 #[test]
 fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
     assert!(matches!(
-        command_mutation(&["powershell.exe".into(), "-Command".into(), "Set-Content out.txt changed".into()], None),
+        command_mutation(
+            &[
+                "powershell.exe".into(),
+                "-Command".into(),
+                "Set-Content out.txt changed".into()
+            ],
+            None
+        ),
         CommandMutation::KnownMutation { .. }
     ));
     for command in [
@@ -534,7 +571,11 @@ fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
         vec!["cargo", "check"],
     ] {
         let command = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        assert_eq!(command_mutation(&command, None), CommandMutation::Uncertain, "{command:?}");
+        assert_eq!(
+            command_mutation(&command, None),
+            CommandMutation::Uncertain,
+            "{command:?}"
+        );
         assert!(command_may_mutate(&command), "{command:?}");
     }
     assert_eq!(CommandMutation::from(true), CommandMutation::Uncertain);
@@ -549,17 +590,49 @@ fn summary_and_turn_diff_share_command_mutation_classification() {
         ("git branch", true),
         ("git branch -D topic", false),
         ("Get-FileHash README.md", true),
-        ("Get-ChildItem | Where-Object { $_.Name -match 'test' }", true),
+        (
+            "Get-ChildItem | Where-Object { $_.Name -match 'test' }",
+            true,
+        ),
         ("Get-ChildItem | ForEach-Object { $_.Name }", true),
         ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
         ("Get-ChildItem | ForEach-Object -MemberName Delete", false),
-        ("git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", true),
-        ("git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }", false),
+        (
+            "git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            true,
+        ),
+        (
+            "git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }",
+            false,
+        ),
         ("Write-Output \"$(Remove-Item a)\"", false),
+        // Read-only probes recorded as possible mutations before comma lists
+        // and conditionals were lowered.
+        (
+            "Get-ChildItem tests -File | Select-Object Name,Length | Format-Table -AutoSize; Get-ChildItem .codex -Force -ErrorAction SilentlyContinue | Select-Object Name,Mode | Format-Table -AutoSize",
+            true,
+        ),
+        (
+            "Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length | Format-Table -AutoSize",
+            true,
+        ),
+        (
+            "Get-Location; Get-ChildItem -Force -Name; if (Test-Path AGENTS.md) { Get-Content AGENTS.md }",
+            true,
+        ),
+        ("if (Test-Path a) { Remove-Item a }", false),
     ] {
         let command = ["pwsh", "-NoProfile", "-Command", script].map(str::to_owned);
-        assert_eq!(command_mutation(&command, None) == CommandMutation::ReadOnly, read_only, "{script}");
-        assert_eq!(crate::tools::shell_output_summary::is_read_only_command(script), read_only, "{script}");
+        assert_eq!(
+            command_mutation(&command, None) == CommandMutation::ReadOnly,
+            read_only,
+            "{script}"
+        );
+        assert_eq!(
+            crate::tools::shell_output_summary::is_read_only_command(script),
+            read_only,
+            "{script}"
+        );
     }
 }
 
@@ -586,15 +659,44 @@ fn git_output_options_do_not_certify_read_only_commands() {
     fs::write(directory.path().join("before"), "before\n").unwrap();
     fs::write(directory.path().join("after"), "after\n").unwrap();
     let output = Command::new("git")
-        .args(["diff", "--no-index", "--output=changes.patch", "before", "after"])
-        .current_dir(directory.path()).output().expect("run real git diff");
+        .args([
+            "diff",
+            "--no-index",
+            "--output=changes.patch",
+            "before",
+            "after",
+        ])
+        .current_dir(directory.path())
+        .output()
+        .expect("run real git diff");
     assert_eq!(output.status.code(), Some(1)); // Different inputs, not a failed write.
-    assert!(fs::read_to_string(directory.path().join("changes.patch")).unwrap().contains("+after"));
-    assert!(Command::new("git").args(["init", "--quiet"]).current_dir(directory.path()).status().unwrap().success());
-    assert!(Command::new("git").args(["add", "before"]).current_dir(directory.path()).status().unwrap().success());
+    assert!(
+        fs::read_to_string(directory.path().join("changes.patch"))
+            .unwrap()
+            .contains("+after")
+    );
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["add", "before"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     let pager = "--open-files-in-pager=echo mutated > pager-marker";
-    let grep = Command::new("git").args(["grep", pager, "before"])
-        .current_dir(directory.path()).output().unwrap();
+    let grep = Command::new("git")
+        .args(["grep", pager, "before"])
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
     assert!(grep.status.success());
     assert!(directory.path().join("pager-marker").is_file());
     for argv in [
@@ -605,17 +707,34 @@ fn git_output_options_do_not_certify_read_only_commands() {
         vec!["git", "-c", "core.fsmonitor=helper", "status"],
     ] {
         let command = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        assert_ne!(command_mutation(&command, None), CommandMutation::ReadOnly, "{command:?}");
+        assert_ne!(
+            command_mutation(&command, None),
+            CommandMutation::ReadOnly,
+            "{command:?}"
+        );
         assert!(!command_is_read_only_git(&command), "{command:?}");
     }
     for subcommand in ["diff", "log", "show"] {
-        for flags in [vec!["--output=changes.patch"], vec!["--output", "changes.patch"], vec!["--ext-diff"], vec!["--textconv"]] {
+        for flags in [
+            vec!["--output=changes.patch"],
+            vec!["--output", "changes.patch"],
+            vec!["--ext-diff"],
+            vec!["--textconv"],
+        ] {
             let mut command = vec!["git".to_string(), subcommand.to_string()];
             command.extend(flags.into_iter().map(str::to_owned));
-            assert_ne!(command_mutation(&command, None), CommandMutation::ReadOnly, "{command:?}");
+            assert_ne!(
+                command_mutation(&command, None),
+                CommandMutation::ReadOnly,
+                "{command:?}"
+            );
             assert!(!command_is_read_only_git(&command), "{command:?}");
             let wrapped = ["bash".to_string(), "-c".to_string(), command.join(" ")];
-            assert_ne!(command_mutation(&wrapped, None), CommandMutation::ReadOnly, "{wrapped:?}");
+            assert_ne!(
+                command_mutation(&wrapped, None),
+                CommandMutation::ReadOnly,
+                "{wrapped:?}"
+            );
         }
         let safe = ["git".to_string(), subcommand.to_string()];
         assert_eq!(command_mutation(&safe, None), CommandMutation::ReadOnly);
@@ -628,8 +747,16 @@ async fn failed_and_timed_out_known_mutators_still_invalidate_immediately() {
     for (script, exit_code, timed_out) in [
         ("Set-Content a.txt changed", 1, false),
         ("Set-Content a.txt changed", 124, true),
-        ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, false),
-        ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, true),
+        (
+            "Set-Content -LiteralPath a.txt -Value changed; exit 1",
+            1,
+            false,
+        ),
+        (
+            "Set-Content -LiteralPath a.txt -Value changed; exit 1",
+            1,
+            true,
+        ),
     ] {
         let dir = tempdir().expect("tempdir");
         let mut tracker = tracker_with_root(dir.path());
@@ -748,7 +875,12 @@ fn mutation_boundary_mutating_validation_flags_and_package_scripts_fail_closed()
 #[test]
 fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
     // A different read-only repository is not evidence for the caller's cwd.
-    assert!(!command_is_read_only_git(&["git".into(), "-C".into(), ".".into(), "log".into()]));
+    assert!(!command_is_read_only_git(&[
+        "git".into(),
+        "-C".into(),
+        ".".into(),
+        "log".into()
+    ]));
     for command in [
         vec!["git".into(), "-C".into(), ".".into(), "log".into()],
         vec![
@@ -767,11 +899,19 @@ fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
         assert!(command_reads_repository_history(&command));
     }
     for command in [
-        vec!["git", "-c", "core.pager=cat", "diff", "--output=changed.patch"],
+        vec![
+            "git",
+            "-c",
+            "core.pager=cat",
+            "diff",
+            "--output=changed.patch",
+        ],
         vec!["git", "-C", ".", "diff", "--output=changed.patch"],
         vec!["git", "-c", "core.pager=touch changed", "log"],
     ] {
-        assert!(command_may_mutate(&command.into_iter().map(str::to_owned).collect::<Vec<_>>()));
+        assert!(command_may_mutate(
+            &command.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        ));
     }
     assert!(command_may_mutate(&[
         "git".into(),
@@ -860,7 +1000,13 @@ async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings(
     let changed_paths = tracker.changed_paths();
     assert_eq!(changed_paths.len(), 5);
     fs::write(dir.path().join("validation.log"), "unrelated").unwrap();
-    let mutation = tracker.reconcile_command_mutation("", CommandMutation::UnattributedWorkspaceChange, Some(LOCAL_FS.as_ref())).await;
+    let mutation = tracker
+        .reconcile_command_mutation(
+            "",
+            CommandMutation::UnattributedWorkspaceChange,
+            Some(LOCAL_FS.as_ref()),
+        )
+        .await;
     tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None, mutation);
     assert_eq!(tracker.get_unified_diff(), original);
     assert_eq!(tracker.changed_paths(), changed_paths);
@@ -869,7 +1015,9 @@ async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings(
     fs::write(dir.path().join("b.txt"), "external edit").unwrap();
     fs::write(dir.path().join("deleted.txt"), "recreated").unwrap();
     fs::write(dir.path().join("destination.txt"), "external rename edit").unwrap();
-    let mutation = tracker.reconcile_command_mutation("", CommandMutation::Uncertain, Some(LOCAL_FS.as_ref())).await;
+    let mutation = tracker
+        .reconcile_command_mutation("", CommandMutation::Uncertain, Some(LOCAL_FS.as_ref()))
+        .await;
     tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None, mutation);
     let partial = tracker.get_unified_diff().unwrap();
     assert!(partial.contains("+one"));
@@ -898,14 +1046,19 @@ async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
     // A failing command may still change a known path. Only that path loses
     // exactness; unrelated apply_patch content remains useful.
     tracker.record_exec_command_end_at(
-        &["rm".into(), "b.txt".into()], 1, false, "", Some(dir.path()),
+        &["rm".into(), "b.txt".into()],
+        1,
+        false,
+        "",
+        Some(dir.path()),
     );
     let partial = tracker.get_unified_diff().expect("partial turn diff");
     assert!(partial.contains("diff --git a/a.txt b/a.txt"));
     assert!(!partial.contains("diff --git a/b.txt b/b.txt"));
     assert!(partial.contains("b.txt: changed, diff unavailable"));
     let known_paths = vec![
-        ("".into(), dir.path().join("a.txt")), ("".into(), dir.path().join("b.txt")),
+        ("".into(), dir.path().join("a.txt")),
+        ("".into(), dir.path().join("b.txt")),
     ];
     assert!(tracker.valid);
     assert!(tracker.has_untracked_changes());
@@ -916,7 +1069,11 @@ async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
 
     assert_eq!(tracker.get_unified_diff(), None);
     tracker.record_exec_command_end_at(
-        &["touch".into(), "c.txt".into()], 0, false, "", Some(dir.path()),
+        &["touch".into(), "c.txt".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
     );
     assert_eq!(tracker.get_unified_diff(), None);
 }
@@ -1013,7 +1170,7 @@ index {left_oid}..{right_oid}
 }
 
 #[tokio::test]
-async fn pure_rename_yields_no_diff() {
+async fn pure_rename_preserves_paths_in_diff() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("old.txt"), "same\n").expect("seed file");
 
@@ -1025,7 +1182,13 @@ async fn pure_rename_yields_no_diff() {
     .await;
     tracker.track_delta("", &rename);
 
-    assert_eq!(tracker.get_unified_diff(), None);
+    assert_eq!(
+        tracker.get_unified_diff(),
+        Some(
+            "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n"
+                .to_string()
+        )
+    );
     assert_eq!(
         tracker.changed_paths(),
         vec![
@@ -1212,7 +1375,10 @@ async fn repeated_updates_only_rerender_the_touched_path() {
     for (index, patch) in [
         "*** Begin Patch\n*** Add File: stable.txt\n+stable\n*** End Patch",
         "*** Begin Patch\n*** Add File: hot.txt\n+value 0\n*** End Patch",
-    ].into_iter().enumerate() {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         tracker.track_delta("", &apply_verified_patch(dir.path(), patch).await);
         assert_eq!(tracker.rendered_diff_count(), index + 1);
     }
@@ -1228,7 +1394,11 @@ async fn repeated_updates_only_rerender_the_touched_path() {
         assert!(diff.contains(&format!("+value {value}\n")));
         assert!(!diff.contains(&format!("+value {}\n", value - 1)));
         assert_eq!(tracker.get_unified_diff(), Some(diff));
-        assert_eq!(tracker.rendered_diff_count(), value + 2, "reads must reuse both cached paths");
+        assert_eq!(
+            tracker.rendered_diff_count(),
+            value + 2,
+            "reads must reuse both cached paths"
+        );
     }
 }
 
@@ -1437,4 +1607,116 @@ fn git_history_requires_the_executable_and_a_single_command() {
         "log".into(),
         "-1".into()
     ]));
+}
+
+#[tokio::test]
+async fn concurrent_writes_stay_unattributed_and_keep_this_turns_exact_diff() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let add = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: own.txt\n+mine\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add);
+    let exact = tracker
+        .exact_unified_diff()
+        .expect("exact")
+        .expect("one edit");
+    // Another session writes while an uncertain command runs. The snapshot also
+    // shows this turn's own file, unchanged since its patch.
+    fs::write(dir.path().join("foreign.txt"), "theirs\n").unwrap();
+    let observed = BTreeSet::from(["own.txt", "foreign.txt"].map(|name| dir.path().join(name)));
+
+    let mutation = tracker
+        .attribute_observed_changes(
+            "",
+            Some(dir.path()),
+            None,
+            &observed,
+            Some(LOCAL_FS.as_ref()),
+        )
+        .await;
+    assert_eq!(
+        mutation,
+        CommandMutation::KnownMutation {
+            paths: Some(BTreeSet::new())
+        }
+    );
+    tracker.record_exec_command_end_with_mutation_at(
+        &["python".into(), "script.py".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
+        mutation,
+    );
+
+    assert!(
+        !tracker.has_untracked_changes(),
+        "a foreign write must not make this diff partial"
+    );
+    assert_eq!(tracker.exact_unified_diff(), Ok(Some(exact)));
+    let changed = tracker.changed_paths();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(changed[0].1.ends_with("own.txt"), "{changed:?}");
+    assert_eq!(
+        tracker.unattributed_display_paths(),
+        vec!["foreign.txt".to_string()]
+    );
+    assert_eq!(tracker.take_invalidation_warning(), None);
+}
+
+#[tokio::test]
+async fn declared_paths_and_rewritten_tracked_paths_stay_attributed() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let add = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: own.txt\n+mine\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add);
+    // The command declares out.txt, and own.txt no longer holds this turn's content.
+    fs::write(dir.path().join("own.txt"), "rewritten\n").unwrap();
+    fs::write(dir.path().join("out.txt"), "generated\n").unwrap();
+    fs::write(dir.path().join("foreign.txt"), "theirs\n").unwrap();
+    let observed =
+        BTreeSet::from(["own.txt", "out.txt", "foreign.txt"].map(|name| dir.path().join(name)));
+    let declared = BTreeSet::from([PathBuf::from("out.txt")]);
+
+    let mutation = tracker
+        .attribute_observed_changes(
+            "",
+            Some(dir.path()),
+            Some(&declared),
+            &observed,
+            Some(LOCAL_FS.as_ref()),
+        )
+        .await;
+    assert_eq!(
+        mutation,
+        CommandMutation::KnownMutation {
+            paths: Some(BTreeSet::from(
+                ["out.txt", "own.txt"].map(|name| dir.path().join(name))
+            )),
+        }
+    );
+    tracker.record_exec_command_end_with_mutation_at(
+        &["generate".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
+        mutation,
+    );
+
+    assert_eq!(
+        tracker.exact_unified_diff(),
+        Err(vec!["out.txt".to_string(), "own.txt".to_string()])
+    );
+    assert_eq!(
+        tracker.unattributed_display_paths(),
+        vec!["foreign.txt".to_string()]
+    );
 }

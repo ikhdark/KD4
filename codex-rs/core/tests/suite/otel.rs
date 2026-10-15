@@ -48,9 +48,10 @@ where
 
 fn extract_log_field(line: &str, key: &str) -> Option<String> {
     let quoted_prefix = format!("{key}=\"");
-    if let Some((start, _)) = line.match_indices(&quoted_prefix).find(|(start, _)| {
-        *start == 0 || line[..*start].ends_with([' ', '\t', '{', ','])
-    }) {
+    if let Some((start, _)) = line
+        .match_indices(&quoted_prefix)
+        .find(|(start, _)| *start == 0 || line[..*start].ends_with([' ', '\t', '{', ',']))
+    {
         let value_start = start + quoted_prefix.len();
         if let Some(end_rel) = line[value_start..].find('"') {
             return Some(line[value_start..value_start + end_rel].to_string());
@@ -58,9 +59,9 @@ fn extract_log_field(line: &str, key: &str) -> Option<String> {
     }
 
     let bare_prefix = format!("{key}=");
-    for token in line.split(|character: char| {
-        character.is_whitespace() || matches!(character, '{' | '}' | ',')
-    }) {
+    for token in line
+        .split(|character: char| character.is_whitespace() || matches!(character, '{' | '}' | ','))
+    {
         let trimmed = token.trim_end_matches(',');
         if let Some(value) = trimmed.strip_prefix(&bare_prefix) {
             return Some(value.to_string());
@@ -162,19 +163,31 @@ fn extract_log_field_does_not_confuse_similar_keys() {
         extract_log_field(line, "mcp_server_origin"),
         Some("stdio".to_string())
     );
-    assert_eq!(extract_log_field("other_mcp_server=\"stdio\"", "mcp_server"), None);
+    assert_eq!(
+        extract_log_field("other_mcp_server=\"stdio\"", "mcp_server"),
+        None
+    );
 }
 
 #[test]
 fn extract_log_field_compares_complete_numeric_span_values() {
-    for line in ["span{input_tokens=3}: close", "event input_tokens=3, next=1"] {
-        assert_eq!(extract_log_field(line, "input_tokens").as_deref(), Some("3"));
+    for line in [
+        "span{input_tokens=3}: close",
+        "event input_tokens=3, next=1",
+    ] {
+        assert_eq!(
+            extract_log_field(line, "input_tokens").as_deref(),
+            Some("3")
+        );
     }
     assert_eq!(
         extract_log_field("span{input_tokens=30}: close", "input_tokens").as_deref(),
         Some("30")
     );
-    assert_eq!(extract_log_field("other_input_tokens=3", "input_tokens"), None);
+    assert_eq!(
+        extract_log_field("other_input_tokens=3", "input_tokens"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -473,12 +486,14 @@ async fn process_sse_failed_event_logs_parse_error() {
         .await
         .unwrap();
 
-    let completed =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completed) = completed else {
         unreachable!();
     };
-    assert!(completed.error.is_some(), "response.failed must fail the turn");
+    assert!(
+        completed.error.is_some(),
+        "response.failed must fail the turn"
+    );
 
     logs_assert(|lines: &[&str]| {
         lines
@@ -524,12 +539,14 @@ async fn process_sse_failed_event_logs_missing_error() {
         .await
         .unwrap();
 
-    let completed =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completed) = completed else {
         unreachable!();
     };
-    assert!(completed.error.is_some(), "response.failed must fail the turn");
+    assert!(
+        completed.error.is_some(),
+        "response.failed must fail the turn"
+    );
 
     logs_assert(|lines: &[&str]| {
         lines
@@ -754,9 +771,11 @@ async fn turn_and_completed_response_spans_record_token_usage() {
                 && line.contains("otel.name=\"completed\"")
                 && line.contains("codex.request.reasoning_effort=high")
                 && extract_log_field(line, "gen_ai.usage.input_tokens").as_deref() == Some("3")
-                && extract_log_field(line, "gen_ai.usage.cache_read.input_tokens").as_deref() == Some("1")
+                && extract_log_field(line, "gen_ai.usage.cache_read.input_tokens").as_deref()
+                    == Some("1")
                 && extract_log_field(line, "gen_ai.usage.output_tokens").as_deref() == Some("5")
-                && extract_log_field(line, "codex.usage.reasoning_output_tokens").as_deref() == Some("2")
+                && extract_log_field(line, "codex.usage.reasoning_output_tokens").as_deref()
+                    == Some("2")
                 && extract_log_field(line, "codex.usage.total_tokens").as_deref() == Some("9")
         }),
         "missing completed response span token usage\nlogs:\n{logs}"
@@ -765,12 +784,20 @@ async fn turn_and_completed_response_spans_record_token_usage() {
         logs.lines().any(|line| {
             line.contains("turn{otel.name=\"session_task.turn\"")
                 && line.contains("codex.turn.reasoning_effort=high")
-                && extract_log_field(line, "codex.turn.token_usage.input_tokens").as_deref() == Some("3")
-                && extract_log_field(line, "codex.turn.token_usage.cached_input_tokens").as_deref() == Some("1")
-                && extract_log_field(line, "codex.turn.token_usage.non_cached_input_tokens").as_deref() == Some("2")
-                && extract_log_field(line, "codex.turn.token_usage.output_tokens").as_deref() == Some("5")
-                && extract_log_field(line, "codex.turn.token_usage.reasoning_output_tokens").as_deref() == Some("2")
-                && extract_log_field(line, "codex.turn.token_usage.total_tokens").as_deref() == Some("9")
+                && extract_log_field(line, "codex.turn.token_usage.input_tokens").as_deref()
+                    == Some("3")
+                && extract_log_field(line, "codex.turn.token_usage.cached_input_tokens").as_deref()
+                    == Some("1")
+                && extract_log_field(line, "codex.turn.token_usage.non_cached_input_tokens")
+                    .as_deref()
+                    == Some("2")
+                && extract_log_field(line, "codex.turn.token_usage.output_tokens").as_deref()
+                    == Some("5")
+                && extract_log_field(line, "codex.turn.token_usage.reasoning_output_tokens")
+                    .as_deref()
+                    == Some("2")
+                && extract_log_field(line, "codex.turn.token_usage.total_tokens").as_deref()
+                    == Some("9")
         }),
         "missing regular turn span token usage\nlogs:\n{logs}"
     );
@@ -1193,7 +1220,9 @@ fn tool_decision_assertion_distinguishes_approval_scope() {
     let assertion = tool_decision_assertion("call", "approved", "user");
     assert!(assertion(&[approved]).is_ok());
     assert!(assertion(&[session_approved]).is_err());
-    assert!(tool_decision_assertion("call", "approvedforsession", "user")(&[session_approved]).is_ok());
+    assert!(
+        tool_decision_assertion("call", "approvedforsession", "user")(&[session_approved]).is_ok()
+    );
     assert!(tool_decision_assertion("call", "approved", "config")(&[approved]).is_err());
     assert!(tool_decision_assertion("cal", "approved", "user")(&[approved]).is_err());
 }

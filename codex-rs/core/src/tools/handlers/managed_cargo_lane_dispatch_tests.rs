@@ -36,12 +36,12 @@ fn executable(directory: &Path, name: &str, managed: bool) -> PathBuf {
         if managed {
             "@\"%KD4_CARGO_FIXTURE%\" build\r\n"
         } else {
-            "@echo off\r\n> \"%KD4_CARGO_ADMISSION_MARKER%\" echo %CARGO_TARGET_DIR%\r\n"
+            "@echo off\r\n> \"%KD4_CARGO_ADMISSION_MARKER%\" echo spawned:%CARGO_TARGET_DIR%\r\n"
         }
     } else if managed {
         "#!/bin/sh\nexec \"$KD4_CARGO_FIXTURE\" build\n"
     } else {
-        "#!/bin/sh\nprintf '%s\\n' \"$CARGO_TARGET_DIR\" > \"$KD4_CARGO_ADMISSION_MARKER\"\n"
+        "#!/bin/sh\nprintf 'spawned:%s\\n' \"$CARGO_TARGET_DIR\" > \"$KD4_CARGO_ADMISSION_MARKER\"\n"
     };
     std::fs::write(&path, source).unwrap();
     #[cfg(unix)]
@@ -54,6 +54,86 @@ fn executable(directory: &Path, name: &str, managed: bool) -> PathBuf {
 
 async fn exercise_dispatch(tool: &str) {
     for (case, args, target, build, include, managed, script, allowed) in [
+        (
+            "generic-default",
+            vec!["test", "--locked"],
+            "",
+            None,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "generic-cli-config",
+            vec!["check", "--config", "build.target-dir='ordinary-output'"],
+            "",
+            None,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "generic-managed-target",
+            vec!["build"],
+            "reserved/debug",
+            None,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "generic-managed-build",
+            vec!["build", "--target-dir=ordinary-output"],
+            "ordinary-output",
+            Some("reserved/intermediates"),
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "generic-shell-control",
+            vec!["build"],
+            "ordinary-output",
+            None,
+            false,
+            false,
+            true,
+            true,
+        ),
+        (
+            "generic-shell-env-newline",
+            vec!["build"],
+            "",
+            None,
+            false,
+            false,
+            true,
+            false,
+        ),
+        (
+            "generic-shell-env-crlf",
+            vec!["build"],
+            "",
+            None,
+            false,
+            false,
+            true,
+            false,
+        ),
+        (
+            "generic-shell-env-try",
+            vec!["build"],
+            "",
+            None,
+            false,
+            false,
+            true,
+            false,
+        ),
         (
             "plugin-unrelated",
             vec!["custom-plugin", "--target-dir=target/unrelated"],
@@ -135,11 +215,42 @@ async fn exercise_dispatch(tool: &str) {
             true,
         ),
     ] {
+        let powershell_boundary = case.starts_with("generic-shell-");
+        if powershell_boundary && !cfg!(windows) {
+            continue;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let cwd = root.join("codex-rs");
-        std::fs::create_dir_all(cwd.join(".config")).unwrap();
-        std::fs::write(cwd.join(".config/kd4-rust-tests.toml"), "").unwrap();
+        let generic = case.starts_with("generic-");
+        let cwd = root.join(if generic {
+            "ordinary-project"
+        } else {
+            "codex-rs"
+        });
+        if generic {
+            std::fs::create_dir_all(cwd.join(".cargo")).unwrap();
+            std::fs::write(
+                cwd.join(".cargo/config.toml"),
+                "[env]\nRUST_TEST_THREADS={value='8',force=false}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                cwd.join("Cargo.toml"),
+                "[package]\nname='ordinary-project'\nversion='0.1.0'\n",
+            )
+            .unwrap();
+            if !allowed {
+                std::fs::create_dir_all(cwd.join("reserved")).unwrap();
+                std::fs::write(
+                    cwd.join("reserved/.codex-cargo-lanes-root"),
+                    "codex-kd cargo lanes root v1\n",
+                )
+                .unwrap();
+            }
+        } else {
+            std::fs::create_dir_all(cwd.join(".config")).unwrap();
+            std::fs::write(cwd.join(".config/kd4-rust-tests.toml"), "").unwrap();
+        }
         if include {
             std::fs::create_dir_all(cwd.join(".cargo/nested")).unwrap();
             std::fs::write(
@@ -189,13 +300,29 @@ async fn exercise_dispatch(tool: &str) {
                 "CARGO_HOME".into(),
                 root.join("cargo-home").display().to_string(),
             ),
-            ("CARGO_TARGET_DIR".into(), target.into()),
             ("KD4_CARGO_FIXTURE".into(), cargo.display().to_string()),
             (
                 "KD4_CARGO_ADMISSION_MARKER".into(),
                 marker.display().to_string(),
             ),
         ]);
+        if powershell_boundary {
+            // Bare Cargo is essential: an `&` call operator would hide the
+            // lost-newline/block-boundary regression. Resolve only our stand-in
+            // first, with an allowed dispatch proving that it can be launched.
+            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+            let path = std::env::join_paths(
+                std::iter::once(root.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
+            )
+            .unwrap();
+            policy.r#set.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+            policy.r#set.insert("PATH".into(), path.into_string().unwrap());
+        }
+        if !target.is_empty() {
+            policy
+                .r#set
+                .insert("CARGO_TARGET_DIR".into(), target.into());
+        }
         if let Some(build) = build {
             policy
                 .r#set
@@ -235,12 +362,27 @@ async fn exercise_dispatch(tool: &str) {
                     .replace('\'', if cfg!(windows) { "''" } else { "'\\''" }),
                 args.join(" ")
             );
+            let command = match case {
+                "generic-shell-control" => "cargo build".to_string(),
+                "generic-shell-env-newline" => {
+                    "$env:CARGO_TARGET_DIR='reserved'\ncargo build".to_string()
+                }
+                "generic-shell-env-crlf" => {
+                    "$env:CARGO_TARGET_DIR='reserved'\r\ncargo build".to_string()
+                }
+                "generic-shell-env-try" => {
+                    "$env:CARGO_TARGET_DIR='reserved'; try { cargo build } finally {}".to_string()
+                }
+                _ => command,
+            };
+            // Default handlers do not advertise `login`; omitting it already
+            // selects a non-login shell.
             if cfg!(windows) {
-                serde_json::json!({"script_body": command, "workdir": cwd, "login": false})
+                serde_json::json!({"script_body": command, "workdir": cwd})
             } else if tool == "exec_command" {
-                serde_json::json!({"cmd": command, "workdir": cwd, "login": false})
+                serde_json::json!({"cmd": command, "workdir": cwd})
             } else {
-                serde_json::json!({"command": command, "workdir": cwd, "login": false})
+                serde_json::json!({"command": command, "workdir": cwd})
             }
         } else {
             serde_json::json!({"program": program, "args": args, "workdir": cwd})
@@ -271,7 +413,7 @@ async fn exercise_dispatch(tool: &str) {
             assert_ne!(output.success, Some(false), "{tool}/{case}: {message}");
             assert_eq!(
                 std::fs::read_to_string(&marker).unwrap().trim(),
-                target,
+                format!("spawned:{target}"),
                 "{tool}/{case}: {message}"
             );
         } else {

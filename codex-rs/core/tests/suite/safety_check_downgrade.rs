@@ -138,8 +138,10 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
     assert_eq!(error.message, CYBER_POLICY_MESSAGE);
     assert_eq!(error.codex_error_info, Some(CodexErrorInfo::CyberPolicy));
 
-    let EventMsg::TurnComplete(completed) =
-        wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
     else {
         unreachable!("predicate guarantees completion");
     };
@@ -269,7 +271,11 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
     }
 
     assert_eq!(warning_count, 1);
-    assert_eq!(mock.requests().len(), 2, "both mismatch responses must be consumed");
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "both mismatch responses must be consumed"
+    );
 
     Ok(())
 }
@@ -318,7 +324,6 @@ async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()> 
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_verification_only_emits_once_per_turn() -> Result<()> {
     require_network!();
@@ -348,7 +353,9 @@ async fn model_verification_only_emits_once_per_turn() -> Result<()> {
     ]));
     let mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
 
-    let mut builder = test_codex().with_model(SERVER_MODEL).with_raw_response_items();
+    let mut builder = test_codex()
+        .with_model(SERVER_MODEL)
+        .with_raw_response_items();
     let test = builder.build(&server).await?;
 
     test.codex
@@ -363,7 +370,10 @@ async fn model_verification_only_emits_once_per_turn() -> Result<()> {
         let event = wait_for_event(&test.codex, |_| true).await;
         match event {
             EventMsg::ModelVerification(event) => {
-                assert_eq!(event.verifications, vec![ModelVerification::TrustedAccessForCyber]);
+                assert_eq!(
+                    event.verifications,
+                    vec![ModelVerification::TrustedAccessForCyber]
+                );
                 verification_count += 1;
             }
             EventMsg::Warning(warning) if warning.message.contains("high-risk cyber activity") => {
@@ -378,9 +388,15 @@ async fn model_verification_only_emits_once_per_turn() -> Result<()> {
                             item,
                             ContentItem::InputText { text } if text.starts_with("Warning: ")
                         ))
-                ) => panic!("model verification must not inject a warning item"),
+                ) =>
+            {
+                panic!("model verification must not inject a warning item")
+            }
             EventMsg::TurnComplete(completed) => {
-                assert!(completed.error.is_none(), "verification turn failed: {completed:?}");
+                assert!(
+                    completed.error.is_none(),
+                    "verification turn failed: {completed:?}"
+                );
                 break;
             }
             _ => {}
@@ -388,7 +404,11 @@ async fn model_verification_only_emits_once_per_turn() -> Result<()> {
     }
 
     assert_eq!(verification_count, 1);
-    assert_eq!(mock.requests().len(), 2, "both verification responses must be consumed");
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "both verification responses must be consumed"
+    );
 
     Ok(())
 }

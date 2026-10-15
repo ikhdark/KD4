@@ -34,20 +34,105 @@ async fn patch_reports_only_added_line_whitespace_and_conflict_diagnostics() {
     let workspace = TempDir::new().unwrap();
     let path = workspace.path().join("diagnostics.txt");
     std::fs::write(&path, "existing trailing  \nold\n").unwrap();
-    let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n existing trailing  \n-old\n+new trailing  \n+ \tindented\n+<<<<<<< ours\n+=======\n+>>>>>>> theirs\n*** End Patch", path.display());
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n existing trailing  \n-old\n+new trailing  \n+ \tindented\n+<<<<<<< ours\n+=======\n+>>>>>>> theirs\n*** End Patch",
+        path.display()
+    );
     let mut call = invocation_for_payload(ToolPayload::Custom { input: patch }).await;
     Arc::get_mut(&mut Arc::make_mut(&mut call.step_context).turn)
-        .expect("test invocation owns its turn").permission_profile = PermissionProfile::Disabled;
+        .expect("test invocation owns its turn")
+        .permission_profile = PermissionProfile::Disabled;
     let payload = call.payload.clone();
-    let result = ApplyPatchHandler::default().handle(call).await.unwrap().code_mode_result(&payload);
+    let result = ApplyPatchHandler::default()
+        .handle(call)
+        .await
+        .unwrap()
+        .code_mode_result(&payload);
     assert_eq!(result["success"], true);
-    assert_eq!(result["diagnostics"], json!([
-        {"path": path, "line": 2, "kind": "trailing_whitespace"},
-        {"path": path, "line": 3, "kind": "space_before_tab"},
-        {"path": path, "line": 4, "kind": "conflict_marker"},
-        {"path": path, "line": 5, "kind": "conflict_marker"},
-        {"path": path, "line": 6, "kind": "conflict_marker"},
-    ]));
+    assert_eq!(
+        result["diagnostics"],
+        json!([
+            {"path": path, "line": 2, "kind": "trailing_whitespace"},
+            {"path": path, "line": 3, "kind": "space_before_tab"},
+            {"path": path, "line": 4, "kind": "conflict_marker"},
+            {"path": path, "line": 5, "kind": "conflict_marker"},
+            {"path": path, "line": 6, "kind": "conflict_marker"},
+        ])
+    );
+}
+
+/// A preflight that finds several conflicts must still name the observed
+/// source. Aggregating the failures into one untyped report left
+/// `observed_source` null, so the model had to re-read the file in a separate
+/// request before it could use the retry receipt.
+#[tokio::test]
+async fn multi_conflict_preflight_still_reports_observed_source_for_retry() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("a.txt"),
+        "alpha\nbeta\ngamma\ndelta\n",
+    )
+    .unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    )];
+    // Two independently stale contexts in one file: the aggregated
+    // "found 2 conflicts" path.
+    let call = ToolInvocation {
+        session: Arc::new(session),
+        step_context: StepContext::for_test(Arc::new(turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "multi-conflict".into(),
+        tool_name: ToolName::plain("apply_patch"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: ToolPayload::Custom {
+            input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-missing-one\n+x\n@@\n-missing-two\n+y\n*** End Patch"
+                .into(),
+        },
+    };
+    let failed = ApplyPatchHandler::default()
+        .handle(call.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&call.payload);
+
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["changes"], json!([]));
+    let text = failed["text"].as_str().unwrap();
+    assert!(text.contains("conflicts; no files were changed"), "{text}");
+
+    // The receipt exists and names the exact snapshot, so a retry needs no
+    // extra read.
+    let observed = &failed["retry"]["observed_source"];
+    assert!(
+        !observed.is_null(),
+        "multi-conflict retry lost observed_source: {failed}"
+    );
+    assert_eq!(
+        observed["sha256"],
+        crate::tool_history::sha256(b"alpha\nbeta\ngamma\ndelta\n")
+    );
+    assert_eq!(observed["hunk"], 1);
+    // Every aggregated conflict is enumerated, not just the first.
+    let conflicts = observed["conflicts"].as_array().unwrap();
+    assert!(
+        conflicts.len() >= 2,
+        "expected each conflict to be retained: {observed}"
+    );
+    assert!(
+        conflicts
+            .iter()
+            .all(|conflict| conflict["sha256"] == observed["sha256"])
+    );
+    // The typed diagnostic survives aggregation too.
+    assert_eq!(failed["diagnostics"][0]["hunk_ordinal"], 1);
+    assert!(failed["diagnostics"][0]["current_content_sha256"].is_string());
 }
 
 #[tokio::test]
@@ -87,8 +172,14 @@ async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
     assert_eq!(diagnostic["kind"], "expected_lines_not_found");
     assert_eq!(diagnostic["hunk_ordinal"], 1);
     assert_eq!(diagnostic["chunk_ordinal"], 1);
-    assert_eq!(diagnostic["current_content_sha256"], failed["retry"]["observed_source"]["sha256"]);
-    assert_eq!(diagnostic["current_content_sha256"], crate::tool_history::sha256(b"current\n"));
+    assert_eq!(
+        diagnostic["current_content_sha256"],
+        failed["retry"]["observed_source"]["sha256"]
+    );
+    assert_eq!(
+        diagnostic["current_content_sha256"],
+        crate::tool_history::sha256(b"current\n")
+    );
     assert!(diagnostic["current_excerpt"].is_string());
     assert!(diagnostic["current_line_start"].is_number());
     call.call_id = "retained-retry".into();
@@ -181,12 +272,14 @@ async fn hook_replacement_consumes_retained_id_without_replaying_original_code()
     })
     .await;
     let step = Arc::make_mut(&mut call.step_context);
-    Arc::get_mut(&mut step.turn).expect("test invocation owns its turn")
+    Arc::get_mut(&mut step.turn)
+        .expect("test invocation owns its turn")
         .permission_profile = PermissionProfile::Disabled;
     step.environments.turn_environments = vec![TurnEnvironment::new(
         codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
         Arc::new(codex_exec_server::Environment::default_for_tests()),
-        PathUri::from_host_native_path(workspace.path()).unwrap(), None,
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
     )];
     let environment = &call.step_context.environments.turn_environments[0];
     let receipt = call
@@ -212,29 +305,64 @@ async fn hook_replacement_consumes_retained_id_without_replaying_original_code()
     let mut changed = ApplyPatchHandler::default()
         .with_updated_hook_input(call.clone(), json!({"command": updated}))
         .unwrap();
-    let ToolPayload::Custom { input } = &changed.payload else { panic!("custom patch"); };
+    let ToolPayload::Custom { input } = &changed.payload else {
+        panic!("custom patch");
+    };
     let recovery = {
         let retained = call.session.services.retained_patches.lock().unwrap();
         assert_eq!(retained.prepare(input).unwrap().args.patch, updated);
-        retained.recovery_for_call(&call.call_id).expect("amended recovery")
+        retained
+            .recovery_for_call(&call.call_id)
+            .expect("amended recovery")
     };
     assert!(input.contains(recovery["patch_id"].as_str().unwrap()));
     changed.cancellation_token.cancel();
-    assert!(ApplyPatchHandler::default().handle(changed.clone()).await.is_err());
+    assert!(
+        ApplyPatchHandler::default()
+            .handle(changed.clone())
+            .await
+            .is_err()
+    );
     assert!(!workspace.path().join("different.txt").exists());
     assert!(!workspace.path().join("hello.txt").exists());
-    assert!(call.session.services.retained_patches.lock().unwrap()
-        .recovery_for_call(&call.call_id).is_some());
+    assert!(
+        call.session
+            .services
+            .retained_patches
+            .lock()
+            .unwrap()
+            .recovery_for_call(&call.call_id)
+            .is_some()
+    );
     changed.cancellation_token = tokio_util::sync::CancellationToken::new();
     let handler = ApplyPatchHandler::default();
-    let (one, two) = tokio::join!(handler.handle(changed.clone()), handler.handle(changed.clone()));
+    let (one, two) = tokio::join!(
+        handler.handle(changed.clone()),
+        handler.handle(changed.clone())
+    );
     let one = one.unwrap().code_mode_result(&changed.payload);
     let two = two.unwrap().code_mode_result(&changed.payload);
-    assert_eq!([&one, &two].iter().filter(|result| result["success"] == true).count(), 1);
-    assert_eq!(std::fs::read_to_string(workspace.path().join("different.txt")).unwrap(), "hook contents\n");
+    assert_eq!(
+        [&one, &two]
+            .iter()
+            .filter(|result| result["success"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("different.txt")).unwrap(),
+        "hook contents\n"
+    );
     assert!(!workspace.path().join("hello.txt").exists());
-    assert!(call.session.services.retained_patches.lock().unwrap()
-        .recovery_for_call(&call.call_id).is_none());
+    assert!(
+        call.session
+            .services
+            .retained_patches
+            .lock()
+            .unwrap()
+            .recovery_for_call(&call.call_id)
+            .is_none()
+    );
     assert!(
         call.session
             .services
@@ -324,9 +452,14 @@ async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structu
     assert_eq!(structured["changes"].as_array().unwrap().len(), names.len());
     assert_eq!(
         structured["changes"],
-        json!(names.iter().map(|name| json!({
-            "path": cwd.join(name).unwrap().to_path_buf(), "kind": "add", "move_path": null,
-        })).collect::<Vec<_>>())
+        json!(
+            names
+                .iter()
+                .map(|name| json!({
+                    "path": cwd.join(name).unwrap().to_path_buf(), "kind": "add", "move_path": null,
+                }))
+                .collect::<Vec<_>>()
+        )
     );
     for name in names {
         assert_eq!(
@@ -670,7 +803,9 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         let cancellation;
         let patch_text = if cancel_after_prefix {
             cancellation = serde_json::from_str::<serde_json::Value>(
-                text.lines().last().expect("structured cancellation recovery"),
+                text.lines()
+                    .last()
+                    .expect("structured cancellation recovery"),
             )
             .expect("cancellation recovery JSON");
             cancellation["details"][0]["detail"]
@@ -764,12 +899,13 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 }
             );
             assert_eq!(
-                patch_text.matches(&format!(
-                    "{} {}",
-                    if cancel_after_prefix { "A" } else { "M" },
-                    target_uri.to_path_buf().display()
-                ))
-                .count(),
+                patch_text
+                    .matches(&format!(
+                        "{} {}",
+                        if cancel_after_prefix { "A" } else { "M" },
+                        target_uri.to_path_buf().display()
+                    ))
+                    .count(),
                 0,
                 "{text}"
             );
@@ -784,7 +920,12 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             assert!(!text.contains("do not retry the whole patch"), "{text}");
             assert_eq!(writes[2]["path"], json!(target_uri));
             assert_eq!(writes[2]["sandbox"], writes[0]["sandbox"]);
-            assert_eq!(STANDARD.decode(writes[2]["dataBase64"].as_str().unwrap()).unwrap(), b"original\n");
+            assert_eq!(
+                STANDARD
+                    .decode(writes[2]["dataBase64"].as_str().unwrap())
+                    .unwrap(),
+                b"original\n"
+            );
             assert_eq!(std::fs::read(&remote_file).unwrap(), b"original\n");
             assert_eq!(std::fs::read(&blocked_file).unwrap(), b"blocked original\n");
         } else if deny_write {
@@ -982,9 +1123,15 @@ async fn patch_workspace_waits_cancel_or_time_out_without_writing_or_publishing_
                 panic!("workspace timeout must be actionable by the caller");
             };
             assert!(message.contains("workspace is busy"), "{route}: {message}");
-            assert!(message.contains("No files were changed"), "{route}: {message}");
+            assert!(
+                message.contains("No files were changed"),
+                "{route}: {message}"
+            );
         }
-        assert!(!path.exists(), "unadmitted patch must not create its target");
+        assert!(
+            !path.exists(),
+            "unadmitted patch must not create its target"
+        );
         assert_eq!(tracker.lock().await.get_unified_diff(), None);
         let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
         assert!(
@@ -1642,7 +1789,10 @@ async fn approval_keys_include_move_destination() {
     let keys = file_paths_for_action(&action);
     assert_eq!(
         keys,
-        vec![cwd.join("old/name.txt").unwrap(), cwd.join("renamed/dir/name.txt").unwrap()]
+        vec![
+            cwd.join("old/name.txt").unwrap(),
+            cwd.join("renamed/dir/name.txt").unwrap()
+        ]
     );
 }
 

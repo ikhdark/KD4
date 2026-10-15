@@ -57,26 +57,51 @@ fn template(uri_template: &str, name: &str) -> ResourceTemplate {
 #[test]
 fn incomplete_collection_prefix_preserves_status_and_continuation_in_delivery() {
     let mut meta = rmcp::model::Meta::new();
-    meta.insert("codex/collectionError".into(), json!("incomplete collection: later page timed out"));
+    meta.insert(
+        "codex/collectionError".into(),
+        json!("incomplete collection: later page timed out"),
+    );
     let resources = ListResourcesResult {
-        meta: Some(meta.clone()), next_cursor: Some("next".into()),
+        meta: Some(meta.clone()),
+        next_cursor: Some("next".into()),
         resources: vec![resource("file:///retained", "retained")],
     };
     let canonical = canonical_single_list_resources("server", &resources).unwrap();
     assert_eq!(canonical["nextCursor"], "next");
-    assert!(canonical["errors"][0]["message"].as_str().unwrap().contains("incomplete"));
-    let payload = ListResourcesPayload::from_single_server("server".into(), resources, TruncationPolicy::Bytes(10_000)).unwrap();
+    assert!(
+        canonical["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete")
+    );
+    let payload = ListResourcesPayload::from_single_server(
+        "server".into(),
+        resources,
+        TruncationPolicy::Bytes(10_000),
+    )
+    .unwrap();
     assert_eq!(payload.resources.len(), 1);
     assert_eq!(payload.next_cursor.as_deref(), Some("next"));
     assert_eq!(payload.errors.len(), 1);
     let templates = ListResourceTemplatesResult {
-        meta: Some(meta), next_cursor: Some("next-template".into()),
+        meta: Some(meta),
+        next_cursor: Some("next-template".into()),
         resource_templates: vec![template("file:///{id}", "retained")],
     };
     let canonical = canonical_single_list_resource_templates("server", &templates).unwrap();
     assert_eq!(canonical["nextCursor"], "next-template");
-    assert!(canonical["errors"][0]["message"].as_str().unwrap().contains("incomplete"));
-    let payload = ListResourceTemplatesPayload::from_single_server("server".into(), templates, TruncationPolicy::Bytes(10_000)).unwrap();
+    assert!(
+        canonical["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete")
+    );
+    let payload = ListResourceTemplatesPayload::from_single_server(
+        "server".into(),
+        templates,
+        TruncationPolicy::Bytes(10_000),
+    )
+    .unwrap();
     assert_eq!(payload.resource_templates.len(), 1);
     assert_eq!(payload.errors.len(), 1);
 }
@@ -262,10 +287,17 @@ fn list_resources_payload_from_all_servers_is_sorted() {
 
 #[test]
 fn call_tool_result_from_content_marks_success() {
-    for (success, is_error) in [(Some(true), Some(false)), (Some(false), Some(true)), (None, None)] {
+    for (success, is_error) in [
+        (Some(true), Some(false)),
+        (Some(false), Some(true)),
+        (None, None),
+    ] {
         let result = call_tool_result_from_content("resource body", success);
         assert_eq!(result.is_error, is_error);
-        assert_eq!(result.content, vec![json!({"type": "text", "text": "resource body"})]);
+        assert_eq!(
+            result.content,
+            vec![json!({"type": "text", "text": "resource body"})]
+        );
         assert_eq!(result.structured_content, None);
         assert_eq!(result.meta, None);
     }
@@ -1097,7 +1129,10 @@ async fn resource_completed_result_survives_cancelled_terminal_delivery() {
     };
     assert_eq!(output.code_mode_result(&payload), json!("known bytes"));
     assert_eq!(
-        output.canonical_result(&payload).expect("retained result").bytes,
+        output
+            .canonical_result(&payload)
+            .expect("retained result")
+            .bytes,
         codex_tools::CanonicalToolResult::json(json!({"value":"known bytes"})).bytes,
     );
     let completed = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1117,5 +1152,8 @@ async fn resource_completed_result_survives_cancelled_terminal_delivery() {
     assert!(completed.error.is_none());
     let result = completed.result.expect("completed resource result");
     assert_eq!(result.is_error, Some(false));
-    assert_eq!(result.content, vec![json!({"type":"text","text":"known bytes"})]);
+    assert_eq!(
+        result.content,
+        vec![json!({"type":"text","text":"known bytes"})]
+    );
 }

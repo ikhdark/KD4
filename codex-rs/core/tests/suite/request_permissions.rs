@@ -966,8 +966,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Result<()>
-{
+async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -1204,8 +1203,6 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
 
     Ok(())
 }
-
-
 
 #[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1541,9 +1538,14 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
     .await?;
     wait_for_completion(&test).await;
 
-    let output = results.single_request().function_call_output_text("exec-call")
+    let output = results
+        .single_request()
+        .function_call_output_text("exec-call")
         .expect("expired grant returns a model-visible rejection");
-    assert!(output.contains("missing `additional_permissions`"), "{output}");
+    assert!(
+        output.contains("missing `additional_permissions`"),
+        "{output}"
+    );
     assert!(
         !later_turn_write.exists(),
         "a turn-scoped grant must not authorize execution in a later turn"
@@ -1799,11 +1801,7 @@ async fn granular_inline_execution_approval(
             "{}",
             result.stdout
         );
-        assert!(
-            result.exit_code == Some(0),
-            "{}",
-            result.stdout
-        );
+        assert!(result.exit_code == Some(0), "{}", result.stdout);
     } else {
         assert!(
             !marker.exists(),

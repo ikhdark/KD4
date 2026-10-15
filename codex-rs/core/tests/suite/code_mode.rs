@@ -252,11 +252,15 @@ fn projected_native_text(output: &str, row: &Value) -> String {
     }
     let count = row["text_lines"].as_u64().expect("counted native text") as usize;
     let (_, text) = output.split_once('\n').expect("native text after envelope");
-    let text = text.split_once('\n').filter(|(line, _)| {
-        line.strip_prefix("[source ").and_then(|line| line.strip_suffix(']'))
-            .and_then(|json| serde_json::from_str::<Value>(json).ok())
-            .is_some_and(|value| value["body"].is_number() && value["selector"].is_object())
-    }).map_or(text, |(_, text)| text);
+    let text = text
+        .split_once('\n')
+        .filter(|(line, _)| {
+            line.strip_prefix("[source ")
+                .and_then(|line| line.strip_suffix(']'))
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+                .is_some_and(|value| value["body"].is_number() && value["selector"].is_object())
+        })
+        .map_or(text, |(_, text)| text);
     let lines = text.split('\n').take(count).collect::<Vec<_>>();
     assert_eq!(lines.len(), count, "native text must be complete");
     lines.join("\n")
@@ -295,6 +299,19 @@ fn text_item(items: &[Value], index: usize) -> &str {
         .get("text")
         .and_then(Value::as_str)
         .expect("content item should be input_text")
+}
+
+/// Cell IDs are session-qualified: `<runtime incarnation UUID>/<sequence>`.
+macro_rules! cell_namespace_pattern {
+    () => {
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    };
+}
+
+macro_rules! cell_id_pattern {
+    () => {
+        concat!(cell_namespace_pattern!(), r"/\d+")
+    };
 }
 
 fn extract_running_cell_id(text: &str) -> String {
@@ -535,7 +552,11 @@ text(JSON.stringify({{chunks,polls,released,exit_code:result.exit_code,session_i
         .map(|v| v.as_str().unwrap())
         .collect::<String>();
     assert_eq!(chunks, "firstmiddlelast");
-    assert_eq!(fs::read_to_string(launch_marker)?, "x", "launch exactly once");
+    assert_eq!(
+        fs::read_to_string(launch_marker)?,
+        "x",
+        "launch exactly once"
+    );
     let requests = server
         .received_requests()
         .await
@@ -627,7 +648,10 @@ text(JSON.stringify(shape));
     );
     assert_eq!(shape["resultCount"], 4, "all requested ranges: {reported}");
     assert_eq!(shape["firstStatus"], "ok");
-    assert_eq!(shape["allExact"], true, "all source bytes reach JavaScript: {reported}");
+    assert_eq!(
+        shape["allExact"], true,
+        "all source bytes reach JavaScript: {reported}"
+    );
     assert_eq!(
         shape["hasSections"],
         Value::Bool(false),
@@ -665,7 +689,6 @@ async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()>
 
     Ok(())
 }
-
 
 async fn run_code_mode_turn_with_rmcp(
     server: &MockServer,
@@ -1258,8 +1281,6 @@ async fn code_mode_validation_preserves_tools_for_remaining_work(
     Ok(())
 }
 
-
-
 /// A final answer alone must not retire the working set. A bounded result keeps
 /// its original projection and exact recovery route across later user turns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1326,9 +1347,15 @@ async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task
     test.submit_turn("Start an unrelated task.").await?;
     let next_request = next_task.single_request();
     let pinned = raw_custom_tool_output_text(&next_request, "answered-evidence");
-    assert_eq!(pinned, raw, "a new request is not an explicit evidence checkpoint");
+    assert_eq!(
+        pinned, raw,
+        "a new request is not an explicit evidence checkpoint"
+    );
     let pin = output_recovery_receipt(&next_request, "answered-evidence");
-    assert_eq!(pin, output_recovery_receipt(&answered.single_request(), "answered-evidence"));
+    assert_eq!(
+        pin,
+        output_recovery_receipt(&answered.single_request(), "answered-evidence")
+    );
     assert_output_has_truncation_marker(&raw);
     let input = next_request.body_json()["input"]
         .as_array()
@@ -1447,13 +1474,19 @@ async fn output_only_preserves_running_command_and_recovers_middle(
     assert!(!raw.contains("Script failed"), "{raw}");
     assert_eq!(raw.contains("INITIAL_RESULT"), !zero_budget, "{raw}");
     assert!(!raw.contains("DECISIVE_FINAL_RESULT"), "{raw}");
-    let session_id = raw.lines()
+    let session_id = raw
+        .lines()
         .find_map(|line| line.strip_prefix("Running command session_id: "))
         .expect("output-only cells must retain the live handle")
         .parse::<u64>()?;
-    let incarnation = raw.lines()
+    let incarnation = raw
+        .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find_map(|value| value["session_capabilities"]["incarnation"].as_str().map(str::to_owned))
+        .find_map(|value| {
+            value["session_capabilities"]["incarnation"]
+                .as_str()
+                .map(str::to_owned)
+        })
         .expect("output-only cells must retain the process incarnation");
     fs::write(&release, "go")?;
 
@@ -1478,15 +1511,19 @@ async fn output_only_preserves_running_command_and_recovers_middle(
     )
     .await;
     let completed = test
-        .submit_turn_and_capture_completion("Collect the remaining output using the returned handle.")
+        .submit_turn_and_capture_completion(
+            "Collect the remaining output using the returned handle.",
+        )
         .await?;
     let counters = &completed.timing.as_ref().expect("turn timing").counters;
     assert!(
         counters.tool_output_truncation_count > counters.tool_output_projection_truncation_count,
         "the native command reduction must be counted independently of outer projection"
     );
-    assert!(raw_custom_tool_output_text(&observed.single_request(), "call-1")
-        .contains(&format!("Running command session_id: {session_id}")));
+    assert!(
+        raw_custom_tool_output_text(&observed.single_request(), "call-1")
+            .contains(&format!("Running command session_id: {session_id}"))
+    );
     let raw = raw_custom_tool_output_text(&observed.single_request(), "poll");
     assert_eq!(
         raw.matches("DECISIVE_FINAL_RESULT").count(),
@@ -1746,8 +1783,15 @@ store('large', result);"#),
         // The script envelope can join the result and its recovery directory.
         .flat_map(str::lines)
         .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .find_map(|value| value["result"].as_str().filter(|text| text.starts_with("exit_code: 0\n")).map(str::to_string))
-        .unwrap_or_else(|| panic!("a silent cell must expose its retained nested evidence: {retained_items:?}"));
+        .find_map(|value| {
+            value["result"]
+                .as_str()
+                .filter(|text| text.starts_with("exit_code: 0\n"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            panic!("a silent cell must expose its retained nested evidence: {retained_items:?}")
+        });
     assert!(retained.len() <= 4_096);
     assert!(retained.contains('🙂'));
     assert!(retained.contains("END_OF_REQUIRED_EVIDENCE"));
@@ -2007,7 +2051,9 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
 #[test_case::test_case("calendar timezone option 99"; "capability query")]
 #[test_case::test_case("+source:mcp__codex_apps__calendar_c529dda749f0 _timezone_o_25fdf15747c7 unavailable_tool"; "partial scoped names")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools(query: &str) -> Result<()> {
+async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools(
+    query: &str,
+) -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
@@ -2114,7 +2160,10 @@ if (!tool) {
         PermissionProfile::Disabled,
     )
     .await?;
-    eprintln!("discovery through complete turn: {:?}; query: {query}", started.elapsed());
+    eprintln!(
+        "discovery through complete turn: {:?}; query: {query}",
+        started.elapsed()
+    );
 
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
@@ -2201,10 +2250,16 @@ text(JSON.stringify({{
   error,
 }}));
 "#,
-        visible_tool_name = codex_tools::code_mode_name_for_tool_name(
-            &codex_protocol::ToolName::namespaced(SEARCH_CALENDAR_NAMESPACE, "_timezone_o_25fdf15747c7")),
-        tool_name = codex_tools::code_mode_name_for_tool_name(
-            &codex_protocol::ToolName::namespaced(SEARCH_CALENDAR_NAMESPACE, "_app_only_a_ffcedc1513b2")),
+        visible_tool_name =
+            codex_tools::code_mode_name_for_tool_name(&codex_protocol::ToolName::namespaced(
+                SEARCH_CALENDAR_NAMESPACE,
+                "_timezone_o_25fdf15747c7"
+            )),
+        tool_name =
+            codex_tools::code_mode_name_for_tool_name(&codex_protocol::ToolName::namespaced(
+                SEARCH_CALENDAR_NAMESPACE,
+                "_app_only_a_ffcedc1513b2"
+            )),
     );
 
     responses::mount_sse_once(
@@ -2509,7 +2564,13 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    assert_eq!(output, format!("Variable truncated: False. Variable: {}", "x".repeat(50_000)));
+    assert_eq!(
+        output,
+        format!(
+            "Variable truncated: False. Variable: {}",
+            "x".repeat(50_000)
+        )
+    );
 
     Ok(())
 }
@@ -2628,7 +2689,13 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    assert_eq!(output, format!("Variable truncated: False. Variable: {}", "x".repeat(50_000)));
+    assert_eq!(
+        output,
+        format!(
+            "Variable truncated: False. Variable: {}",
+            "x".repeat(50_000)
+        )
+    );
 
     Ok(())
 }
@@ -2764,10 +2831,7 @@ throw new Error("boom");
     let items = custom_tool_output_items(&req, "call-1");
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
         text_item(&items, /*index*/ 0),
     );
     assert_regex_match(
@@ -2873,7 +2937,11 @@ text("phase 3");
     let first_request = first_completion.single_request();
     let first_output = raw_custom_tool_output_text(&first_request, "call-1");
     assert_regex_match(
-        r"\AScript running with cell ID \d+ after explicit yield\nphase 1\z",
+        concat!(
+            r"\AScript running with cell ID ",
+            cell_id_pattern!(),
+            r" after explicit yield\nphase 1\z"
+        ),
         &first_output,
     );
     let cell_id = extract_running_cell_id(&first_output);
@@ -2909,9 +2977,17 @@ text("phase 3");
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
     assert_eq!(second_items.len(), 2);
-    let second_output = format!("{}\n{}", text_item(&second_items, 0), text_item(&second_items, 1));
+    let second_output = format!(
+        "{}\n{}",
+        text_item(&second_items, 0),
+        text_item(&second_items, 1)
+    );
     assert_regex_match(
-        r"\AScript running with cell ID \d+ after explicit yield\nphase 2\z",
+        concat!(
+            r"\AScript running with cell ID ",
+            cell_id_pattern!(),
+            r" after explicit yield\nphase 2\z"
+        ),
         &second_output,
     );
     assert_eq!(extract_running_cell_id(&second_output), cell_id);
@@ -3002,7 +3078,9 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+(?: after explicit yield)?\z"
+            r"Script running with cell ID ",
+            cell_id_pattern!(),
+            r"(?: after explicit yield)?\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -3041,7 +3119,9 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script terminated with cell ID \d+\z"
+            r"Script terminated with cell ID ",
+            cell_id_pattern!(),
+            r"\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -3396,7 +3476,9 @@ for (let index = 0; index < 10; index++) {
 text("progress log");
 await tools.fixture__result({index: 10});
 text("must not run after cancellation");
-"#.replace("fixture__result", &fixture_tool).as_str(),
+"#
+                    .replace("fixture__result", &fixture_tool)
+                    .as_str(),
                 ),
                 ev_completed("retained-start"),
             ]),
@@ -3404,15 +3486,10 @@ text("must not run after cancellation");
         vec![StreamingSseChunk {
             // Keep the original turn active so its nested dynamic calls can
             // receive responses, then terminate after the eleventh call starts.
+            // Cell IDs are session-qualified, so this wait call is supplied
+            // once the running cell's ID is observed, before the gate opens.
             gate: Some(termination_ready),
-            body: sse(vec![
-                responses::ev_function_call(
-                    "retained-terminate",
-                    "wait",
-                    r#"{"cell_id":"1","terminate":true}"#,
-                ),
-                ev_completed("terminate"),
-            ]),
+            body: String::new(),
         }],
         vec![StreamingSseChunk {
             gate: None,
@@ -3422,15 +3499,9 @@ text("must not run after cancellation");
             ]),
         }],
         vec![StreamingSseChunk {
+            // Supplied with the closed cell's ID before the later turn starts.
             gate: None,
-            body: sse(vec![
-                responses::ev_function_call(
-                    "retained-after",
-                    "wait",
-                    r#"{"cell_id":"1","yield_time_ms":1}"#,
-                ),
-                ev_completed("after"),
-            ]),
+            body: String::new(),
         }],
         vec![StreamingSseChunk {
             gate: None,
@@ -3501,11 +3572,34 @@ text("must not run after cancellation");
     // completes: the later cancellation packet must carry those results itself.
     tokio::time::timeout(Duration::from_secs(10), server.wait_for_request_count(2)).await?;
     let started = output_for(&server.requests().await[1], "retained-exec").to_string();
-    assert!(
-        started.contains("Script running with cell ID 1"),
-        "{started}"
-    );
+    // The first cell of this runtime incarnation carries sequence 1.
+    let cell_id = assert_regex_match(
+        concat!(
+            r"Script running with cell ID (",
+            cell_namespace_pattern!(),
+            r"/1)\b"
+        ),
+        &started,
+    )[1]
+    .to_string();
     assert!(!started.contains("RETAINED_RESULT_"));
+    let wait_call = |call_id: &str, response_id: &str, arguments: Value| {
+        sse(vec![
+            responses::ev_function_call(call_id, "wait", &arguments.to_string()),
+            ev_completed(response_id),
+        ])
+    };
+    server
+        .replace_chunk_body(
+            /*response_index*/ 1,
+            /*chunk_index*/ 0,
+            wait_call(
+                "retained-terminate",
+                "terminate",
+                serde_json::json!({"cell_id": cell_id, "terminate": true}),
+            ),
+        )
+        .await;
     for index in 0..10 {
         assert_eq!(request.arguments, serde_json::json!({"index":index}));
         test.codex
@@ -3562,25 +3656,45 @@ text("must not run after cancellation");
     assert_eq!(retained[0]["result"], "RETAINED_RESULT_0");
     assert_eq!(retained[1]["result"]["status"], "aborted");
     assert_eq!(retained[2]["omitted_inline_result_count"], 9);
-    let directory = retained[2]["nested_result_recovery_directory"].as_array().unwrap();
+    let directory = retained[2]["nested_result_recovery_directory"]
+        .as_array()
+        .unwrap();
     assert_eq!(directory.len(), 11);
     for (index, item) in directory.iter().take(10).enumerate() {
         assert_eq!(item["failed"], false);
-        assert_eq!(item["outcome"]["result"], format!("RETAINED_RESULT_{index}"));
+        assert_eq!(
+            item["outcome"]["result"],
+            format!("RETAINED_RESULT_{index}")
+        );
     }
     assert_eq!(directory[10]["failed"], true);
     assert_eq!(directory[10]["outcome"]["result"]["status"], "aborted");
     assert!(!visible.contains("must not run after cancellation"));
 
+    server
+        .replace_chunk_body(
+            /*response_index*/ 3,
+            /*chunk_index*/ 0,
+            wait_call(
+                "retained-after",
+                "after",
+                serde_json::json!({"cell_id": cell_id, "yield_time_ms": 1}),
+            ),
+        )
+        .await;
     test.submit_turn("observe the closed cell again").await?;
     let sent = server.requests().await;
     assert_eq!(sent.len(), 5);
     let after = output_for(&sent[4], "retained-after").to_string();
     // Closed cells replay their cached terminal event. Per-packet nested
     // evidence has been consumed and must not reappear on a later observation.
-    assert!(
-        after.contains("Script terminated with cell ID 1"),
-        "{after}"
+    assert_regex_match(
+        concat!(
+            r"Script terminated with cell ID ",
+            cell_namespace_pattern!(),
+            r"/1\b"
+        ),
+        &after,
     );
     assert!(after.contains("progress log"), "{after}");
     assert!(!after.contains("RETAINED_RESULT_"));
@@ -3664,11 +3778,17 @@ text("phase 2");
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
     assert!(!second_items.is_empty());
-    assert!(!second_items.iter().any(|item| item["text"].as_str().is_some_and(|text| text.contains("phase 2"))));
+    assert!(!second_items.iter().any(|item| {
+        item["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("phase 2"))
+    }));
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script terminated with cell ID \d+\z"
+            r"Script terminated with cell ID ",
+            cell_id_pattern!(),
+            r"\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -3775,7 +3895,9 @@ await new Promise(resolve => setTimeout(resolve, 60_000));"#,
         .expect("function tool output should be present");
     assert_ne!(success, Some(true));
     let output = output.expect("wait failure should include text output");
-    let receipt = output.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    let receipt = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|value| value["kind"] == "exec_result_unavailable")
         .expect("unknown cell must return a typed unavailable receipt");
     assert_eq!(receipt["cell_id"], "999999");
@@ -3952,7 +4074,9 @@ text("after yield");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+(?: after explicit yield)?\z"
+            r"Script running with cell ID ",
+            cell_id_pattern!(),
+            r"(?: after explicit yield)?\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -4105,8 +4229,6 @@ text({ json: true });
     Ok(())
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_notify_injects_additional_exec_tool_output_into_active_context() -> Result<()> {
     require_network!();
@@ -4129,7 +4251,9 @@ text("done");
         .any(|item| {
             item.get("call_id").and_then(serde_json::Value::as_str) == Some("call-1")
                 && item.get("name").and_then(serde_json::Value::as_str) == Some("exec")
-                && item["output"].to_string().contains("code_mode_notify_marker")
+                && item["output"]
+                    .to_string()
+                    .contains("code_mode_notify_marker")
         });
     assert!(
         has_notify_output,
@@ -4199,10 +4323,7 @@ text(circular);
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
         text_item(&items, /*index*/ 0),
     );
     assert!(text_item(&items, /*index*/ 1).contains("Script error:"));
@@ -4351,10 +4472,7 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
         text_item(&items, /*index*/ 0),
     );
     assert_eq!(
@@ -4438,7 +4556,9 @@ image(out);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"(?:Script running with cell ID \d+)?\z"
+            r"(?:Script running with cell ID ",
+            cell_id_pattern!(),
+            r")?\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -4486,7 +4606,9 @@ image(imageItem);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"(?:Script running with cell ID \d+)?\z"
+            r"(?:Script running with cell ID ",
+            cell_id_pattern!(),
+            r")?\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -4602,13 +4724,19 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         assert_eq!(exec_description.matches("declare const tools:").count(), 1);
         if code_mode_only {
             assert!(direct.is_none(), "code-mode-only patches resolve lazily");
-            assert!(exec_description.contains("apply_patch(input: string"), "the bootstrap callable remains advertised");
+            assert!(
+                exec_description.contains("apply_patch(input: string"),
+                "the bootstrap callable remains advertised"
+            );
         } else {
             let direct = direct.expect("mixed mode retains raw apply_patch");
             assert_eq!(direct["description"], description);
             assert!(exec_description.contains("apply_patch(input: string"));
         }
-        assert_eq!(exec_description.matches(description).count(), usize::from(code_mode_only));
+        assert_eq!(
+            exec_description.matches(description).count(),
+            usize::from(code_mode_only)
+        );
         assert_eq!(output["result"]["success"], true);
         assert_eq!(output["result"]["changes_exact"], true);
         assert_eq!(output["result"]["changes"].as_array().unwrap().len(), 1);
@@ -4627,8 +4755,6 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
     }
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_mcp_tool() -> Result<()> {
@@ -4752,8 +4878,6 @@ text(JSON.stringify({
 
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_normalized_illegal_mcp_tool_names() -> Result<()> {
@@ -4901,12 +5025,30 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "yield_control",
     ];
     for required in [
-        "tools", "text", "image", "store", "load", "listKeys", "deleteStored",
-        "notify", "yield_control", "setTimeout", "clearTimeout", "resolve_tool",
-        "ALL_TOOLS", "ALL_TOOL_NAMES", "read_files", "read_status", "await_command",
-        "run_graph", "format_tool_result",
+        "tools",
+        "text",
+        "image",
+        "store",
+        "load",
+        "listKeys",
+        "deleteStored",
+        "notify",
+        "yield_control",
+        "setTimeout",
+        "clearTimeout",
+        "resolve_tool",
+        "ALL_TOOLS",
+        "ALL_TOOL_NAMES",
+        "read_files",
+        "read_status",
+        "await_command",
+        "run_graph",
+        "format_tool_result",
     ] {
-        assert!(globals.contains(required), "missing runtime helper {required}");
+        assert!(
+            globals.contains(required),
+            "missing runtime helper {required}"
+        );
     }
     for g in &globals {
         assert!(
@@ -5228,7 +5370,8 @@ text(JSON.stringify({
   allowedType: typeof tools.update_plan,
   allowedMetadata: ALL_TOOLS.some(({ name }) => name === "update_plan"),
 }));
-"#.replace("EXCLUDED_NAME", &serde_json::to_string(&excluded_name)?),
+"#
+                .replace("EXCLUDED_NAME", &serde_json::to_string(&excluded_name)?),
             ),
             ev_completed("resp-1"),
         ]),

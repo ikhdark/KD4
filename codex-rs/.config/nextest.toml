@@ -137,3 +137,10 @@ test-group = 'windows_core'
 platform = "cfg(windows)"
 filter = "package(codex-rollout) & test(filesystem_listing_reaches_threads_beyond_the_former_scan_cap)"
 slow-timeout = { period = "1m", terminate-after = 5 }
+
+[[profile.default.overrides]]
+# This regression drives two full logical-generation allowances (about 1,000
+# mock sampling requests) through the real turn loop; each phase has its own
+# one-minute wait inside the test.
+filter = "package(codex-core) & kind(lib) & test(=session::turn::tests::generation_budget_renews_on_reentry_input_and_persists_terminal_directive)"
+slow-timeout = { period = "1m", terminate-after = 3 }

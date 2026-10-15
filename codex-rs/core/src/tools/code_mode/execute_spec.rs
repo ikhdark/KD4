@@ -86,14 +86,8 @@ SOURCE: /[\s\S]+/
         let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
         assert!(exec_description.contains("defaults to 10000 tokens"));
-        assert!(
-            codex_code_mode::build_wait_tool_description()
-                .contains("default to 10000 tokens")
-        );
-        assert!(
-            codex_code_mode::build_wait_tool_description()
-                .contains("capped at 40000 tokens")
-        );
+        assert!(codex_code_mode::build_wait_tool_description().contains("default to 10000 tokens"));
+        assert!(codex_code_mode::build_wait_tool_description().contains("capped at 40000 tokens"));
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
             10_000

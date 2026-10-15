@@ -544,7 +544,10 @@ mod disable_powershell_profile_tests {
     fn inserts_no_profile_for_elevated_windows_sandbox() {
         for (flag, script) in [
             ("-Command", "Write-Output ok"),
-            ("-EncodedCommand", "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA"),
+            (
+                "-EncodedCommand",
+                "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA",
+            ),
         ] {
             for (level, managed_network) in [
                 (WindowsSandboxLevel::Elevated, false),
@@ -704,13 +707,18 @@ mod shell_snapshot_replay_tests {
             &command,
             &shell,
             remote_path,
-            &format!("@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n@set CODEX_CMD_VALUE=100%%^^^&! %%PATH%%\r\n"),
+            &format!(
+                "@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n@set CODEX_CMD_VALUE=100%%^^^&! %%PATH%%\r\n"
+            ),
             &HashMap::new(),
             &mut env,
         );
 
         assert_eq!(rewritten, command);
-        assert_eq!(env.get("CODEX_CMD_VALUE").map(String::as_str), Some("100%^&! %PATH%"));
+        assert_eq!(
+            env.get("CODEX_CMD_VALUE").map(String::as_str),
+            Some("100%^&! %PATH%")
+        );
         assert!(!env.contains_key("__CODEX_SNAPSHOT_FILE"));
     }
 

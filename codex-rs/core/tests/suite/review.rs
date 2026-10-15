@@ -210,11 +210,9 @@ async fn review_op_emits_lifecycle_and_review_output() {
     assert_eq!(parse_errors, 0, "invalid rollout records");
     let parent_thread_id = items
         .iter()
-        .find_map(|item| {
-            match item {
-                RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
-                _ => None,
-            }
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
+            _ => None,
         })
         .expect("parent session meta");
 
@@ -959,7 +957,10 @@ async fn review_history_surfaces_in_parent_session() {
     let input = body["input"].as_array().expect("input array");
 
     // Runtime developer context may follow the final user message.
-    let last = input.iter().rev().find(|item| item["role"] == "user")
+    let last = input
+        .iter()
+        .rev()
+        .find(|item| item["role"] == "user")
         .expect("at least one user message in input");
     assert_eq!(last["role"].as_str().unwrap(), "user");
     let last_text = last["content"][0]["text"].as_str().unwrap();
@@ -987,10 +988,16 @@ async fn review_history_surfaces_in_parent_session() {
         "review assistant output missing from parent turn input"
     );
 
-    assert_eq!(input.iter().flat_map(|msg| msg["content"].as_array().into_iter().flatten())
-        .filter_map(|item| item["text"].as_str())
-        .map(|text| text.matches("review assistant output").count()).sum::<usize>(), 1,
-        "the next provider request must contain each review result exactly once");
+    assert_eq!(
+        input
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|item| item["text"].as_str())
+            .map(|text| text.matches("review assistant output").count())
+            .sum::<usize>(),
+        1,
+        "the next provider request must contain each review result exactly once"
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;

@@ -215,8 +215,11 @@ mod deadline_tests {
         use std::time::Duration;
         let (mut session, _) = crate::session::tests::make_session_and_context().await;
         let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-        builder.thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(20))));
-        builder.thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(3600))));
+        builder
+            .thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(20))));
+        builder.thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(
+            3600,
+        ))));
         session.services.extensions = Arc::new(builder.build());
         let session = Arc::new(session);
         tokio::time::pause();
@@ -225,8 +228,11 @@ mod deadline_tests {
         assert!(started.elapsed() >= Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(31));
         let started = tokio::time::Instant::now();
-        assert!(tokio::time::timeout(Duration::from_secs(35), session.shutdown_runtime_for_test())
-            .await.expect("pending stop callback must not strand ShutdownComplete"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(35), session.shutdown_runtime_for_test())
+                .await
+                .expect("pending stop callback must not strand ShutdownComplete")
+        );
         assert!(started.elapsed() >= Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(35));
     }

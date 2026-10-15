@@ -154,7 +154,10 @@ impl CodeModeDispatchBroker {
         // never take another queued message after this handoff.
         let owner = Arc::new(());
         {
-            let mut current = self.dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut current = self
+                .dequeue_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cleanup_terminal_cells(&self.cells);
             *current = Some(Arc::clone(&owner));
         }
@@ -171,8 +174,13 @@ impl CodeModeDispatchBroker {
                 let receive = dispatch_rx.recv();
                 tokio::pin!(receive);
                 let receive = std::future::poll_fn(|cx| {
-                    let current = dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &worker_owner)) {
+                    let current = dequeue_owner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &worker_owner))
+                    {
                         return std::task::Poll::Ready(None);
                     }
                     std::future::Future::poll(receive.as_mut(), cx).map(Result::ok)
@@ -333,8 +341,13 @@ impl CodeModeDispatchBroker {
                     }
                 }
             }
-            let current = dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &worker_owner)) {
+            let current = dequeue_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &worker_owner))
+            {
                 cleanup_terminal_cells(&cells);
             }
         });
@@ -510,8 +523,14 @@ pub(crate) struct CodeModeDispatchWorker {
 
 impl Drop for CodeModeDispatchWorker {
     fn drop(&mut self) {
-        let mut current = self.dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.owner)) {
+        let mut current = self
+            .dequeue_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.owner))
+        {
             *current = None;
         }
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
@@ -523,8 +542,16 @@ impl Drop for CodeModeDispatchWorker {
 impl DispatchMessage {
     fn cancelled(&self) -> bool {
         match self {
-            Self::InvokeTool { cancellation, response_tx, .. } => cancellation.is_cancelled() || response_tx.is_closed(),
-            Self::Notify { cancellation_token, response_tx, .. } => cancellation_token.is_cancelled() || response_tx.is_closed(),
+            Self::InvokeTool {
+                cancellation,
+                response_tx,
+                ..
+            } => cancellation.is_cancelled() || response_tx.is_closed(),
+            Self::Notify {
+                cancellation_token,
+                response_tx,
+                ..
+            } => cancellation_token.is_cancelled() || response_tx.is_closed(),
         }
     }
 }
@@ -579,12 +606,20 @@ mod tests {
         let broker = CodeModeDispatchBroker::new();
         for index in 0..MAX_QUEUED_DISPATCHES * 4 {
             let cancellation = CancellationToken::new();
-            let notify = broker.notify("parent".into(), CellId::new("cell".into()), "payload".repeat(1000), cancellation.clone());
+            let notify = broker.notify(
+                "parent".into(),
+                CellId::new("cell".into()),
+                "payload".repeat(1000),
+                cancellation.clone(),
+            );
             tokio::pin!(notify);
             assert!(futures::poll!(&mut notify).is_pending());
             cancellation.cancel();
             assert!(notify.await.is_err());
-            assert_eq!(broker.dispatch_rx.len(), (index + 1).min(MAX_QUEUED_DISPATCHES));
+            assert_eq!(
+                broker.dispatch_rx.len(),
+                (index + 1).min(MAX_QUEUED_DISPATCHES)
+            );
         }
         while let Ok(message) = broker.dispatch_rx.try_recv() {
             assert!(message.cancelled(), "retired entries must never dispatch");
@@ -600,8 +635,17 @@ mod tests {
         let broker = CodeModeDispatchBroker::new();
         let start = |session: Arc<crate::session::Session>, turn| {
             let turn = Arc::new(turn);
-            broker.start_turn_worker(ExecContext { session, turn: Arc::clone(&turn) }, StepContext::for_test(turn),
-                Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())), Default::default())
+            broker.start_turn_worker(
+                ExecContext {
+                    session,
+                    turn: Arc::clone(&turn),
+                },
+                StepContext::for_test(turn),
+                Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                Default::default(),
+            )
         };
         let old = start(Arc::clone(&old_session), old_turn);
         let replacement = start(Arc::clone(&new_session), new_turn);
@@ -609,14 +653,37 @@ mod tests {
         broker.mark_cell_ready_for_dispatch(&cell);
         // The retired worker is still alive and was spawned first, so only the
         // dequeue fence keeps it from taking the queued notification.
-        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell.clone(), "replacement-only".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
-        let old_history = serde_json::to_string(&old_session.clone_history().await.into_raw_items())?;
-        let new_history = serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            broker.notify(
+                "handoff-parent".into(),
+                cell.clone(),
+                "replacement-only".into(),
+                CancellationToken::new(),
+            ),
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
+        let old_history =
+            serde_json::to_string(&old_session.clone_history().await.into_raw_items())?;
+        let new_history =
+            serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
         assert!(!old_history.contains("replacement-only"));
         assert!(new_history.contains("replacement-only"));
         drop(old); // A late old drop must not revoke its replacement.
-        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell, "after-old-drop".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
-        let new_history = serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            broker.notify(
+                "handoff-parent".into(),
+                cell,
+                "after-old-drop".into(),
+                CancellationToken::new(),
+            ),
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
+        let new_history =
+            serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
         assert!(new_history.contains("after-old-drop"));
         drop(replacement);
         Ok(())
@@ -644,57 +711,94 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_returns_buffered_cell_output_and_nested_receipts() -> anyhow::Result<()> {
-        use crate::tools::code_mode::{CodeModeService, CodeModeNestedResultEvidence};
         use crate::tools::code_mode::execute_handler::CodeModeExecuteHandler;
         use crate::tools::code_mode::wait_handler::CodeModeWaitHandler;
+        use crate::tools::code_mode::{CodeModeNestedResultEvidence, CodeModeService};
         use crate::tools::context::ToolPayload;
         use crate::tools::registry::{CoreToolRuntime, ToolRegistry};
         use crate::tools::router::{ToolCall, ToolRouter};
         use codex_tools::ToolName;
         for use_wait in [false, true] {
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
-            session.services.code_mode_service = CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
+            session.services.code_mode_service =
+                CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
             let session = Arc::new(session);
             let step = StepContext::for_test(Arc::new(turn));
             let execute = CodeModeExecuteHandler::new(
-                crate::tools::code_mode::execute_spec::create_code_mode_tool(true, false, &[], &[]), Vec::new(), Vec::new(),
-            ).map_err(anyhow::Error::msg)?;
-            let handlers: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(execute), Arc::new(CodeModeWaitHandler)];
-            let router = Arc::new(ToolRouter::from_parts(ToolRegistry::from_tools(handlers), Vec::new()));
+                crate::tools::code_mode::execute_spec::create_code_mode_tool(true, false, &[], &[]),
+                Vec::new(),
+                Vec::new(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let handlers: Vec<Arc<dyn CoreToolRuntime>> =
+                vec![Arc::new(execute), Arc::new(CodeModeWaitHandler)];
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_tools(handlers),
+                Vec::new(),
+            ));
             let step = step.with_tool_router_for_test(router);
             let timing = Arc::clone(&step.turn.turn_timing_state);
-            let tracker = Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new()));
+            let tracker = Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            ));
             let runtime = ToolCallRuntime::new(Arc::clone(&session), step, tracker);
             let service = &session.services.code_mode_service;
             // Notification admission is a deterministic rendezvous after text(),
             // not a sleep or a second observer that drains the buffered output.
             let source = "text('buffered before interrupt'); await notify('ready');";
             let call = if use_wait {
-                let started = service.execute(codex_code_mode::ExecuteRequest {
-                    state_path: None, tool_call_id: "outer".into(), enabled_tools: Vec::new().into(),
-                    source: format!("await yield_control(); {source}"), yield_time_ms: None,
-                    max_output_tokens: None, default_tool_timeout_ms: None,
-                }).await.map_err(anyhow::Error::msg)?;
+                let started = service
+                    .execute(codex_code_mode::ExecuteRequest {
+                        state_path: None,
+                        tool_call_id: "outer".into(),
+                        enabled_tools: Vec::new().into(),
+                        source: format!("await yield_control(); {source}"),
+                        yield_time_ms: None,
+                        max_output_tokens: None,
+                        default_tool_timeout_ms: None,
+                    })
+                    .await
+                    .map_err(anyhow::Error::msg)?;
                 let cell = started.cell_id.clone();
                 service.record_cell_parent_call_id(&cell, "outer");
                 service.mark_cell_ready_for_dispatch(&cell);
-                assert!(matches!(started.initial_response().await.unwrap(), codex_code_mode::RuntimeResponse::ExplicitYield { .. }));
-                ToolCall { tool_name: ToolName::plain("wait"), call_id: "wait-call".into(),
-                    payload: ToolPayload::Function { arguments: json!({"cell_id": cell.as_str()}).to_string() } }
+                assert!(matches!(
+                    started.initial_response().await.unwrap(),
+                    codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+                ));
+                ToolCall {
+                    tool_name: ToolName::plain("wait"),
+                    call_id: "wait-call".into(),
+                    payload: ToolPayload::Function {
+                        arguments: json!({"cell_id": cell.as_str()}).to_string(),
+                    },
+                }
             } else {
-                ToolCall { tool_name: ToolName::plain("exec"), call_id: "outer".into(),
-                    payload: ToolPayload::Custom { input: source.into() } }
+                ToolCall {
+                    tool_name: ToolName::plain("exec"),
+                    call_id: "outer".into(),
+                    payload: ToolPayload::Custom {
+                        input: source.into(),
+                    },
+                }
             };
             let cancellation = CancellationToken::new();
             let task = tokio::spawn(runtime.handle_tool_call(call, cancellation.clone()));
-            let notification = tokio::time::timeout(std::time::Duration::from_secs(10), service.dispatch_broker.dispatch_rx.recv()).await??;
-            let DispatchMessage::Notify { cell_id, .. } = &notification else { panic!("expected notification rendezvous"); };
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                service.dispatch_broker.dispatch_rx.recv(),
+            )
+            .await??;
+            let DispatchMessage::Notify { cell_id, .. } = &notification else {
+                panic!("expected notification rendezvous");
+            };
             // A yielded cell can enqueue its notification before wait is admitted.
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while timing.lifecycle_context().active_tool_count == 0 {
                     tokio::task::yield_now().await;
                 }
-            }).await?;
+            })
+            .await?;
             let ordinal = service.begin_packet_call(cell_id).unwrap();
             service.complete_packet_call(cell_id, ordinal, false, 0, Vec::new(), Some(CodeModeNestedResultEvidence {
                 failed: false, ordinal, call_id: "completed-nested".into(), parent_call_id: Some("outer".into()),
@@ -705,12 +809,16 @@ mod tests {
                 command_state: Some(json!({"tool":"exec_command", "session_id":60964, "process_exited":false})),
             }), None);
             cancellation.cancel();
-            let response = tokio::time::timeout(std::time::Duration::from_secs(10), task).await???;
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(10), task).await???;
             let text = serde_json::to_string(&response)?;
             assert!(text.contains("buffered before interrupt"), "{text}");
             assert!(text.contains("completed nested result"), "{text}");
             assert!(text.contains("60964"), "{text}");
-            assert!(!text.contains("cleanup_state"), "cleanup must finish before the response: {text}");
+            assert!(
+                !text.contains("cleanup_state"),
+                "cleanup must finish before the response: {text}"
+            );
             assert!(!service.dispatch_broker.has_waitable_cells());
             drop(notification);
             service.shutdown().await.map_err(anyhow::Error::msg)?;
@@ -955,7 +1063,11 @@ mod tests {
             loop {
                 // The fixture deliberately holds session state; only drain the
                 // physical recorder, without reacquiring it for artifact sync.
-                session.live_thread().expect("attached persistence").flush().await?;
+                session
+                    .live_thread()
+                    .expect("attached persistence")
+                    .flush()
+                    .await?;
                 if outputs(&physical(&rollout).await?, CALL).len() == 1 {
                     break;
                 }

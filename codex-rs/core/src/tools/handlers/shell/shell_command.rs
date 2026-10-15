@@ -258,8 +258,12 @@ impl ShellCommandHandler {
         mut invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let Some(turn_environment) = crate::tools::handlers::wait_for_tool_environment(
-            &invocation.step_context.environments, None, &invocation.cancellation_token,
-        ).await? else {
+            &invocation.step_context.environments,
+            None,
+            &invocation.cancellation_token,
+        )
+        .await?
+        else {
             return Err(FunctionCallError::RespondToModel(
                 "shell is unavailable in this session".to_string(),
             ));
@@ -386,7 +390,8 @@ impl ShellCommandHandler {
             original_shell_type,
             (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
             params.validation.clone(),
-        ).await;
+        )
+        .await;
         let validation_launch = validation.is_some()
             || matches!(
                 classify_validation_invocations(&validation_invocations),
@@ -844,8 +849,15 @@ mod tests {
             json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"], "yield_time_ms": 1000, "timeout_ms": 60_000})
         ))).await.unwrap().unwrap();
         assert_eq!(output.log_preview(), "remote ok\n");
-        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
-        assert!(result["repair"].as_str().unwrap().contains("Ignored `timeout_ms`"));
+        let result = output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into(),
+        });
+        assert!(
+            result["repair"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored `timeout_ms`")
+        );
         assert_eq!(
             output.outcome_for_logging(),
             codex_tools::ToolOutputOutcome::Success
@@ -860,17 +872,25 @@ mod tests {
 
     #[test]
     fn forwarded_timeout_preserves_the_legacy_field_for_unified_exec_normalization() {
-        for (allow_login, login) in [(true, None), (false, None), (true, Some(false)), (false, Some(true))] {
+        for (allow_login, login) in [
+            (true, None),
+            (false, None),
+            (true, Some(false)),
+            (false, Some(true)),
+        ] {
             let mut input = json!({"command": "long-running", "timeout_ms": 60_000});
             if let Some(login) = login {
                 input["login"] = json!(login);
             }
             let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
-                &input.to_string(), "remote", allow_login,
+                &input.to_string(),
+                "remote",
+                allow_login,
             )
             .expect("forward shell_command arguments");
             let arguments: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
-            let mut expected = json!({"cmd": "long-running", "timeout_ms": 60_000, "environment_id": "remote"});
+            let mut expected =
+                json!({"cmd": "long-running", "timeout_ms": 60_000, "environment_id": "remote"});
             if let Some(login) = login.or((!allow_login).then_some(false)) {
                 expected["login"] = json!(login);
             }

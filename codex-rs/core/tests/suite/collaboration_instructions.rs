@@ -123,10 +123,20 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
     let request = req2.single_request();
     let user_texts = request.message_input_texts("user");
     for prompt in ["hello 1", "hello 2"] {
-        assert_eq!(user_texts.iter().filter(|text| text.as_str() == prompt).count(), 1);
+        assert_eq!(
+            user_texts
+                .iter()
+                .filter(|text| text.as_str() == prompt)
+                .count(),
+            1
+        );
     }
     let dev_texts = developer_texts(&request.input());
-    assert!(dev_texts.iter().any(|text| text.contains("<permissions instructions>")));
+    assert!(
+        dev_texts
+            .iter()
+            .any(|text| text.contains("<permissions instructions>"))
+    );
     let active_xml = collab_xml(active_instructions);
     assert_eq!(count_messages_containing(&dev_texts, &active_xml), 0);
     assert_eq!(
@@ -180,8 +190,6 @@ async fn no_collaboration_instructions_by_default() -> Result<()> {
 
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
@@ -424,7 +432,13 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     let second_text = collab_xml(second_text);
     assert_eq!(count_messages_containing(&dev_texts, &first_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &second_text), 1);
-    assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&second_text));
+    assert!(
+        dev_texts
+            .iter()
+            .rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG))
+            .unwrap()
+            .contains(&second_text)
+    );
 
     Ok(())
 }
@@ -604,7 +618,13 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     let plan_text = collab_xml(plan_text);
     assert_eq!(count_messages_containing(&dev_texts, &default_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &plan_text), 1);
-    assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&plan_text));
+    assert!(
+        dev_texts
+            .iter()
+            .rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG))
+            .unwrap()
+            .contains(&plan_text)
+    );
 
     Ok(())
 }
@@ -737,8 +757,15 @@ async fn empty_collaboration_instructions_are_ignored() -> Result<()> {
 
     let input = req.single_request().input();
     let dev_texts = developer_texts(&input);
-    assert!(dev_texts.iter().any(|text| text.contains("<permissions instructions>")));
-    assert_eq!(count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG), 0);
+    assert!(
+        dev_texts
+            .iter()
+            .any(|text| text.contains("<permissions instructions>"))
+    );
+    assert_eq!(
+        count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG),
+        0
+    );
 
     Ok(())
 }

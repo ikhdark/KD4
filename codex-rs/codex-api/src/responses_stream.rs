@@ -774,17 +774,27 @@ mod tests {
 
     #[test]
     fn transport_audit_initial_model_is_not_reemitted() {
-        let metadata = ResponsesStreamMetadata::from_headers(&HeaderMap::from_iter([
-            (HeaderName::from_static(OPENAI_MODEL_HEADER), HeaderValue::from_static("initial")),
-        ]));
+        let metadata = ResponsesStreamMetadata::from_headers(&HeaderMap::from_iter([(
+            HeaderName::from_static(OPENAI_MODEL_HEADER),
+            HeaderValue::from_static("initial"),
+        )]));
         let mut interpreter = ResponsesEventInterpreter::new(&metadata, None);
-        assert_eq!(interpreter.process_payload(
-            r#"{"type":"response.metadata","headers":{"openai-model":"initial"}}"#
-        ).unwrap().count(), 0);
-        let events = interpreter.process_payload(
-            r#"{"type":"response.metadata","headers":{"openai-model":"changed"}}"#
-        ).unwrap().collect::<Vec<_>>();
-        assert!(matches!(events.as_slice(), [ResponseEvent::ServerModel(model)] if model == "changed"));
+        assert_eq!(
+            interpreter
+                .process_payload(
+                    r#"{"type":"response.metadata","headers":{"openai-model":"initial"}}"#
+                )
+                .unwrap()
+                .count(),
+            0
+        );
+        let events = interpreter
+            .process_payload(r#"{"type":"response.metadata","headers":{"openai-model":"changed"}}"#)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(events.as_slice(), [ResponseEvent::ServerModel(model)] if model == "changed")
+        );
     }
 
     #[test]
@@ -796,11 +806,27 @@ mod tests {
             if name == "test" && arguments == r#"{"text":"hello"}"#));
 
         let event: ResponsesStreamEvent<'_> = serde_json::from_str(
-            r#"{"type":"response.completed","response":{"id":"owned-identity","end_turn":true}}"#
-        ).unwrap();
-        let id_allocation = event.response.as_ref().unwrap().id.as_ref().unwrap().as_str().unwrap().as_ptr();
-        let Some(ResponseEvent::Completed { response_id, end_turn, .. }) =
-            process_responses_event(event).unwrap() else { panic!("completion"); };
+            r#"{"type":"response.completed","response":{"id":"owned-identity","end_turn":true}}"#,
+        )
+        .unwrap();
+        let id_allocation = event
+            .response
+            .as_ref()
+            .unwrap()
+            .id
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let Some(ResponseEvent::Completed {
+            response_id,
+            end_turn,
+            ..
+        }) = process_responses_event(event).unwrap()
+        else {
+            panic!("completion");
+        };
         assert_eq!(response_id.as_ptr(), id_allocation);
         assert_eq!(end_turn, Some(true));
     }
@@ -830,7 +856,10 @@ mod tests {
             assert_eq!(item_id, "ctc_1");
             assert_eq!(item_id.as_ptr(), item_allocation);
             assert_eq!(actual_call_id.as_deref(), call_id);
-            assert_eq!(actual_call_id.as_ref().map(|id| id.as_ptr()), call_allocation);
+            assert_eq!(
+                actual_call_id.as_ref().map(|id| id.as_ptr()),
+                call_allocation
+            );
             assert_eq!(delta, "*** Begin");
         }
     }
@@ -854,13 +883,18 @@ mod tests {
             .to_string();
             let mut interpreter =
                 ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
-            let events = interpreter.process_payload(&payload).unwrap().collect::<Vec<_>>();
+            let events = interpreter
+                .process_payload(&payload)
+                .unwrap()
+                .collect::<Vec<_>>();
             if let (Some(expected_id), Some(expected_delta)) = (item_id.or(call_id), delta) {
-                assert!(matches!(events.as_slice(), [ResponseEvent::ToolCallInputDelta {
+                assert!(
+                    matches!(events.as_slice(), [ResponseEvent::ToolCallInputDelta {
                     item_id, call_id: actual_call_id, delta,
                 }] if item_id == expected_id
                     && actual_call_id.as_deref() == call_id
-                    && delta == expected_delta));
+                    && delta == expected_delta)
+                );
             } else {
                 assert!(events.is_empty());
             }
@@ -1011,7 +1045,10 @@ mod tests {
                 );
                 use codex_protocol::error::CodexErr;
                 match (code, mapped) {
-                    ("invalid_image" | "invalid_base64_image", CodexErr::InvalidRequest(message))
+                    (
+                        "invalid_image" | "invalid_base64_image",
+                        CodexErr::InvalidRequest(message),
+                    )
                     | ("cyber_policy", CodexErr::CyberPolicy { message })
                     | ("server_error", CodexErr::Stream(message, None)) => {
                         assert_eq!(message, "same message");

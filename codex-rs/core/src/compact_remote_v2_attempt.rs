@@ -137,6 +137,9 @@ pub(super) async fn run_remote_compact_v2_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
+    prompt.stream_progress_timeout = Some(super::remote_compaction_progress_timeout(
+        turn_context.provider.info(),
+    ));
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context.as_ref(),
@@ -171,14 +174,21 @@ fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
         &prompt.tool_history_fallback_input,
         &prompt.stable_context_tool_history_fallback_input,
     ] {
-        let tokens = measured.iter().find(|(previous, _)| Arc::ptr_eq(previous, input))
+        let tokens = measured
+            .iter()
+            .find(|(previous, _)| Arc::ptr_eq(previous, input))
             .map(|(_, tokens)| *tokens)
-            .unwrap_or_else(|| input.iter()
-                .map(crate::context_manager::estimate_item_token_count)
-                .fold(0_i64, i64::saturating_add));
+            .unwrap_or_else(|| {
+                input
+                    .iter()
+                    .map(crate::context_manager::estimate_item_token_count)
+                    .fold(0_i64, i64::saturating_add)
+            });
         measured.push((input, tokens));
     }
-    measured.into_iter().max_by_key(|(_, tokens)| *tokens)
+    measured
+        .into_iter()
+        .max_by_key(|(_, tokens)| *tokens)
         .map(|(input, _)| Arc::clone(input))
         .unwrap_or_else(|| Arc::clone(&prompt.input))
 }
@@ -194,7 +204,8 @@ fn append_compaction_trigger(prompt: &mut Prompt) {
         &mut prompt.tool_history_fallback_input,
         &mut prompt.stable_context_tool_history_fallback_input,
     ] {
-        if let Some((_, replacement)) = appended.iter()
+        if let Some((_, replacement)) = appended
+            .iter()
             .find(|(original, _)| Arc::ptr_eq(original, input))
         {
             *input = Arc::clone(replacement);
@@ -215,13 +226,17 @@ mod tests {
     #[test]
     fn compaction_variants_preserve_sharing_and_measure_distinct_fallbacks() {
         let small: Arc<[ResponseItem]> = vec![ResponseItem::Compaction {
-            id: None, encrypted_content: "x".repeat(1_000),
+            id: None,
+            encrypted_content: "x".repeat(1_000),
             internal_chat_message_metadata_passthrough: None,
-        }].into();
+        }]
+        .into();
         let large: Arc<[ResponseItem]> = vec![ResponseItem::Compaction {
-            id: None, encrypted_content: "y".repeat(10_000),
+            id: None,
+            encrypted_content: "y".repeat(10_000),
             internal_chat_message_metadata_passthrough: None,
-        }].into();
+        }]
+        .into();
         let mut prompt = Prompt {
             input: Arc::clone(&small),
             stable_context_fallback_input: Arc::clone(&small),
@@ -232,40 +247,75 @@ mod tests {
         append_compaction_trigger(&mut prompt);
         assert_eq!(small.len(), 1);
         assert_eq!(large.len(), 1);
-        assert!(Arc::ptr_eq(&prompt.input, &prompt.stable_context_fallback_input));
-        assert!(Arc::ptr_eq(&prompt.tool_history_fallback_input,
-            &prompt.stable_context_tool_history_fallback_input));
-        assert!(!Arc::ptr_eq(&prompt.input, &prompt.tool_history_fallback_input));
-        for input in [&prompt.input, &prompt.stable_context_fallback_input,
-            &prompt.tool_history_fallback_input, &prompt.stable_context_tool_history_fallback_input] {
+        assert!(Arc::ptr_eq(
+            &prompt.input,
+            &prompt.stable_context_fallback_input
+        ));
+        assert!(Arc::ptr_eq(
+            &prompt.tool_history_fallback_input,
+            &prompt.stable_context_tool_history_fallback_input
+        ));
+        assert!(!Arc::ptr_eq(
+            &prompt.input,
+            &prompt.tool_history_fallback_input
+        ));
+        for input in [
+            &prompt.input,
+            &prompt.stable_context_fallback_input,
+            &prompt.tool_history_fallback_input,
+            &prompt.stable_context_tool_history_fallback_input,
+        ] {
             assert_eq!(input.len(), 2);
-            assert!(matches!(input.last(), Some(ResponseItem::CompactionTrigger {})));
+            assert!(matches!(
+                input.last(),
+                Some(ResponseItem::CompactionTrigger {})
+            ));
         }
-        assert!(Arc::ptr_eq(&largest_compaction_request_input(&prompt),
-            &prompt.stable_context_tool_history_fallback_input));
+        assert!(Arc::ptr_eq(
+            &largest_compaction_request_input(&prompt),
+            &prompt.stable_context_tool_history_fallback_input
+        ));
         for largest_index in 0..4 {
             let inputs: [Arc<[ResponseItem]>; 4] = std::array::from_fn(|index| {
-                Arc::clone(if index == largest_index { &large } else { &small })
+                Arc::clone(if index == largest_index {
+                    &large
+                } else {
+                    &small
+                })
             });
-            let [input, stable_context_fallback_input, tool_history_fallback_input,
-                stable_context_tool_history_fallback_input] = inputs;
+            let [
+                input,
+                stable_context_fallback_input,
+                tool_history_fallback_input,
+                stable_context_tool_history_fallback_input,
+            ] = inputs;
             let prompt = Prompt {
-                input, stable_context_fallback_input, tool_history_fallback_input,
-                stable_context_tool_history_fallback_input, ..Default::default()
+                input,
+                stable_context_fallback_input,
+                tool_history_fallback_input,
+                stable_context_tool_history_fallback_input,
+                ..Default::default()
             };
-            assert!(Arc::ptr_eq(&largest_compaction_request_input(&prompt), &large));
+            assert!(Arc::ptr_eq(
+                &largest_compaction_request_input(&prompt),
+                &large
+            ));
         }
     }
 
     #[test]
-    #[ignore]
-    #[expect(clippy::print_stderr, reason = "This opt-in benchmark reports timing samples and their median")]
+    #[ignore = "manual local microbenchmark; timing is descriptive"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "This opt-in benchmark reports timing samples and their median"
+    )]
     fn benchmark_compaction_shared_variants() {
         let input: Arc<[ResponseItem]> = vec![ResponseItem::Compaction {
             id: None,
             encrypted_content: "x".repeat(2_000_000),
             internal_chat_message_metadata_passthrough: None,
-        }].into();
+        }]
+        .into();
         let mut samples = Vec::new();
         for _ in 0..25 {
             let mut prompt = Prompt {
@@ -281,10 +331,16 @@ mod tests {
             samples.push(started.elapsed().as_micros());
         }
         samples.sort_unstable();
-        eprintln!("compaction_shared_variants_us={samples:?} median={}", samples[12]);
+        eprintln!(
+            "compaction_shared_variants_us={samples:?} median={}",
+            samples[12]
+        );
         if let Some(directory) = std::env::var_os("COMPACTION_BENCHMARK_DIR") {
-            std::fs::write(std::path::PathBuf::from(directory).join("shared-variants.txt"),
-                format!("microseconds={samples:?}\nmedian={}\n", samples[12])).unwrap();
+            std::fs::write(
+                std::path::PathBuf::from(directory).join("shared-variants.txt"),
+                format!("microseconds={samples:?}\nmedian={}\n", samples[12]),
+            )
+            .unwrap();
         }
     }
 }

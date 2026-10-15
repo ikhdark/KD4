@@ -9,12 +9,12 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_item_token_count;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tool_history::ToolSearchReceiptV1 as RemoteToolSearchReceiptV1;
 use crate::tool_history::response_item_has_valid_tool_history_receipt;
+use crate::tool_history::tool_search_receipt_id as remote_tool_search_receipt_id;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
-use crate::tool_history::ToolSearchReceiptV1 as RemoteToolSearchReceiptV1;
-use crate::tool_history::tool_search_receipt_id as remote_tool_search_receipt_id;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -170,13 +170,14 @@ fn bounded_remote_compacted_history(
                     continue;
                 }
                 let item_tokens = |item: &ResponseItem| {
-                    usize::try_from(estimate_item_token_count(item).max(1))
-                        .unwrap_or(usize::MAX)
+                    usize::try_from(estimate_item_token_count(item).max(1)).unwrap_or(usize::MAX)
                 };
                 let tokens = search_receipt.as_ref().map_or_else(
-                    || group.iter().fold(0usize, |total, index| {
-                        total.saturating_add(item_tokens(&items[*index]))
-                    }),
+                    || {
+                        group.iter().fold(0usize, |total, index| {
+                            total.saturating_add(item_tokens(&items[*index]))
+                        })
+                    },
                     |(_, call, output)| item_tokens(call).saturating_add(item_tokens(output)),
                 );
                 if tokens <= remaining_tokens {
@@ -352,8 +353,7 @@ fn remote_tool_search_receipt_group(
                 .is_none_or(|receipt| receipt.complete)
             && status == "completed"
             && prior_omitted_result_count.unwrap_or(0) == 0;
-        let omitted_identity_count =
-            total_identity_count.saturating_sub(retained);
+        let omitted_identity_count = total_identity_count.saturating_sub(retained);
         let receipt_id = remote_tool_search_receipt_id(
             call_id,
             status,
@@ -578,7 +578,8 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
         {
             continue;
         }
-        let Some(rewritten_item) = rewritten_output_for_context_window(history.raw_items(), &receipt_index, index)
+        let Some(rewritten_item) =
+            rewritten_output_for_context_window(history.raw_items(), &receipt_index, index)
         else {
             continue;
         };
@@ -627,7 +628,9 @@ fn rewritten_output_for_context_window(
             ..
         } => {
             let call_index = *receipt_index.get(&(
-                ToolReceiptKind::Search, ToolReceiptSide::Call, call_id.as_str(),
+                ToolReceiptKind::Search,
+                ToolReceiptSide::Call,
+                call_id.as_str(),
             ))?;
             let (_, _, output) =
                 remote_tool_search_receipt_group(items, &[call_index, index], false)?;

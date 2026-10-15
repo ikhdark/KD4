@@ -836,11 +836,12 @@ impl WritableRoot {
             return false;
         };
 
-        self.protected_metadata_names
-            .iter()
-            .any(|name| crate::permissions::path_component_matches(
-                first_component.as_os_str(), std::ffi::OsStr::new(name),
-            ))
+        self.protected_metadata_names.iter().any(|name| {
+            crate::permissions::path_component_matches(
+                first_component.as_os_str(),
+                std::ffi::OsStr::new(name),
+            )
+        })
     }
 }
 
@@ -7663,7 +7664,10 @@ mod tests {
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         let err = serde_json::from_value::<SessionMeta>(unknown).unwrap_err();
-        assert!(err.to_string().contains("unknown variant `future`"), "{err}");
+        assert!(
+            err.to_string().contains("unknown variant `future`"),
+            "{err}"
+        );
         Ok(())
     }
 
@@ -8438,14 +8442,15 @@ mod tests {
         }
         for historical in ["new_named_evidence", "source_closure"] {
             assert_eq!(
-                serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(historical)).unwrap(),
+                serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(historical))
+                    .unwrap(),
                 TurnTimingProgressKind::NewSourceEvidence,
             );
         }
         assert_eq!(
-            serde_json::from_value::<TurnTimingProgressKind>(
-                serde_json::json!("new_source_evidence")
-            )
+            serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(
+                "new_source_evidence"
+            ))
             .expect("new source evidence progress kind"),
             TurnTimingProgressKind::NewSourceEvidence,
         );

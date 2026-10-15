@@ -1118,6 +1118,17 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    /// The service tier as configured now, including settings updates applied
+    /// after the current turn was constructed.
+    pub(crate) async fn configured_service_tier(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .service_tier
+            .clone()
+    }
+
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
@@ -1548,13 +1559,28 @@ impl Session {
                 });
             }
             let config_path = config.codex_home.join(CONFIG_TOML_FILE);
-            if let Some(event) = codex_features::unknown_features_warning_event(
+            // Attribute each flagged key to the layer that set it. A key
+            // injected by a managed or bundled layer is not in the user's
+            // config.toml, so advising them to edit that file cannot help.
+            let feature_origins = config.config_layer_stack.origins();
+            let user_config_file = config_path.display().to_string();
+            if let Some(event) = codex_features::unknown_features_warning_event_with_origins(
                 config
                     .config_layer_stack
                     .effective_config()
                     .get("features")
                     .and_then(TomlValue::as_table),
-                &config_path.display().to_string(),
+                &user_config_file,
+                |key| {
+                    let metadata = feature_origins.get(&format!("features.{key}"))?;
+                    if matches!(metadata.name, codex_config::ConfigLayerSource::User { .. }) {
+                        return None;
+                    }
+                    Some(codex_config::format_config_layer_source(
+                        &metadata.name,
+                        CONFIG_TOML_FILE,
+                    ))
+                },
             ) {
                 post_session_configured_events.push(event);
             }
@@ -1678,7 +1704,9 @@ impl Session {
                     },
                 )],
             );
-            let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions).with_thread_id(thread_id.to_string()));
+            let agents_md_manager = Arc::new(
+                AgentsMdManager::new(user_instructions).with_thread_id(thread_id.to_string()),
+            );
             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
@@ -1945,7 +1973,13 @@ impl Session {
                 .with_shared_http_clients(shared_model_http_clients.as_deref()),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
                     &code_mode_session_provider,
-                )).with_recovery_path(config.codex_home.join("code-mode-state").join(format!("{thread_id}.json"))),
+                ))
+                .with_recovery_path(
+                    config
+                        .codex_home
+                        .join("code-mode-state")
+                        .join(format!("{thread_id}.json")),
+                ),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
                 git_workspace,

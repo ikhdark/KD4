@@ -8,8 +8,9 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutPersistenceTelemetry;
-use codex_rollout::measure_and_filter_rollout_items;
-use codex_rollout::persisted_rollout_items;
+use codex_rollout::is_rollout_activity_event;
+use codex_rollout::measure_and_filter_rollout_items_with_activity;
+use codex_rollout::persisted_rollout_items_with_activity;
 use codex_rollout::should_persist_event_msg;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -278,13 +279,25 @@ impl LiveThread {
     /// Append history and apply its metadata. A metadata failure can occur after history
     /// was accepted; retry pending metadata with a barrier instead of replaying the batch.
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.append_items_with_durability(raw_items, true).await
+        self.append_items_with_durability(raw_items, true, false)
+            .await
     }
 
     /// Queue items in canonical order and defer rollout plus metadata durability to the next
     /// persist/flush/shutdown barrier.
     pub async fn append_items_ordered(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.append_items_with_durability(raw_items, false).await
+        self.append_items_with_durability(raw_items, false, false)
+            .await
+    }
+
+    /// Capture one explicitly enabled diagnostic observation through the existing ordered
+    /// writer. No per-delta flush: the normal terminal barrier owns durability.
+    pub async fn append_activity_event_ordered(&self, event: &EventMsg) -> ThreadStoreResult<()> {
+        if !is_rollout_activity_event(event) {
+            return Ok(());
+        }
+        self.append_items_with_durability(&[RolloutItem::EventMsg(event.clone())], false, true)
+            .await
     }
 
     pub fn should_persist_event(&self, event: &EventMsg) -> bool {
@@ -299,6 +312,7 @@ impl LiveThread {
         &self,
         raw_items: &[RolloutItem],
         durable: bool,
+        capture_activity: bool,
     ) -> ThreadStoreResult<()> {
         // Empty appends are intentionally ignored rather than represented as zero-sized batches.
         if raw_items.is_empty() {
@@ -306,10 +320,13 @@ impl LiveThread {
         }
         let (items, measurement) = if self.persistence_telemetry.is_enabled() {
             let (items, measurement) =
-                measure_and_filter_rollout_items(raw_items, self.history_mode);
+                measure_and_filter_rollout_items_with_activity(raw_items, self.history_mode, capture_activity);
             (items, Some(measurement))
         } else {
-            (persisted_rollout_items(raw_items, self.history_mode), None)
+            (
+                persisted_rollout_items_with_activity(raw_items, self.history_mode, capture_activity),
+                None,
+            )
         };
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
@@ -591,6 +608,106 @@ mod tests {
             time_to_first_token_ms: None,
             timing: None,
         }))
+    }
+
+    #[tokio::test]
+    async fn rollout_activity_failed_flush_retries_without_losing_or_duplicating_events() {
+        let home = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig {
+                codex_home: home.path().to_path_buf(),
+                sqlite_home: home.path().to_path_buf(),
+                default_model_provider_id: "test-provider".into(),
+            },
+            None,
+        ));
+        let thread_id = ThreadId::new();
+        let live = LiveThread::create(
+            store.clone(), create_params(thread_id, home.path().to_path_buf()),
+        ).await.unwrap();
+        let path = store.live_rollout_path(thread_id).await.unwrap();
+        let event =
+            EventMsg::McpToolCallProgress(codex_protocol::protocol::McpToolCallProgressEvent {
+                call_id: "call".into(),
+                message: "halfway".into(),
+                progress: Some(1.0),
+                total: Some(2.0),
+            });
+        live.append_activity_event_ordered(&event).await.unwrap();
+        assert!(!path.exists(), "activity must not force a per-event flush");
+        // A directory occupying the file name is a deterministic storage failure, even
+        // when the test process has privileges that bypass read-only permission bits.
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(live.persist().await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        live.persist().await.unwrap();
+        live.shutdown().await.unwrap();
+        let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+            .await
+            .unwrap();
+        assert_eq!(errors, 0);
+        let events: Vec<_> = items
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(events).unwrap(),
+            serde_json::to_value(vec![event]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Exercises cancellation while the metadata owner blocks an activity append"
+    )]
+    async fn rollout_activity_cancelled_before_admission_does_not_duplicate_on_retry() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(
+            store.clone(),
+            create_params(ThreadId::new(), PathBuf::new()),
+        )
+        .await
+        .unwrap();
+        let event =
+            EventMsg::McpToolCallProgress(codex_protocol::protocol::McpToolCallProgressEvent {
+                call_id: "call".into(),
+                message: "halfway".into(),
+                progress: Some(1.0),
+                total: Some(2.0),
+            });
+        let owner = live.metadata_sync.lock().await;
+        let mut append = Box::pin(live.append_activity_event_ordered(&event));
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                append.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
+        assert_eq!(store.calls().await.append_items, 0);
+        drop(append);
+        drop(owner);
+        live.append_activity_event_ordered(&event).await.unwrap();
+        assert_eq!(store.calls().await.append_items, 1);
+        assert_eq!(store.calls().await.flush_thread, 0);
+        let history = live.load_history(true).await.unwrap();
+        let events: Vec<_> = history
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(events).unwrap(),
+            serde_json::to_value(vec![event]).unwrap()
+        );
     }
 
     #[tokio::test]

@@ -26,9 +26,47 @@ pub fn persisted_rollout_items(
     items: &[RolloutItem],
     history_mode: ThreadHistoryMode,
 ) -> Vec<RolloutItem> {
+    persisted_rollout_items_with_activity(items, history_mode, false)
+}
+
+/// Opt-in diagnostic events. These carry observations, not completed history items or
+/// executable approval requests. Keeping them must not duplicate canonical completions.
+pub fn is_rollout_activity_event(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::TurnPhaseChanged(_)
+            | EventMsg::SafetyBuffering(_)
+            | EventMsg::AgentReasoningSectionBreak(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::PatchApplyUpdated(_)
+            | EventMsg::TurnDiff(_)
+            | EventMsg::McpToolCallProgress(_)
+            | EventMsg::ExecCommandOutputDelta(_)
+            | EventMsg::TerminalInteraction(_)
+    )
+}
+
+pub fn is_persisted_rollout_item_with_activity(
+    item: &RolloutItem,
+    history_mode: ThreadHistoryMode,
+    capture_activity: bool,
+) -> bool {
+    is_persisted_rollout_item(item, history_mode)
+        || (capture_activity
+            && matches!(item, RolloutItem::EventMsg(event) if is_rollout_activity_event(event)))
+}
+
+pub fn persisted_rollout_items_with_activity(
+    items: &[RolloutItem],
+    history_mode: ThreadHistoryMode,
+    capture_activity: bool,
+) -> Vec<RolloutItem> {
     let mut persisted = Vec::new();
     for item in items {
-        if is_persisted_rollout_item(item, history_mode) {
+        if is_persisted_rollout_item_with_activity(item, history_mode, capture_activity) {
             persisted.push(item.clone());
         }
     }
@@ -66,9 +104,10 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         EventMsg::ItemCompleted(event) => {
             // Paginated rollouts store TurnItems.
             // Legacy assistant events lack IDs; keep their canonical item for output recovery.
+            // Legacy compaction markers also lack the canonical item's metadata.
             // Other legacy items are retained only when they lack a raw/legacy equivalent.
             matches!(history_mode, ThreadHistoryMode::Paginated)
-                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_))
+                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_) | TurnItem::ContextCompaction(_))
                 || matches!(&event.item, TurnItem::DynamicToolCall(item)
                     if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell")
         }
@@ -159,6 +198,7 @@ mod tests {
     use super::persisted_rollout_items;
     use super::should_persist_event_msg;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::HasLegacyEvent;
     use codex_protocol::protocol::McpToolCallProgressEvent;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::ThreadHistoryMode;
@@ -258,6 +298,93 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(events).unwrap(),
                 serde_json::to_value(&expected).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_metadata_survives_record_and_load_in_both_history_modes() {
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let mut live_items = Vec::new();
+            let mut expected = Vec::new();
+            for (id, tokens_before, tokens_after, omitted_text) in [
+                ("compaction-a", 20_000, 12_000, true),
+                ("compaction-b", 18_000, 10_000, false),
+            ] {
+                let item = codex_protocol::items::TurnItem::ContextCompaction(
+                    codex_protocol::items::ContextCompactionItem {
+                        id: id.into(),
+                        tokens_before: Some(tokens_before),
+                        tokens_after: Some(tokens_after),
+                        omitted_image_count: Some(2),
+                        retained_image_count: Some(0),
+                        omitted_text: Some(omitted_text),
+                    },
+                );
+                let completed = EventMsg::ItemCompleted(
+                    codex_protocol::protocol::ItemCompletedEvent {
+                        thread_id: codex_protocol::ThreadId::default(),
+                        turn_id: "turn-1".into(),
+                        completed_at_ms: 0,
+                        item,
+                    },
+                );
+                // The emitter sends the canonical completion before its legacy mirror.
+                live_items.push(RolloutItem::EventMsg(completed.clone()));
+                expected.push(RolloutItem::EventMsg(completed.clone()));
+                for mirror in completed.as_legacy_events(false) {
+                    live_items.push(RolloutItem::EventMsg(mirror.clone()));
+                    if matches!(history_mode, ThreadHistoryMode::Legacy) {
+                        expected.push(RolloutItem::EventMsg(mirror));
+                    }
+                }
+            }
+            let persisted = persisted_rollout_items(&live_items, history_mode);
+            assert_eq!(
+                serde_json::to_value(&persisted).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            let home = tempfile::tempdir().unwrap();
+            let config = crate::config::RolloutConfig {
+                codex_home: home.path().to_path_buf(),
+                sqlite_home: home.path().to_path_buf(),
+                cwd: home.path().to_path_buf(),
+                model_provider_id: "test-provider".to_string(),
+            };
+            let thread_id = codex_protocol::ThreadId::new();
+            let recorder = crate::recorder::RolloutRecorder::new(
+                &config,
+                crate::recorder::RolloutRecorderParams::new(
+                    thread_id,
+                    None,
+                    None,
+                    codex_protocol::protocol::SessionSource::Exec,
+                    None,
+                    "compaction-metadata-test".to_string(),
+                    codex_protocol::models::BaseInstructions::default(),
+                    Vec::new(),
+                )
+                .with_history_mode(history_mode),
+            )
+            .await
+            .unwrap();
+            recorder.record_canonical_items(&persisted).await.unwrap();
+            recorder.persist().await.unwrap();
+            recorder.shutdown().await.unwrap();
+            let (replayed, loaded_id, errors) =
+                crate::recorder::RolloutRecorder::load_rollout_items(recorder.rollout_path())
+                    .await
+                    .unwrap();
+            assert_eq!(loaded_id, Some(thread_id));
+            assert_eq!(errors, 0);
+            let events = replayed
+                .into_iter()
+                .filter(|item| matches!(item, RolloutItem::EventMsg(_)))
+                .collect::<Vec<_>>();
+            // Both IDs and every metadata field must survive real JSONL storage.
+            assert_eq!(
+                serde_json::to_value(events).unwrap(),
+                serde_json::to_value(expected).unwrap()
             );
         }
     }

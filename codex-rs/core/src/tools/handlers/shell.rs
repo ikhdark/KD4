@@ -159,12 +159,12 @@ pub(super) fn shell_sampling_signal(
     shell_failure_sampling_signal(attempt_key, command, exit_code).or_else(|| {
         (exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)))
             .then(|| {
-                let mut signal = crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
-                    crate::tools::context::successful_command_evidence(
+                let mut signal = crate::tools::context::semantic_evidence_sampling_signal(
+                    serde_json::json!(crate::tools::context::successful_command_evidence(
                         canonical_output.unwrap_or_default(),
                         Some(command),
-                    )
-                ));
+                    )),
+                );
                 signal["command_evidence"] = json!(true);
                 signal["empty_output"] = json!(canonical_output.unwrap_or_default().is_empty());
                 if let Some(lineage) = crate::tools::context::declared_lineage_evidence(
@@ -328,19 +328,25 @@ pub(super) async fn run_exec_like(
             environment_id: args.turn_environment.environment_id.clone(),
             command: args.exec_params.command.clone(),
             environment_fingerprint: validation_environment_hash(&args.exec_params.env),
-            cwd: if args.turn_environment.environment.is_remote() { None } else {
+            cwd: if args.turn_environment.environment.is_remote() {
+                None
+            } else {
                 Some(args.exec_params.cwd.as_path().to_path_buf())
             },
         });
     }
-    let validation = command_validation.as_ref().and_then(|validation| validation.declared.clone());
+    let validation = command_validation
+        .as_ref()
+        .and_then(|validation| validation.declared.clone());
     let validation_output_owned = args.validation_launch;
     let max_output_tokens = args.max_output_tokens;
     let mut result = run_exec_like_with_exit_code(args).await?;
     if let Some(signal) = result.output.sampling_request_signal.as_mut() {
         crate::tools::context::attach_command_validation(
-            signal, result.canonical_output.as_deref().unwrap_or_default(),
-            command_validation.as_ref(), result.exit_code,
+            signal,
+            result.canonical_output.as_deref().unwrap_or_default(),
+            command_validation.as_ref(),
+            result.exit_code,
             result.validation_execution_outcome != ValidationExecutionOutcome::NotExecuted,
         );
     }
@@ -426,18 +432,17 @@ pub(super) async fn run_exec_like_with_exit_code(
     let session_source = args.turn.session_source.clone();
     let safety_command = args.safety_command.clone();
     let shell_wrapper_is_owned = args.shell_wrapper_is_owned;
-    let inspection_command =
-        crate::tools::run_blocking_command_analysis(move || {
-            if shell_wrapper_is_owned {
-                is_known_safe_command(&safety_command)
-            } else {
-                is_known_safe_direct_argv(&safety_command)
-            }
-        })
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
-            })?;
+    let inspection_command = crate::tools::run_blocking_command_analysis(move || {
+        if shell_wrapper_is_owned {
+            is_known_safe_command(&safety_command)
+        } else {
+            is_known_safe_direct_argv(&safety_command)
+        }
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
+    })?;
     validate_independent_review_shell(
         &session_source,
         inspection_command,
@@ -890,7 +895,8 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         None
     };
-    let reduction_notice = raw_output_artifact.as_ref()
+    let reduction_notice = raw_output_artifact
+        .as_ref()
         .zip(execution_output)
         .zip(model_projection.as_ref())
         .and_then(|((artifact, source), projection)| {

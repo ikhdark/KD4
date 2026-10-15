@@ -133,6 +133,10 @@ pub struct TurnDiffTracker {
     validation_unknown_revision: u64,
     rendered_diffs: BTreeMap<(String, TrackedPath), String>,
     unavailable_paths: BTreeSet<TrackedPath>,
+    /// Observed workspace changes that no command declared and no tracked path
+    /// explains: another writer's, or an undeclared command effect. They are
+    /// reported, never charged to this turn's change set.
+    unattributed_paths: BTreeSet<TrackedPath>,
     display_keys: HashMap<TrackedPath, String>,
     destination_by_origin: HashMap<TrackedPath, TrackedPath>,
     aggregate_dirty: bool,
@@ -161,6 +165,7 @@ impl Default for TurnDiffTracker {
             validation_unknown_revision: 0,
             rendered_diffs: BTreeMap::new(),
             unavailable_paths: BTreeSet::new(),
+            unattributed_paths: BTreeSet::new(),
             display_keys: HashMap::new(),
             destination_by_origin: HashMap::new(),
             aggregate_dirty: false,
@@ -260,10 +265,14 @@ impl TurnDiffTracker {
                 paths.push(TrackedPath::new(environment_id, path));
             }
             for path in &paths {
-                self.validation_path_revisions.insert(path.clone(), self.mutation_revision);
+                self.validation_path_revisions
+                    .insert(path.clone(), self.mutation_revision);
                 self.collect_diff_partners(path, &mut changed);
             }
-            if paths.iter().any(|path| self.unavailable_paths.contains(path)) {
+            if paths
+                .iter()
+                .any(|path| self.unavailable_paths.contains(path))
+            {
                 self.unavailable_paths.extend(paths.iter().cloned());
             }
             self.apply_change(environment_id, change);
@@ -362,9 +371,12 @@ impl TurnDiffTracker {
             CommandMutation::Uncertain => "uncertain",
             CommandMutation::UnattributedWorkspaceChange => "unattributed_workspace_change",
         };
-        let command_prefix: String = command.iter().enumerate().flat_map(|(index, arg)| {
-            (index != 0).then_some(' ').into_iter().chain(arg.chars())
-        }).take(240).collect();
+        let command_prefix: String = command
+            .iter()
+            .enumerate()
+            .flat_map(|(index, arg)| (index != 0).then_some(' ').into_iter().chain(arg.chars()))
+            .take(240)
+            .collect();
         self.record_invalidation_cause(serde_json::json!({
             "call_id": call_id, "tool": tool, "mutation_class": mutation_class,
             "command_prefix": command_prefix,
@@ -417,12 +429,18 @@ impl TurnDiffTracker {
                 }
                 let mut affected = HashSet::new();
                 for path in paths {
-                    let absolute = if path.is_absolute() { path } else {
+                    let absolute = if path.is_absolute() {
+                        path
+                    } else {
                         cwd.map_or_else(|| path.clone(), |cwd| cwd.join(&path))
                     };
                     let path = TrackedPath::new(environment_id, &absolute);
                     self.collect_diff_partners(&path, &mut affected);
-                    for tracked in self.baseline_by_path.keys().chain(self.current_by_path.keys()) {
+                    for tracked in self
+                        .baseline_by_path
+                        .keys()
+                        .chain(self.current_by_path.keys())
+                    {
                         if tracked.environment_id == path.environment_id
                             && tracked.comparison_key.starts_with(&path.comparison_key)
                         {
@@ -430,7 +448,8 @@ impl TurnDiffTracker {
                         }
                     }
                 }
-                self.rendered_diffs.retain(|(_, path), _| !affected.contains(path));
+                self.rendered_diffs
+                    .retain(|(_, path), _| !affected.contains(path));
                 self.unavailable_paths.extend(affected);
                 self.aggregate_dirty = true;
             }
@@ -456,32 +475,99 @@ impl TurnDiffTracker {
         mutation: CommandMutation,
         fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
     ) -> CommandMutation {
-        if !self.valid || !matches!(mutation, CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange) {
+        if !self.valid
+            || !matches!(
+                mutation,
+                CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange
+            )
+        {
             return mutation;
         }
-        let paths = self.baseline_by_path.keys().chain(self.current_by_path.keys())
+        let paths = self
+            .baseline_by_path
+            .keys()
+            .chain(self.current_by_path.keys())
             .filter(|path| path.environment_id == environment_id)
             .collect::<BTreeSet<_>>();
         let mut mismatches = BTreeSet::new();
         for path in paths {
-            let expected = self.current_by_path.get(path).map(|content| content.content.as_str());
-            let matches = if let (Some(fs), Ok(uri)) = (fs, codex_utils_path_uri::PathUri::from_host_native_path(&path.path)) {
-                let limit = expected.map_or(0, str::len);
-                match (expected, fs.read_file_bounded(&uri, limit, None).await) {
-                    (Some(expected), Ok(Some(actual))) => actual == expected.as_bytes(),
-                    (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            if !matches {
+            let expected = self
+                .current_by_path
+                .get(path)
+                .map(|content| content.content.as_str());
+            if !content_matches(&path.path, expected, fs).await {
                 mismatches.insert(path.path.clone());
             }
         }
         // Even an empty mismatch set advances the workspace evidence revision;
         // it does not turn an unattributed change into proof of a read-only call.
-        CommandMutation::KnownMutation { paths: Some(mismatches) }
+        CommandMutation::KnownMutation {
+            paths: Some(mismatches),
+        }
+    }
+
+    /// Attributes a command's observed workspace changes to this turn: its
+    /// declared paths, plus observed tracked paths whose content no longer
+    /// matches this turn's edits. Any other observed path, such as a concurrent
+    /// session's write, is kept as unattributed rather than discarding this
+    /// turn's exact diffs or entering its change set. The caller holds the
+    /// tracker lock, as for `reconcile_command_mutation`.
+    pub(crate) async fn attribute_observed_changes(
+        &mut self,
+        environment_id: &str,
+        cwd: Option<&Path>,
+        declared: Option<&BTreeSet<PathBuf>>,
+        observed: &BTreeSet<PathBuf>,
+        fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
+    ) -> CommandMutation {
+        let mut attributed = declared
+            .into_iter()
+            .flatten()
+            .map(|path| match cwd {
+                Some(cwd) if !path.is_absolute() => cwd.join(path),
+                _ => path.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let declared = attributed
+            .iter()
+            .map(|path| TrackedPath::new(environment_id, path))
+            .collect::<Vec<_>>();
+        let mut unattributed = Vec::new();
+        for path in observed {
+            let observed_path = TrackedPath::new(environment_id, path);
+            if declared.iter().any(|declared| {
+                observed_path
+                    .comparison_key
+                    .starts_with(&declared.comparison_key)
+            }) {
+                continue;
+            }
+            let tracked = self.baseline_by_path.contains_key(&observed_path)
+                || self.current_by_path.contains_key(&observed_path);
+            if !tracked {
+                unattributed.push(observed_path);
+                continue;
+            }
+            let expected = self
+                .current_by_path
+                .get(&observed_path)
+                .map(|content| content.content.as_str());
+            if !content_matches(&observed_path.path, expected, fs).await {
+                attributed.insert(path.clone());
+            }
+        }
+        self.unattributed_paths.extend(unattributed);
+        CommandMutation::KnownMutation {
+            paths: Some(attributed),
+        }
+    }
+
+    /// Display paths of observed changes this turn neither made nor declared.
+    pub(crate) fn unattributed_display_paths(&self) -> Vec<String> {
+        self.unattributed_paths
+            .iter()
+            .map(|path| self.display_path(path))
+            .collect()
     }
 
     pub(crate) fn current_mutation_revision(&self) -> u64 {
@@ -489,12 +575,19 @@ impl TurnDiffTracker {
     }
 
     pub(crate) fn validation_changes_since(&self, revision: u64) -> Option<Vec<(String, PathBuf)>> {
-        if !self.valid || self.validation_unknown_revision > revision || revision > self.mutation_revision {
+        if !self.valid
+            || self.validation_unknown_revision > revision
+            || revision > self.mutation_revision
+        {
             return None;
         }
-        Some(self.validation_path_revisions.iter()
-            .filter(|(_, changed_at)| **changed_at > revision)
-            .map(|(path, _)| (path.environment_id.clone(), path.path.clone())).collect())
+        Some(
+            self.validation_path_revisions
+                .iter()
+                .filter(|(_, changed_at)| **changed_at > revision)
+                .map(|(path, _)| (path.environment_id.clone(), path.path.clone()))
+                .collect(),
+        )
     }
 
     pub(crate) fn attributed_mutation_revision(&self) -> u64 {
@@ -508,16 +601,28 @@ impl TurnDiffTracker {
     /// Known patch paths remain useful for validation attribution even when
     /// their exact diff is unavailable. This is not the entire workspace delta.
     pub(crate) fn changed_paths(&self) -> Vec<(String, PathBuf)> {
-        self.baseline_by_path.keys().chain(self.current_by_path.keys())
+        self.baseline_by_path
+            .keys()
+            .chain(self.current_by_path.keys())
             .chain(self.unavailable_paths.iter())
-            .filter(|path| !self.valid || self.unavailable_paths.contains(*path)
-                || match (self.baseline_by_path.get(*path), self.current_by_path.get(*path)) {
-                    (Some(before), Some(after)) => before.content != after.content || before.mode != after.mode,
-                    (None, None) => false,
-                    _ => true,
-                })
+            .filter(|path| {
+                !self.valid
+                    || self.unavailable_paths.contains(*path)
+                    || match (
+                        self.baseline_by_path.get(*path),
+                        self.current_by_path.get(*path),
+                    ) {
+                        (Some(before), Some(after)) => {
+                            before.content != after.content || before.mode != after.mode
+                        }
+                        (None, None) => false,
+                        _ => true,
+                    }
+            })
             .map(|path| (path.environment_id.clone(), path.path.clone()))
-            .collect::<BTreeSet<_>>().into_iter().collect()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     #[cfg(test)]
@@ -527,6 +632,28 @@ impl TurnDiffTracker {
         } else {
             self.unified_diff.clone()
         }
+    }
+
+    /// Returns the net diff of this turn's tracked edits when it is exact, or
+    /// the display paths whose changes it cannot diff. An empty list means
+    /// command effects invalidated the whole diff. Does not affect publication.
+    pub(crate) fn exact_unified_diff(&self) -> Result<Option<String>, Vec<String>> {
+        if !self.valid {
+            return Err(Vec::new());
+        }
+        if !self.unavailable_paths.is_empty() {
+            return Err(self
+                .unavailable_paths
+                .iter()
+                .map(|path| self.display_path(path))
+                .collect());
+        }
+        let diff = if self.aggregate_dirty {
+            self.flatten_diff()
+        } else {
+            self.unified_diff.clone()
+        };
+        Ok(diff.filter(|diff| !diff.is_empty()))
     }
 
     /// Returns the latest aggregate only when it differs from the last value
@@ -554,7 +681,9 @@ impl TurnDiffTracker {
         let status = if self.valid { "partial" } else { "unavailable" };
         Some(format!(
             "The turn diff is {status} because command effects or workspace changes could not be tracked exactly. First cause: {}. Do not claim that no files changed without fresh workspace verification.",
-            self.first_invalidation_cause.as_ref().unwrap_or(&serde_json::Value::Null),
+            self.first_invalidation_cause
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
         ))
     }
 
@@ -584,7 +713,11 @@ impl TurnDiffTracker {
             aggregate.push_str(fragment);
         }
         for path in &self.unavailable_paths {
-            let _ = writeln!(aggregate, "# {}: changed, diff unavailable (command effects)", self.display_path(path));
+            let _ = writeln!(
+                aggregate,
+                "# {}: changed, diff unavailable (command effects)",
+                self.display_path(path)
+            );
         }
         Some(aggregate)
     }
@@ -595,7 +728,8 @@ impl TurnDiffTracker {
         }
         for path in changed {
             if self.unavailable_paths.contains(&path) {
-                self.rendered_diffs.retain(|(_, rendered_path), _| rendered_path != &path);
+                self.rendered_diffs
+                    .retain(|(_, rendered_path), _| rendered_path != &path);
                 continue;
             }
             let display = match self.display_keys.get(&path) {
@@ -779,7 +913,7 @@ impl TurnDiffTracker {
     ) -> Option<String> {
         let left_text = left_content.map(|content| content.content.as_str());
         let right_text = right_content.map(|content| content.content.as_str());
-        if left_text == right_text {
+        if left_text == right_text && (left_path == right_path || left_text.is_none()) {
             return None;
         }
 
@@ -789,6 +923,13 @@ impl TurnDiffTracker {
 
         let left_display = self.display_path(left_path);
         let right_display = self.display_path(right_path);
+        if left_text == right_text {
+            // A content-preserving move still changes the workspace. Include
+            // Git's rename metadata so exact exports can replay it.
+            return Some(format!(
+                "diff --git a/{left_display} b/{right_display}\nsimilarity index 100%\nrename from {left_display}\nrename to {right_display}\n"
+            ));
+        }
         let left_oid = left_content.map_or(ZERO_OID, |content| {
             content
                 .blob_oid
@@ -1273,10 +1414,16 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
     // The safety check and this consumer share the cached native AST parse.
     // Never reinterpret quoted source with a second shell tokenizer.
     codex_shell_command::powershell::parse_powershell_command_into_plain_commands(command)
-        .is_some_and(|commands| !commands.is_empty() && commands.iter().all(|argv| {
-            let Some(program) = argv.first().map(|word| word.to_ascii_lowercase()) else { return false; };
-            if matches!(program.as_str(), "get-command" | "gcm") { return false; }
-            codex_shell_command::is_safe_command::is_safe_powershell_words(argv)
+        .is_some_and(|commands| {
+            !commands.is_empty()
+                && commands.iter().all(|argv| {
+                    let Some(program) = argv.first().map(|word| word.to_ascii_lowercase()) else {
+                        return false;
+                    };
+                    if matches!(program.as_str(), "get-command" | "gcm") {
+                        return false;
+                    }
+                    codex_shell_command::is_safe_command::is_safe_powershell_words(argv)
                 || matches!(program.as_str(),
                     "compare-object" | "convertfrom-json" | "convertto-json"
                     | "format-list" | "fl" | "format-table" | "ft"
@@ -1289,7 +1436,8 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
                 // them from semantic argv. Member-invocation forms stay opaque.
                 || (matches!(program.as_str(), "foreach-object" | "%") && argv.len() == 1)
                 || !looks_like_mutating_command(argv)
-        }))
+                })
+        })
 }
 pub(crate) fn command_may_mutate(command: &[String]) -> bool {
     command_mutation(command, None).may_have_mutated()
@@ -1297,8 +1445,15 @@ pub(crate) fn command_may_mutate(command: &[String]) -> bool {
 
 pub(crate) fn script_is_read_only(script: &str) -> bool {
     let bash = ["bash".to_string(), "-lc".to_string(), script.to_string()];
-    if command_mutation(&bash, None) == CommandMutation::ReadOnly { return true; }
-    let powershell = ["pwsh".to_string(), "-NoProfile".to_string(), "-Command".to_string(), script.to_string()];
+    if command_mutation(&bash, None) == CommandMutation::ReadOnly {
+        return true;
+    }
+    let powershell = [
+        "pwsh".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        script.to_string(),
+    ];
     command_mutation(&powershell, None) == CommandMutation::ReadOnly
 }
 
@@ -1321,6 +1476,27 @@ pub(crate) fn resolve_uncertain_command_observation(
         Some(false) => CommandMutation::ReadOnly,
         Some(true) => CommandMutation::UnattributedWorkspaceChange,
         None => CommandMutation::Uncertain,
+    }
+}
+
+/// Whether a tracked path still holds this turn's expected content (`None`:
+/// deleted). Without a readable filesystem the content cannot be proven.
+async fn content_matches(
+    path: &Path,
+    expected: Option<&str>,
+    fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
+) -> bool {
+    let (Some(fs), Ok(uri)) = (
+        fs,
+        codex_utils_path_uri::PathUri::from_host_native_path(path),
+    ) else {
+        return false;
+    };
+    let limit = expected.map_or(0, str::len);
+    match (expected, fs.read_file_bounded(&uri, limit, None).await) {
+        (Some(expected), Ok(Some(actual))) => actual == expected.as_bytes(),
+        (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
     }
 }
 
@@ -1394,7 +1570,7 @@ fn is_known_mutating_command(command: &[String]) -> bool {
                 | "touch"
                 | "truncate"
         )
-    }) || command.join(" ").contains('>')
+    }) || tokens_contain_redirect(&tokens)
     {
         return true;
     }
@@ -1464,7 +1640,8 @@ pub(crate) fn command_is_read_only_git(command: &[String]) -> bool {
     {
         return false;
     }
-    git_subcommand(command).is_some_and(|subcommand| git_argv_is_read_only(command, subcommand, false))
+    git_subcommand(command)
+        .is_some_and(|subcommand| git_argv_is_read_only(command, subcommand, false))
 }
 
 fn git_argv_is_read_only(command: &[String], subcommand: &str, allow_cwd_change: bool) -> bool {
@@ -1472,7 +1649,13 @@ fn git_argv_is_read_only(command: &[String], subcommand: &str, allow_cwd_change:
     // overrides. Keep exact argv case: -C changes cwd, whereas -c sets config.
     let removable = match command.get(1).map(String::as_str) {
         Some("-ccolor.ui=false" | "-ccore.pager=cat") => 1,
-        Some("-c") if command.get(2).is_some_and(|arg| matches!(arg.as_str(), "color.ui=false" | "core.pager=cat")) => 2,
+        Some("-c")
+            if command
+                .get(2)
+                .is_some_and(|arg| matches!(arg.as_str(), "color.ui=false" | "core.pager=cat")) =>
+        {
+            2
+        }
         // Changing cwd does not make a read mutate, but its output cannot be
         // attributed to the caller's cwd without resolving that change.
         Some("-C") if allow_cwd_change && command.get(2).is_some() => 2,
@@ -1493,8 +1676,7 @@ fn git_argv_is_read_only(command: &[String], subcommand: &str, allow_cwd_change:
         // global configuration or unsupported subcommand options as read-only.
         is_read_only_git_subcommand(subcommand)
             && command.get(1).is_some_and(|arg| arg == subcommand)
-            && (subcommand == "status"
-                || command.iter().skip(2).all(|arg| !arg.starts_with('-')))
+            && (subcommand == "status" || command.iter().skip(2).all(|arg| !arg.starts_with('-')))
     }
 }
 
@@ -1652,6 +1834,25 @@ fn shell_filter_tokens(command: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// True when `tokens` contain a shell output-redirection operator.
+///
+/// A redirect is an operator that *begins* a token: `> file`, `>file`, `>>file`,
+/// `2>err`, `&>both`. A `>` in the interior of a token is not a redirect — it is a
+/// comparison or arrow inside argument data (`if i > 3`, `a->b`). Matching on the
+/// operator's position, rather than scanning the raw joined command for any `>`
+/// character, keeps real redirects (which always write) while leaving such data
+/// alone. `shell_filter_tokens` splits on unquoted whitespace, so a `>` preceded
+/// by non-space text lands mid-token and is correctly ignored.
+fn tokens_contain_redirect(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        // Strip a leading stream descriptor (e.g. `1`, `2`, `&`) so `2>`/`&>` match.
+        let rest = token.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '&');
+        // Only a token that STARTS with the operator is a redirect; this covers both
+        // the spaced (`> out.txt`) and attached (`>out.txt`) forms.
+        rest.starts_with('>')
+    })
 }
 
 fn git_blob_oid(data: &[u8]) -> String {

@@ -1012,6 +1012,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn comma_lists_and_conditionals_lower_every_command_they_can_run() {
+        let host = try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let mut parser = PowershellParserProcess::spawn(host.as_path().to_str().unwrap()).unwrap();
+        for (script, expected) in [
+            (
+                "Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length",
+                vec![
+                    vec!["Get-ChildItem", "rolloutdetect", "tests", "-Recurse", "-File"],
+                    vec!["Select-Object", "FullName", "Length"],
+                ],
+            ),
+            (
+                "if (Test-Path AGENTS.md) { Get-Content AGENTS.md } elseif (Test-Path README.md) { Get-Content README.md } else { Get-Location }",
+                vec![
+                    vec!["Test-Path", "AGENTS.md"],
+                    vec!["Get-Content", "AGENTS.md"],
+                    vec!["Test-Path", "README.md"],
+                    vec!["Get-Content", "README.md"],
+                    vec!["Get-Location"],
+                ],
+            ),
+        ] {
+            let PowershellParseOutcome::Analysis(analysis) = parser.parse(script).unwrap() else {
+                panic!("{script}");
+            };
+            let expected = expected
+                .into_iter()
+                .map(|argv| argv.into_iter().map(str::to_string).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(analysis.commands, expected, "{script}");
+        }
+        for script in [
+            "Get-Content a,$(Remove-Item b)",
+            "Get-Content a,$path",
+            "if (Test-Path a) { $x = 1 }",
+            "if (Test-Path a) { exit 1 }",
+            "if (Test-Path a) { if (Test-Path b) { Get-Content b } }",
+        ] {
+            assert_eq!(
+                parser.parse(script).unwrap(),
+                PowershellParseOutcome::Unsupported,
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
     fn cached_parser_contention_bounds_temporary_hosts() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
         let temporary_slot: [_; MAX_SPARE_PARSERS] =
@@ -1142,7 +1190,7 @@ mod tests {
             .expect("start parser");
         for _ in 0..2 {
             assert_eq!(
-                parser.parse("if ($true) { Write-Output hidden }").unwrap(),
+                parser.parse("while ($true) { Write-Output hidden }").unwrap(),
                 PowershellParseOutcome::Unsupported,
             );
         }
@@ -1382,5 +1430,37 @@ mod tests {
             analysis.commands,
             vec![vec!["Write-Output".to_string(), "after-rejection".to_string()]]
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parser_data_output_loops_do_not_hide_execution_or_stale_bindings() {
+        let host = try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let mut parser = PowershellParserProcess::spawn(host.as_path().to_str().unwrap()).unwrap();
+        for script in [
+            "$commands = @('cargo test --workspace'); foreach ($command in $commands) { Write-Output $command }",
+            "foreach ($command in @('cargo test')) { foreach ($value in @($command)) { Write-Output $value } }",
+        ] {
+            let PowershellParseOutcome::Analysis(analysis) = parser.parse(script).unwrap() else {
+                panic!("data-only loop must parse: {script}");
+            };
+            assert_eq!(analysis.commands, vec![vec!["Write-Output".to_string()]]);
+            assert!(analysis.direct_argv.is_none());
+        }
+        for script in [
+            "foreach ($command in @('cargo test')) { Invoke-Expression $command }",
+            "foreach ($command in @('cargo test')) { Write-Output $(cargo test) }",
+            "foreach ($command in @('cargo test')) { Write-Output $command > out.txt }",
+            "foreach ($command in @('cargo test')) { Write-Output $command -OutVariable saved }",
+            "foreach ($command in @('cargo test')) { & $command }",
+            "foreach ($command in @('cargo test')) { Write-Output ([scriptblock]::Create($command).Invoke()) }",
+            "$path = 'safe.txt'; foreach ($path in @('other.txt')) { Write-Output $path }; Get-Content $path",
+        ] {
+            assert_eq!(
+                parser.parse(script).unwrap(),
+                PowershellParseOutcome::Unsupported,
+                "{script}"
+            );
+        }
     }
 }

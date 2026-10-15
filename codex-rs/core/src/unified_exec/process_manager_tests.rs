@@ -26,33 +26,65 @@ async fn fallback_cleanup_worker_does_not_serialize_independent_custody() {
     let first_control = Arc::new(TerminationControl::new());
     let second_control = Arc::new(TerminationControl::new());
     second_control.allowed.send_replace(true);
-    let first_process = remote_process_with_termination_control(codex_exec_server::WriteStatus::Accepted, None, Some(first_control.clone())).await;
-    let second_process = remote_process_with_termination_control(codex_exec_server::WriteStatus::Accepted, None, Some(second_control.clone())).await;
+    let first_process = remote_process_with_termination_control(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+        Some(first_control.clone()),
+    )
+    .await;
+    let second_process = remote_process_with_termination_control(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+        Some(second_control.clone()),
+    )
+    .await;
     let owners = Arc::new(std::sync::Mutex::new(Vec::new()));
     let blocked_store = Arc::new(tokio::sync::Mutex::new(ProcessStore::default()));
     let held = blocked_store.lock().await;
-    let make = |process_id, process_store, process| Arc::new(PendingProcessCleanup {
-        process_id, process_store, session: std::sync::Weak::new(),
-        cleanup_owners: Arc::downgrade(&owners),
-        attempt_key: crate::tools::command_execution::CommandAttemptKey::new("exec_command", "local", ".", &[]),
-        processes: vec![PendingProcessToTerminate { process, requires_confirmed_termination: true }],
-        primary_process: None, network_approval: None,
-    });
+    let make = |process_id, process_store, process| {
+        Arc::new(PendingProcessCleanup {
+            process_id,
+            process_store,
+            session: std::sync::Weak::new(),
+            cleanup_owners: Arc::downgrade(&owners),
+            attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+                "exec_command",
+                "local",
+                ".",
+                &[],
+            ),
+            processes: vec![PendingProcessToTerminate {
+                process,
+                requires_confirmed_termination: true,
+            }],
+            primary_process: None,
+            network_approval: None,
+        })
+    };
     let first = make(1, Arc::downgrade(&blocked_store), first_process);
     let second = make(2, std::sync::Weak::new(), second_process);
-    owners.lock().unwrap().extend([first.clone(), second.clone()]);
+    owners
+        .lock()
+        .unwrap()
+        .extend([first.clone(), second.clone()]);
     let (send, receive) = tokio::sync::mpsc::unbounded_channel();
     let worker = tokio::spawn(drain_pending_process_cleanups(receive));
     send.send(first).unwrap();
     send.send(second).unwrap();
     drop(send);
-    tokio::time::timeout(Duration::from_secs(1), first_control.started.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_control.started.notified())
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if owners.lock().unwrap().len() == 1 { break; }
+            if owners.lock().unwrap().len() == 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.expect("second cleanup retires while first remains held");
+    })
+    .await
+    .expect("second cleanup retires while first remains held");
     assert_eq!(owners.lock().unwrap()[0].process_id, 1);
     assert!(second_control.completed.load(Ordering::Acquire));
     assert!(!first_control.completed.load(Ordering::Acquire));
@@ -67,37 +99,89 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
-        codex_exec_server::WriteStatus::Accepted, None,
-    ).await;
-    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&process)).await;
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
     let execution_id = manager.process_store.lock().await.processes[&1000].command_execution_id;
     let policy = codex_utils_output_truncation::TruncationPolicy::Bytes(1000);
-    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
+    assert!(
+        manager
+            .reuse_running_validation(1000, execution_id, policy, None)
+            .await
+            .is_none()
+    );
     process.set_validation(Some(crate::validation::CommandValidation {
         execution_context: None,
-        declared: None, receipt_runner: None,
+        declared: None,
+        receipt_runner: None,
         classification: crate::validation::classify_validation(
             &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                program: "cargo".into(), args: vec!["test".into(), "-p".into(), "app".into()],
-            }),
+                program: "cargo".into(),
+                args: vec!["test".into(), "-p".into(), "app".into()],
+            },
+        ),
     }));
-    process.publish_output_for_test(b"unconsumed validation evidence\n".to_vec()).await;
-    let reused = manager.reuse_running_validation(1000, execution_id, policy, None).await.unwrap();
+    process
+        .publish_output_for_test(b"unconsumed validation evidence\n".to_vec())
+        .await;
+    let reused = manager
+        .reuse_running_validation(1000, execution_id, policy, None)
+        .await
+        .unwrap();
     assert_eq!(reused.process_id, Some(1000));
     assert!(reused.raw_output.is_empty());
     assert!(reused.session_capabilities.is_some());
     assert_eq!(reused.event_call_id, "exec-call-1000");
-    assert!(manager.process_store.lock().await.processes.contains_key(&1000));
-    assert_eq!(process.snapshot_output().await, b"unconsumed validation evidence\n");
-    let active = Arc::clone(&manager.process_store.lock().await.processes[&1000].initial_exec_command_active);
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&1000)
+    );
+    assert_eq!(
+        process.snapshot_output().await,
+        b"unconsumed validation evidence\n"
+    );
+    let active = Arc::clone(
+        &manager.process_store.lock().await.processes[&1000].initial_exec_command_active,
+    );
     active.store(true, Ordering::Release);
-    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
+    assert!(
+        manager
+            .reuse_running_validation(1000, execution_id, policy, None)
+            .await
+            .is_none()
+    );
     active.store(false, Ordering::Release);
     let other_id = session.services.command_execution.allocate_execution_id();
-    assert!(manager.reuse_running_validation(1000, other_id, policy, None).await.is_none());
-    assert_eq!(process.snapshot_output().await, b"unconsumed validation evidence\n");
+    assert!(
+        manager
+            .reuse_running_validation(1000, other_id, policy, None)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        process.snapshot_output().await,
+        b"unconsumed validation evidence\n"
+    );
     process.signal_exit_for_test(Some(0));
-    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
+    assert!(
+        manager
+            .reuse_running_validation(1000, execution_id, policy, None)
+            .await
+            .is_none()
+    );
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
 }
@@ -106,7 +190,8 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
 async fn validation_workspace_lease_survives_observer_and_releases_at_process_exit() {
     let workspace = tempfile::tempdir().unwrap();
     let independent = tempfile::tempdir().unwrap();
-    let permit = crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()).await;
+    let permit =
+        crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()).await;
     let registration = PendingSpawnRegistration::default().with_workspace_operation(permit);
     let process = crate::unified_exec::process_tests::remote_process(
         codex_exec_server::WriteStatus::Accepted,
@@ -148,15 +233,28 @@ async fn queued_exit_returns_observed_state_without_expired_lock_waits() {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
-        codex_exec_server::WriteStatus::Accepted, None,
-    ).await;
-    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn,
-        1000, Arc::clone(&process)).await;
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
     let interaction = process.interaction_lock().lock_owned().await;
-    let request = WriteStdinRequest { process_id: 1000, input: "do not deliver", yield_time_ms: 5000,
+    let request = WriteStdinRequest {
+        process_id: 1000,
+        input: "do not deliver",
+        yield_time_ms: 5000,
         max_output_tokens: None,
         truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
-        nested_deadline: Some((Instant::now() + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std()),
+        nested_deadline: Some(
+            (Instant::now() + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std(),
+        ),
     };
     let poll = manager.write_stdin(request);
     tokio::pin!(poll);
@@ -165,7 +263,10 @@ async fn queued_exit_returns_observed_state_without_expired_lock_waits() {
     let store = manager.process_store.lock().await;
     process.signal_exit_for_test(Some(0));
     tokio::time::advance(Duration::from_secs(1)).await;
-    let response = tokio::time::timeout(Duration::from_millis(10), &mut poll).await.unwrap().unwrap();
+    let response = tokio::time::timeout(Duration::from_millis(10), &mut poll)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(response.process_exited);
     assert_eq!(response.exit_code, Some(0));
     assert_eq!(response.process_id, Some(1000));
@@ -184,25 +285,55 @@ async fn nested_deadline_clips_recorded_yield_budget() {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
-        codex_exec_server::WriteStatus::Accepted, None,
-    ).await;
-    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn,
-        1000, Arc::clone(&process)).await;
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
     let start = Instant::now();
     let nested = (start + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std();
     let timing = Arc::new(ToolDispatchTiming::new(start, false));
-    scope_tool_dispatch_timing(Arc::clone(&timing), manager.write_stdin(WriteStdinRequest {
-        process_id: 1000, input: "", yield_time_ms: 30_000, max_output_tokens: None,
-        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
-        nested_deadline: Some(nested),
-    })).await.unwrap();
+    scope_tool_dispatch_timing(
+        Arc::clone(&timing),
+        manager.write_stdin(WriteStdinRequest {
+            process_id: 1000,
+            input: "",
+            yield_time_ms: 30_000,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: Some(nested),
+        }),
+    )
+    .await
+    .unwrap();
     let snapshot = timing.snapshot(Instant::now());
-    let wait = snapshot.timer_waits.iter().find(|w| w.wait_kind == "write_stdin_yield").unwrap();
+    let wait = snapshot
+        .timer_waits
+        .iter()
+        .find(|w| w.wait_kind == "write_stdin_yield")
+        .unwrap();
     assert_eq!(wait.requested_timeout_ms, Some(30_000));
     // The fixture leaves exactly one second after reserving the nested-call margin.
     assert_eq!(wait.effective_timeout_ms, Some(1_000));
-    assert!(snapshot.timer_waits.iter().any(|w| w.wait_kind == "owner_output_wait"));
-    assert!(!snapshot.timer_waits.iter().any(|w| w.wait_kind == "post_exit_output_drain"));
+    assert!(
+        snapshot
+            .timer_waits
+            .iter()
+            .any(|w| w.wait_kind == "owner_output_wait")
+    );
+    assert!(
+        !snapshot
+            .timer_waits
+            .iter()
+            .any(|w| w.wait_kind == "post_exit_output_drain")
+    );
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
 }
@@ -214,28 +345,51 @@ async fn short_empty_polls_require_unreported_output() {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
-        codex_exec_server::WriteStatus::Accepted, None,
-    ).await;
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
     crate::unified_exec::process_tests::store_process_for_test(
-        manager, &session, &turn, 1000, Arc::clone(&process),
-    ).await;
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
     for (has_output, expected) in [(false, 5_000), (true, 250), (false, 5_000)] {
         if has_output {
-            process.output_handles().output_buffer.lock().await.push_chunk(b"new output\n");
+            process
+                .output_handles()
+                .output_buffer
+                .lock()
+                .await
+                .push_chunk(b"new output\n");
         }
         let timing = Arc::new(ToolDispatchTiming::new(Instant::now(), false));
-        let result = scope_tool_dispatch_timing(Arc::clone(&timing),
+        let result = scope_tool_dispatch_timing(
+            Arc::clone(&timing),
             manager.write_stdin(WriteStdinRequest {
-                process_id: 1000, input: "", yield_time_ms: 250,
+                process_id: 1000,
+                input: "",
+                yield_time_ms: 250,
                 max_output_tokens: None,
                 truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
                 nested_deadline: None,
-            })
-        ).await.unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(!result.raw_output.is_empty(), has_output);
         let waits = timing.snapshot(Instant::now()).timer_waits;
-        assert_eq!(waits.iter().find(|wait| wait.wait_kind == "write_stdin_yield").unwrap().effective_timeout_ms,
-            Some(expected));
+        assert_eq!(
+            waits
+                .iter()
+                .find(|wait| wait.wait_kind == "write_stdin_yield")
+                .unwrap()
+                .effective_timeout_ms,
+            Some(expected)
+        );
     }
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
@@ -253,33 +407,72 @@ async fn failed_process_receipt_preserves_output_and_uncertain_cleanup() {
         let process = crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             cleanup_error,
-        ).await;
+        )
+        .await;
         crate::unified_exec::process_tests::store_process_for_test(
-            manager, &session, &turn, 1000, Arc::clone(&process),
-        ).await;
-        process.output_handles().completion_output_buffer.lock().await
+            manager,
+            &session,
+            &turn,
+            1000,
+            Arc::clone(&process),
+        )
+        .await;
+        process
+            .output_handles()
+            .completion_output_buffer
+            .lock()
+            .await
             .push_chunk(b"retained evidence");
-        let error = manager.fail_process_with_message(
-            1000, &process, "command failed".to_string(),
-        ).await;
+        let error = manager
+            .fail_process_with_message(1000, &process, "command failed".to_string())
+            .await;
         let UnifiedExecError::ProcessFailedWithOutput { output, .. } = error else {
             panic!("failure must retain a structured receipt");
         };
         assert!(!output.success_for_logging());
-        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".to_string() });
+        let result = output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        });
         assert!(result["error"].as_str().unwrap().contains("command failed"));
-        assert!(result["output"].as_str().unwrap().contains("retained evidence"));
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("retained evidence")
+        );
         assert_eq!(result["process_exited"], !cleanup_failed);
-        assert_eq!(result["streams_complete"], false, "remote streams are merged");
+        assert_eq!(
+            result["streams_complete"], false,
+            "remote streams are merged"
+        );
         if cleanup_failed {
             assert_eq!(result["session_id"], 1000);
-            assert!(result["error"].as_str().unwrap().contains("cleanup refused"));
-            assert!(manager.process_store.lock().await.processes.contains_key(&1000));
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cleanup refused")
+            );
+            assert!(
+                manager
+                    .process_store
+                    .lock()
+                    .await
+                    .processes
+                    .contains_key(&1000)
+            );
             manager.process_store.lock().await.remove(1000);
             process.signal_exit_for_test(Some(1));
         } else {
             assert!(result.get("session_id").is_none());
-            assert!(!manager.process_store.lock().await.processes.contains_key(&1000));
+            assert!(
+                !manager
+                    .process_store
+                    .lock()
+                    .await
+                    .processes
+                    .contains_key(&1000)
+            );
         }
     }
 }
@@ -331,7 +524,10 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     else {
         panic!("write_stdin must advertise a function schema");
     };
-    let schema = spec.output_schema.expect("published output schema").into_value();
+    let schema = spec
+        .output_schema
+        .expect("published output schema")
+        .into_value();
     jsonschema::validator_for(&schema)
         .expect("valid output schema")
         .validate(&value)
@@ -351,7 +547,10 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     // Direct callers see the same live-session capabilities as code mode.
     let prompt: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
     assert_eq!(prompt["session_id"], 1000);
-    assert_eq!(prompt["session_capabilities"], value["session_capabilities"]);
+    assert_eq!(
+        prompt["session_capabilities"],
+        value["session_capabilities"]
+    );
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
 }
@@ -556,7 +755,10 @@ async fn retirement_waits_for_output_without_blocking_store_or_removing_reused_i
 async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     let manager = UnifiedExecProcessManager::default();
     let mut reservation = manager.reserve_process_id().await;
-    manager.reserve_process_capacity(&mut reservation).await.unwrap();
+    manager
+        .reserve_process_capacity(&mut reservation)
+        .await
+        .unwrap();
     assert_eq!(reservation.process_id(), 1000);
     drop(reservation);
 
@@ -576,7 +778,14 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     })
     .await
     .expect("dropped reservation should be released");
-    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_slots
+            .is_empty()
+    );
 
     let next = manager.reserve_process_id().await;
     assert_ne!(next.process_id(), 1000);
@@ -654,10 +863,22 @@ async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
     manager.reserve_process_capacity(&mut first).await.unwrap();
     let id = first.process_id();
     manager.release_process_id_reservation(&mut first).await;
-    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_slots
+            .is_empty()
+    );
     // Production no longer recycles handles. Force legacy reuse here to retain
     // coverage of the delayed-cleanup ownership boundary as well.
-    manager.process_store.lock().await.used_process_ids.remove(&id);
+    manager
+        .process_store
+        .lock()
+        .await
+        .used_process_ids
+        .remove(&id);
     let mut second = manager.reserve_process_id().await;
     manager.reserve_process_capacity(&mut second).await.unwrap();
     assert_eq!(second.process_id(), id);
@@ -674,7 +895,14 @@ async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
     );
     let third = manager.reserve_process_id().await;
     assert_ne!(third.process_id(), id);
-    assert!(manager.process_store.lock().await.reserved_process_slots.contains(&id));
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_slots
+            .contains(&id)
+    );
 }
 
 #[tokio::test]
@@ -685,15 +913,29 @@ async fn capacity_admission_counts_concurrent_launch_reservations() {
     )
     .await;
     let results = futures::future::join_all(
-        reservations.iter_mut().map(|reservation| manager.reserve_process_capacity(reservation)),
+        reservations
+            .iter_mut()
+            .map(|reservation| manager.reserve_process_capacity(reservation)),
     )
     .await;
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), MAX_UNIFIED_EXEC_PROCESSES);
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        MAX_UNIFIED_EXEC_PROCESSES
+    );
     assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-    assert_eq!(manager.process_store.lock().await.occupied_slots(), MAX_UNIFIED_EXEC_PROCESSES);
-    manager.reserve_process_capacity(&mut reservations[0]).await.unwrap();
+    assert_eq!(
+        manager.process_store.lock().await.occupied_slots(),
+        MAX_UNIFIED_EXEC_PROCESSES
+    );
+    manager
+        .reserve_process_capacity(&mut reservations[0])
+        .await
+        .unwrap();
     manager.terminate_all_processes().await;
-    assert_eq!(manager.process_store.lock().await.occupied_slots(), MAX_UNIFIED_EXEC_PROCESSES);
+    assert_eq!(
+        manager.process_store.lock().await.occupied_slots(),
+        MAX_UNIFIED_EXEC_PROCESSES
+    );
     drop(reservations);
     tokio::time::timeout(Duration::from_secs(1), async {
         while manager.process_store.lock().await.occupied_slots() != 0 {
@@ -703,7 +945,10 @@ async fn capacity_admission_counts_concurrent_launch_reservations() {
     .await
     .expect("cancelled launches release all capacity");
     let mut reservation = manager.reserve_process_id().await;
-    manager.reserve_process_capacity(&mut reservation).await.unwrap();
+    manager
+        .reserve_process_capacity(&mut reservation)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -713,7 +958,10 @@ async fn saturated_admission_rejects_before_marker_command_can_start() {
     let mut occupied = Vec::new();
     for _ in 0..MAX_UNIFIED_EXEC_PROCESSES {
         let mut reservation = manager.reserve_process_id().await;
-        manager.reserve_process_capacity(&mut reservation).await.unwrap();
+        manager
+            .reserve_process_capacity(&mut reservation)
+            .await
+            .unwrap();
         occupied.push(reservation);
     }
     let fixture = tempfile::tempdir().unwrap();
@@ -726,18 +974,28 @@ async fn saturated_admission_rejects_before_marker_command_can_start() {
     ];
     let reservation = manager.reserve_process_id().await;
     let process_id = reservation.process_id();
-    let context = UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "capacity-marker".into());
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "capacity-marker".into(),
+    );
     let request = ExecCommandRequest {
         stall_timeout_ms: None,
         validation: None,
         command: command.clone(),
         command_for_safety: command.clone(),
         attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
-            "exec_command", "local", turn.cwd().to_string_lossy(), &command,
+            "exec_command",
+            "local",
+            turn.cwd().to_string_lossy(),
+            &command,
         ),
         raw_output_artifact: crate::tools::command_output_artifact::create_raw_output_artifact(
-            fixture.path(), "capacity-marker", b"",
-        ).await,
+            fixture.path(),
+            "capacity-marker",
+            b"",
+        )
+        .await,
         shell_type: crate::shell::ShellType::Sh,
         shell_wrapper_is_owned: false,
         hook_command: command.join(" "),
@@ -747,7 +1005,11 @@ async fn saturated_admission_rejects_before_marker_command_can_start() {
         cwd: turn.cwd().clone().into(),
         normalization_cwd: None,
         sandbox_cwd: turn.cwd().clone().into(),
-        turn_environment: turn.environments.primary().cloned().expect("primary environment"),
+        turn_environment: turn
+            .environments
+            .primary()
+            .cloned()
+            .expect("primary environment"),
         network: None,
         tty: false,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
@@ -758,10 +1020,18 @@ async fn saturated_admission_rejects_before_marker_command_can_start() {
         prefix_rule: None,
         validation_launch: false,
     };
-    let result = manager.exec_command(request, reservation, &context, &CancellationToken::new()).await;
+    let result = manager
+        .exec_command(request, reservation, &context, &CancellationToken::new())
+        .await;
     let error = result.expect_err("saturated capacity must reject before spawn");
-    assert!(error.to_string().contains("command was not started"), "{error}");
-    assert!(!marker.exists(), "rejected launch must have no command side effects");
+    assert!(
+        error.to_string().contains("command was not started"),
+        "{error}"
+    );
+    assert!(
+        !marker.exists(),
+        "rejected launch must have no command side effects"
+    );
     drop(occupied);
 }
 
@@ -852,7 +1122,12 @@ async fn refresh_rejects_reused_identity_and_keeps_unread_closed_output() {
         store_process_for_test(manager, &session, &turn, other_id, Arc::clone(&original)).await;
     }
     let mut reservation = manager.reserve_process_id().await;
-    assert!(manager.reserve_process_capacity(&mut reservation).await.is_err());
+    assert!(
+        manager
+            .reserve_process_capacity(&mut reservation)
+            .await
+            .is_err()
+    );
 
     assert!(matches!(
         manager.refresh_process_state(id, &original).await,
@@ -1338,7 +1613,10 @@ async fn output_wait_does_not_spin_on_resume_or_closed_pause_channel() {
         assert_eq!(collected.await, b"complete evidence\n", "{state}");
         assert_eq!(Instant::now() - started_at, Duration::from_millis(1_250));
         let snapshot = timing.snapshot(Instant::now());
-        assert_eq!(snapshot.retry_count, 0, "{state}: waiting is not execution retry");
+        assert_eq!(
+            snapshot.retry_count, 0,
+            "{state}: waiting is not execution retry"
+        );
         let waits = snapshot.timer_waits;
         assert_eq!(
             waits.len(),
@@ -1399,7 +1677,10 @@ async fn initial_output_preserves_quiet_deadline_and_evidence_across_pause() {
         // 100ms before pause + 1s paused + 150ms after resume = 1.25s.
         // New output at 1.2s restarts its 250ms quiet period, yielding at 1.45s.
         assert_eq!(collected, expected);
-        assert_eq!(Instant::now() - started_at, Duration::from_millis(elapsed_ms));
+        assert_eq!(
+            Instant::now() - started_at,
+            Duration::from_millis(elapsed_ms)
+        );
         drop(producer.await.unwrap());
     }
 }
@@ -2113,7 +2394,10 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
     let manager = &session.services.unified_exec_manager;
     let mut reservation = manager.reserve_process_id().await;
     // Admit before holding the store at the post-launch registration boundary.
-    manager.reserve_process_capacity(&mut reservation).await.unwrap();
+    manager
+        .reserve_process_capacity(&mut reservation)
+        .await
+        .unwrap();
     let process_id = reservation.process_id();
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
@@ -2219,7 +2503,11 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
     let result = tokio::time::timeout(Duration::from_secs(10), &mut execution)
         .await
         .expect("normal manager failure settles");
-    let Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) = result else {
+    let Err(
+        UnifiedExecError::ProcessFailed { message }
+        | UnifiedExecError::ProcessFailedWithOutput { message, .. },
+    ) = result
+    else {
         panic!("expected registration failure: {result:?}");
     };
     if cancel_during_registration {
@@ -2530,7 +2818,11 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
     )
     .await
     .expect("normal manager failure settles");
-    let Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) = result else {
+    let Err(
+        UnifiedExecError::ProcessFailed { message }
+        | UnifiedExecError::ProcessFailedWithOutput { message, .. },
+    ) = result
+    else {
         panic!("expected registration failure: {result:?}");
     };
     assert!(
@@ -2774,8 +3066,8 @@ async fn deny_network_completion(
     session: &crate::session::session::Session,
     deferred: &DeferredNetworkApproval,
 ) {
-    let mut blocked = codex_network_proxy::BlockedRequest::new(
-        codex_network_proxy::BlockedRequestArgs {
+    let mut blocked =
+        codex_network_proxy::BlockedRequest::new(codex_network_proxy::BlockedRequestArgs {
             host: "completion-denied.example".to_string(),
             reason: "not_allowed".to_string(),
             client: None,
@@ -2785,62 +3077,89 @@ async fn deny_network_completion(
             decision: Some("deny".to_string()),
             source: Some("decider".to_string()),
             port: Some(80),
-        },
-    );
+        });
     blocked.execution_id = Some(deferred.registration_id().to_string());
-    session.services.network_approval.record_blocked_request(blocked).await;
+    session
+        .services
+        .network_approval
+        .record_blocked_request(blocked)
+        .await;
 }
 
 #[tokio::test]
-async fn deferred_network_completion_preserves_initial_grace_and_late_denial() -> anyhow::Result<()> {
+async fn deferred_network_completion_preserves_initial_grace_and_late_denial() -> anyhow::Result<()>
+{
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let proxy = network_completion_proxy(&turn).await?;
     let allowed = network_completion_registration(&session, &turn, &proxy.proxy()).await;
     let denied = network_completion_registration(&session, &turn, &proxy.proxy()).await;
     tokio::time::pause();
     let started = Instant::now();
-    let mut first = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(allowed),
-    ));
+    let mut first = Box::pin(
+        finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            Some(allowed),
+        ),
+    );
     assert!(futures::poll!(&mut first).is_pending());
     tokio::time::advance(Duration::from_millis(99)).await;
-    assert!(futures::poll!(&mut first).is_pending(), "first completion must retain the denial grace");
+    assert!(
+        futures::poll!(&mut first).is_pending(),
+        "first completion must retain the denial grace"
+    );
     tokio::time::advance(Duration::from_millis(1)).await;
     first.await.map_err(anyhow::Error::msg)?;
     // The grace is a minimum, not an exact wakeup deadline: Tokio's timer
     // resolution may round the sleep up even with the clock paused.
     assert!(started.elapsed() >= Duration::from_millis(100));
 
-    let mut late = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(denied.clone()),
-    ));
+    let mut late = Box::pin(
+        finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            Some(denied.clone()),
+        ),
+    );
     assert!(futures::poll!(&mut late).is_pending());
     tokio::time::advance(Duration::from_millis(10)).await;
     deny_network_completion(&session, &denied).await;
-    assert!(late.await.unwrap_err().contains("completion-denied.example"));
+    assert!(
+        late.await
+            .unwrap_err()
+            .contains("completion-denied.example")
+    );
     tokio::time::resume();
     Ok(())
 }
 
 #[tokio::test]
-async fn deferred_network_completion_concurrent_waiters_and_cancelled_initializer() -> anyhow::Result<()> {
+async fn deferred_network_completion_concurrent_waiters_and_cancelled_initializer()
+-> anyhow::Result<()> {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let proxy = network_completion_proxy(&turn).await?;
     let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
     tokio::time::pause();
-    let mut cancelled = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(deferred.clone()),
-    ));
+    let mut cancelled = Box::pin(
+        finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            Some(deferred.clone()),
+        ),
+    );
     assert!(futures::poll!(&mut cancelled).is_pending());
     tokio::time::advance(Duration::from_millis(20)).await;
     drop(cancelled);
 
-    let mut first = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(deferred.clone()),
-    ));
-    let mut second = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(deferred.clone()),
-    ));
+    let mut first = Box::pin(
+        finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            Some(deferred.clone()),
+        ),
+    );
+    let mut second = Box::pin(
+        finish_deferred_network_approval_after_process_exit_for_session(
+            Some(&session),
+            Some(deferred.clone()),
+        ),
+    );
     assert!(futures::poll!(&mut first).is_pending());
     assert!(futures::poll!(&mut second).is_pending());
     tokio::time::advance(Duration::from_millis(10)).await;
@@ -2848,7 +3167,11 @@ async fn deferred_network_completion_concurrent_waiters_and_cancelled_initialize
     let (first, second) = tokio::join!(first, second);
     let first = first.expect_err("surviving initializer must still see late denial");
     assert!(first.contains("completion-denied.example"));
-    assert_eq!(second.unwrap_err(), first, "both concurrent consumers retain the same denial");
+    assert_eq!(
+        second.unwrap_err(),
+        first,
+        "both concurrent consumers retain the same denial"
+    );
     tokio::time::resume();
     Ok(())
 }
@@ -2860,13 +3183,22 @@ async fn deferred_network_completion_replays_cached_denial() -> anyhow::Result<(
     let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
     deny_network_completion(&session, &deferred).await;
     let first = finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(deferred.clone()),
-    ).await.unwrap_err();
+        Some(&session),
+        Some(deferred.clone()),
+    )
+    .await
+    .unwrap_err();
     let second = finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session), Some(deferred),
-    ).await.unwrap_err();
+        Some(&session),
+        Some(deferred),
+    )
+    .await
+    .unwrap_err();
     assert!(first.contains("completion-denied.example"));
-    assert_eq!(second, first, "retiring the registration must not erase its cached denial");
+    assert_eq!(
+        second, first,
+        "retiring the registration must not erase its cached denial"
+    );
     Ok(())
 }
 
@@ -2882,42 +3214,90 @@ async fn network_completion_finished_process(
         vec!["cmd.exe", "/d", "/c", "exit 0"]
     } else {
         vec!["sh", "-c", "exit 0"]
-    }.into_iter().map(str::to_string).collect();
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     let manager = &session.services.unified_exec_manager;
     let mut reservation = manager.reserve_process_id().await;
     manager.reserve_process_capacity(&mut reservation).await?;
     let process_id = reservation.process_id();
     let context = UnifiedExecContext::new(
-        Arc::clone(session), Arc::clone(turn), format!("network-completion-{process_id}"),
+        Arc::clone(session),
+        Arc::clone(turn),
+        format!("network-completion-{process_id}"),
     );
     let cwd: PathUri = turn.cwd().clone().into();
     let attempt = crate::tools::command_execution::CommandAttemptKey::new(
-        "exec_command", "local", cwd.to_string(), &command,
+        "exec_command",
+        "local",
+        cwd.to_string(),
+        &command,
     );
     let mut registration = PendingProcessRegistration::new(
-        Arc::clone(&manager.process_store), &context, attempt.clone(), process_id,
+        Arc::clone(&manager.process_store),
+        &context,
+        attempt.clone(),
+        process_id,
     );
     let started = Instant::now();
     let spawned = codex_utils_pty::spawn_pipe_process_no_stdin(
-        &command[0], &command[1..], turn.cwd().as_path(), &std::env::vars().collect(), &None,
-    ).await?;
+        &command[0],
+        &command[1..],
+        turn.cwd().as_path(),
+        &std::env::vars().collect(),
+        &None,
+    )
+    .await?;
     let process = UnifiedExecProcess::from_spawned(
-        spawned, codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle), None, &registration.pending_spawns(),
-    ).await?;
+        spawned,
+        codex_sandboxing::SandboxType::None,
+        Box::new(crate::unified_exec::NoopSpawnLifecycle),
+        None,
+        &registration.pending_spawns(),
+    )
+    .await?;
     registration.attach_process(Arc::clone(&process), deferred.clone());
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     ToolEmitter::unified_exec(
-        &command, cwd.clone(), ExecCommandSource::UnifiedExecStartup,
-        Some(process_id.to_string()), "local".to_string(),
-    ).begin(ToolEventCtx::new(session.as_ref(), turn.as_ref(), &context.call_id, None)).await?;
+        &command,
+        cwd.clone(),
+        ExecCommandSource::UnifiedExecStartup,
+        Some(process_id.to_string()),
+        "local".to_string(),
+    )
+    .begin(ToolEventCtx::new(
+        session.as_ref(),
+        turn.as_ref(),
+        &context.call_id,
+        None,
+    ))
+    .await?;
     start_streaming_output(&process, &context, Arc::clone(&transcript))?;
-    manager.store_process(
-        Arc::clone(&process), &context, &command, command.join(" "), cwd,
-        "local".to_string(), started, process_id, &mut reservation, false, attempt,
-        crate::tools::command_output_artifact::RawOutputArtifact::unavailable("quiet benchmark"),
-        deferred, transcript, Arc::new(AtomicBool::new(false)), &mut registration, false, None,
-    ).await?;
+    manager
+        .store_process(
+            Arc::clone(&process),
+            &context,
+            &command,
+            command.join(" "),
+            cwd,
+            "local".to_string(),
+            started,
+            process_id,
+            &mut reservation,
+            false,
+            attempt,
+            crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
+                "quiet benchmark",
+            ),
+            deferred,
+            transcript,
+            Arc::new(AtomicBool::new(false)),
+            &mut registration,
+            false,
+            None,
+        )
+        .await?;
     tokio::time::timeout(Duration::from_secs(10), process.wait_for_terminal_completion())
         .await.map_err(|error| anyhow::anyhow!(
             "terminal completion timed out: {error}; exited={}, output_closed={}, output_drained={}, terminal_ready={}, exit_code={:?}, failure={:?}",
@@ -2933,7 +3313,10 @@ async fn network_completion_finished_process(
 
 #[ignore = "latency benchmark"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(clippy::print_stderr, reason = "ignored benchmark emits raw monotonic timings for paired comparison")]
+#[expect(
+    clippy::print_stderr,
+    reason = "ignored benchmark emits raw monotonic timings for paired comparison"
+)]
 async fn deferred_network_completion_latency_benchmark() -> anyhow::Result<()> {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let proxy = network_completion_proxy(&turn).await?;
@@ -2945,26 +3328,35 @@ async fn deferred_network_completion_latency_benchmark() -> anyhow::Result<()> {
         for phase in ["initial_grace", "cached_helper"] {
             let started = std::time::Instant::now();
             finish_deferred_network_approval_after_process_exit_for_session(
-                Some(&session), Some(deferred.clone()),
-            ).await.map_err(anyhow::Error::msg)?;
+                Some(&session),
+                Some(deferred.clone()),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
             let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
             samples.entry(phase).or_default().push(elapsed_ns);
-            eprintln!("{}", serde_json::json!({
-                "benchmark": "deferred_network_completion", "executable": executable,
-                "sample": sample, "phase": phase,
-                "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
-                "elapsed_ns": elapsed_ns,
-            }));
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "benchmark": "deferred_network_completion", "executable": executable,
+                    "sample": sample, "phase": phase,
+                    "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
+                    "elapsed_ns": elapsed_ns,
+                })
+            );
         }
     }
     for (phase, mut values) in samples {
         values.sort_unstable();
         let percentile = |percent: usize| values[(values.len() * percent).div_ceil(100) - 1];
-        eprintln!("{}", serde_json::json!({
-            "benchmark": "deferred_network_completion", "executable": executable,
-            "phase": phase, "samples": values.len(), "percentile_method": "nearest_rank",
-            "p50_ns": percentile(50), "p90_ns": percentile(90), "p95_ns": percentile(95),
-        }));
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "benchmark": "deferred_network_completion", "executable": executable,
+                "phase": phase, "samples": values.len(), "percentile_method": "nearest_rank",
+                "p50_ns": percentile(50), "p90_ns": percentile(90), "p95_ns": percentile(95),
+            })
+        );
     }
     assert!(session.list_background_terminals().await.is_empty());
     Ok(())
@@ -2975,7 +3367,10 @@ async fn deferred_network_completion_latency_benchmark() -> anyhow::Result<()> {
 // and must not dominate the separate 20-sample helper benchmark.
 #[ignore = "latency benchmark"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(clippy::print_stderr, reason = "ignored benchmark emits raw monotonic timings for paired comparison")]
+#[expect(
+    clippy::print_stderr,
+    reason = "ignored benchmark emits raw monotonic timings for paired comparison"
+)]
 async fn deferred_network_completion_final_poll_benchmark() -> anyhow::Result<()> {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let proxy = network_completion_proxy(&turn).await?;
@@ -2984,26 +3379,42 @@ async fn deferred_network_completion_final_poll_benchmark() -> anyhow::Result<()
     for with_network in [false, true] {
         let deferred = if with_network {
             Some(network_completion_registration(&session, &turn, &proxy.proxy()).await)
-        } else { None };
+        } else {
+            None
+        };
         let process_id = network_completion_finished_process(&session, &turn, deferred).await?;
         let started = std::time::Instant::now();
-        let response = session.services.unified_exec_manager.write_stdin(WriteStdinRequest {
-            process_id, input: "", yield_time_ms: 5_000, max_output_tokens: None,
-            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1_000),
-            nested_deadline: None,
-        }).await?;
+        let response = session
+            .services
+            .unified_exec_manager
+            .write_stdin(WriteStdinRequest {
+                process_id,
+                input: "",
+                yield_time_ms: 5_000,
+                max_output_tokens: None,
+                truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1_000),
+                nested_deadline: None,
+            })
+            .await?;
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
         assert_eq!(response.exit_code, Some(0));
         assert!(response.process_exited);
         assert!(response.process_id.is_none());
         assert!(response.raw_output.is_empty());
-        let phase = if with_network { "final_poll_network" } else { "final_poll_no_network" };
-        eprintln!("{}", serde_json::json!({
-            "benchmark": "deferred_network_completion", "executable": executable,
-            "sample": 0, "phase": phase,
-            "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
-            "elapsed_ns": elapsed_ns,
-        }));
+        let phase = if with_network {
+            "final_poll_network"
+        } else {
+            "final_poll_no_network"
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "benchmark": "deferred_network_completion", "executable": executable,
+                "sample": 0, "phase": phase,
+                "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
+                "elapsed_ns": elapsed_ns,
+            })
+        );
     }
     assert!(session.list_background_terminals().await.is_empty());
     Ok(())
@@ -3102,12 +3513,15 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     );
     assert_eq!(item.exit_code, None);
     assert_eq!(item.process_id.as_deref(), Some("123"));
+    assert_eq!(item.aggregated_output.as_deref(), Some("PRE_DENIAL_MARKER"));
     assert_eq!(
-        item.aggregated_output.as_deref(),
-        Some("PRE_DENIAL_MARKER")
+        item.output_metadata
+            .as_ref()
+            .unwrap()
+            .failure_cause
+            .as_deref(),
+        Some("Network access denied")
     );
-    assert_eq!(item.output_metadata.as_ref().unwrap().failure_cause.as_deref(),
-        Some("Network access denied"));
 }
 
 #[test]
@@ -4452,13 +4866,24 @@ async fn collected_output_carries_absolute_poll_ranges_and_retention_gap() {
     ] {
         buffer.lock().await.push_chunk(bytes);
         let result = UnifiedExecProcessManager::collect_output_until_deadline_with_quiet_yield(
-            &buffer, &notify, &closed, &closed_notify, &cancel, None,
-            Instant::now(), None, None, &mut None,
-        ).await;
+            &buffer,
+            &notify,
+            &closed,
+            &closed_notify,
+            &cancel,
+            None,
+            Instant::now(),
+            None,
+            None,
+            &mut None,
+        )
+        .await;
         let ranges = result.ranges.unwrap();
         assert_eq!(ranges.range, expected);
         assert_eq!(ranges.gap, gap);
-        if gap.is_none() { assert_eq!(result.bytes, bytes); }
+        if gap.is_none() {
+            assert_eq!(result.bytes, bytes);
+        }
         buffer.lock().await.acknowledge_pending_output();
     }
 }

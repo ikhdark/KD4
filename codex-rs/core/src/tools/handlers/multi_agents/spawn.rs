@@ -76,6 +76,7 @@ async fn handle_spawn_agent(
         ));
     }
     let mut config = build_agent_spawn_config(turn.as_ref())?;
+    let parent_service_tier = inherit_live_service_tier(&session, &mut config).await;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -106,7 +107,7 @@ async fn handle_spawn_agent(
         &session,
         turn.as_ref(),
         &mut config,
-        turn.config.service_tier.as_deref(),
+        parent_service_tier.as_deref(),
         args.service_tier.as_deref(),
     )
     .await?;

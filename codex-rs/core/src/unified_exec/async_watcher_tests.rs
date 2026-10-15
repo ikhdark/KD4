@@ -33,7 +33,10 @@ async fn trailing_output_waits_for_quiet_without_extending_the_hard_bound() {
     let extended = super::trailing_output_deadline(tokio::time::Instant::now(), hard);
     assert!(extended > quiet);
     tokio::time::advance(Duration::from_millis(85)).await;
-    assert_eq!(super::trailing_output_deadline(tokio::time::Instant::now(), hard), hard);
+    assert_eq!(
+        super::trailing_output_deadline(tokio::time::Instant::now(), hard),
+        hard
+    );
 }
 
 #[tokio::test]
@@ -99,19 +102,32 @@ async fn transcript_drain_does_not_overtake_raw_output_finalization() {
             let output_closed = AtomicBool::new(already_closed);
             let output_closed_notify = Notify::new();
             let waiter = wait_for_process_output_for_result(
-                direct_runtime, &output_drained, &output_closed, &output_closed_notify,
+                direct_runtime,
+                &output_drained,
+                &output_closed,
+                &output_closed_notify,
             );
             tokio::pin!(waiter);
-            assert!(futures::poll!(&mut waiter).is_pending(), "both modes require transcript drain");
+            assert!(
+                futures::poll!(&mut waiter).is_pending(),
+                "both modes require transcript drain"
+            );
             output_drained.cancel();
             if !direct_runtime && !already_closed {
-                assert!(futures::poll!(&mut waiter).is_pending(), "artifact is still pending");
+                assert!(
+                    futures::poll!(&mut waiter).is_pending(),
+                    "artifact is still pending"
+                );
                 output_closed.store(true, Ordering::Release);
                 output_closed_notify.notify_waiters();
             }
             tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await.expect("completion barrier should release");
-            assert_eq!(output_closed.load(Ordering::Acquire), already_closed || !direct_runtime);
+                .await
+                .expect("completion barrier should release");
+            assert_eq!(
+                output_closed.load(Ordering::Acquire),
+                already_closed || !direct_runtime
+            );
         }
     }
 }
@@ -317,7 +333,12 @@ async fn streaming_utf8_pending_bytes_are_isolated_between_stdout_and_stderr() {
         .await;
     }
     super::flush_pending(
-        &mut pending, &transcript, "stream-isolation", &session, &turn, &limiter,
+        &mut pending,
+        &transcript,
+        "stream-isolation",
+        &session,
+        &turn,
+        &limiter,
     )
     .await;
     let mut deltas = Vec::new();
@@ -354,7 +375,13 @@ async fn streaming_lag_flushes_both_utf8_prefixes_before_post_gap_bytes() {
             // These bytes are not adjacent in either producer stream. A lag
             // must not let their UTF-8 projections fabricate an é character.
             super::handle_lagged_output(
-                7, &mut pending, &transcript, "stream-gap", &session, &turn, &limiter,
+                7,
+                &mut pending,
+                &transcript,
+                "stream-gap",
+                &session,
+                &turn,
+                &limiter,
             )
             .await;
         }
@@ -366,13 +393,21 @@ async fn streaming_lag_flushes_both_utf8_prefixes_before_post_gap_bytes() {
                 &session,
                 &turn,
                 &limiter,
-                ProcessOutputChunk { stream, bytes: vec![byte] },
+                ProcessOutputChunk {
+                    stream,
+                    bytes: vec![byte],
+                },
             )
             .await;
         }
     }
     super::flush_pending(
-        &mut pending, &transcript, "stream-gap", &session, &turn, &limiter,
+        &mut pending,
+        &transcript,
+        "stream-gap",
+        &session,
+        &turn,
+        &limiter,
     )
     .await;
     let mut deltas = Vec::new();
@@ -639,8 +674,12 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
         if denied {
             assert!(
                 terminal_events[0]
-                    .output_metadata.as_ref().expect("completion metadata")
-                    .failure_cause.as_deref().expect("denial cause")
+                    .output_metadata
+                    .as_ref()
+                    .expect("completion metadata")
+                    .failure_cause
+                    .as_deref()
+                    .expect("denial cause")
                     .contains("denied.example")
             );
             assert!(

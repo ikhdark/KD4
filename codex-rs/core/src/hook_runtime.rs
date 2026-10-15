@@ -621,12 +621,18 @@ pub(crate) async fn record_pending_input(
         TurnInput::UserInput { content, client_id } => {
             sess.record_user_prompt_and_emit_turn_item(turn_context, content.as_slice(), client_id)
                 .await?;
-            sess.services.plan_store.record_accepted_input(&turn_context.sub_id, content.iter().filter_map(|item| {
-                match item {
-                    codex_protocol::user_input::UserInput::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                }
-            })).await;
+            sess.services
+                .plan_store
+                .record_accepted_input(
+                    &turn_context.sub_id,
+                    content.iter().filter_map(|item| match item {
+                        codex_protocol::user_input::UserInput::Text { text, .. } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    }),
+                )
+                .await;
         }
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
             sess.record_conversation_items_ordered(turn_context, std::slice::from_ref(&item))
@@ -746,7 +752,10 @@ async fn record_session_start_additional_contexts(
         .map(|(index, text)| {
             let mut item = ContextualUserFragment::into(HookAdditionalContext::new(text));
             if let ResponseItem::Message { id, .. } = &mut item {
-                *id = Some(codex_protocol::ResponseItemId::with_suffix("msg_startup_context", index));
+                *id = Some(codex_protocol::ResponseItemId::with_suffix(
+                    "msg_startup_context",
+                    index,
+                ));
             }
             item
         })
@@ -757,14 +766,21 @@ async fn record_session_start_additional_contexts(
         .filter_map(single_developer_input_text)
         .map(str::to_owned)
         .collect();
-    let mut developer_messages = prepare_additional_context_items(sess, turn_context, contexts).await;
+    let mut developer_messages =
+        prepare_additional_context_items(sess, turn_context, contexts).await;
     let mut sources = candidates.iter();
     for item in &mut developer_messages {
         // Whole-item admission can skip an oversized source and admit a later
         // one. Preserve attribution by matching its exact retained text, not
         // its position in the shortened list. Omission notices have no owner.
-        let source = sources.find(|source| single_developer_input_text(source) == single_developer_input_text(item));
-        if let (ResponseItem::Message { id, .. }, Some(ResponseItem::Message { id: source_id, .. })) = (item, source) {
+        let source = sources.find(|source| {
+            single_developer_input_text(source) == single_developer_input_text(item)
+        });
+        if let (
+            ResponseItem::Message { id, .. },
+            Some(ResponseItem::Message { id: source_id, .. }),
+        ) = (item, source)
+        {
             *id = source_id.clone();
         }
     }
@@ -784,7 +800,9 @@ pub(crate) fn dedupe_existing_developer_contexts(
         // A single hook snapshot can repeat a body at multiple positions. Do
         // not charge that duplicate against the shared admission budget twice.
         if single_developer_input_text(&candidate).is_some_and(|text| {
-            retained.iter().any(|item| single_developer_input_text(item) == Some(text))
+            retained
+                .iter()
+                .any(|item| single_developer_input_text(item) == Some(text))
         }) {
             continue;
         }
@@ -792,18 +810,25 @@ pub(crate) fn dedupe_existing_developer_contexts(
             ResponseItem::Message { id, .. } => id.as_ref(),
             _ => None,
         };
-        let latest = existing.iter().chain(retained.iter()).rev().find(|item| {
-            matches!(item, ResponseItem::Message { role, id, .. }
+        let latest = existing
+            .iter()
+            .chain(retained.iter())
+            .rev()
+            .find(|item| {
+                matches!(item, ResponseItem::Message { role, id, .. }
                 if role == "developer" && source.is_none_or(|source| id.as_ref() == Some(source)))
-        }).or_else(|| {
-            // Older rollouts have no startup-source IDs and may group several
-            // fragments into one developer message. Only the newest legacy
-            // message is an effective fallback, never all historical bodies.
-            existing.iter().rev().find(|item| matches!(item,
+            })
+            .or_else(|| {
+                // Older rollouts have no startup-source IDs and may group several
+                // fragments into one developer message. Only the newest legacy
+                // message is an effective fallback, never all historical bodies.
+                existing.iter().rev().find(|item| {
+                    matches!(item,
                 ResponseItem::Message { role, id, .. }
                     if role == "developer" && id.as_ref().is_none_or(|id|
-                        !id.as_str().starts_with("msg_startup_context_"))))
-        });
+                        !id.as_str().starts_with("msg_startup_context_")))
+                })
+            });
         if single_developer_input_text(&candidate).is_none_or(|text| {
             !matches!(latest, Some(ResponseItem::Message { content, .. })
                 if content.iter().any(|part| matches!(part,
@@ -857,7 +882,8 @@ pub(crate) async fn prepare_additional_context_items(
 
 #[cfg(test)]
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
-    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default()).0
+    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default())
+        .0
 }
 
 fn additional_context_messages_with_budget(
@@ -874,13 +900,21 @@ fn additional_context_messages_with_budget(
                 omitted += 1;
                 return None;
             }
-            Some(ContextualUserFragment::into(RenderedContextFragment::new("developer", text)))
+            Some(ContextualUserFragment::into(RenderedContextFragment::new(
+                "developer",
+                text,
+            )))
         })
         .collect::<Vec<_>>();
     if omitted > 0 {
-        let notice = format!("Omitted {omitted} whole hook context fragment(s) due to the context budget; no partial instructions were admitted.");
+        let notice = format!(
+            "Omitted {omitted} whole hook context fragment(s) due to the context budget; no partial instructions were admitted."
+        );
         if budget.try_take(&notice) {
-            messages.push(ContextualUserFragment::into(RenderedContextFragment::new("developer", notice)));
+            messages.push(ContextualUserFragment::into(RenderedContextFragment::new(
+                "developer",
+                notice,
+            )));
         }
     }
     (messages, omitted)
@@ -1249,22 +1283,33 @@ mod tests {
         let item = |text: &str, source: &str| {
             let mut item = additional_context_messages(vec![text.to_string()]).remove(0);
             if let codex_protocol::models::ResponseItem::Message { id, .. } = &mut item {
-                *id = Some(codex_protocol::ResponseItemId::from_server(source.to_string()));
+                *id = Some(codex_protocol::ResponseItemId::from_server(
+                    source.to_string(),
+                ));
             }
             item
         };
         let a = item("A", "msg_startup_context_0");
         let b = item("B", "msg_startup_context_0");
         let other = item("A", "msg_startup_context_1");
-        assert_eq!(dedupe_existing_developer_contexts(&[a.clone(), b, other], vec![a.clone()]), vec![a.clone()]);
-        assert!(dedupe_existing_developer_contexts(std::slice::from_ref(&a), vec![a.clone()]).is_empty());
+        assert_eq!(
+            dedupe_existing_developer_contexts(&[a.clone(), b, other], vec![a.clone()]),
+            vec![a.clone()]
+        );
+        assert!(
+            dedupe_existing_developer_contexts(std::slice::from_ref(&a), vec![a.clone()])
+                .is_empty()
+        );
     }
 
     #[test]
     fn startup_context_legacy_fallback_uses_only_latest_message() {
         let mut candidate = additional_context_messages(vec!["A".to_string()]).remove(0);
         if let codex_protocol::models::ResponseItem::Message { id, .. } = &mut candidate {
-            *id = Some(codex_protocol::ResponseItemId::with_suffix("msg_startup_context", 0));
+            *id = Some(codex_protocol::ResponseItemId::with_suffix(
+                "msg_startup_context",
+                0,
+            ));
         }
         let legacy = additional_context_messages(vec!["A".to_string(), "B".to_string()]);
         assert_eq!(
@@ -1298,12 +1343,19 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>();
-        assert!(rendered_bytes <= codex_context_fragments::ModelContextBudget::default().remaining_bytes());
+        assert!(
+            rendered_bytes
+                <= codex_context_fragments::ModelContextBudget::default().remaining_bytes()
+        );
     }
 
     #[test]
     fn oversized_hook_instructions_are_never_spliced() {
-        let instruction = format!("Perform the action. {} Except when unapproved, do not perform it. {} Proceed.", "x".repeat(30_000), "y".repeat(30_000));
+        let instruction = format!(
+            "Perform the action. {} Except when unapproved, do not perform it. {} Proceed.",
+            "x".repeat(30_000),
+            "y".repeat(30_000)
+        );
         let messages = additional_context_messages(vec![instruction]);
         assert_eq!(messages.len(), 1);
         let text = super::single_developer_input_text(&messages[0]).unwrap();
@@ -1377,7 +1429,11 @@ mod tests {
     async fn hook_run_analytics_payload_resolves_completed_or_current_turn_id() {
         let (_session, turn_context) = make_session_and_context().await;
         for (turn_id, status, source) in [
-            (Some("turn-from-hook"), HookRunStatus::Blocked, HookSource::Project),
+            (
+                Some("turn-from-hook"),
+                HookRunStatus::Blocked,
+                HookSource::Project,
+            ),
             (None, HookRunStatus::Failed, HookSource::Unknown),
         ] {
             let completed = HookCompletedEvent {
@@ -1398,16 +1454,50 @@ mod tests {
     #[test]
     fn hook_run_metric_tags_match_analytics_shape() {
         for (status, source, status_label, source_label) in [
-            (HookRunStatus::Blocked, HookSource::Project, "blocked", "project"),
-            (HookRunStatus::Blocked, HookSource::CloudRequirements, "blocked", "cloud_requirements"),
-            (HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm, "completed", "legacy_managed_config_mdm"),
-            (HookRunStatus::Running, HookSource::Unknown, "running", "unknown"),
-            (HookRunStatus::Failed, HookSource::Project, "failed", "project"),
-            (HookRunStatus::Stopped, HookSource::Project, "stopped", "project"),
+            (
+                HookRunStatus::Blocked,
+                HookSource::Project,
+                "blocked",
+                "project",
+            ),
+            (
+                HookRunStatus::Blocked,
+                HookSource::CloudRequirements,
+                "blocked",
+                "cloud_requirements",
+            ),
+            (
+                HookRunStatus::Completed,
+                HookSource::LegacyManagedConfigMdm,
+                "completed",
+                "legacy_managed_config_mdm",
+            ),
+            (
+                HookRunStatus::Running,
+                HookSource::Unknown,
+                "running",
+                "unknown",
+            ),
+            (
+                HookRunStatus::Failed,
+                HookSource::Project,
+                "failed",
+                "project",
+            ),
+            (
+                HookRunStatus::Stopped,
+                HookSource::Project,
+                "stopped",
+                "project",
+            ),
         ] {
             assert_eq!(
                 hook_run_metric_tags(&sample_hook_run(status, source)),
-                [("hook_name", "Stop"), ("source", source_label), ("status", status_label)]
+                [
+                    ("hook_name", "Stop"),
+                    ("source", source_label),
+                    ("status", status_label)
+                ]
             );
         }
     }

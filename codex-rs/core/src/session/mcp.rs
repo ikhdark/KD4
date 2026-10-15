@@ -611,14 +611,15 @@ impl Session {
             };
             break (mcp_projection, available_environment_ids, expected_runtime);
         };
-        let runtime = self.refresh_mcp_servers_inner(
-            turn_context,
-            mcp_projection,
-            &turn_context.environments,
-            &available_environment_ids,
-            expected_runtime,
-        )
-        .await;
+        let runtime = self
+            .refresh_mcp_servers_inner(
+                turn_context,
+                mcp_projection,
+                &turn_context.environments,
+                &available_environment_ids,
+                expected_runtime,
+            )
+            .await;
         // A lost compare-and-publish race returns the winning runtime. Only
         // acknowledge if that authoritative runtime satisfies this request.
         if codex_mcp::configured_mcp_servers(runtime.config()) == mcp_servers
@@ -633,7 +634,10 @@ impl Session {
         let mut pending = self.pending_mcp_server_refresh_config.lock().await;
         // Value equality cannot distinguish a later identical refresh (for
         // example, a changed elicitation capability using the same server map).
-        if pending.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, applied)) {
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, applied))
+        {
             *pending = None;
         }
     }

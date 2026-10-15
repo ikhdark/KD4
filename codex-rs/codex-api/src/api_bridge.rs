@@ -27,11 +27,24 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
         ApiError::IncompleteResponse(response) => CodexErr::IncompleteResponse(response),
         ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
-        ApiError::Stream(message) => CodexErr::ResponseStreamFailed(ResponseStreamFailed {
-            message,
-            status: None,
-            request_id: None,
-        }),
+        ApiError::Stream(message) => {
+            // Provider silence is recoverable by waiting, and a close that
+            // invites a reconnect is recoverable by rebuilding the transport; a
+            // broken stream is neither. Classify before the message is moved
+            // into the error.
+            let idle_timeout = crate::error::is_stream_idle_timeout_message(&message);
+            let reconnectable_close = crate::error::is_reconnectable_close_message(&message);
+            // The marker carried the close code past the frame; it is routing
+            // state, not something to show a user.
+            let message = crate::error::strip_reconnectable_close_marker(message);
+            CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                message,
+                status: None,
+                request_id: None,
+                idle_timeout,
+                reconnectable_close,
+            })
+        }
         ApiError::ServerOverloaded { retry_after } => CodexErr::ServerOverloaded { retry_after },
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
@@ -155,6 +168,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     message,
                     status: None,
                     request_id: None,
+                    // A transport-level network failure, not provider silence.
+                    // `TransportError::Connection` above is the recoverable
+                    // case and already maps to `ConnectionFailed`.
+                    idle_timeout: false,
+                    // The transport broke; the provider never closed the stream.
+                    reconnectable_close: false,
                 })
             }
             TransportError::Build(msg) => CodexErr::RequestBuild(msg),

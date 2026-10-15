@@ -321,11 +321,21 @@ impl std::fmt::Display for ConnectionFailedError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ResponseStreamFailed {
     pub message: String,
     pub status: Option<StatusCode>,
     pub request_id: Option<String>,
+    /// The provider went silent on an otherwise healthy transport, rather than
+    /// the stream breaking. This is recoverable by waiting (sleep/wake, VPN
+    /// churn), so retry routing sends it to the connection-recovery loop
+    /// instead of charging the small, bounded provider retry budget.
+    pub idle_timeout: bool,
+    /// The provider closed the stream with a code that invites another
+    /// connection (load shedding, a node restart) rather than rejecting this
+    /// request. Retry routing rebuilds the transport once before abandoning it,
+    /// so one such close cannot degrade the rest of the session.
+    pub reconnectable_close: bool,
 }
 
 impl std::fmt::Display for ResponseStreamFailed {

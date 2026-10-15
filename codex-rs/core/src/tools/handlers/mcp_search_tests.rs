@@ -50,8 +50,13 @@ fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
         panic!("expected namespace");
     };
     namespace.description = "Shortened source description".to_string();
-    let metadata_only = handler.search_info_for_registered_spec(&ToolSpec::Namespace(namespace.clone())).unwrap();
-    assert_eq!(metadata_only.entry.callable_title.as_deref(), Some("Create event"));
+    let metadata_only = handler
+        .search_info_for_registered_spec(&ToolSpec::Namespace(namespace.clone()))
+        .unwrap();
+    assert_eq!(
+        metadata_only.entry.callable_title.as_deref(),
+        Some("Create event")
+    );
     let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
     tool.name = "overridden".to_string();
     tool.parameters = codex_tools::JsonSchema::string(Some("Override input".to_string()));
@@ -60,7 +65,9 @@ fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
     expected_tool.defer_loading = Some(true);
     expected_tool.output_schema = None;
     let registered = ToolSpec::Namespace(namespace);
-    let info = handler.search_info_for_registered_spec(&registered).unwrap();
+    let info = handler
+        .search_info_for_registered_spec(&registered)
+        .unwrap();
     assert_eq!(info.entry.callable_title, None);
     assert!(!Arc::ptr_eq(&handler.spec, &info.entry.output));
     assert_eq!(info.entry.tool_names, vec!["overridden"]);

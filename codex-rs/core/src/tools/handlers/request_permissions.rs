@@ -7,9 +7,9 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::handlers::shell_spec::create_request_permissions_tool;
 use crate::tools::handlers::shell_spec::request_permissions_tool_description;
+use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
@@ -71,7 +71,8 @@ impl RequestPermissionsHandler {
             &step_context.environments,
             environment_args.environment_id.as_deref(),
             &cancellation_token,
-        ).await?
+        )
+        .await?
         else {
             return Err(FunctionCallError::RespondToModel(
                 "request_permissions requires a primary environment".to_string(),
@@ -207,9 +208,14 @@ mod tests {
         let ToolSpec::Function(spec) = spec else {
             panic!("permissions uses a function spec");
         };
-        let validator =
-            jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
-                .expect("valid permission output schema");
+        let validator = jsonschema::validator_for(
+            &spec
+                .output_schema
+                .as_ref()
+                .expect("output schema")
+                .to_value(),
+        )
+        .expect("valid permission output schema");
         for expected in [
             json!({"permissions":{"network":null,"file_system":null},"scope":"turn"}),
             json!({"permissions":{"network":{"enabled":true},"file_system":null},"scope":"session"}),

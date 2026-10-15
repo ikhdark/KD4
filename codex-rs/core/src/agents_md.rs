@@ -138,7 +138,10 @@ pub(crate) struct ProjectDocOmissionRecovery {
 
 impl ProjectDocOmissionRecovery {
     pub(crate) fn new(thread_id: String) -> Self {
-        Self { thread_id, cached: tokio::sync::Mutex::new(None) }
+        Self {
+            thread_id,
+            cached: tokio::sync::Mutex::new(None),
+        }
     }
 
     #[expect(
@@ -147,8 +150,11 @@ impl ProjectDocOmissionRecovery {
     )]
     async fn notice(&self, config: &Config, documents: &[ProjectDocOmission]) -> String {
         let (notice, overflow) = project_doc_omission_notice(documents, "");
-        if !overflow { return notice; }
-        let canonical = codex_tools::CanonicalToolResult::json(serde_json::json!({"documents":documents}));
+        if !overflow {
+            return notice;
+        }
+        let canonical =
+            codex_tools::CanonicalToolResult::json(serde_json::json!({"documents":documents}));
         let mut cached = self.cached.lock().await;
         if let Some((hash, notice)) = cached.as_ref()
             && hash == &canonical.sha256
@@ -156,17 +162,24 @@ impl ProjectDocOmissionRecovery {
             return notice.clone();
         }
         let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-            config.codex_home.as_path(), &self.thread_id, &canonical,
-        ).await;
+            config.codex_home.as_path(),
+            &self.thread_id,
+            &canonical,
+        )
+        .await;
         let recovery = if artifact.complete {
             artifact.artifact_id().map(|id| format!(
                 "\nRecover omitted paths with read_tool_output: {}",
                 serde_json::json!({"artifact_id":id,"selectors":[{"kind":"json_pointer","pointer":"/documents"}]}),
             ))
-        } else { None };
+        } else {
+            None
+        };
         let notice = project_doc_omission_notice(documents, recovery.as_deref()
             .unwrap_or("\nPath manifest recovery unavailable; inspect the named environments before relying on omitted instructions.")).0;
-        if recovery.is_some() { *cached = Some((canonical.sha256, notice.clone())); }
+        if recovery.is_some() {
+            *cached = Some((canonical.sha256, notice.clone()));
+        }
         notice
     }
 }
@@ -295,9 +308,7 @@ pub(crate) async fn discover_project_instructions_with_markers(
         .collect::<Vec<_>>()
         .await;
 
-    ProjectInstructionsDiscovery {
-        environments,
-    }
+    ProjectInstructionsDiscovery { environments }
 }
 
 #[cfg(test)]
@@ -307,7 +318,14 @@ pub(crate) async fn load_project_instructions_from_discovery(
     discovery: ProjectInstructionsDiscovery,
     omission_recovery: Option<&ProjectDocOmissionRecovery>,
 ) -> ProjectInstructionsLoad {
-    load_project_instructions_with_fallback(config, user_instructions, discovery, omission_recovery, None).await
+    load_project_instructions_with_fallback(
+        config,
+        user_instructions,
+        discovery,
+        omission_recovery,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn load_project_instructions_with_fallback(
@@ -351,23 +369,28 @@ pub(crate) async fn load_project_instructions_with_fallback(
     let contributing_environments = environments
         .iter()
         .filter(|(discovery, retained)| {
-            !retained.is_empty()
-                || matches!(&discovery.result, Ok(paths) if !paths.is_empty())
+            !retained.is_empty() || matches!(&discovery.result, Ok(paths) if !paths.is_empty())
         })
         .count();
     let mut first_project_environment = true;
-    for (EnvironmentProjectInstructionsDiscovery {
-        environment_id,
-        cwd,
-        filesystem,
-        result,
-    }, retained) in environments
+    for (
+        EnvironmentProjectInstructionsDiscovery {
+            environment_id,
+            cwd,
+            filesystem,
+            result,
+        },
+        retained,
+    ) in environments
     {
         let (candidates, retained) = match result {
             Ok(candidates) => (candidates, None),
             Err(err) => {
                 complete = false;
-                error!(environment_id, "error trying to find AGENTS.md docs: {err:#}");
+                error!(
+                    environment_id,
+                    "error trying to find AGENTS.md docs: {err:#}"
+                );
                 let candidates = retained.iter().map(|doc| doc.candidate.clone()).collect();
                 (candidates, Some(retained))
             }
@@ -391,13 +414,11 @@ pub(crate) async fn load_project_instructions_with_fallback(
             .len();
         }
         if generated_overhead >= remaining_rendered_bytes {
-            omitted_documents.extend(candidates.iter().map(|candidate| {
-                ProjectDocOmission {
-                    environment_id: environment_id.clone(),
-                    cwd: cwd.inferred_native_path_string(),
-                    path: candidate.path.inferred_native_path_string(),
-                    source_bytes: candidate.size,
-                }
+            omitted_documents.extend(candidates.iter().map(|candidate| ProjectDocOmission {
+                environment_id: environment_id.clone(),
+                cwd: cwd.inferred_native_path_string(),
+                path: candidate.path.inferred_native_path_string(),
+                source_bytes: candidate.size,
             }));
             remaining_rendered_bytes = 0;
             first_project_environment = false;
@@ -405,7 +426,10 @@ pub(crate) async fn load_project_instructions_with_fallback(
         }
         remaining_rendered_bytes -= generated_overhead;
 
-        let source_order = candidates.iter().map(|candidate| candidate.path.clone()).collect::<Vec<_>>();
+        let source_order = candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>();
         let project_docs = if let Some(mut retained) = retained {
             // Match healthy nearest-first source allocation without any I/O.
             let mut remaining = remaining_source_bytes;
@@ -443,8 +467,10 @@ pub(crate) async fn load_project_instructions_with_fallback(
             loaded.entries.extend(docs.entries);
         }
         loaded.entries[environment_start..].sort_by_key(|entry| match &entry.provenance {
-            InstructionProvenance::Project { source_path, .. } =>
-                source_order.iter().position(|path| path == source_path).unwrap_or(usize::MAX),
+            InstructionProvenance::Project { source_path, .. } => source_order
+                .iter()
+                .position(|path| path == source_path)
+                .unwrap_or(usize::MAX),
             _ => usize::MAX,
         });
         first_project_environment = false;
@@ -476,7 +502,9 @@ fn retain_failed_environment(
 ) -> Vec<LoadedProjectDoc> {
     // Freshness is reported by the existing world-state transition. Putting a
     // notice in the body would spuriously replace unchanged instructions.
-    let Some((previous, sources)) = previous else { return Vec::new(); };
+    let Some((previous, sources)) = previous else {
+        return Vec::new();
+    };
     let mut retained = Vec::new();
     for entry in &previous.entries {
         if !matches!(&entry.provenance, InstructionProvenance::Project { environment_id: id, cwd: old_cwd, .. } if id == environment_id && old_cwd == cwd)
@@ -484,7 +512,8 @@ fn retain_failed_environment(
             continue;
         }
         if let Some(source) = sources.iter().find(|source| {
-            source.environment_id == environment_id && &source.cwd == cwd
+            source.environment_id == environment_id
+                && &source.cwd == cwd
                 && entry.provenance.path().as_ref() == Some(&source.candidate.path)
         }) {
             retained.push(LoadedProjectDoc {
@@ -535,11 +564,12 @@ async fn read_discovered_agents_md(
     max_total: usize,
 ) -> io::Result<EnvironmentProjectInstructions> {
     let (project_docs, failed_sources) = read_discovered_project_docs(
-        fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false,
-        None,
+        fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false, None,
     )
     .await;
-    if !failed_sources.is_empty() { return Err(io::Error::other("instruction source read failed")); }
+    if !failed_sources.is_empty() {
+        return Err(io::Error::other("instruction source read failed"));
+    }
     let rendered_max = project_doc_rendered_max_bytes(max_total);
     let aggregate_reserve = rendered_max.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
     let mut rendered = render_project_docs(
@@ -597,10 +627,15 @@ async fn read_discovered_project_docs(
                 error!(path = %candidate.path, "error reading instruction source: {err:#}");
                 failed_sources.push(candidate.path.clone());
                 let cached = fallback.and_then(|(previous, environment_id, cwd)| {
-                    previous.iter().find(|source| source.candidate.path == candidate.path
-                        && source.environment_id == environment_id && &source.cwd == cwd)
+                    previous.iter().find(|source| {
+                        source.candidate.path == candidate.path
+                            && source.environment_id == environment_id
+                            && &source.cwd == cwd
+                    })
                 });
-                let Some(cached) = cached else { continue; };
+                let Some(cached) = cached else {
+                    continue;
+                };
                 // Admit the last accepted body at its normal nearest-first priority,
                 // before fresh ancestors consume the shared budget. No extra I/O.
                 cached.read.clone()
@@ -734,9 +769,14 @@ fn project_doc_omission_notice(documents: &[ProjectDocOmission], recovery: &str)
     );
     let mut displayed = 0;
     for document in documents {
-        let row = format!("\n{}", serde_json::json!({"environment_id":document.environment_id,"path":document.path}));
+        let row = format!(
+            "\n{}",
+            serde_json::json!({"environment_id":document.environment_id,"path":document.path})
+        );
         // Reserve a bounded overflow count plus the executable recovery call.
-        if notice.len() + row.len() + recovery.len() + 80 + 2 > PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES {
+        if notice.len() + row.len() + recovery.len() + 80 + 2
+            > PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
+        {
             break;
         }
         notice.push_str(&row);
@@ -744,7 +784,10 @@ fn project_doc_omission_notice(documents: &[ProjectDocOmission], recovery: &str)
     }
     let overflow = displayed < documents.len();
     if overflow {
-        notice.push_str(&format!("\nAdditional omitted paths: {}.", documents.len() - displayed));
+        notice.push_str(&format!(
+            "\nAdditional omitted paths: {}.",
+            documents.len() - displayed
+        ));
         notice.push_str(recovery);
     }
     (notice, overflow)

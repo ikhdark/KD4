@@ -38,32 +38,54 @@ use tokio::time::Duration;
 const UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn mount_sse_sequence(
-    server: &wiremock::MockServer, bodies: Vec<String>,
+    server: &wiremock::MockServer,
+    bodies: Vec<String>,
 ) -> core_test_support::responses::ResponseMock {
-    core_test_support::responses::mount_sse_sequence_with_request(server, bodies, |request, body| {
-        body.lines().map(|line| {
-            let Some(data) = line.strip_prefix("data: ") else { return line.to_string() };
-            let Ok(mut event) = serde_json::from_str::<Value>(data) else { return line.to_string() };
-            let item = &mut event["item"];
-            if item["type"] == "function_call" && item["name"] == "write_stdin" {
-                let mut args: Value = serde_json::from_str(
-                    item["arguments"].as_str().expect("write_stdin fixture arguments must be a string"),
-                ).expect("write_stdin fixture arguments must be valid JSON");
-                if args.get("incarnation").is_none() {
-                    let incarnation = request["input"].as_array().expect("model request input must be an array").iter().rev()
-                        .filter(|item| item["type"] == "function_call_output")
-                        .filter_map(extract_output_text)
-                        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-                        .find(|output| output["session_id"] == args["session_id"])
-                        .expect("poll must consume a prior live process handle");
-                    args["incarnation"] = incarnation["session_capabilities"]["incarnation"].clone();
-                    assert!(args["incarnation"].is_string());
-                    item["arguments"] = args.to_string().into();
-                }
-            }
-            format!("data: {event}")
-        }).collect::<Vec<_>>().join("\n") + "\n"
-    }).await
+    core_test_support::responses::mount_sse_sequence_with_request(
+        server,
+        bodies,
+        |request, body| {
+            body.lines()
+                .map(|line| {
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        return line.to_string();
+                    };
+                    let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                        return line.to_string();
+                    };
+                    let item = &mut event["item"];
+                    if item["type"] == "function_call" && item["name"] == "write_stdin" {
+                        let mut args: Value = serde_json::from_str(
+                            item["arguments"]
+                                .as_str()
+                                .expect("write_stdin fixture arguments must be a string"),
+                        )
+                        .expect("write_stdin fixture arguments must be valid JSON");
+                        if args.get("incarnation").is_none() {
+                            let incarnation = request["input"]
+                                .as_array()
+                                .expect("model request input must be an array")
+                                .iter()
+                                .rev()
+                                .filter(|item| item["type"] == "function_call_output")
+                                .filter_map(extract_output_text)
+                                .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+                                .find(|output| output["session_id"] == args["session_id"])
+                                .expect("poll must consume a prior live process handle");
+                            args["incarnation"] =
+                                incarnation["session_capabilities"]["incarnation"].clone();
+                            assert!(args["incarnation"].is_string());
+                            item["arguments"] = args.to_string().into();
+                        }
+                    }
+                    format!("data: {event}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        },
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -125,11 +147,15 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
                 |event| matches!(event, EventMsg::TurnComplete(_)),
                 Duration::from_secs(120),
             )
-            .await else {
+            .await
+            else {
                 unreachable!("completion predicate");
             };
             assert!(completed.error.is_none(), "{completed:?}");
-            assert_eq!(completed.last_agent_message.as_deref(), Some("Observed command output."));
+            assert_eq!(
+                completed.last_agent_message.as_deref(),
+                Some("Observed command output.")
+            );
             let requests = request_log.requests();
             assert_eq!(
                 requests.len(),
@@ -184,8 +210,7 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
                 .context("live command needs a session ID")?
                 .parse::<u32>()?;
             tool = "write_stdin";
-            args =
-                json!({"session_id": session_id, "incarnation": result.incarnation, "yield_time_ms": 1000, "max_output_tokens": 2000});
+            args = json!({"session_id": session_id, "incarnation": result.incarnation, "yield_time_ms": 1000, "max_output_tokens": 2000});
         }
         let exit = terminal_exit.context("validation must finish, not leave a live process")?;
         assert_eq!(exit == 0, expected_success, "exit {exit}: {output}");
@@ -210,7 +235,13 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
             );
         }
     }
-    assert!(!test.config.codex_home.join("workspace-transactions").exists());
+    assert!(
+        !test
+            .config
+            .codex_home
+            .join("workspace-transactions")
+            .exists()
+    );
     assert!(!test.config.codex_home.join("validation-cache").exists());
     Ok(())
 }
@@ -250,7 +281,9 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
             chunk_id: None,
             wall_time_seconds: 0.0,
             process_id: parsed.session_id.map(|id| id.to_string()),
-            incarnation: parsed.session_capabilities["incarnation"].as_str().map(str::to_owned),
+            incarnation: parsed.session_capabilities["incarnation"]
+                .as_str()
+                .map(str::to_owned),
             exit_code: parsed.exit_code,
             original_token_count: None,
             output: parsed.output,
@@ -968,7 +1001,9 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
 
         if expected_exit_code == 0 {
             assert!(
-                output.output.contains("test result: ok. 1 passed; 0 failed"),
+                output
+                    .output
+                    .contains("test result: ok. 1 passed; 0 failed"),
                 "the success fixture must execute, not pass with zero selected tests: {output:?}"
             );
         }
@@ -1442,7 +1477,8 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
         |event| matches!(event, EventMsg::TurnComplete(_)),
         UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
     )
-    .await else {
+    .await
+    else {
         unreachable!("event predicate requires TurnComplete")
     };
 
@@ -1673,7 +1709,8 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
         |event| matches!(event, EventMsg::TurnComplete(_)),
         UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
     )
-    .await else {
+    .await
+    else {
         unreachable!("completion predicate");
     };
     assert!(completed.error.is_none(), "{completed:?}");
@@ -1750,7 +1787,8 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
         |event| matches!(event, EventMsg::TurnComplete(_)),
         UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
     )
-    .await else {
+    .await
+    else {
         unreachable!("completion predicate");
     };
     assert!(completed.error.is_none(), "{completed:?}");

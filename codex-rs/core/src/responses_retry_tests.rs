@@ -42,6 +42,8 @@ fn transport_fallback_requires_a_transport_class_error() {
             message: "websocket closed".to_string(),
             status: None,
             request_id: None,
+            idle_timeout: false,
+            reconnectable_close: false,
         })
     ));
     assert!(!should_switch_fallback_transport(&CodexErr::Stream(
@@ -181,6 +183,130 @@ async fn first_stream_read_failure_switches_to_https_with_bounded_remaining_retr
             tokio::time::resume();
         }
     }
+}
+
+/// A server close that invites another connection must rebuild the WebSocket
+/// rather than abandon it: falling back on the first such close degraded every
+/// later request of the session, which the recorded rollouts showed happening
+/// within the opening minute of long sessions.
+#[tokio::test]
+async fn reconnectable_server_close_rebuilds_the_websocket_before_falling_back() {
+    for request in [
+        ResponsesStreamRequest::Sampling,
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let (session, turn_context, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = true,
+            )
+            .await;
+        let mut client_session = session.services.model_client.new_session();
+        let mut retry_state = ResponsesStreamRetryState::default();
+        let cancellation_token = CancellationToken::new();
+        assert!(session.services.model_client.responses_websocket_enabled());
+        tokio::time::pause();
+
+        let reconnectable = || {
+            codex_api::map_api_error(codex_api::ApiError::reconnectable_close(
+                "websocket closed by server before response.completed (code 1012, reason: \"\")",
+            ))
+        };
+
+        // The first close reconnects: the transport stays on WebSockets and the
+        // provider retry budget is untouched.
+        let started = tokio::time::Instant::now();
+        handle_retryable_response_stream_error(
+            &mut retry_state,
+            /*max_retries*/ 2,
+            reconnectable(),
+            &mut client_session,
+            &session,
+            &turn_context,
+            request,
+            &cancellation_token,
+        )
+        .await
+        .expect("a reconnectable close must retry");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the server already answered; there is nothing to back off for"
+        );
+        assert!(
+            session.services.model_client.responses_websocket_enabled(),
+            "one reconnectable close must not abandon WebSockets for the session"
+        );
+        assert_eq!(
+            retry_state.retries, 0,
+            "a reconnect must not spend the provider retry budget"
+        );
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 1);
+        assert!(
+            matches!(&emitted[0].msg, EventMsg::StreamError(error)
+                if error.message.contains("the server closed the stream")),
+            "{:?}",
+            emitted[0].msg
+        );
+
+        // A second close of the same request falls back, so a server closing in
+        // a loop cannot reconnect without bound.
+        handle_retryable_response_stream_error(
+            &mut retry_state,
+            /*max_retries*/ 2,
+            reconnectable(),
+            &mut client_session,
+            &session,
+            &turn_context,
+            request,
+            &cancellation_token,
+        )
+        .await
+        .expect("the second close falls back to HTTPS");
+        assert!(
+            !session.services.model_client.responses_websocket_enabled(),
+            "the reconnect is allowed once per request"
+        );
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(&emitted[0].msg, EventMsg::Warning(warning)
+            if warning.message.contains("Falling back from WebSockets to HTTPS")));
+        tokio::time::resume();
+    }
+}
+
+/// A close that rejects the request must keep failing fast: reconnecting would
+/// only repeat the rejection.
+#[test]
+fn only_reconnectable_closes_rebuild_the_transport() {
+    let close = |reconnectable_close| {
+        CodexErr::ResponseStreamFailed(codex_protocol::error::ResponseStreamFailed {
+            message: "websocket closed by server before response.completed".to_string(),
+            status: None,
+            request_id: None,
+            idle_timeout: false,
+            reconnectable_close,
+        })
+    };
+    let fresh = ResponsesStreamRetryState::default();
+    assert!(should_reconnect_after_close(&close(true), &fresh));
+    assert!(!should_reconnect_after_close(&close(false), &fresh));
+    assert!(!should_reconnect_after_close(&connection_failed(), &fresh));
+    assert!(!should_reconnect_after_close(
+        &CodexErr::RequestTimeout,
+        &fresh
+    ));
+
+    let spent = ResponsesStreamRetryState {
+        reconnected_after_close: true,
+        ..ResponsesStreamRetryState::default()
+    };
+    assert!(!should_reconnect_after_close(&close(true), &spent));
 }
 
 #[tokio::test]
@@ -383,6 +509,59 @@ fn connection_recovery_wait_is_limited_to_user_facing_sessions() {
         &SessionSource::VSCode,
         &ModelProviderInfo::default(),
     ));
+}
+
+#[test]
+fn provider_silence_waits_for_recovery_while_a_broken_stream_still_fails_fast() {
+    // A post-connect idle timeout means the transport was healthy and the
+    // provider stopped sending: the sleep/wake and VPN-churn case this loop
+    // exists for. Charging it to the bounded provider budget (2 retries for
+    // compaction, each capped at a 5s backoff) failed turns on links that
+    // would have recovered.
+    for message in [
+        "idle timeout waiting for SSE after 300000ms",
+        "idle timeout waiting for websocket after 300000ms",
+        "model progress timeout waiting for SSE",
+        "model progress timeout waiting for websocket",
+    ] {
+        let err = codex_api::map_api_error(codex_api::ApiError::Stream(message.to_string()));
+        assert!(
+            matches!(&err, CodexErr::ResponseStreamFailed(failed) if failed.idle_timeout),
+            "{message} must be classified as provider silence"
+        );
+        assert!(
+            should_wait_for_connection_recovery(
+                &err,
+                &SessionSource::VSCode,
+                &ModelProviderInfo::default(),
+            ),
+            "{message} must wait for recovery"
+        );
+    }
+
+    // A stream that actually broke is not recoverable by waiting, so it keeps
+    // the bounded retry path and its fast transport fallback.
+    for message in [
+        "websocket closed",
+        "websocket connection is closed",
+        "failed to encode responses request: boom",
+    ] {
+        let err = codex_api::map_api_error(codex_api::ApiError::Stream(message.to_string()));
+        assert!(
+            matches!(&err, CodexErr::ResponseStreamFailed(failed) if !failed.idle_timeout),
+            "{message} must not be classified as provider silence"
+        );
+        assert!(
+            !should_wait_for_connection_recovery(
+                &err,
+                &SessionSource::VSCode,
+                &ModelProviderInfo::default(),
+            ),
+            "{message} must keep the bounded retry path"
+        );
+        // The transport fallback must still fire on the first such failure.
+        assert!(should_switch_fallback_transport(&err), "{message}");
+    }
 }
 
 #[tokio::test]
@@ -706,4 +885,291 @@ async fn cancelled_retry_does_not_switch_transport_or_announce_an_attempt() {
             assert!(events.try_recv().is_err());
         }
     }
+}
+
+fn store_test_login(codex_home: &std::path::Path, api_key: &str) {
+    codex_login::login_with_api_key(
+        codex_home,
+        api_key,
+        codex_login::AuthCredentialsStoreMode::File,
+        codex_login::AuthKeyringBackendKind::default(),
+    )
+    .expect("store test credentials");
+}
+
+/// Makes the turn interactive and backed by a first-party account whose stored
+/// credentials match the cached ones, as after a normal login.
+fn interactive_turn_with_account(
+    turn: &mut std::sync::Arc<TurnContext>,
+    codex_home: &std::path::Path,
+) -> std::sync::Arc<codex_login::AuthManager> {
+    store_test_login(codex_home, "first-account");
+    let auth_manager = codex_login::AuthManager::from_auth_for_testing_with_home(
+        codex_login::CodexAuth::from_api_key("first-account"),
+        codex_home.to_path_buf(),
+    );
+    let turn = std::sync::Arc::get_mut(turn).expect("test turn context should be uniquely owned");
+    turn.provider = codex_model_provider::create_model_provider(
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+        Some(std::sync::Arc::clone(&auth_manager)),
+    );
+    turn.session_source = SessionSource::Cli;
+    auth_manager
+}
+
+fn usage_limit(resets_at: Option<chrono::DateTime<chrono::Utc>>) -> UsageLimitReachedError {
+    UsageLimitReachedError {
+        plan_type: None,
+        resets_at,
+        rate_limits: None,
+        promo_message: None,
+        rate_limit_reached_type: None,
+    }
+}
+
+#[tokio::test]
+async fn missing_credentials_wait_ends_when_a_login_lands() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
+    let codex_home = tempfile::tempdir().unwrap();
+    let auth_manager = interactive_turn_with_account(&mut turn, codex_home.path());
+    assert!(!turn.provider.missing_required_credentials());
+    auth_manager.logout().await.expect("logout");
+    assert!(
+        turn.provider.missing_required_credentials(),
+        "a logged-out first-party provider would send no credentials"
+    );
+
+    let login = tokio::spawn({
+        let auth_manager = std::sync::Arc::clone(&auth_manager);
+        let codex_home = codex_home.path().to_path_buf();
+        async move {
+            store_test_login(&codex_home, "second-account");
+            auth_manager.reload().await
+        }
+    });
+    let mut deadline = None;
+    let retry = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_account_change(
+            AccountChangeWait::MissingCredentials,
+            &mut deadline,
+            &session,
+            &turn,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("a login must end the wait")
+    .expect("the wait was not cancelled");
+    assert!(retry, "the request is sent once credentials are back");
+    assert!(login.await.unwrap(), "the login changed the cached auth");
+    assert!(!turn.provider.missing_required_credentials());
+    assert!(
+        deadline.is_some(),
+        "the first wait sets the request's bound"
+    );
+    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::Warning(warning) if warning.message.contains("No model credentials are loaded")))
+    );
+}
+
+#[tokio::test]
+async fn usage_limit_wait_ends_at_a_reset_inside_its_bound() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
+    let codex_home = tempfile::tempdir().unwrap();
+    let _auth_manager = interactive_turn_with_account(&mut turn, codex_home.path());
+    tokio::time::pause();
+    let error = usage_limit(Some(chrono::Utc::now() + chrono::Duration::seconds(90)));
+    let started = tokio::time::Instant::now();
+    let mut deadline = None;
+    let retry = wait_for_account_change(
+        AccountChangeWait::UsageLimit(&error),
+        &mut deadline,
+        &session,
+        &turn,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the wait was not cancelled");
+    let waited = started.elapsed();
+    tokio::time::resume();
+    assert!(retry, "a reset inside the bound retries the request");
+    // The reset, not the 15-minute bound, ends the wait. Credential reloads
+    // while waiting find the same account and do not wake it early.
+    assert!(
+        waited >= Duration::from_secs(89) && waited < ACCOUNT_CHANGE_WAIT,
+        "waited {waited:?}"
+    );
+    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(emitted.iter().any(|event| matches!(&event.msg,
+        EventMsg::Warning(warning)
+            if warning.message.contains("Waiting up to 15 min for an account switch or the limit reset"))));
+}
+
+#[tokio::test]
+async fn owner_cancellation_interrupts_the_account_wait() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
+    let codex_home = tempfile::tempdir().unwrap();
+    let _auth_manager = interactive_turn_with_account(&mut turn, codex_home.path());
+    let error = usage_limit(/*resets_at*/ None);
+    let cancellation = CancellationToken::new();
+    let mut deadline = None;
+    tokio::time::pause();
+    let wait = wait_for_account_change(
+        AccountChangeWait::UsageLimit(&error),
+        &mut deadline,
+        &session,
+        &turn,
+        &cancellation,
+    );
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    assert!(events.try_recv().is_ok(), "the wait is announced");
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(1), wait.as_mut())
+        .await
+        .expect("cancellation must not wait for the account bound");
+    tokio::time::resume();
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+}
+
+#[tokio::test]
+async fn account_wait_keeps_batch_sessions_and_spent_bounds_failing_fast() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
+    let codex_home = tempfile::tempdir().unwrap();
+    let _auth_manager = interactive_turn_with_account(&mut turn, codex_home.path());
+    let error = usage_limit(/*resets_at*/ None);
+
+    // An exhausted bound keeps the original error without another announcement.
+    let mut spent = Some(tokio::time::Instant::now());
+    assert!(
+        !wait_for_account_change(
+            AccountChangeWait::UsageLimit(&error),
+            &mut spent,
+            &session,
+            &turn,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    );
+
+    // Batch and internal sessions fail fast for their callers.
+    for source in [
+        SessionSource::Exec,
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+        SessionSource::SubAgent(SubAgentSource::Review),
+    ] {
+        std::sync::Arc::get_mut(&mut turn).unwrap().session_source = source.clone();
+        let mut deadline = None;
+        assert!(
+            !wait_for_account_change(
+                AccountChangeWait::UsageLimit(&error),
+                &mut deadline,
+                &session,
+                &turn,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            "{source:?}"
+        );
+        assert!(deadline.is_none(), "{source:?}");
+    }
+    assert!(events.try_recv().is_err(), "no wait was announced");
+
+    // Spawned agents wait with their interactive parent.
+    assert!(waits_for_account_change(&SessionSource::SubAgent(
+        SubAgentSource::ThreadSpawn {
+            parent_thread_id: codex_protocol::ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }
+    )));
+}
+#[tokio::test]
+async fn missing_credentials_wait_rechecks_a_login_that_already_completed() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
+    let codex_home = tempfile::tempdir().unwrap();
+    let auth_manager = interactive_turn_with_account(&mut turn, codex_home.path());
+    auth_manager.logout().await.unwrap();
+    // Model the caller's missing-credentials observation, followed by a login
+    // on another task before the wait can subscribe to auth changes.
+    assert!(turn.provider.missing_required_credentials());
+    store_test_login(codex_home.path(), "second-account");
+    assert!(auth_manager.reload().await);
+    assert!(!turn.provider.missing_required_credentials());
+
+    tokio::time::pause();
+    for cancelled in [false, true] {
+        let cancellation = CancellationToken::new();
+        if cancelled {
+            cancellation.cancel();
+        }
+        let mut deadline = None;
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            wait_for_account_change(
+                AccountChangeWait::MissingCredentials,
+                &mut deadline,
+                &session,
+                &turn,
+                &cancellation,
+            ),
+        )
+        .await
+        .expect("an already completed login must not wait for another auth change");
+        if cancelled {
+            assert!(matches!(result, Err(CodexErr::TurnAborted)));
+        } else {
+            assert!(result.unwrap(), "the authenticated request can now be retried");
+        }
+        assert!(deadline.is_none(), "no account wait was needed");
+        assert!(events.try_recv().is_err(), "do not announce a stale wait");
+    }
+    tokio::time::resume();
 }

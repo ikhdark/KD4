@@ -1079,7 +1079,13 @@ mod tests {
         let message = super::stalled_assignment_nudge(author.clone(), recipient.clone());
         assert!(message.trigger_turn);
         assert_eq!(message.encrypted_content, None);
-        let ResponseItem::AgentMessage { author: actual_author, recipient: actual_recipient, content, .. } = message.to_model_input_item() else {
+        let ResponseItem::AgentMessage {
+            author: actual_author,
+            recipient: actual_recipient,
+            content,
+            ..
+        } = message.to_model_input_item()
+        else {
             panic!("nudge must be an agent message");
         };
         assert_eq!(actual_author, author.to_string());
@@ -1147,7 +1153,10 @@ mod tests {
             Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unique fixture turn").config)
                 .multi_agent_v2
                 .min_wait_timeout_ms = 0;
-            session.services.agent_control.task_coordinator()
+            session
+                .services
+                .agent_control
+                .task_coordinator()
                 .initialize_for_workspace_coordination(
                     None,
                     fixture.path().join("state"),
@@ -1191,7 +1200,9 @@ mod tests {
             };
             let cancellation = CancellationToken::new();
             let first = tokio::spawn(runtime.clone().handle_tool_call_with_source(
-                call("held-wait", 60_000), source("held-wait"), cancellation.clone(),
+                call("held-wait", 60_000),
+                source("held-wait"),
+                cancellation.clone(),
             ));
             // Observe actual handler entry, not a sleep or a flag-only assertion.
             let entered = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1204,14 +1215,20 @@ mod tests {
                         return Ok::<_, anyhow::Error>(());
                     }
                 }
-            }).await;
+            })
+            .await;
             let second = if matches!(&entered, Ok(Ok(()))) {
-                Some(tokio::time::timeout(Duration::from_secs(5),
-                    runtime.clone().handle_tool_call_with_source(
-                        call("independent-wait", 0), source("independent-wait"),
-                        CancellationToken::new(),
-                    ),
-                ).await)
+                Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        runtime.clone().handle_tool_call_with_source(
+                            call("independent-wait", 0),
+                            source("independent-wait"),
+                            CancellationToken::new(),
+                        ),
+                    )
+                    .await,
+                )
             } else {
                 None
             };
@@ -1219,17 +1236,23 @@ mod tests {
             cancellation.cancel();
             let cancelled = tokio::time::timeout(Duration::from_secs(5), first).await???;
             entered??;
-            assert!(first_was_pending, "the long wait must still own its lifecycle");
+            assert!(
+                first_was_pending,
+                "the long wait must still own its lifecycle"
+            );
             let second = second.expect("first wait entered")??;
             assert_eq!(second.code_mode_result()["timed_out"], true);
             assert!(serde_json::to_string(&cancelled.response())?.contains("aborted by user"));
             // A cancelled waiter must release its gate and leave later work usable.
-            let after = tokio::time::timeout(Duration::from_secs(5),
+            let after = tokio::time::timeout(
+                Duration::from_secs(5),
                 runtime.handle_tool_call_with_source(
-                    call("after-cancellation", 0), source("after-cancellation"),
+                    call("after-cancellation", 0),
+                    source("after-cancellation"),
                     CancellationToken::new(),
                 ),
-            ).await??;
+            )
+            .await??;
             assert_eq!(after.code_mode_result()["timed_out"], true);
         }
         Ok(())
@@ -1577,6 +1600,7 @@ mod tests {
                 relation: None,
                 architecture_contract_ref: None,
                 integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
+                benign_read_overlap_count: 0,
                 task_capsule: None,
                 created_at: now,
             },
@@ -1680,7 +1704,11 @@ mod tests {
     fn durable_progress_rejects_missing_and_repeated_cursor_revisions() {
         let cursor = WakeEventId::new();
         let valid = test_wake_page(
-            test_wake_events(AssignmentId::new(), codex_agent_task_store::AttemptId::new(), 2),
+            test_wake_events(
+                AssignmentId::new(),
+                codex_agent_task_store::AttemptId::new(),
+                2,
+            ),
             0,
             0,
         );
@@ -1696,7 +1724,10 @@ mod tests {
         let mut wrong_bounds = valid;
         wrong_bounds.truncated_count = 1;
         for (page, expected_error) in [
-            (test_wake_page(Vec::new(), 0, 0), "contained no advancing event"),
+            (
+                test_wake_page(Vec::new(), 0, 0),
+                "contained no advancing event",
+            ),
             (missing, "omitted its cursor revision"),
             (repeated, "repeated its cursor identity"),
             (mismatched, "cursor did not identify its final event"),
@@ -2000,7 +2031,9 @@ mod tests {
         let step_context = StepContext::for_test(Arc::new(turn));
         let session = Arc::new(session);
         for arguments in [json!({}), json!({"timeout_ms": 300_000})] {
-            let payload = ToolPayload::Function { arguments: arguments.to_string() };
+            let payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
             let invocation = ToolInvocation {
                 session: Arc::clone(&session),
                 step_context: Arc::clone(&step_context),
@@ -2009,18 +2042,22 @@ mod tests {
                 call_id: "nested-deadline".into(),
                 tool_name: ToolName::plain("wait_agent"),
                 source: ToolCallSource::CodeMode {
-                    cell_id: "deadline-cell".into(), parent_call_id: None,
+                    cell_id: "deadline-cell".into(),
+                    parent_call_id: None,
                     runtime_tool_call_id: "deadline-wait".into(),
                     nested_deadline: Some(std::time::Instant::now()),
                     cancellation_cause: None,
                 },
                 payload: payload.clone(),
             };
-            let result = tokio::time::timeout(Duration::from_secs(5),
-                Handler::default().handle_call(invocation))
-                .await.expect("nested wait must return, not wait indefinitely")
-                .expect("nested timeout is a normal result")
-                .code_mode_result(&payload);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                Handler::default().handle_call(invocation),
+            )
+            .await
+            .expect("nested wait must return, not wait indefinitely")
+            .expect("nested timeout is a normal result")
+            .code_mode_result(&payload);
             assert_eq!(result["timed_out"], true);
             assert_eq!(result["message"], "Wait timed out.");
         }
@@ -2038,11 +2075,23 @@ mod tests {
             let deadline = earliest_deadline(explicit, nested);
             assert_eq!(deadline, nested);
             let (outcome, _) = wait_for_activity(
-                &mut activity_rx, &mut activity_open, None, deadline, None, None, None,
-            ).await.unwrap();
+                &mut activity_rx,
+                &mut activity_open,
+                None,
+                deadline,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(outcome, WaitOutcome::BoundaryElapsed);
             let result = WaitAgentResult::from_outcome(
-                WaitOutcome::TimedOut, None, Vec::new(), 0, Vec::new(),
+                WaitOutcome::TimedOut,
+                None,
+                Vec::new(),
+                0,
+                Vec::new(),
             );
             assert!(result.timed_out);
             assert_eq!(result.message, "Wait timed out.");

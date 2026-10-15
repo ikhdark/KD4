@@ -201,7 +201,10 @@ mod tests {
                 apply_env_overlay(&mut env, HashMap::new());
                 assert_eq!(env, HashMap::from([("Path".into(), "mixed".into())]));
                 apply_env_overlay(&mut env, make_vars(&overlay).into_iter().collect());
-                assert_eq!(env, HashMap::from([("Path".into(), "overlay-mixed".into())]));
+                assert_eq!(
+                    env,
+                    HashMap::from([("Path".into(), "overlay-mixed".into())])
+                );
                 apply_env_overlay(
                     &mut env,
                     HashMap::from([("PATH".into(), "last-layer".into())]),
@@ -294,9 +297,8 @@ mod tests {
         ]);
         assert_eq!(populate_env(vars.clone(), &policy, None), expected);
         let mut expected_with_lookup_defaults = expected;
-        expected_with_lookup_defaults.insert(
-            "PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string(),
-        );
+        expected_with_lookup_defaults
+            .insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
         assert_eq!(
             create_env_from_vars(vars, &policy, None),
             expected_with_lookup_defaults,

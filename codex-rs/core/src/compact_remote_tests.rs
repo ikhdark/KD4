@@ -10,30 +10,43 @@ use pretty_assertions::assert_eq;
 // Opt-in microbenchmark: excludes session setup and fixture construction. This
 // measures local preparation only, not provider latency or end-to-end turns.
 #[test]
-#[ignore]
-#[expect(clippy::print_stderr, reason = "This opt-in benchmark reports timing samples and their median")]
+#[ignore = "manual local microbenchmark; timing is descriptive"]
+#[expect(
+    clippy::print_stderr,
+    reason = "This opt-in benchmark reports timing samples and their median"
+)]
 fn benchmark_compaction_search_receipt() {
     let mut items = tool_search_group("benchmark");
     if let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] {
-        *tools = (0..256).map(|index| serde_json::json!({
-            "namespace": "apps", "name": format!("tool_{index:04}"),
-            "description": "schema documentation ".repeat(64),
-        })).collect();
+        *tools = (0..256)
+            .map(|index| {
+                serde_json::json!({
+                    "namespace": "apps", "name": format!("tool_{index:04}"),
+                    "description": "schema documentation ".repeat(64),
+                })
+            })
+            .collect();
     }
     let mut samples = Vec::new();
     for _ in 0..9 {
         let started = std::time::Instant::now();
-        let (_, _, output) = remote_tool_search_receipt_group(
-            std::hint::black_box(&items), &[0, 1], true,
-        ).expect("bounded receipt");
+        let (_, _, output) =
+            remote_tool_search_receipt_group(std::hint::black_box(&items), &[0, 1], true)
+                .expect("bounded receipt");
         samples.push(started.elapsed().as_micros());
         std::hint::black_box(output);
     }
     samples.sort_unstable();
-    eprintln!("compaction_search_receipt_us={samples:?} median={}", samples[4]);
+    eprintln!(
+        "compaction_search_receipt_us={samples:?} median={}",
+        samples[4]
+    );
     if let Some(directory) = std::env::var_os("COMPACTION_BENCHMARK_DIR") {
-        std::fs::write(std::path::PathBuf::from(directory).join("search-receipt.txt"),
-            format!("microseconds={samples:?}\nmedian={}\n", samples[4])).unwrap();
+        std::fs::write(
+            std::path::PathBuf::from(directory).join("search-receipt.txt"),
+            format!("microseconds={samples:?}\nmedian={}\n", samples[4]),
+        )
+        .unwrap();
     }
 }
 
@@ -181,26 +194,41 @@ fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
         let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] else {
             unreachable!()
         };
-        *tools = identities.iter().map(|name| serde_json::json!({"name": name})).collect();
+        *tools = identities
+            .iter()
+            .map(|name| serde_json::json!({"name": name}))
+            .collect();
         let expected_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(tools).unwrap()));
         let (_, call, output) = remote_tool_search_receipt_group(&items, &[0, 1], true).unwrap();
-        let ResponseItem::ToolSearchOutput { tools, .. } = &output else { unreachable!() };
+        let ResponseItem::ToolSearchOutput { tools, .. } = &output else {
+            unreachable!()
+        };
         let actual = parse_remote_tool_search_receipt(&tools[0]).unwrap();
         assert_eq!(actual.result_count, count);
         assert_eq!(actual.result_set_sha256, expected_hash);
-        let expected = (0..=count).rev().find_map(|retained| {
-            let mut candidate = actual.clone();
-            candidate.ordered_tool_identities = identities[..retained].to_vec();
-            candidate.omitted_identity_count = count - retained;
-            candidate.receipt_id = remote_tool_search_receipt_id(
-                &candidate.call_id, &candidate.status, &candidate.execution,
-                &candidate.arguments, &candidate.result_set_sha256, candidate.result_count,
-                candidate.omitted_result_count, candidate.complete,
-                candidate.omitted_identity_count, &candidate.ordered_tool_identities,
-            );
-            (approx_token_count(&serde_json::to_string(&candidate).unwrap())
-                <= TOOL_SEARCH_RECEIPT_MAX_TOKENS).then_some(candidate)
-        }).unwrap();
+        let expected = (0..=count)
+            .rev()
+            .find_map(|retained| {
+                let mut candidate = actual.clone();
+                candidate.ordered_tool_identities = identities[..retained].to_vec();
+                candidate.omitted_identity_count = count - retained;
+                candidate.receipt_id = remote_tool_search_receipt_id(
+                    &candidate.call_id,
+                    &candidate.status,
+                    &candidate.execution,
+                    &candidate.arguments,
+                    &candidate.result_set_sha256,
+                    candidate.result_count,
+                    candidate.omitted_result_count,
+                    candidate.complete,
+                    candidate.omitted_identity_count,
+                    &candidate.ordered_tool_identities,
+                );
+                (approx_token_count(&serde_json::to_string(&candidate).unwrap())
+                    <= TOOL_SEARCH_RECEIPT_MAX_TOKENS)
+                    .then_some(candidate)
+            })
+            .unwrap();
         assert_eq!(actual, expected);
         let again = vec![call, output];
         let (_, _, repeated) = remote_tool_search_receipt_group(&again, &[0, 1], true).unwrap();
@@ -217,8 +245,13 @@ async fn compaction_fitting_never_expands_small_search_outputs() {
     let mut history = ContextManager::new();
     history.replace(items.clone());
     let result = trim_function_call_history_to_fit_context_window_for_prompt(
-        &mut history, &turn, &BaseInstructions { text: String::new() },
-        Some(&items), 0,
+        &mut history,
+        &turn,
+        &BaseInstructions {
+            text: String::new(),
+        },
+        Some(&items),
+        0,
     );
     assert_eq!(result, (0, 0));
     assert_eq!(history.raw_items(), items);
@@ -232,7 +265,13 @@ fn remote_compaction_keeps_tool_outputs_with_recovery_references() {
         function_call_output("output", "call-1", &artifact_reference),
     ];
 
-    assert_eq!(bounded_remote_compacted_history(items.clone(), response_item_has_valid_tool_history_receipt), items);
+    assert_eq!(
+        bounded_remote_compacted_history(
+            items.clone(),
+            response_item_has_valid_tool_history_receipt
+        ),
+        items
+    );
 }
 
 #[test]
@@ -270,7 +309,8 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
         compaction.clone(),
     ];
 
-    let retained = bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt);
+    let retained =
+        bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt);
 
     assert_eq!(
         retained,
@@ -321,10 +361,13 @@ fn over_truncation_remote_compaction_keeps_exact_artifact_recovery_sidecar() {
     })
     .to_string();
 
-    let retained = append_remote_compaction_artifact_pins(vec![compaction.clone()], Some(payload.clone()));
+    let retained =
+        append_remote_compaction_artifact_pins(vec![compaction.clone()], Some(payload.clone()));
     assert_eq!(retained.len(), 2);
     assert_eq!(retained[0], compaction);
-    assert!(crate::stable_context::is_trusted_stable_context_item(&retained[1]));
+    assert!(crate::stable_context::is_trusted_stable_context_item(
+        &retained[1]
+    ));
     assert!(!crate::compact::task_compaction_items(&retained).iter().any(|item|
         matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part|
             matches!(part, ContentItem::InputText { text } if text.contains("tool_history_artifact_pins"))))));
@@ -356,7 +399,10 @@ fn remote_compaction_drops_orphan_tool_receipts() {
         &tool_history_receipt("call-orphan"),
     )];
 
-    assert!(bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt).is_empty());
+    assert!(
+        bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -584,8 +630,13 @@ async fn prepared_prompt_size_does_not_rewrite_an_output_already_absent_from_pro
     let mut included = history.clone();
     assert_eq!(
         trim_function_call_history_to_fit_context_window_for_prompt(
-            &mut included, &turn_context, &base_instructions, Some(&items), 1_000,
-        ).0,
+            &mut included,
+            &turn_context,
+            &base_instructions,
+            Some(&items),
+            1_000,
+        )
+        .0,
         1
     );
     let (rewritten, savings) = trim_function_call_history_to_fit_context_window_for_prompt(

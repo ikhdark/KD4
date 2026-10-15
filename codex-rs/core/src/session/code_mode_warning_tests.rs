@@ -35,9 +35,8 @@ fn warning_policy_covers_features_metadata_and_model_selectors() {
                     Some(ToolMode::CodeMode),
                     Some(ToolMode::CodeModeOnly),
                 ] {
-                    let should_warn = (code_mode || code_mode_only)
-                        && !fallback
-                        && tool_mode.is_none();
+                    let should_warn =
+                        (code_mode || code_mode_only) && !fallback && tool_mode.is_none();
                     let model_info = ModelInfo {
                         tool_mode,
                         used_fallback_model_metadata: fallback,

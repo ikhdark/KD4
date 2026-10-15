@@ -7,6 +7,7 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::sandboxing::SandboxPermissions;
+use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
@@ -205,11 +206,26 @@ pub(super) fn attach_powershell_failure_advisory(
 }
 
 /// Lists only host directories, so the caller passes a native local cwd.
-async fn attach_missing_rg_path_advisory(response: &mut ExecCommandToolOutput, cwd: &Path) {
+pub(super) async fn attach_missing_rg_path_advisory(
+    response: &mut ExecCommandToolOutput,
+    cwd: &Path,
+    turn: &TurnContext,
+) {
+    // Raw command output is untrusted: an apparent rg error can name any host
+    // path. Match read_file's policy before probing for diagnostic suggestions.
+    if !turn.file_system_sandbox_policy().has_full_disk_read_access() {
+        return;
+    }
     const RG_ERROR: &[u8] = b"rg: ";
     if response.process_id.is_some()
-        || response.repair_notice.as_deref().is_some_and(|notice| notice.contains("rg_missing_path"))
-        || !response.raw_output.windows(RG_ERROR.len()).any(|window| window == RG_ERROR)
+        || response
+            .repair_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("rg_missing_path"))
+        || !response
+            .raw_output
+            .windows(RG_ERROR.len())
+            .any(|window| window == RG_ERROR)
     {
         return;
     }
@@ -217,10 +233,12 @@ async fn attach_missing_rg_path_advisory(response: &mut ExecCommandToolOutput, c
     let cwd = cwd.to_path_buf();
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = cancellation.clone().drop_guard();
-    let Ok(Ok(Some(advisory))) = tokio::time::timeout(Duration::from_millis(25),
+    let Ok(Ok(Some(advisory))) = tokio::time::timeout(
+        Duration::from_millis(25),
         crate::tools::run_blocking_command_analysis(move || {
             missing_rg_path_advisory_with_cancellation(&output, &cwd, cancellation)
-        }))
+        }),
+    )
     .await
     else {
         return;
@@ -232,27 +250,49 @@ async fn attach_missing_rg_path_advisory(response: &mut ExecCommandToolOutput, c
 }
 
 pub(super) async fn attach_hidden_rg_directory_advisory(
-    response: &mut ExecCommandToolOutput, cwd: &Path,
+    response: &mut ExecCommandToolOutput,
+    cwd: &Path,
+    turn: &TurnContext,
     workspace: &crate::git_workspace::GitWorkspaceCache,
 ) {
-    if !response.search_no_match_is_success() {
+    // Both exec_command and write_stdin use host-side directory/Git queries.
+    if !turn.file_system_sandbox_policy().has_full_disk_read_access()
+        || !response.search_no_match_is_success()
+    {
         return;
     }
-    let Some(script) = response.hook_command.clone() else { return };
+    let Some(script) = response.hook_command.clone() else {
+        return;
+    };
     let directory = cwd.to_path_buf();
-    let Ok(candidates) = crate::tools::run_blocking_command_analysis(move ||
-        crate::tools::handlers::command_search::skipped_hidden_rg_directories(&script, &directory)).await
-    else { return };
-    if candidates.is_empty() { return; }
-    let Ok(Some(root)) = workspace.resolve_workspace_root(cwd).await else { return };
+    let Ok(candidates) = crate::tools::run_blocking_command_analysis(move || {
+        crate::tools::handlers::command_search::skipped_hidden_rg_directories(&script, &directory)
+    })
+    .await
+    else {
+        return;
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let Ok(Some(root)) = workspace.resolve_workspace_root(cwd).await else {
+        return;
+    };
     let mut visible = Vec::new();
     for path in candidates {
-        if !crate::git_workspace::git_ignores_all_changed_paths(&root, std::slice::from_ref(&path)).await {
+        if !crate::git_workspace::git_ignores_all_changed_paths(&root, std::slice::from_ref(&path))
+            .await
+        {
             visible.push(path.display().to_string());
         }
     }
-    if visible.is_empty() { return; }
-    let advisory = format!("rg_hidden_directories: no matches in the searched scope; without --hidden, rg skips hidden directories. Non-ignored candidates (bounded directory scan, not exhaustive):\n{}\nUse --hidden when these paths belong to the requested search scope.", visible.join("\n"));
+    if visible.is_empty() {
+        return;
+    }
+    let advisory = format!(
+        "rg_hidden_directories: no matches in the searched scope; without --hidden, rg skips hidden directories. Non-ignored candidates (bounded directory scan, not exhaustive):\n{}\nUse --hidden when these paths belong to the requested search scope.",
+        visible.join("\n")
+    );
     response.repair_notice = Some(match response.repair_notice.take() {
         Some(previous) => format!("{previous}\n\n{advisory}"),
         None => advisory,
@@ -301,7 +341,8 @@ impl ExecCommandHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let preparation_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_handler_preparation");
+        let preparation_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_handler_preparation");
         let ToolInvocation {
             session,
             step_context,
@@ -336,9 +377,9 @@ impl ExecCommandHandler {
             &step_context.environments,
             environment_args.environment_id.as_deref(),
             &cancellation_token,
-        ).await?;
-        let Some(turn_environment) = turn_environment.as_ref()
-        else {
+        )
+        .await?;
+        let Some(turn_environment) = turn_environment.as_ref() else {
             return Err(FunctionCallError::RespondToModel(
                 "exec_command requires a selected execution environment".to_string(),
             ));
@@ -418,10 +459,11 @@ impl ExecCommandHandler {
             .clone()
             .map(Arc::new)
             .unwrap_or_else(|| session.user_shell());
-        let allow_login_shell = super::super::shell::ShellCommandHandler::effective_allow_login_shell(
-            &turn.session_source,
-            turn.config.permissions.allow_login_shell,
-        );
+        let allow_login_shell =
+            super::super::shell::ShellCommandHandler::effective_allow_login_shell(
+                &turn.session_source,
+                turn.config.permissions.allow_login_shell,
+            );
         let (mut args, original_resolved_command) = get_command_async(
             args,
             Arc::clone(&shell),
@@ -437,7 +479,13 @@ impl ExecCommandHandler {
             original_invocation,
             &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,
-            if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
+            if environment_is_remote {
+                None
+            } else {
+                native_cwd
+                    .as_ref()
+                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
+            },
         )
         .await
         .map_err(|issue| {
@@ -450,7 +498,13 @@ impl ExecCommandHandler {
             crate::tools::handlers::command_preflight::check_full_suite_command(
                 &original_resolved_command.safety_command,
                 original_resolved_command.preflight_shell_type,
-                if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
+                if environment_is_remote {
+                    None
+                } else {
+                    native_cwd
+                        .as_ref()
+                        .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
+                },
             )
             .await
             .map_err(FunctionCallError::RespondToModel)?
@@ -484,55 +538,62 @@ impl ExecCommandHandler {
         let validation_analysis = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
             resolved_command.preflight_shell_type,
-            if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
+            if environment_is_remote {
+                None
+            } else {
+                native_cwd
+                    .as_ref()
+                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
+            },
             args.validation.clone(),
         );
         let search_analysis = async {
-        let search_narrowing = if !environment_is_remote {
-            if let Some(native_cwd) = native_cwd.as_ref() {
-                let search_command = resolved_command.safety_command.clone();
-                let search_shell_type = resolved_command.preflight_shell_type;
-                let search_cwd = native_cwd.clone();
-                let mut search = crate::tools::run_blocking_command_analysis(move || {
-                    classify_rg_search_with_repository(
-                        &search_command,
-                        search_shell_type,
-                        search_cwd.as_path(),
-                        || resolve_search_repository_root(search_cwd.as_path()),
-                    )
-                })
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "command search worker failed: {error}"
-                    ))
-                })?
-                .map_err(FunctionCallError::RespondToModel)?;
-                if let Some((_, search)) = search.as_mut() {
-                    observe_rg_search_scope_state_with_freshness(search, args.force_fresh).await;
+            let search_narrowing = if !environment_is_remote {
+                if let Some(native_cwd) = native_cwd.as_ref() {
+                    let search_command = resolved_command.safety_command.clone();
+                    let search_shell_type = resolved_command.preflight_shell_type;
+                    let search_cwd = native_cwd.clone();
+                    let mut search = crate::tools::run_blocking_command_analysis(move || {
+                        classify_rg_search_with_repository(
+                            &search_command,
+                            search_shell_type,
+                            search_cwd.as_path(),
+                            || resolve_search_repository_root(search_cwd.as_path()),
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "command search worker failed: {error}"
+                        ))
+                    })?
+                    .map_err(FunctionCallError::RespondToModel)?;
+                    if let Some((_, search)) = search.as_mut() {
+                        observe_rg_search_scope_state_with_freshness(search, args.force_fresh)
+                            .await;
+                    }
+                    search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
+                } else {
+                    let search_command = resolved_command.safety_command.clone();
+                    let search_shell_type = resolved_command.preflight_shell_type;
+                    crate::tools::run_blocking_command_analysis(move || {
+                        classify_rg_search_narrowing_without_native_scope(
+                            &search_command,
+                            search_shell_type,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "command search worker failed: {error}"
+                        ))
+                    })?
+                    .map(|search| (String::new(), search))
                 }
-                search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
             } else {
-                let search_command = resolved_command.safety_command.clone();
-                let search_shell_type = resolved_command.preflight_shell_type;
-                crate::tools::run_blocking_command_analysis(move || {
-                    classify_rg_search_narrowing_without_native_scope(
-                        &search_command,
-                        search_shell_type,
-                    )
-                })
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "command search worker failed: {error}"
-                    ))
-                })?
-                .map(|search| (String::new(), search))
-            }
-        } else {
-            None
-        };
-        Ok::<_, FunctionCallError>(search_narrowing)
+                None
+            };
+            Ok::<_, FunctionCallError>(search_narrowing)
         };
         let safety_command = resolved_command.safety_command.clone();
         let direct_argv = command_invocation.is_argv();
@@ -548,7 +609,9 @@ impl ExecCommandHandler {
         let (mut validation, search_narrowing, inspection_command) =
             tokio::join!(validation_analysis, search_analysis, safety_analysis);
         args.apply_validation_observation_policy(
-            validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation),
+            validation
+                .as_ref()
+                .is_some_and(crate::validation::CommandValidation::is_validation),
         );
         let validation_launch = !direct_runtime
             && (validation.is_some()
@@ -556,9 +619,12 @@ impl ExecCommandHandler {
                     classify_validation_invocations(&validation_invocations),
                     ValidationClassification::Validation { .. }
                 ));
-        let search_narrowing = if validation_launch { None } else { search_narrowing? };
-        let inspection_command = inspection_command
-        .map_err(|error| {
+        let search_narrowing = if validation_launch {
+            None
+        } else {
+            search_narrowing?
+        };
+        let inspection_command = inspection_command.map_err(|error| {
             FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
         })?;
         validate_independent_review_shell(
@@ -685,7 +751,9 @@ impl ExecCommandHandler {
         if let Some(validation) = validation.as_mut() {
             validation.execution_context = Some(crate::validation::ValidationExecutionContext {
                 environment_id: turn_environment.environment_id.clone(),
-                cwd: if environment_is_remote { None } else {
+                cwd: if environment_is_remote {
+                    None
+                } else {
                     native_cwd.as_ref().map(|cwd| cwd.as_path().to_path_buf())
                 },
                 command: command.clone(),
@@ -693,20 +761,24 @@ impl ExecCommandHandler {
             });
         }
         drop(preparation_phase);
-        let baseline_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_baseline_wait");
+        let baseline_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_baseline_wait");
         crate::tools::parallel::wait_for_workspace_baseline().await;
         drop(baseline_phase);
-        let tracker_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_mutation_tracker_wait");
+        let tracker_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_mutation_tracker_wait");
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         drop(tracker_phase);
-        let revision_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_repository_revision");
+        let revision_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_repository_revision");
         let repository_epoch = session
             .services
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
         drop(revision_phase);
-        let identity_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_identity");
+        let identity_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_identity");
         let workspace_identity = match cwd.to_abs_path() {
             Ok(cwd) => {
                 session
@@ -745,7 +817,8 @@ impl ExecCommandHandler {
         .with_search_environment(&effective_environment);
         drop(key_phase);
         if !validation_launch {
-            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_search_admission");
+            let _phase =
+                crate::tools::tool_dispatch_trace::begin_tool_phase("exec_search_admission");
             session
                 .services
                 .command_execution
@@ -754,13 +827,24 @@ impl ExecCommandHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
         }
         let validation_attempt = validation_launch;
-        let reuse_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_running_validation_reuse");
-        if validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation)
-            && let Some((process_id, execution_id)) = session.services.command_execution
-                .identical_running_process(&attempt_key).await
-            && let Some(response) = manager.reuse_running_validation(
-                process_id, execution_id, turn.model_info.truncation_policy.into(), max_output_tokens,
-            ).await
+        let reuse_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_running_validation_reuse");
+        if validation
+            .as_ref()
+            .is_some_and(crate::validation::CommandValidation::is_validation)
+            && let Some((process_id, execution_id)) = session
+                .services
+                .command_execution
+                .identical_running_process(&attempt_key)
+                .await
+            && let Some(response) = manager
+                .reuse_running_validation(
+                    process_id,
+                    execution_id,
+                    turn.model_info.truncation_policy.into(),
+                    max_output_tokens,
+                )
+                .await
         {
             return Ok(boxed_tool_output(response));
         }
@@ -770,12 +854,13 @@ impl ExecCommandHandler {
         turn.full_suite_budget
             .admit(full_suite)
             .map_err(FunctionCallError::RespondToModel)?;
-        let attempt_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");
+        let attempt_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");
         if let Err(blocked) = session
-                .services
-                .command_execution
-                .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
-                .await
+            .services
+            .command_execution
+            .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
+            .await
         {
             if blocked.is_search_miss() {
                 return Ok(boxed_tool_output(FunctionToolOutput::from_text(
@@ -789,7 +874,8 @@ impl ExecCommandHandler {
         }
         drop(attempt_phase);
 
-        let interception_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_patch_interception");
+        let interception_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_patch_interception");
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
             validation_attempt,
@@ -828,32 +914,36 @@ impl ExecCommandHandler {
                     .record_exit(&attempt_key, 0)
                     .await;
                 let mut response = ExecCommandToolOutput {
-                        output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
-                            range: 0..raw_output.len() as u64, gap: None,
-                        }),
-                        process_output: None,
-                        error: None,
-                        validation: validation.clone(),
-                        event_call_id: String::new(),
-                        chunk_id: String::new(),
-                        wall_time: interception_wall_time,
-                        raw_output,
-                        truncation_policy: turn.model_info.truncation_policy.into(),
-                        max_output_tokens,
-                        process_id: None,
-                        session_capabilities: None,
-                        exit_code: Some(0),
-                        process_exited: true,
-                        search_no_match: false,
-                        original_token_count: None,
-                        hook_command: Some(hook_command),
-                        raw_output_artifact,
-                        repair_notice,
-                        pending_deferred_completions: Vec::new(),
-                    };
-                response.prepare_recovery_artifact(
-                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
-                ).await;
+                    output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
+                        range: 0..raw_output.len() as u64,
+                        gap: None,
+                    }),
+                    process_output: None,
+                    error: None,
+                    validation: validation.clone(),
+                    event_call_id: String::new(),
+                    chunk_id: String::new(),
+                    wall_time: interception_wall_time,
+                    raw_output,
+                    truncation_policy: turn.model_info.truncation_policy.into(),
+                    max_output_tokens,
+                    process_id: None,
+                    session_capabilities: None,
+                    exit_code: Some(0),
+                    process_exited: true,
+                    search_no_match: false,
+                    original_token_count: None,
+                    hook_command: Some(hook_command),
+                    raw_output_artifact,
+                    repair_notice,
+                    pending_deferred_completions: Vec::new(),
+                };
+                response
+                    .prepare_recovery_artifact(
+                        turn.config.codex_home.as_path(),
+                        &session.thread_id.to_string(),
+                    )
+                    .await;
                 return Ok(boxed_tool_output(response));
             }
             Ok(None) => {}
@@ -984,16 +1074,22 @@ impl ExecCommandHandler {
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
-                    attach_missing_rg_path_advisory(&mut response, native_cwd.as_path()).await;
-                    attach_hidden_rg_directory_advisory(&mut response, native_cwd.as_path(),
-                        &session.services.git_workspace).await;
+                    attach_missing_rg_path_advisory(&mut response, native_cwd.as_path(), &turn).await;
+                    attach_hidden_rg_directory_advisory(
+                        &mut response,
+                        native_cwd.as_path(),
+                        &turn,
+                        &session.services.git_workspace,
+                    )
+                    .await;
                 }
-                response.prepare_recovery_artifact(
-                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
-                ).await;
-                Ok(boxed_tool_output(
-                    response,
-                ))
+                response
+                    .prepare_recovery_artifact(
+                        turn.config.codex_home.as_path(),
+                        &session.thread_id.to_string(),
+                    )
+                    .await;
+                Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::SandboxDenied {
                 output,
@@ -1036,7 +1132,8 @@ impl ExecCommandHandler {
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
                     output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
-                        range: 0..output_text.len() as u64, gap: None,
+                        range: 0..output_text.len() as u64,
+                        gap: None,
                     }),
                     process_output: None,
                     error: None,
@@ -1061,15 +1158,19 @@ impl ExecCommandHandler {
                     pending_deferred_completions: Vec::new(),
                 };
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
-                response.prepare_recovery_artifact(
-                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
-                ).await;
-                Ok(boxed_tool_output(
-                    response,
-                ))
+                response
+                    .prepare_recovery_artifact(
+                        turn.config.codex_home.as_path(),
+                        &session.thread_id.to_string(),
+                    )
+                    .await;
+                Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::ToolHistoryPersistence {
-                message, exit_code, output, ..
+                message,
+                exit_code,
+                output,
+                ..
             }) => {
                 // The process completed; retain its actual outcome in command
                 // accounting while ending this model turn on failed durability.
@@ -1099,9 +1200,15 @@ impl ExecCommandHandler {
                         .record_exit(&attempt_key, exit_code)
                         .await;
                 }
-                Err(FunctionCallError::Fatal(super::preserve_durability_failure_output(
-                    message, output, &turn.config.codex_home, &session.thread_id.to_string(),
-                ).await))
+                Err(FunctionCallError::Fatal(
+                    super::preserve_durability_failure_output(
+                        message,
+                        output,
+                        &turn.config.codex_home,
+                        &session.thread_id.to_string(),
+                    )
+                    .await,
+                ))
             }
             Err(err) => {
                 let retry_failure = matches!(

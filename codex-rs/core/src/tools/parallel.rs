@@ -22,10 +22,10 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::TypedToolClass;
 use crate::scoped_workspace_gate::WORKSPACE_GATE_CALL;
 use crate::scoped_workspace_gate::WorkspaceGateCall;
 use crate::scoped_workspace_gate::WorkspaceGateHolder;
-use crate::agent::task_capabilities::TypedToolClass;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -90,7 +90,9 @@ async fn workspace_baseline_wait_releases_on_ready_and_is_a_no_op_outside_dispat
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(capture, handler);
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     // Ordinary direct handler unit tests have no dispatch-scoped baseline.
     wait_for_workspace_baseline().await;
 }
@@ -294,10 +296,15 @@ pub(crate) struct ToolCallRuntime {
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
     global_gate_holders: WorkspaceGlobalHolders,
-    workspace_execution:
-        Arc<Mutex<std::collections::HashMap<std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>>,
-    canonical_workspace_resources:
-        Arc<crate::git_workspace::WorkspaceRootCache>,
+    workspace_execution: Arc<
+        Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+            >,
+        >,
+    >,
+    canonical_workspace_resources: Arc<crate::git_workspace::WorkspaceRootCache>,
     sampling_request_signals: Option<SamplingRequestSignalCollector>,
     terminal_completion_only: bool,
 }
@@ -307,8 +314,14 @@ pub(crate) struct ToolCallRuntime {
 pub(crate) struct WorkspaceExecutionCoordinator {
     parallel_execution: Arc<RwLock<()>>,
     global_gate_holders: WorkspaceGlobalHolders,
-    workspace_execution:
-        Arc<Mutex<std::collections::HashMap<std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>>,
+    workspace_execution: Arc<
+        Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+            >,
+        >,
+    >,
 }
 
 struct PendingWorkspaceEvidenceResponse {
@@ -365,10 +378,7 @@ type WorkspaceEvidenceGenerationBaselineSlot =
 pub(crate) struct WorkspaceEvidenceGenerationBatch {
     state: Mutex<WorkspaceEvidenceGenerationBatchState>,
     baselines: Mutex<
-        std::collections::HashMap<
-            std::path::PathBuf,
-            WorkspaceEvidenceGenerationBaselineSlot,
-        >,
+        std::collections::HashMap<std::path::PathBuf, WorkspaceEvidenceGenerationBaselineSlot>,
     >,
 }
 
@@ -459,13 +469,23 @@ impl WorkspaceEvidenceGenerationBatch {
         }
         if matches!(tool_name, "read_file" | "list_files")
             && !classification.source_dependencies.is_empty()
-            && !turn.is_some_and(|turn| turn.environments.primary()
-                .is_some_and(|selected| selected.environment.is_remote()))
-            && let Some(root) = cache.resolve_workspace_root(&classification.workspace_cwd).await.ok().flatten()
+            && !turn.is_some_and(|turn| {
+                turn.environments
+                    .primary()
+                    .is_some_and(|selected| selected.environment.is_remote())
+            })
+            && let Some(root) = cache
+                .resolve_workspace_root(&classification.workspace_cwd)
+                .await
+                .ok()
+                .flatten()
         {
             let observations = begin_source_path_observations(
-                cache, Some(&root), &classification.source_dependencies,
-            ).await;
+                cache,
+                Some(&root),
+                &classification.source_dependencies,
+            )
+            .await;
             if observations.len() == classification.source_dependencies.len() {
                 // Do not put this root-only identity in the batch's full-identity
                 // cache: commands and their search-miss ledger need the digests.
@@ -485,8 +505,14 @@ impl WorkspaceEvidenceGenerationBatch {
                 };
             }
         }
-        self.capture_baseline(cache, turn, &classification.workspace_cwd,
-            classification.source_dependencies.clone(), mutation_revision).await
+        self.capture_baseline(
+            cache,
+            turn,
+            &classification.workspace_cwd,
+            classification.source_dependencies.clone(),
+            mutation_revision,
+        )
+        .await
     }
 
     #[expect(
@@ -507,11 +533,7 @@ impl WorkspaceEvidenceGenerationBatch {
                 .baselines
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(
-                baselines
-                    .entry(cwd.to_path_buf())
-                    .or_default(),
-            )
+            Arc::clone(baselines.entry(cwd.to_path_buf()).or_default())
         };
         let mut baseline_entry = slot.lock().await;
         if let Some((revision, baseline)) = baseline_entry.as_ref()
@@ -894,7 +916,8 @@ impl WorkspaceEvidenceGenerationBatch {
                 &response.workspace_cwd,
                 &mut canonical_keys,
                 session.services.git_workspace.as_ref(),
-            ).await;
+            )
+            .await;
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -910,7 +933,8 @@ impl WorkspaceEvidenceGenerationBatch {
                 &mutation.workspace_cwd,
                 &mut canonical_keys,
                 session.services.git_workspace.as_ref(),
-            ).await;
+            )
+            .await;
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -945,7 +969,8 @@ impl WorkspaceEvidenceGenerationBatch {
                     mutations.iter().any(|(ordinal, paths)| {
                         *ordinal >= response.observed_effect_ordinal
                             && paths.as_ref().is_none_or(|paths| {
-                                !response.source_scope_complete || response.source_dependencies.is_empty()
+                                !response.source_scope_complete
+                                    || response.source_dependencies.is_empty()
                                     || paths.iter().any(|changed| {
                                         response.source_dependencies.iter().any(|dependency| {
                                             crate::tool_history::source_dependency_overlaps(
@@ -976,10 +1001,12 @@ impl WorkspaceEvidenceGenerationBatch {
                 .map(|(call_id, _)| call_id),
         );
 
-        let primary_key =
-            canonical_workspace_evidence_key_cached(
-                turn.config.cwd.as_path(), &mut canonical_keys, session.services.git_workspace.as_ref(),
-            ).await;
+        let primary_key = canonical_workspace_evidence_key_cached(
+            turn.config.cwd.as_path(),
+            &mut canonical_keys,
+            session.services.git_workspace.as_ref(),
+        )
+        .await;
         let mut prefetched_workspace_identity = None;
         let mut finalized_responses = Vec::new();
         let mut persistence_error = None;
@@ -991,14 +1018,20 @@ impl WorkspaceEvidenceGenerationBatch {
                     group.responses.sort_by_key(|response| response.ordinal);
                     group.mutations.sort_by_key(|mutation| mutation.ordinal);
                     let capture_started = Instant::now();
-                    let cached = self.captured_identity(&group.cwd, final_mutation_revision).await;
+                    let cached = self
+                        .captured_identity(&group.cwd, final_mutation_revision)
+                        .await;
                     let captured = cached.is_none();
                     let capture = match cached {
                         Some(identity) => crate::git_workspace::WorkspaceEvidenceCapture {
                             identity,
                             timed_out_git_dependencies: Vec::new(),
                         },
-                        None => git_workspace.workspace_evidence_for_turn(turn, &group.cwd).await,
+                        None => {
+                            git_workspace
+                                .workspace_evidence_for_turn(turn, &group.cwd)
+                                .await
+                        }
                     };
                     (key, group, capture, capture_started.elapsed(), captured)
                 }
@@ -1135,7 +1168,9 @@ impl WorkspaceEvidenceGenerationBatch {
         .collect::<CodexResult<Vec<_>>>()?;
         // Buffered projection preserves admission order. Publish the complete
         // batch under one history update so readers cannot see a partial flush.
-        session.register_workspace_evidence_batch(observations.into_iter().flatten().collect()).await;
+        session
+            .register_workspace_evidence_batch(observations.into_iter().flatten().collect())
+            .await;
 
         Ok(WorkspaceEvidenceGenerationFlush {
             prefetched_workspace_identity,
@@ -1171,7 +1206,8 @@ async fn canonical_workspace_evidence_key_cached(
             let cwd = cwd.to_path_buf();
             let fallback = cwd.clone();
             tokio::task::spawn_blocking(move || dunce::canonicalize(&cwd).unwrap_or(cwd))
-                .await.unwrap_or(fallback)
+                .await
+                .unwrap_or(fallback)
         }
     };
     cache.insert(cwd.to_path_buf(), key.clone());
@@ -1190,21 +1226,41 @@ mod plan_admission_tests {
     async fn plan_owner_bypasses_workspace_writer_without_bypassing_dispatch() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
-            crate::tools::registry::ToolRegistry::from_tools([
-                Arc::new(crate::tools::handlers::PlanHandler) as Arc<dyn crate::tools::registry::CoreToolRuntime>,
-            ]), Vec::new(),
+            crate::tools::registry::ToolRegistry::from_tools([Arc::new(
+                crate::tools::handlers::PlanHandler,
+            )
+                as Arc<dyn crate::tools::registry::CoreToolRuntime>]),
+            Vec::new(),
         ));
-        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
-        let runtime = ToolCallRuntime::new(Arc::new(session), step,
-            Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())));
+        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn))
+            .with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::new(session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+        );
         let _workspace_writer = Arc::clone(&runtime.parallel_execution).write_owned().await;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.handle_tool_call(
-            crate::tools::router::ToolCall {
-                tool_name: codex_tools::ToolName::plain("update_plan"), call_id: "independent-plan".into(),
-                payload: ToolPayload::Function { arguments: r#"{"plan":[{"step":"work","status":"pending"}]}"#.into() },
-            }, tokio_util::sync::CancellationToken::new(),
-        )).await.expect("plan must not acquire the workspace gate").unwrap();
-        let ResponseInputItem::FunctionCallOutput { output, .. } = response else { panic!("function output") };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: codex_tools::ToolName::plain("update_plan"),
+                    call_id: "independent-plan".into(),
+                    payload: ToolPayload::Function {
+                        arguments: r#"{"plan":[{"step":"work","status":"pending"}]}"#.into(),
+                    },
+                },
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("plan must not acquire the workspace gate")
+        .unwrap();
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("function output")
+        };
         assert_eq!(output.success, Some(true));
     }
 }
@@ -1230,11 +1286,14 @@ fn native_file_classification(
     };
     let environment = match arguments.get("environment_id") {
         None | Some(serde_json::Value::Null) => environments.primary(),
-        Some(serde_json::Value::String(id)) => environments.turn_environments.iter()
+        Some(serde_json::Value::String(id)) => environments
+            .turn_environments
+            .iter()
             .find(|environment| environment.environment_id == *id),
         _ => None,
     };
-    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote()) else {
+    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote())
+    else {
         return conservative;
     };
     let Ok(cwd) = environment.cwd().to_abs_path() else {
@@ -1245,7 +1304,9 @@ fn native_file_classification(
     }
     crate::tool_history::classify_workspace_tool_call(
         tool_identity,
-        &ToolPayload::Function { arguments: arguments.to_string() },
+        &ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
         cwd.as_path(),
     )
 }
@@ -1267,8 +1328,6 @@ fn workspace_tool_call_classifications_for_dispatch(
     (admission, inner_evidence)
 }
 
-
-
 fn workspace_evidence_baseline_is_compatible(
     original: &crate::tool_history::WorkspaceCallClassification,
     executed: &crate::tool_history::WorkspaceCallClassification,
@@ -1283,11 +1342,19 @@ async fn executed_workspace_classification(
     default_cwd: &std::path::Path,
     environments: &crate::environment_selection::TurnEnvironmentSnapshot,
 ) -> Result<crate::tool_history::WorkspaceCallClassification, FunctionCallError> {
-    let Some(payload) = executed_payload else { return Ok(original.clone()); };
+    let Some(payload) = executed_payload else {
+        return Ok(original.clone());
+    };
     crate::tool_history::classify_workspace_tool_call_at_admission(
-        tool_identity.to_string(), payload.clone(), default_cwd.to_path_buf(),
-    ).await.map(|(classification, _)| native_file_classification(classification, tool_identity, payload, environments))
-        .map_err(|error| FunctionCallError::Fatal(format!("executed payload analysis failed: {error}")))
+        tool_identity.to_string(),
+        payload.clone(),
+        default_cwd.to_path_buf(),
+    )
+    .await
+    .map(|(classification, _)| {
+        native_file_classification(classification, tool_identity, payload, environments)
+    })
+    .map_err(|error| FunctionCallError::Fatal(format!("executed payload analysis failed: {error}")))
 }
 
 fn canonical_workspace_resource_key(
@@ -1348,7 +1415,12 @@ fn workspace_admission_plan(
 }
 
 fn workspace_resource_gate(
-    workspace_execution: &Mutex<std::collections::HashMap<std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>,
+    workspace_execution: &Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+        >,
+    >,
     resource_key: std::path::PathBuf,
 ) -> Arc<crate::scoped_workspace_gate::ScopedWorkspaceGate> {
     let mut gates = workspace_execution
@@ -1363,8 +1435,10 @@ fn workspace_resource_gate(
     gate
 }
 
+/// Pre-admission workspace state captured for one tool call. Fields stay
+/// module-private: callers outside this module only pass the opaque slot.
 #[derive(Clone)]
-struct WorkspaceEvidenceBaseline {
+pub(crate) struct WorkspaceEvidenceBaseline {
     revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     cache_hit: bool,
     timed_out_git_dependencies: Vec<crate::git_workspace::WorkspaceEvidenceGitDependency>,
@@ -1377,7 +1451,14 @@ fn is_passive_workspace_poll(router: &ToolRouter, call: &ToolCall) -> bool {
         && router.permits_shared_workspace_observation(call)
 }
 
-type WorkspaceEvidenceBaselineSlot = Arc<Mutex<Option<(WorkspaceEvidenceBaseline, u64)>>>;
+pub(crate) type WorkspaceEvidenceBaselineSlot =
+    Arc<Mutex<Option<(WorkspaceEvidenceBaseline, u64)>>>;
+
+/// Allocates a pre-admission baseline slot for a caller outside this module,
+/// which never inspects the captured baseline itself.
+pub(crate) fn new_workspace_evidence_baseline_slot() -> WorkspaceEvidenceBaselineSlot {
+    Arc::new(Mutex::new(None))
+}
 
 #[derive(Default)]
 struct ToolCallWorkspaceEvidenceContext {
@@ -1410,9 +1491,15 @@ struct WorkspaceEvidenceObservation<'a> {
 }
 
 enum WorkspaceResourceGateGuard {
-    Shared { _guard: crate::scoped_workspace_gate::WorkspaceLease },
-    Exclusive { _guard: crate::scoped_workspace_gate::WorkspaceLease },
-    Scoped { _guard: crate::scoped_workspace_gate::WorkspaceLease },
+    Shared {
+        _guard: crate::scoped_workspace_gate::WorkspaceLease,
+    },
+    Exclusive {
+        _guard: crate::scoped_workspace_gate::WorkspaceLease,
+    },
+    Scoped {
+        _guard: crate::scoped_workspace_gate::WorkspaceLease,
+    },
 }
 
 enum WorkspaceGateGuard {
@@ -1434,14 +1521,20 @@ enum WorkspaceGateGuard {
 
 impl WorkspaceGateGuard {
     fn attributed(self, holders: &WorkspaceGlobalHolders, shared: bool) -> Self {
-        let Ok(holder) = WORKSPACE_GATE_CALL.try_with(|call| Arc::new(call.admitted(shared))) else {
+        let Ok(holder) = WORKSPACE_GATE_CALL.try_with(|call| Arc::new(call.admitted(shared)))
+        else {
             return self;
         };
-        holders.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Arc::clone(&holder));
         Self::Attributed {
             guard: Box::new(self),
-            holder: WorkspaceGlobalHolder { holders: Arc::clone(holders), holder },
+            holder: WorkspaceGlobalHolder {
+                holders: Arc::clone(holders),
+                holder,
+            },
         }
     }
 
@@ -1477,7 +1570,9 @@ struct WorkspaceGlobalHolder {
 
 impl Drop for WorkspaceGlobalHolder {
     fn drop(&mut self) {
-        self.holders.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|holder| !Arc::ptr_eq(holder, &self.holder));
     }
 }
@@ -1530,7 +1625,12 @@ async fn acquire_exclusive_workspace_gate(
 async fn acquire_workspace_gate(
     parallel_execution: Arc<RwLock<()>>,
     workspace_execution: Arc<
-        Mutex<std::collections::HashMap<std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>,
+        Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+            >,
+        >,
     >,
     resource_key: Option<std::path::PathBuf>,
     shared_resource: bool,
@@ -1539,7 +1639,8 @@ async fn acquire_workspace_gate(
     turn_timing_state: &Arc<TurnTimingState>,
 ) -> WorkspaceGateGuard {
     acquire_workspace_gate_with_additions(
-        parallel_execution, workspace_execution,
+        parallel_execution,
+        workspace_execution,
         WorkspaceAdmissionPlan {
             bypass_outer_gate: false,
             resource_key,
@@ -1547,14 +1648,24 @@ async fn acquire_workspace_gate(
             supports_parallel,
             workspace_capable,
         },
-        turn_timing_state, None, &WorkspaceGlobalHolders::default(), &mut None,
-    ).await
+        turn_timing_state,
+        None,
+        &WorkspaceGlobalHolders::default(),
+        &mut None,
+    )
+    .await
 }
 
 async fn acquire_workspace_gate_for_call(
     parallel_execution: Arc<RwLock<()>>,
-    workspace_execution: Arc<Mutex<std::collections::HashMap<
-        std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>>,
+    workspace_execution: Arc<
+        Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+            >,
+        >,
+    >,
     admission: WorkspaceAdmissionPlan,
     turn_timing_state: &Arc<TurnTimingState>,
     additions: Option<crate::scoped_workspace_gate::NativeAdditions>,
@@ -1565,13 +1676,24 @@ async fn acquire_workspace_gate_for_call(
     let started = TokioInstant::now();
     let mut waiting_resource = None;
     let owner = WorkspaceGateCall {
-        tool_name: call.tool_name.to_string(), call_id: call.call_id.clone(),
+        tool_name: call.tool_name.to_string(),
+        call_id: call.call_id.clone(),
     };
-    let acquire = WORKSPACE_GATE_CALL.scope(owner, acquire_workspace_gate_with_additions(
-        parallel_execution, workspace_execution, admission, turn_timing_state,
-        additions, global_holders, &mut waiting_resource,
-    ));
-    let reason = if let Some(return_bound) = crate::unified_exec::nested_poll_bound(source.nested_deadline()) {
+    let acquire = WORKSPACE_GATE_CALL.scope(
+        owner,
+        acquire_workspace_gate_with_additions(
+            parallel_execution,
+            workspace_execution,
+            admission,
+            turn_timing_state,
+            additions,
+            global_holders,
+            &mut waiting_resource,
+        ),
+    );
+    let reason = if let Some(return_bound) =
+        crate::unified_exec::nested_poll_bound(source.nested_deadline())
+    {
         let admission_bound = started + NESTED_WORKSPACE_GATE_GRACE;
         let bound = return_bound.min(admission_bound);
         // Drop the entire acquisition on expiry, including any partial resource
@@ -1600,20 +1722,38 @@ async fn acquire_workspace_gate_for_call(
     let (count, holders) = if let Some(resource) = waiting_resource {
         resource.holders(HOLDER_LIMIT)
     } else {
-        let holders = global_holders.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (holders.len(), holders.iter().take(HOLDER_LIMIT).map(|holder| (**holder).clone()).collect())
+        let holders = global_holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            holders.len(),
+            holders
+                .iter()
+                .take(HOLDER_LIMIT)
+                .map(|holder| (**holder).clone())
+                .collect(),
+        )
     };
     let mut message = format!(
         "Tool `{}` (call {}) did not run: workspace gate wait ended after {} ms because {reason}. Gate holders: {count}.",
-        call.tool_name, call.call_id, started.elapsed().as_millis(),
+        call.tool_name,
+        call.call_id,
+        started.elapsed().as_millis(),
     );
     for holder in &holders {
         let mode = if holder.shared { "shared" } else { "exclusive" };
-        message.push_str(&format!("\n- `{}` (call {}): {mode}, held for {} ms",
-            holder.call.tool_name, holder.call.call_id, holder.admitted_at.elapsed().as_millis()));
+        message.push_str(&format!(
+            "\n- `{}` (call {}): {mode}, held for {} ms",
+            holder.call.tool_name,
+            holder.call.call_id,
+            holder.admitted_at.elapsed().as_millis()
+        ));
     }
     if count > holders.len() {
-        message.push_str(&format!("\n- {} additional holders omitted", count - holders.len()));
+        message.push_str(&format!(
+            "\n- {} additional holders omitted",
+            count - holders.len()
+        ));
     } else if count == 0 {
         message.push_str(" No holder remained at the expiry snapshot (admission may also queue behind an earlier waiter).");
     }
@@ -1622,8 +1762,14 @@ async fn acquire_workspace_gate_for_call(
 
 async fn acquire_workspace_gate_with_additions(
     parallel_execution: Arc<RwLock<()>>,
-    workspace_execution: Arc<Mutex<std::collections::HashMap<
-        std::path::PathBuf, Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>>>>,
+    workspace_execution: Arc<
+        Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                Weak<crate::scoped_workspace_gate::ScopedWorkspaceGate>,
+            >,
+        >,
+    >,
     admission: WorkspaceAdmissionPlan,
     turn_timing_state: &Arc<TurnTimingState>,
     additions: Option<crate::scoped_workspace_gate::NativeAdditions>,
@@ -1640,27 +1786,35 @@ async fn acquire_workspace_gate_with_additions(
     if workspace_tool_may_use_parallel_gate(supports_parallel, workspace_capable) {
         return WorkspaceGateGuard::Shared {
             _guard: acquire_shared_workspace_gate(parallel_execution, turn_timing_state).await,
-        }.attributed(global_holders, true);
+        }
+        .attributed(global_holders, true);
     }
     let Some(resource_key) = resource_key.filter(|_| supports_parallel && workspace_capable) else {
         return WorkspaceGateGuard::Exclusive {
             _guard: acquire_exclusive_workspace_gate(parallel_execution, turn_timing_state).await,
-        }.attributed(global_holders, false);
+        }
+        .attributed(global_holders, false);
     };
 
     let resource_gate = workspace_resource_gate(workspace_execution.as_ref(), resource_key);
     *waiting_resource = Some(Arc::clone(&resource_gate));
     let resource = if let Some(additions) = additions {
         let _waiter = LifecycleCounterGuard::increment(
-            turn_timing_state, LifecycleCounter::ParallelGateWaiter,
+            turn_timing_state,
+            LifecycleCounter::ParallelGateWaiter,
         );
-        WorkspaceResourceGateGuard::Scoped { _guard: additions.acquire(resource_gate).await }
+        WorkspaceResourceGateGuard::Scoped {
+            _guard: additions.acquire(resource_gate).await,
+        }
     } else if shared_resource {
         WorkspaceResourceGateGuard::Shared {
             _guard: match Arc::clone(&resource_gate).try_read_owned() {
                 Ok(guard) => guard,
                 Err(()) => {
-                    let _waiter = LifecycleCounterGuard::increment(turn_timing_state, LifecycleCounter::ParallelGateWaiter);
+                    let _waiter = LifecycleCounterGuard::increment(
+                        turn_timing_state,
+                        LifecycleCounter::ParallelGateWaiter,
+                    );
                     resource_gate.read_owned().await
                 }
             },
@@ -1670,7 +1824,10 @@ async fn acquire_workspace_gate_with_additions(
             _guard: match Arc::clone(&resource_gate).try_write_owned() {
                 Ok(guard) => guard,
                 Err(()) => {
-                    let _waiter = LifecycleCounterGuard::increment(turn_timing_state, LifecycleCounter::ParallelGateWaiter);
+                    let _waiter = LifecycleCounterGuard::increment(
+                        turn_timing_state,
+                        LifecycleCounter::ParallelGateWaiter,
+                    );
                     resource_gate.write_owned().await
                 }
             },
@@ -1684,7 +1841,8 @@ async fn acquire_workspace_gate_with_additions(
     WorkspaceGateGuard::ResourceScoped {
         _resource: resource,
         _global: global,
-    }.attributed(global_holders, true)
+    }
+    .attributed(global_holders, true)
 }
 
 async fn capture_workspace_evidence_baseline(
@@ -1857,17 +2015,21 @@ impl ToolCallRuntime {
     /// Classification identity for the turn signal collector, so a namespaced
     /// or wrapped registration is classified like the handler it exposes.
     fn semantic_tool_name(&self, tool_name: &codex_tools::ToolName) -> codex_tools::ToolName {
-        self.step_context
-            .tool_router()
-            .map_or_else(|| tool_name.clone(), |router| router.semantic_tool_name(tool_name))
+        self.step_context.tool_router().map_or_else(
+            || tool_name.clone(),
+            |router| router.semantic_tool_name(tool_name),
+        )
     }
 
-    pub(crate) fn command_semantic_name(&self, tool_name: &codex_tools::ToolName) -> Option<codex_tools::ToolName> {
+    pub(crate) fn command_semantic_name(
+        &self,
+        tool_name: &codex_tools::ToolName,
+    ) -> Option<codex_tools::ToolName> {
         let router = self.step_context.tool_router()?;
         let semantic = router.semantic_tool_name(tool_name);
         (router.semantic_capabilities(tool_name).command.is_some()
             || semantic == codex_tools::ToolName::plain("write_stdin"))
-            .then_some(semantic)
+        .then_some(semantic)
     }
 
     pub(crate) fn record_rejected_tool_call(
@@ -1989,9 +2151,12 @@ impl ToolCallRuntime {
         }
         // Only a fresh workspace capture needs synchronization with tool effects.
         let gate_guard = if baseline.is_none() || mutation_advanced {
-            Some(WorkspaceGateGuard::Shared {
-                _guard: Arc::clone(&self.parallel_execution).read_owned().await,
-            }.attributed(&self.global_gate_holders, true))
+            Some(
+                WorkspaceGateGuard::Shared {
+                    _guard: Arc::clone(&self.parallel_execution).read_owned().await,
+                }
+                .attributed(&self.global_gate_holders, true),
+            )
         } else {
             None
         };
@@ -2123,14 +2288,80 @@ impl ToolCallRuntime {
                 source_dependencies,
                 captured_current,
             )
-            .map(|observation| observation.with_source_scope_complete(source_scope_complete)
-                .with_source_path_observations(source_path_observations))
+            .map(|observation| {
+                observation
+                    .with_source_scope_complete(source_scope_complete)
+                    .with_source_path_observations(source_path_observations)
+            })
         else {
             return;
         };
         session
             .register_workspace_evidence(observation, workspace_gate_guard)
             .await;
+    }
+
+    /// Registers a successful nested read's path-scoped observation so a later
+    /// identical read can be served from retained bytes.
+    ///
+    /// This mirrors the direct lane's evidence recording and grants no freshness
+    /// of its own: the replaying dispatcher revalidates the file hash and every
+    /// source path under its workspace read lease before reusing these bytes. A
+    /// mutation that advanced during the read discards the observation outright.
+    pub(crate) async fn record_nested_read_replay_evidence(
+        &self,
+        call_id: &str,
+        baseline_slot: WorkspaceEvidenceBaselineSlot,
+        source_dependencies: Option<
+            std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        >,
+        payload: &ToolPayload,
+        read_output: &serde_json::Value,
+        response: &ResponseInputItem,
+    ) {
+        let Some(collector) = &self.sampling_request_signals else {
+            return;
+        };
+        let Some(ordinal) = collector.ordinal_for_call(call_id) else {
+            return;
+        };
+        let Some((baseline, revision)) = ({
+            let mut slot = baseline_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.take()
+        }) else {
+            return;
+        };
+        // An exact, complete per-path scope is the only replayable observation.
+        // A union of cell paths carries no completeness proof, and a read whose
+        // watches could not be registered has nothing to invalidate it.
+        if baseline.source_dependencies.is_empty()
+            || baseline.source_dependencies.len() != baseline.source_path_observations.len()
+            || source_dependencies
+                .is_some_and(|dependencies| dependencies != baseline.source_dependencies)
+        {
+            return;
+        }
+        if self.tracker.lock().await.current_mutation_revision() != revision {
+            return;
+        }
+        collector.record_replay_dependencies(
+            ordinal,
+            revision,
+            baseline.source_path_observations.clone(),
+            baseline.revision.clone(),
+        );
+        collector.record_replay_authorization(
+            ordinal,
+            crate::tools::registry::authorized_tool_invocation_sha256(
+                &self.step_context.turn,
+                payload,
+                None,
+            ),
+        );
+        collector.record_read_replay_output(ordinal, read_output.clone());
+        collector.record_nested_read_replay_response(ordinal, response);
     }
 
     pub(crate) fn record_code_mode_result(
@@ -2144,39 +2375,64 @@ impl ToolCallRuntime {
         };
         // Dispatch already attached scoped evidence using the executed payload.
         // In particular, None is not an unscoped workspace observation.
-        let parent = self.session.services.code_mode_service.cell_parent_call_id(
-            &codex_code_mode::CellId::new(result.cell_id.to_string()),
-        );
+        let parent = self
+            .session
+            .services
+            .code_mode_service
+            .cell_parent_call_id(&codex_code_mode::CellId::new(result.cell_id.to_string()));
         collector.record_code_mode_parent(result.cell_id, parent.as_deref());
         let semantic_tool_name = self.semantic_tool_name(result.tool_name);
         if !result.canonical_artifact_required
-            && let Some(adapter) = self.step_context.tool_router()
+            && let Some(adapter) = self
+                .step_context
+                .tool_router()
                 .and_then(|router| router.terminal_result_adapter(result.tool_name))
         {
             collector.record_registered_owner_result(
-                adapter, &semantic_tool_name, result.payload, result.signal,
-                Some(result.result), true,
+                adapter,
+                &semantic_tool_name,
+                result.payload,
+                result.signal,
+                Some(result.result),
+                true,
             );
         }
         if let Some(router) = self.step_context.tool_router() {
             collector.register_runtime_semantics(
-                &semantic_tool_name, router.semantic_capabilities(result.tool_name),
+                &semantic_tool_name,
+                router.semantic_capabilities(result.tool_name),
             );
         }
-        let signal = self.step_context.environments.turn_environments.first()
-            .filter(|environment| !environment.environment.is_remote()
-                || result.signal.is_some_and(|signal| signal["command_validation"]["execution_context"].is_object()))
-            .and_then(|environment| crate::session::turn_execution::validation_scope_signal(
-                &semantic_tool_name, result.payload, result.signal.cloned(),
-                result.source_dependencies.as_ref(),
-                self.step_context.turn.config.cwd.as_path(),
-                &environment.environment_id,
-            )).or_else(|| result.signal.cloned());
-        collector.record_code_mode_result_for_call(Some(call_id), CodeModeToolResult {
-            tool_name: &semantic_tool_name,
-            signal: signal.as_ref(),
-            ..result
-        });
+        let signal = self
+            .step_context
+            .environments
+            .turn_environments
+            .first()
+            .filter(|environment| {
+                !environment.environment.is_remote()
+                    || result.signal.is_some_and(|signal| {
+                        signal["command_validation"]["execution_context"].is_object()
+                    })
+            })
+            .and_then(|environment| {
+                crate::session::turn_execution::validation_scope_signal(
+                    &semantic_tool_name,
+                    result.payload,
+                    result.signal.cloned(),
+                    result.source_dependencies.as_ref(),
+                    self.step_context.turn.config.cwd.as_path(),
+                    &environment.environment_id,
+                )
+            })
+            .or_else(|| result.signal.cloned());
+        collector.record_code_mode_result_for_call(
+            Some(call_id),
+            CodeModeToolResult {
+                tool_name: &semantic_tool_name,
+                signal: signal.as_ref(),
+                ..result
+            },
+        );
         collector.record_accepted_deterministic_continuation_receipts(receipts);
     }
 
@@ -2190,9 +2446,11 @@ impl ToolCallRuntime {
         let Some(collector) = &self.sampling_request_signals else {
             return;
         };
-        let parent = self.session.services.code_mode_service.cell_parent_call_id(
-            &codex_code_mode::CellId::new(cell_id.to_string()),
-        );
+        let parent = self
+            .session
+            .services
+            .code_mode_service
+            .cell_parent_call_id(&codex_code_mode::CellId::new(cell_id.to_string()));
         collector.record_code_mode_parent(cell_id, parent.as_deref());
         // A rejected payload never reached dispatch and cannot add a workspace
         // observation. For dispatched failures, use the same command-aware
@@ -2200,10 +2458,14 @@ impl ToolCallRuntime {
         let source_dependencies = match payload {
             None => None,
             Some(payload) => match crate::tool_history::classify_workspace_tool_call_at_admission(
-                tool_name.name.to_string(), payload.clone(),
+                tool_name.name.to_string(),
+                payload.clone(),
                 self.step_context.turn.config.cwd.to_path_buf(),
-            ).await {
-                Ok((classification, _)) => classification.observes_workspace
+            )
+            .await
+            {
+                Ok((classification, _)) => classification
+                    .observes_workspace
                     .then_some(classification.source_dependencies),
                 Err(_) => Some(Default::default()),
             },
@@ -2211,7 +2473,8 @@ impl ToolCallRuntime {
         let semantic_tool_name = self.semantic_tool_name(tool_name);
         if let Some(router) = self.step_context.tool_router() {
             collector.register_runtime_semantics(
-                &semantic_tool_name, router.semantic_capabilities(tool_name),
+                &semantic_tool_name,
+                router.semantic_capabilities(tool_name),
             );
         }
         collector.record_code_mode_failure(
@@ -2266,10 +2529,11 @@ impl ToolCallRuntime {
         });
         // Hooks can change a read into a writer. Such commands must wait for
         // ordinary dispatch, where the rewritten input is classified again.
-        let safe_read = typed_read || (read_only
-            && call.tool_name.namespace.is_none()
-            && call.tool_name.name.as_str() == crate::tools::EXEC_COMMAND_TOOL_NAME
-            && !self.pre_tool_use_hook_may_run(call));
+        let safe_read = typed_read
+            || (read_only
+                && call.tool_name.namespace.is_none()
+                && call.tool_name.name.as_str() == crate::tools::EXEC_COMMAND_TOOL_NAME
+                && !self.pre_tool_use_hook_may_run(call));
         let parallel_read = safe_read
             && self
                 .step_context
@@ -2376,10 +2640,14 @@ impl ToolCallRuntime {
                 router.classify_tool_name(self.step_context.turn.as_ref(), &call.tool_name)
             });
         let authoritative_direct_wait = matches!(&tool_class, TypedToolClass::AgentCommunication);
-        let terminal_result_adapter = self.step_context.tool_router()
+        let terminal_result_adapter = self
+            .step_context
+            .tool_router()
             .and_then(|router| router.terminal_result_adapter(&call.tool_name));
         let semantic_tool_name = self.semantic_tool_name(&call.tool_name);
-        let passive_poll = self.step_context.tool_router()
+        let passive_poll = self
+            .step_context
+            .tool_router()
             .is_some_and(|router| is_passive_workspace_poll(router, &call));
         let failure_reuse = self.step_context.tool_router().map_or(
             crate::tools::registry::TerminalFailureReuse::Never,
@@ -2388,7 +2656,8 @@ impl ToolCallRuntime {
         let signal_registration = self.sampling_request_signals.as_ref().map(|collector| {
             if let Some(router) = self.step_context.tool_router() {
                 collector.register_runtime_semantics(
-                    &semantic_tool_name, router.semantic_capabilities(&call.tool_name),
+                    &semantic_tool_name,
+                    router.semantic_capabilities(&call.tool_name),
                 );
             }
             collector.register_deterministic_tool_call_with_reuse(
@@ -2400,7 +2669,8 @@ impl ToolCallRuntime {
         });
         let signal_collector = self.sampling_request_signals.clone();
         let gate_call = WorkspaceGateCall {
-            tool_name: call.tool_name.to_string(), call_id: call.call_id.clone(),
+            tool_name: call.tool_name.to_string(),
+            call_id: call.call_id.clone(),
         };
         WORKSPACE_GATE_CALL.scope(gate_call, async move {
             self.ensure_execution_allowed().map_err(|error| CodexErr::Fatal(error.to_string()))?;
@@ -2933,7 +3203,7 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        self.handle_tool_call_with_admitted_revision(call, source, cancellation_token, None)
+        self.handle_tool_call_with_admitted_revision(call, source, cancellation_token, None, None)
     }
 
     pub(crate) fn handle_tool_call_with_admitted_revision(
@@ -2942,6 +3212,7 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
         admitted_revision: Option<Arc<Mutex<Option<u64>>>>,
+        workspace_evidence_baseline_slot: Option<WorkspaceEvidenceBaselineSlot>,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         self.step_context
             .workspace_evidence_generation_batch
@@ -2998,6 +3269,7 @@ impl ToolCallRuntime {
                     Arc::clone(&timing),
                     ToolCallWorkspaceEvidenceContext {
                         admitted_revision,
+                        baseline_slot: workspace_evidence_baseline_slot,
                         ..Default::default()
                     },
                 )
@@ -3048,7 +3320,8 @@ impl ToolCallRuntime {
         let cleanup_deadline = router.tool_cancellation_cleanup_deadline(&call);
         let owns_unified_exec_processes = router.tool_owns_unified_exec_processes(&call);
         let requires_commit_barrier = router.tool_cancellation_requires_commit_barrier(&call);
-        let retains_cancelled_cell_output = crate::tools::code_mode::is_orchestration_tool_name(&call.tool_name);
+        let retains_cancelled_cell_output =
+            crate::tools::code_mode::is_orchestration_tool_name(&call.tool_name);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
@@ -3084,9 +3357,12 @@ impl ToolCallRuntime {
         let dispatch_tool_name = call.tool_name.name.clone();
         let evidence_call = call.clone();
         let native_additions = router.native_addition_paths(&evidence_call);
-        let workspace_capable =
-            crate::tool_history::tool_observes_workspace(router.semantic_tool_name(&evidence_call.tool_name).name.as_str())
-                || native_additions.is_some();
+        let workspace_capable = crate::tool_history::tool_observes_workspace(
+            router
+                .semantic_tool_name(&evidence_call.tool_name)
+                .name
+                .as_str(),
+        ) || native_additions.is_some();
         let canonical_workspace_resources = Arc::clone(&self.canonical_workspace_resources);
         let tracks_workspace = workspace_capable
             || !supports_parallel
@@ -3123,7 +3399,9 @@ impl ToolCallRuntime {
         let cancellation_token = cancellation_token.child_token();
         let caller_drop = cancellation_token.clone().drop_guard();
         let admission_cancellation_token = cancellation_token.clone();
-        let mut commit_guard = (owns_unified_exec_processes || requires_commit_barrier || retains_cancelled_cell_output)
+        let mut commit_guard = (owns_unified_exec_processes
+            || requires_commit_barrier
+            || retains_cancelled_cell_output)
             .then(|| self.session.retain_tool_dispatch_commit());
         let terminal_tasks = self.session.terminal_tasks.clone();
 
@@ -3133,23 +3411,34 @@ impl ToolCallRuntime {
                 let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
                     None => crate::tool_history::classify_workspace_tool_call_at_admission(
-                        admission_tool_name.name.to_string(), dispatch_call.payload.clone(),
+                        admission_tool_name.name.to_string(),
+                        dispatch_call.payload.clone(),
                         turn.config.cwd.to_path_buf(),
-                    ).await.map_err(|error| FunctionCallError::Fatal(format!(
-                        "workspace admission analysis failed: {error}"
-                    )))?,
+                    )
+                    .await
+                    .map_err(|error| {
+                        FunctionCallError::Fatal(format!(
+                            "workspace admission analysis failed: {error}"
+                        ))
+                    })?,
                 };
                 let admission = native_file_classification(
-                    admission, admission_tool_name.name.as_str(), &dispatch_call.payload,
+                    admission,
+                    admission_tool_name.name.as_str(),
+                    &dispatch_call.payload,
                     &step_context.environments,
                 );
                 let (workspace_admission_classification, workspace_call_classification) =
                     workspace_tool_call_classifications_for_dispatch(
-                        &source, admission_tool_name.name.as_str(), &dispatch_call.payload,
-                        turn.config.cwd.as_path(), Some(admission),
+                        &source,
+                        admission_tool_name.name.as_str(),
+                        &dispatch_call.payload,
+                        turn.config.cwd.as_path(),
+                        Some(admission),
                     );
                 let projection_source_dependencies = projection_source_dependencies.or_else(|| {
-                    workspace_call_classification.as_ref()
+                    workspace_call_classification
+                        .as_ref()
                         .filter(|classification| classification.observes_workspace)
                         .map(|classification| classification.source_dependencies.clone())
                 });
@@ -3172,17 +3461,25 @@ impl ToolCallRuntime {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (workspace_admission_classification, workspace_call_classification) =
                     if hook_rewrote_input {
-                        let (classification, rewritten_read_only) = crate::tool_history::classify_workspace_tool_call_at_admission(
-                            admission_tool_name.name.to_string(), dispatch_call.payload.clone(),
-                            turn.config.cwd.to_path_buf(),
-                        ).await.map_err(|error| FunctionCallError::Fatal(format!(
-                            "rewritten workspace admission analysis failed: {error}"
-                        )))?;
+                        let (classification, rewritten_read_only) =
+                            crate::tool_history::classify_workspace_tool_call_at_admission(
+                                admission_tool_name.name.to_string(),
+                                dispatch_call.payload.clone(),
+                                turn.config.cwd.to_path_buf(),
+                            )
+                            .await
+                            .map_err(|error| {
+                                FunctionCallError::Fatal(format!(
+                                    "rewritten workspace admission analysis failed: {error}"
+                                ))
+                            })?;
                         // A hook may turn a read into a writer. Never retain
                         // the original payload's admission proof after rewriting.
                         read_only = rewritten_read_only;
                         let classification = native_file_classification(
-                            classification, admission_tool_name.name.as_str(), &dispatch_call.payload,
+                            classification,
+                            admission_tool_name.name.as_str(),
+                            &dispatch_call.payload,
                             &step_context.environments,
                         );
                         workspace_tool_call_classifications_for_dispatch(
@@ -3217,23 +3514,32 @@ impl ToolCallRuntime {
                 )
                 .await;
                 let additions = if let (Some(root), Some(paths), Some(environment)) = (
-                    resource_key.as_ref(), native_additions.as_ref(), step_context.environments.primary(),
+                    resource_key.as_ref(),
+                    native_additions.as_ref(),
+                    step_context.environments.primary(),
                 ) {
                     if !environment.environment.is_remote()
-                        && environment.cwd().to_abs_path().ok().as_ref()
+                        && environment
+                            .cwd()
+                            .to_abs_path()
+                            .ok()
+                            .as_ref()
                             .is_some_and(|cwd| cwd.as_path() == turn.config.cwd.as_path())
                     {
                         crate::scoped_workspace_gate::NativeAdditions::resolve(
-                            root, turn.config.cwd.as_path(), paths,
-                        ).await
+                            root,
+                            turn.config.cwd.as_path(),
+                            paths,
+                        )
+                        .await
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                let supports_parallel = supports_parallel
-                    && (native_additions.is_none() || additions.is_some());
+                let supports_parallel =
+                    supports_parallel && (native_additions.is_none() || additions.is_some());
                 timing.record_boundary(ToolLifecycleBoundary::ResourceResolutionEnd);
                 let passive_poll = is_passive_workspace_poll(&router, &evidence_call);
                 let workspace_admission = workspace_admission_plan(
@@ -3276,7 +3582,8 @@ impl ToolCallRuntime {
                             &dispatch_call,
                             &source,
                         )
-                        .await {
+                        .await
+                        {
                             Ok(guard) => guard,
                             Err(result) => {
                                 timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitEnd);
@@ -3293,11 +3600,15 @@ impl ToolCallRuntime {
                                     // Return failure as data, never a rejected JS
                                     // promise that could cancel sibling calls.
                                     result: crate::tools::context::boxed_tool_output(
-                                        codex_tools::JsonToolOutput::with_success(serde_json::json!({
-                                            "kind": "workspace_gate_timeout",
-                                            "did_run": false,
-                                            "output": result.0,
-                                        }), Some(false)).with_code_mode_failure_as_data(),
+                                        codex_tools::JsonToolOutput::with_success(
+                                            serde_json::json!({
+                                                "kind": "workspace_gate_timeout",
+                                                "did_run": false,
+                                                "output": result.0,
+                                            }),
+                                            Some(false),
+                                        )
+                                        .with_code_mode_failure_as_data(),
                                     ),
                                     model_projection: None,
                                     source_dependencies: None,
@@ -3346,77 +3657,91 @@ impl ToolCallRuntime {
                 let baseline_ready = CancellationToken::new();
                 let overlap_baseline = router.prepares_during_workspace_baseline(&dispatch_call);
                 let baseline_capture = async {
-                let prefetched_workspace_evidence =
-                    if let Some(classification) = evidence_capture_classification {
-                        // The repository lease must precede baseline work. A queued
-                        // call must neither spend Git/disk resources nor carry an
-                        // observation made before its execution boundary.
-                        timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitStart);
-                        let admitted_mutation_revision =
-                            evidence_tracker.lock().await.current_mutation_revision();
-                        if passive_poll && let Some(parent_call_id) = code_mode_parent_call_id.as_deref() {
-                            step_context.workspace_evidence_generation_batch
-                                .record_code_mode_workspace_observation(parent_call_id, admitted_mutation_revision);
-                        }
-                        if let Some(slot) = admitted_revision.as_ref() {
-                            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(admitted_mutation_revision);
-                        }
-                        timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitEnd);
-                        let evidence_capture_started = Instant::now();
-                        let baseline = step_context
-                            .workspace_evidence_generation_batch
-                            .capture_baseline_for_tool(
-                                session.services.git_workspace.as_ref(),
-                                Some(&turn),
-                                classification,
-                                admission_tool_name.name.as_str(),
-                                admitted_mutation_revision,
-                            )
-                            .await;
-                        let capture_duration = evidence_capture_started.elapsed();
-                        timing.record_workspace_evidence_before(capture_duration);
-                        timing.record_workspace_evidence_before_attribution(
-                            baseline.cache_hit,
-                            baseline
-                                .timed_out_git_dependencies
-                                .iter()
-                                .map(|dependency| dependency.as_str().to_string())
-                                .collect(),
-                        );
-                        if !baseline.revision.as_ref().is_some_and(|identity|
-                            !identity.unavailable && !baseline.source_path_observations.is_empty()
-                                && identity.repository_root.is_some() && identity.worktree_identity.is_none())
-                            && turn
-                            .environments
-                            .primary()
-                            .is_some_and(|environment| !environment.environment.is_remote())
-                        {
-                            session
-                                .services
-                                .command_execution
-                                .observe_workspace_baseline(
-                                    &turn.sub_id,
+                    let prefetched_workspace_evidence =
+                        if let Some(classification) = evidence_capture_classification {
+                            // The repository lease must precede baseline work. A queued
+                            // call must neither spend Git/disk resources nor carry an
+                            // observation made before its execution boundary.
+                            timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitStart);
+                            let admitted_mutation_revision =
+                                evidence_tracker.lock().await.current_mutation_revision();
+                            if passive_poll
+                                && let Some(parent_call_id) = code_mode_parent_call_id.as_deref()
+                            {
+                                step_context
+                                    .workspace_evidence_generation_batch
+                                    .record_code_mode_workspace_observation(
+                                        parent_call_id,
+                                        admitted_mutation_revision,
+                                    );
+                            }
+                            if let Some(slot) = admitted_revision.as_ref() {
+                                *slot
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(admitted_mutation_revision);
+                            }
+                            timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitEnd);
+                            let evidence_capture_started = Instant::now();
+                            let baseline = step_context
+                                .workspace_evidence_generation_batch
+                                .capture_baseline_for_tool(
+                                    session.services.git_workspace.as_ref(),
+                                    Some(&turn),
+                                    classification,
+                                    admission_tool_name.name.as_str(),
                                     admitted_mutation_revision,
-                                    &classification.workspace_cwd,
-                                    baseline.revision.clone(),
                                 )
                                 .await;
-                        }
-                        if let Some(slot) = workspace_evidence_baseline_slot.as_ref() {
-                            *slot
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some((baseline, admitted_mutation_revision));
-                            None
+                            let capture_duration = evidence_capture_started.elapsed();
+                            timing.record_workspace_evidence_before(capture_duration);
+                            timing.record_workspace_evidence_before_attribution(
+                                baseline.cache_hit,
+                                baseline
+                                    .timed_out_git_dependencies
+                                    .iter()
+                                    .map(|dependency| dependency.as_str().to_string())
+                                    .collect(),
+                            );
+                            if !baseline.revision.as_ref().is_some_and(|identity| {
+                                !identity.unavailable
+                                    && !baseline.source_path_observations.is_empty()
+                                    && identity.repository_root.is_some()
+                                    && identity.worktree_identity.is_none()
+                            }) && turn
+                                .environments
+                                .primary()
+                                .is_some_and(|environment| !environment.environment.is_remote())
+                            {
+                                session
+                                    .services
+                                    .command_execution
+                                    .observe_workspace_baseline(
+                                        &turn.sub_id,
+                                        admitted_mutation_revision,
+                                        &classification.workspace_cwd,
+                                        baseline.revision.clone(),
+                                    )
+                                    .await;
+                            }
+                            if let Some(slot) = workspace_evidence_baseline_slot.as_ref() {
+                                // Nested dispatch still owns history evidence. Exporting
+                                // replay proof must not consume its pre-read baseline.
+                                let nested_baseline = (!model_issued)
+                                    .then(|| (baseline.clone(), admitted_mutation_revision));
+                                *slot
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some((baseline, admitted_mutation_revision));
+                                nested_baseline
+                            } else {
+                                Some((baseline, admitted_mutation_revision))
+                            }
                         } else {
-                            Some((baseline, admitted_mutation_revision))
-                        }
-                    } else {
-                        None
-                    };
-                baseline_ready.cancel();
-                prefetched_workspace_evidence
+                            None
+                        };
+                    baseline_ready.cancel();
+                    prefetched_workspace_evidence
                 };
 
                 let projection_source_dependencies = projection_source_dependencies
@@ -3444,29 +3769,34 @@ impl ToolCallRuntime {
                     .instrument(dispatch_span.clone());
                 let dispatch =
                     crate::tools::registry::with_prepared_hook_input(hook_notice, dispatch);
-                let dispatch = WORKSPACE_BASELINE_READY.scope(baseline_ready.clone(), scope_tool_dispatch_timing(
-                    Arc::clone(&timing),
-                    crate::tools::registry::with_precomputed_projection_source_dependencies(
-                        projection_source_dependencies,
-                        dispatch,
+                let dispatch = WORKSPACE_BASELINE_READY.scope(
+                    baseline_ready.clone(),
+                    scope_tool_dispatch_timing(
+                        Arc::clone(&timing),
+                        crate::tools::registry::with_precomputed_projection_source_dependencies(
+                            projection_source_dependencies,
+                            dispatch,
+                        ),
                     ),
-                ));
+                );
                 // Both futures stay owned by the supervised dispatch. The
                 // repository lease still precedes capture, and opted-in handlers
                 // wait at their read/effect boundary, not before pure preparation.
-                let (prefetched_workspace_evidence, mut result) = if overlap_baseline && !passive_poll {
-                    tokio::join!(baseline_capture, dispatch)
-                } else {
-                    let baseline = baseline_capture.await;
-                    if passive_poll {
-                        // Retain admission ordering, not a claim that later process
-                        // output observes this epoch. Its evidence stays unverified.
-                        step_context.workspace_evidence_generation_batch
-                            .record_workspace_observation(&evidence_call.call_id);
-                        drop(gate_guard.take());
-                    }
-                    (baseline, dispatch.await)
-                };
+                let (prefetched_workspace_evidence, mut result) =
+                    if overlap_baseline && !passive_poll {
+                        tokio::join!(baseline_capture, dispatch)
+                    } else {
+                        let baseline = baseline_capture.await;
+                        if passive_poll {
+                            // Retain admission ordering, not a claim that later process
+                            // output observes this epoch. Its evidence stays unverified.
+                            step_context
+                                .workspace_evidence_generation_batch
+                                .record_workspace_observation(&evidence_call.call_id);
+                            drop(gate_guard.take());
+                        }
+                        (baseline, dispatch.await)
+                    };
                 let (evidence_revision_before, evidence_mutation_revision_before) =
                     prefetched_workspace_evidence.unzip();
                 timing.mark_output_collected();
@@ -3486,20 +3816,29 @@ impl ToolCallRuntime {
                 turn.turn_timing_state
                     .record_tool_completion(dispatch_tool_name.as_str(), successful);
                 let evidence_classification = match workspace_call_classification.as_ref() {
-                    Some(classification) => Some(executed_workspace_classification(
-                        classification, admission_tool_name.name.as_str(),
-                        result.as_ref().ok().map(|result| &result.payload)
-                            .filter(|payload| *payload != &evidence_call.payload),
-                        turn.config.cwd.as_path(),
-                        &step_context.environments,
-                    ).await?),
+                    Some(classification) => Some(
+                        executed_workspace_classification(
+                            classification,
+                            admission_tool_name.name.as_str(),
+                            result
+                                .as_ref()
+                                .ok()
+                                .map(|result| &result.payload)
+                                .filter(|payload| *payload != &evidence_call.payload),
+                            turn.config.cwd.as_path(),
+                            &step_context.environments,
+                        )
+                        .await?,
+                    ),
                     None => None,
                 };
                 if let (Some(classification), Ok(result)) =
                     (evidence_classification.as_ref(), result.as_mut())
                 {
                     result.source_dependencies = classification.observes_workspace.then(|| {
-                        result.projected_source_dependencies().cloned()
+                        result
+                            .projected_source_dependencies()
+                            .cloned()
                             .unwrap_or_else(|| classification.source_dependencies.clone())
                     });
                 }
@@ -3534,7 +3873,9 @@ impl ToolCallRuntime {
                     let evidence_capture_started = Instant::now();
                     let mutation_revision =
                         evidence_tracker.lock().await.current_mutation_revision();
-                    if !passive_poll && let Some(parent_call_id) = code_mode_parent_call_id.as_deref() {
+                    if !passive_poll
+                        && let Some(parent_call_id) = code_mode_parent_call_id.as_deref()
+                    {
                         // Record while the workspace lease is held. Registration
                         // can release it before persisting the observation.
                         step_context
@@ -3549,23 +3890,29 @@ impl ToolCallRuntime {
                     let workspace_evidence_deferred = if passive_poll {
                         drop(gate_guard);
                         Self::register_passive_poll_evidence(
-                            &session, &turn, response, evidence_revision_before,
-                        ).await
-                    } else { Self::register_workspace_evidence_after_call(
-                        session.as_ref(),
-                        turn.as_ref(),
-                        WorkspaceEvidenceAfterCall {
+                            &session,
+                            &turn,
                             response,
-                            baseline: evidence_revision_before,
-                            mutation_advanced,
-                            source_dependencies_override,
-                            classification,
-                            workspace_gate_guard: gate_guard,
-                        },
-                        Some(&step_context.workspace_evidence_generation_batch),
-                        Some(Arc::clone(&timing)),
-                    )
-                    .await };
+                            evidence_revision_before,
+                        )
+                        .await
+                    } else {
+                        Self::register_workspace_evidence_after_call(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            WorkspaceEvidenceAfterCall {
+                                response,
+                                baseline: evidence_revision_before,
+                                mutation_advanced,
+                                source_dependencies_override,
+                                classification,
+                                workspace_gate_guard: gate_guard,
+                            },
+                            Some(&step_context.workspace_evidence_generation_batch),
+                            Some(Arc::clone(&timing)),
+                        )
+                        .await
+                    };
                     if !workspace_evidence_deferred {
                         timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
                     }
@@ -3736,7 +4083,9 @@ async fn supervise_cancelled_dispatch_cleanup(
         match tokio::time::timeout_at(cleanup_until, &mut dispatch_handle).await {
             Ok(Ok(Err(error))) => {
                 effects = recovery_for(None, Some(&error.to_string()));
-                recovery.push(serde_json::json!({"kind":"handler_recovery","detail":error.to_string()}));
+                recovery.push(
+                    serde_json::json!({"kind":"handler_recovery","detail":error.to_string()}),
+                );
             }
             Ok(Ok(Ok(result))) => {
                 let value = result.result.code_mode_result(&result.payload);
@@ -3748,7 +4097,9 @@ async fn supervise_cancelled_dispatch_cleanup(
             }
             Ok(Err(err)) if err.is_cancelled() => {}
             Ok(Err(err)) => {
-                recovery.push(serde_json::json!({"kind":"cleanup_join_failed","detail":err.to_string()}));
+                recovery.push(
+                    serde_json::json!({"kind":"cleanup_join_failed","detail":err.to_string()}),
+                );
                 warn!(
                     tool_name = %tool_name,
                     call_id,
@@ -3782,7 +4133,8 @@ async fn supervise_cancelled_dispatch_cleanup(
         if let Err(err) = dispatch_handle.await
             && !err.is_cancelled()
         {
-            recovery.push(serde_json::json!({"kind":"cleanup_join_failed","detail":err.to_string()}));
+            recovery
+                .push(serde_json::json!({"kind":"cleanup_join_failed","detail":err.to_string()}));
             warn!(
                 tool_name = %tool_name,
                 call_id,
@@ -3812,9 +4164,15 @@ async fn supervise_cancelled_dispatch_cleanup(
             Err(error) => {
                 timing.record_exec_cleanup_state(false, true);
                 effects.uncertain_effects.push(error.clone());
-                let surviving = session.services.unified_exec_manager.list_processes().await
-                    .into_iter().filter(|process| process.item_id == call_id)
-                    .map(|process| process.process_id).collect::<Vec<_>>();
+                let surviving = session
+                    .services
+                    .unified_exec_manager
+                    .list_processes()
+                    .await
+                    .into_iter()
+                    .filter(|process| process.item_id == call_id)
+                    .map(|process| process.process_id)
+                    .collect::<Vec<_>>();
                 recovery.push(serde_json::json!({
                     "kind": "process_cleanup_failed",
                     "detail": error,
@@ -4017,8 +4375,6 @@ impl ToolCallRuntime {
 }
 
 impl ToolCallTimingGuard {
-
-
     fn capture_for_turn(
         timing: Arc<ToolDispatchTiming>,
         turn_timing_state: Arc<TurnTimingState>,
@@ -4217,17 +4573,24 @@ mod tests {
             let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
             let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
             batch.retain_generation_owner(&session, &turn, &tracker);
-            tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+            tracker
+                .lock()
+                .await
+                .activate_workspace_evidence_generation_batch(&batch);
             let history_guard = session.lock_history_state_for_test().await;
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 if wrapper {
-                    session.flush_workspace_evidence_generation(&turn, &batch, &tracker).await
+                    session
+                        .flush_workspace_evidence_generation(&turn, &batch, &tracker)
+                        .await
                 } else {
                     batch.flush(&session, &turn, &tracker).await
                 }
-            }).await;
+            })
+            .await;
             drop(history_guard);
-            let result = result.expect("empty flush must not acquire unrelated history state")
+            let result = result
+                .expect("empty flush must not acquire unrelated history state")
                 .expect("empty flush succeeds");
             assert_eq!(result.prefetched_workspace_identity, None);
             assert_eq!(result.authoritative_capture_count, 0);
@@ -4249,25 +4612,39 @@ mod tests {
             let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
             assert!(batch.register_call("no-workspace-effects"));
             batch.retain_generation_owner(&session, &turn, &tracker);
-            tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+            tracker
+                .lock()
+                .await
+                .activate_workspace_evidence_generation_batch(&batch);
             assert_eq!(Arc::weak_count(&batch), 1);
             let flush = if wrapper {
-                session.flush_workspace_evidence_generation(&turn, &batch, &tracker).await
+                session
+                    .flush_workspace_evidence_generation(&turn, &batch, &tracker)
+                    .await
             } else {
                 batch.flush(&session, &turn, &tracker).await
-            }.expect("empty generation flush");
+            }
+            .expect("empty generation flush");
             // No capture is different from an authoritative non-Git capture.
             assert_eq!(flush.prefetched_workspace_identity, None);
             assert_eq!(flush.authoritative_capture_count, 0);
             assert!(flush.registered_call_ids.is_empty());
             assert!(!batch.accepts_call("no-workspace-effects"));
             assert!(!batch.register_call("late-call"));
-            assert_eq!(Arc::weak_count(&batch), 0, "tracker must retire this generation");
+            assert_eq!(
+                Arc::weak_count(&batch),
+                0,
+                "tracker must retire this generation"
+            );
             assert_eq!(tracker.lock().await.current_mutation_revision(), revision);
             assert!(batch.state.lock().unwrap().owner.is_none());
-            tokio::time::timeout(Duration::from_secs(5), session.flush_rollout_after_ordered_commits(&turn))
-                .await.expect("empty flush must release terminal ownership")
-                .expect("terminal commit barrier");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                session.flush_rollout_after_ordered_commits(&turn),
+            )
+            .await
+            .expect("empty flush must release terminal ownership")
+            .expect("terminal commit barrier");
         }
     }
 
@@ -4276,7 +4653,8 @@ mod tests {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let workspace = tempfile::tempdir().expect("workspace");
         Arc::make_mut(&mut turn.config).cwd =
-            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
+                .unwrap();
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let source = workspace.path().join("source.txt");
@@ -4289,10 +4667,11 @@ mod tests {
                 output: FunctionCallOutputPayload::from_text("before".to_string()),
                 internal_chat_message_metadata_passthrough: None,
             },
-            std::collections::BTreeSet::from([
-                crate::tool_history::SourceDependencyV1::new(&source, false),
-            ]),
-        ).expect("workspace observation");
+            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+                &source, false,
+            )]),
+        )
+        .expect("workspace observation");
         session.register_workspace_evidence(observation, ()).await;
         let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -4300,20 +4679,39 @@ mod tests {
         assert!(batch.register_call("mutation-only"));
         std::fs::write(&source, "after").unwrap();
         tracker.lock().await.record_unknown_mutation();
-        assert!(batch.record_mutation("mutation-only", workspace.path().to_path_buf(),
-            Some(std::collections::BTreeSet::from([source])), false));
-        let flush = session.flush_workspace_evidence_generation(&turn, &batch, &tracker)
-            .await.expect("mutation-only flush");
+        assert!(batch.record_mutation(
+            "mutation-only",
+            workspace.path().to_path_buf(),
+            Some(std::collections::BTreeSet::from([source])),
+            false
+        ));
+        let flush = session
+            .flush_workspace_evidence_generation(&turn, &batch, &tracker)
+            .await
+            .expect("mutation-only flush");
         assert_eq!(flush.prefetched_workspace_identity, Some(None));
         assert!(flush.registered_call_ids.is_empty());
-        session.flush_tool_history_persistence().await.expect("invalidation durable");
-        let live = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
-        assert_eq!(live["workspace_evidence"]["prior-read"]["source_dependencies_current"], false);
+        session
+            .flush_tool_history_persistence()
+            .await
+            .expect("invalidation durable");
+        let live =
+            serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+        assert_eq!(
+            live["workspace_evidence"]["prior-read"]["source_dependencies_current"],
+            false
+        );
         let (saved, warning) = crate::tool_history::load_tool_history_state(
-            &turn.config.codex_home, &session.thread_id.to_string(),
-        ).await.into_state_and_warning();
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+        )
+        .await
+        .into_state_and_warning();
         assert_eq!(warning, None);
-        assert_eq!(serde_json::to_value(saved).unwrap()["workspace_evidence"]["prior-read"]["source_dependencies_current"], false);
+        assert_eq!(
+            serde_json::to_value(saved).unwrap()["workspace_evidence"]["prior-read"]["source_dependencies_current"],
+            false
+        );
     }
 
     /// Real evidence-flush and Session-wrapper timing, not a full model-turn benchmark.
@@ -4321,7 +4719,10 @@ mod tests {
     /// flush completion, before joining that task, so bypassed contention is visible.
     #[tokio::test]
     #[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
-    #[expect(clippy::print_stdout, reason = "matched empty-flush baseline emits raw monotonic timings")]
+    #[expect(
+        clippy::print_stdout,
+        reason = "matched empty-flush baseline emits raw monotonic timings"
+    )]
     async fn kd4_latency_bench_empty_generation_flush() {
         const SAMPLES: usize = 24;
         const STATE_HOLD: Duration = Duration::from_millis(60);
@@ -4331,7 +4732,10 @@ mod tests {
                 let (session, mut turn) = crate::session::tests::make_session_and_context().await;
                 let workspace = tempfile::tempdir().expect("workspace");
                 Arc::make_mut(&mut turn.config).cwd =
-                    codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+                    codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                        workspace.path(),
+                    )
+                    .unwrap();
                 let session = Arc::new(session);
                 let turn = Arc::new(turn);
                 let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -4340,7 +4744,10 @@ mod tests {
                     let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
                     assert!(batch.register_call("empty-flush-benchmark"));
                     batch.retain_generation_owner(&session, &turn, &tracker);
-                    tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+                    tracker
+                        .lock()
+                        .await
+                        .activate_workspace_evidence_generation_batch(&batch);
                     let holder = if contended {
                         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
                         let (begin_tx, begin_rx) = tokio::sync::oneshot::channel();
@@ -4356,7 +4763,9 @@ mod tests {
                         });
                         held_rx.await.expect("state holder ready");
                         Some((begin_tx, task))
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let started_us = epoch.elapsed().as_micros();
                     let started = Instant::now();
                     let holder = holder.map(|(begin, task)| {
@@ -4365,11 +4774,14 @@ mod tests {
                     });
                     let flush = tokio::time::timeout(Duration::from_secs(10), async {
                         if wrapper {
-                            session.flush_workspace_evidence_generation(&turn, &batch, &tracker).await
+                            session
+                                .flush_workspace_evidence_generation(&turn, &batch, &tracker)
+                                .await
                         } else {
                             batch.flush(&session, &turn, &tracker).await
                         }
-                    }).await;
+                    })
+                    .await;
                     let elapsed_us = started.elapsed().as_micros();
                     let ended_us = epoch.elapsed().as_micros();
                     let held_us = match holder {
@@ -4389,12 +4801,15 @@ mod tests {
                         }));
                     }
                 }
-                println!("{}", serde_json::json!({
-                    "benchmark": "empty_generation_flush", "session_wrapper": wrapper,
-                    "executable": std::env::current_exe().expect("benchmark executable"),
-                    "state_contended": contended, "state_hold_ms": STATE_HOLD.as_millis(),
-                    "samples": samples, "model_calls": 0, "samples_exclude_warmup": true,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "benchmark": "empty_generation_flush", "session_wrapper": wrapper,
+                        "executable": std::env::current_exe().expect("benchmark executable"),
+                        "state_contended": contended, "state_hold_ms": STATE_HOLD.as_millis(),
+                        "samples": samples, "model_calls": 0, "samples_exclude_warmup": true,
+                    })
+                );
             }
         }
     }
@@ -4489,8 +4904,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn reused_failure_diagnosis_is_nonterminal_for_the_next_sample() {
         let call = ToolCall {
@@ -4520,10 +4933,17 @@ mod tests {
         assert_eq!(diagnosis["failure_fingerprint"], "stable-failure");
         assert_eq!(diagnosis["executed"], false);
         assert_eq!(diagnosis["outcome"], "skipped");
-        assert_eq!(diagnosis["retry_condition"], "changed_action_or_relevant_state");
+        assert_eq!(
+            diagnosis["retry_condition"],
+            "changed_action_or_relevant_state"
+        );
         assert!(diagnosis.get("retryable").is_none());
-        assert!(diagnosis["next_action"].as_str().unwrap()
-            .contains("Do not repeat this call with unchanged arguments"));
+        assert!(
+            diagnosis["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("Do not repeat this call with unchanged arguments")
+        );
     }
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
@@ -4615,23 +5035,40 @@ mod tests {
         let call = |name: &str| ToolCall {
             tool_name: codex_tools::ToolName::plain(name),
             call_id: format!("{name}-call"),
-            payload: ToolPayload::Function { arguments: "{}".into() },
+            payload: ToolPayload::Function {
+                arguments: "{}".into(),
+            },
         };
         let plan = |resource_key, shared_resource| WorkspaceAdmissionPlan {
-            bypass_outer_gate: false, resource_key, shared_resource,
-            supports_parallel: true, workspace_capable: true,
+            bypass_outer_gate: false,
+            resource_key,
+            shared_resource,
+            supports_parallel: true,
+            workspace_capable: true,
         };
         let holder_call = call("global_writer");
         let held = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(None, false),
-            &timing, None, &holders, &holder_call, &ToolCallSource::Direct,
-        ).await.unwrap();
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(None, false),
+            &timing,
+            None,
+            &holders,
+            &holder_call,
+            &ToolCallSource::Direct,
+        )
+        .await
+        .unwrap();
         let key = std::path::PathBuf::from("resource");
         let resource = workspace_resource_gate(&resources, key.clone());
-        let deadline = TokioInstant::now() + crate::unified_exec::NESTED_POLL_MARGIN + Duration::from_millis(500);
+        let deadline = TokioInstant::now()
+            + crate::unified_exec::NESTED_POLL_MARGIN
+            + Duration::from_millis(500);
         let source = ToolCallSource::CodeMode {
-            cell_id: "cell".into(), parent_call_id: Some("outer".into()),
-            runtime_tool_call_id: "queued".into(), nested_deadline: Some(deadline.into_std()),
+            cell_id: "cell".into(),
+            parent_call_id: Some("outer".into()),
+            runtime_tool_call_id: "queued".into(),
+            nested_deadline: Some(deadline.into_std()),
             cancellation_cause: None,
         };
         // Time spent BEFORE entering the gate counts against the same bound.
@@ -4639,35 +5076,76 @@ mod tests {
         let queued = call("resource_writer");
         {
             let pending = acquire_workspace_gate_for_call(
-                Arc::clone(&global), Arc::clone(&resources), plan(Some(key.clone()), false),
-                &timing, None, &holders, &queued, &source,
+                Arc::clone(&global),
+                Arc::clone(&resources),
+                plan(Some(key.clone()), false),
+                &timing,
+                None,
+                &holders,
+                &queued,
+                &source,
             );
             tokio::pin!(pending);
             assert!(futures::poll!(&mut pending).is_pending());
-            assert!(Arc::clone(&resource).try_write_owned().is_err(), "partial resource lease is held while waiting globally");
-            assert_eq!(resource.holders(8).0, 1, "record the partial lease at grant, not final admission");
+            assert!(
+                Arc::clone(&resource).try_write_owned().is_err(),
+                "partial resource lease is held while waiting globally"
+            );
+            assert_eq!(
+                resource.holders(8).0,
+                1,
+                "record the partial lease at grant, not final admission"
+            );
             tokio::time::advance(Duration::from_millis(99)).await;
             assert!(futures::poll!(&mut pending).is_pending());
             tokio::time::advance(Duration::from_millis(1)).await;
-            let Err(result) = pending.await else { panic!("global writer must exclude queued call") };
+            let Err(result) = pending.await else {
+                panic!("global writer must exclude queued call")
+            };
             assert!(result.0.contains("global_writer-call"), "{}", result.0);
-            assert!(result.0.contains("exclusive, held for 500 ms"), "{}", result.0);
-            assert!(!result.0.contains("Gate holders: 2"), "partial lease is not its own blocker");
+            assert!(
+                result.0.contains("exclusive, held for 500 ms"),
+                "{}",
+                result.0
+            );
+            assert!(
+                !result.0.contains("Gate holders: 2"),
+                "partial lease is not its own blocker"
+            );
         }
-        assert_eq!(TokioInstant::now(), deadline - crate::unified_exec::NESTED_POLL_MARGIN);
-        assert!(Arc::clone(&resource).try_write_owned().is_ok(), "timeout must release partial lease");
+        assert_eq!(
+            TokioInstant::now(),
+            deadline - crate::unified_exec::NESTED_POLL_MARGIN
+        );
+        assert!(
+            Arc::clone(&resource).try_write_owned().is_ok(),
+            "timeout must release partial lease"
+        );
         assert_eq!(resource.holders(8).0, 0);
         assert_eq!(timing.lifecycle_context().parallel_gate_waiter_count, 0);
 
         // Missing nested deadlines must not introduce another unbounded path.
         let mut no_deadline = source.clone();
-        if let ToolCallSource::CodeMode { nested_deadline, .. } = &mut no_deadline {
+        if let ToolCallSource::CodeMode {
+            nested_deadline, ..
+        } = &mut no_deadline
+        {
             *nested_deadline = None;
         }
         let Err(result) = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(None, false),
-            &timing, None, &holders, &queued, &no_deadline,
-        ).await else { panic!("held gate cannot be acquired") };
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(None, false),
+            &timing,
+            None,
+            &holders,
+            &queued,
+            &no_deadline,
+        )
+        .await
+        else {
+            panic!("held gate cannot be acquired")
+        };
         assert!(result.0.contains("no nested deadline"));
         drop(held);
         assert!(holders.lock().unwrap().is_empty());
@@ -4675,21 +5153,56 @@ mod tests {
         // Multiple resource readers, not unrelated global readers, are the
         // blockers of a resource writer. Downgrade must update attribution.
         let first = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(Some(key.clone()), false),
-            &timing, None, &holders, &holder_call, &ToolCallSource::Direct,
-        ).await.unwrap().downgrade_for_observation();
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(Some(key.clone()), false),
+            &timing,
+            None,
+            &holders,
+            &holder_call,
+            &ToolCallSource::Direct,
+        )
+        .await
+        .unwrap()
+        .downgrade_for_observation();
         let second_call = call("second_reader");
         let second = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(Some(key.clone()), true),
-            &timing, None, &holders, &second_call, &ToolCallSource::Direct,
-        ).await.unwrap();
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(Some(key.clone()), true),
+            &timing,
+            None,
+            &holders,
+            &second_call,
+            &ToolCallSource::Direct,
+        )
+        .await
+        .unwrap();
         let Err(result) = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(Some(key), false),
-            &timing, None, &holders, &queued, &no_deadline,
-        ).await else { panic!("resource readers must exclude writer") };
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(Some(key), false),
+            &timing,
+            None,
+            &holders,
+            &queued,
+            &no_deadline,
+        )
+        .await
+        else {
+            panic!("resource readers must exclude writer")
+        };
         assert!(result.0.contains("Gate holders: 2"), "{}", result.0);
-        assert!(result.0.contains("global_writer-call): shared"), "{}", result.0);
-        assert!(result.0.contains("second_reader-call): shared"), "{}", result.0);
+        assert!(
+            result.0.contains("global_writer-call): shared"),
+            "{}",
+            result.0
+        );
+        assert!(
+            result.0.contains("second_reader-call): shared"),
+            "{}",
+            result.0
+        );
         drop((first, second));
         assert!(Arc::clone(&resource).try_write_owned().is_ok());
         assert!(holders.lock().unwrap().is_empty());
@@ -4704,25 +5217,38 @@ mod tests {
         let call = ToolCall {
             tool_name: codex_tools::ToolName::plain("exec_command"),
             call_id: "queued-command".into(),
-            payload: ToolPayload::Function { arguments: "{}".into() },
+            payload: ToolPayload::Function {
+                arguments: "{}".into(),
+            },
         };
         let key = std::path::PathBuf::from("bounded-admission");
         let resource = workspace_resource_gate(&resources, key.clone());
         let plan = || WorkspaceAdmissionPlan {
-            bypass_outer_gate: false, resource_key: Some(key.clone()),
-            shared_resource: false, supports_parallel: true, workspace_capable: true,
+            bypass_outer_gate: false,
+            resource_key: Some(key.clone()),
+            shared_resource: false,
+            supports_parallel: true,
+            workspace_capable: true,
         };
         let source = ToolCallSource::CodeMode {
-            cell_id: "cell".into(), parent_call_id: Some("outer".into()),
-            runtime_tool_call_id: "queued".into(), cancellation_cause: None,
+            cell_id: "cell".into(),
+            parent_call_id: Some("outer".into()),
+            runtime_tool_call_id: "queued".into(),
+            cancellation_cause: None,
             nested_deadline: Some((TokioInstant::now() + Duration::from_secs(300)).into_std()),
         };
         let held = Arc::clone(&global).write_owned().await;
         let started = TokioInstant::now();
         {
             let pending = acquire_workspace_gate_for_call(
-                Arc::clone(&global), Arc::clone(&resources), plan(),
-                &timing, None, &holders, &call, &source,
+                Arc::clone(&global),
+                Arc::clone(&resources),
+                plan(),
+                &timing,
+                None,
+                &holders,
+                &call,
+                &source,
             );
             tokio::pin!(pending);
             assert!(futures::poll!(&mut pending).is_pending());
@@ -4730,29 +5256,55 @@ mod tests {
             tokio::time::advance(Duration::from_millis(999)).await;
             assert!(futures::poll!(&mut pending).is_pending());
             tokio::time::advance(Duration::from_millis(1)).await;
-            let Err(error) = pending.await else { panic!("busy command must not run") };
-            assert!(error.0.contains("one-second workspace admission grace"), "{}", error.0);
+            let Err(error) = pending.await else {
+                panic!("busy command must not run")
+            };
+            assert!(
+                error.0.contains("one-second workspace admission grace"),
+                "{}",
+                error.0
+            );
         }
         assert_eq!(started.elapsed(), Duration::from_secs(1));
-        assert!(Arc::clone(&resource).try_write_owned().is_ok(), "expiry must release partial admission");
-        assert!(Arc::clone(&global).try_write_owned().is_err(), "the original holder must remain owned");
+        assert!(
+            Arc::clone(&resource).try_write_owned().is_ok(),
+            "expiry must release partial admission"
+        );
+        assert!(
+            Arc::clone(&global).try_write_owned().is_err(),
+            "the original holder must remain owned"
+        );
         assert_eq!(timing.lifecycle_context().parallel_gate_waiter_count, 0);
         drop(held);
 
         // No mandatory grace on idle admission and no stale queued writer.
         let idle = TokioInstant::now();
         let guard = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(),
-            &timing, None, &holders, &call, &source,
-        ).await.unwrap();
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(),
+            &timing,
+            None,
+            &holders,
+            &call,
+            &source,
+        )
+        .await
+        .unwrap();
         assert_eq!(idle.elapsed(), Duration::ZERO);
         drop(guard);
 
         // Transient contention can clear within the grace without a refusal.
         let held = Arc::clone(&global).write_owned().await;
         let pending = acquire_workspace_gate_for_call(
-            Arc::clone(&global), Arc::clone(&resources), plan(),
-            &timing, None, &holders, &call, &source,
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(),
+            &timing,
+            None,
+            &holders,
+            &call,
+            &source,
         );
         tokio::pin!(pending);
         assert!(futures::poll!(&mut pending).is_pending());
@@ -5004,7 +5556,8 @@ mod tests {
             ToolRegistry::from_tools([
                 Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>,
                 Arc::new(ListFilesHandler) as Arc<dyn CoreToolRuntime>,
-                Arc::new(crate::tools::handlers::ExecCommandHandler::default()) as Arc<dyn CoreToolRuntime>,
+                Arc::new(crate::tools::handlers::ExecCommandHandler::default())
+                    as Arc<dyn CoreToolRuntime>,
             ]),
             Vec::new(),
         ));
@@ -5026,9 +5579,21 @@ mod tests {
         .await;
 
         for (name, arguments, expected) in [
-            ("read_file", serde_json::json!({"path":"evidence.txt"}), "reader evidence"),
-            ("list_files", serde_json::json!({"path":"."}), "evidence.txt"),
-            ("exec_command", serde_json::json!({"cmd":"git status --short --untracked-files=all"}), "evidence.txt"),
+            (
+                "read_file",
+                serde_json::json!({"path":"evidence.txt"}),
+                "reader evidence",
+            ),
+            (
+                "list_files",
+                serde_json::json!({"path":"."}),
+                "evidence.txt",
+            ),
+            (
+                "exec_command",
+                serde_json::json!({"cmd":"git status --short --untracked-files=all"}),
+                "evidence.txt",
+            ),
         ] {
             for nested in [false, true] {
                 let call = ToolCall {
@@ -5061,13 +5626,26 @@ mod tests {
                             })
                             .map_err(|error| error.to_string())
                     } else {
-                        let admission = crate::tool_history::classify_workspace_tool_call_at_admission(
-                            call.tool_name.name.to_string(), call.payload.clone(), workspace.path().to_path_buf(),
-                        ).await.expect("admission proof");
-                        let timing = runtime.create_tool_dispatch_timing(TokioInstant::now(), false);
-                        runtime.clone().handle_model_tool_call_with_admission(
-                            call, CancellationToken::new(), timing, Some(admission),
-                        ).await.map(|completion| completion.response)
+                        let admission =
+                            crate::tool_history::classify_workspace_tool_call_at_admission(
+                                call.tool_name.name.to_string(),
+                                call.payload.clone(),
+                                workspace.path().to_path_buf(),
+                            )
+                            .await
+                            .expect("admission proof");
+                        let timing =
+                            runtime.create_tool_dispatch_timing(TokioInstant::now(), false);
+                        runtime
+                            .clone()
+                            .handle_model_tool_call_with_admission(
+                                call,
+                                CancellationToken::new(),
+                                timing,
+                                Some(admission),
+                            )
+                            .await
+                            .map(|completion| completion.response)
                             .map_err(|error| error.to_string())
                     }
                 })
@@ -5110,11 +5688,14 @@ mod tests {
                         }
                     }
                 }
-            }).await.expect("writer should queue without entering its handler");
+            })
+            .await
+            .expect("writer should queue without entering its handler");
             assert!(!workspace.path().join("blocked.txt").exists());
             cancellation.cancel();
             tokio::time::timeout(Duration::from_secs(10), pending)
-                .await.expect("queued cancellation must release admission")
+                .await
+                .expect("queued cancellation must release admission")
                 .expect("cancelled call has an inspectable terminal result");
             assert_eq!(timing.lifecycle_context().parallel_gate_waiter_count, 0);
         }
@@ -5127,7 +5708,8 @@ mod tests {
             crate::tools::code_mode::execute_spec::create_code_mode_tool(false, false, &[], &[]),
             Vec::new(),
             Vec::new(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(exec.delegates_workspace_admission());
         assert!(crate::tools::code_mode::CodeModeWaitHandler.delegates_workspace_admission());
         assert!(!crate::tools::handlers::ReadFileHandler.delegates_workspace_admission());
@@ -5143,22 +5725,8 @@ mod tests {
             workspace_cwd: std::path::PathBuf::from("missing-workspace"),
             source_dependencies: Default::default(),
         };
-        let exec = workspace_admission_plan(
-            true,
-            false,
-            &classification,
-            None,
-            true,
-            true,
-        );
-        let nested = workspace_admission_plan(
-            false,
-            true,
-            &classification,
-            None,
-            false,
-            true,
-        );
+        let exec = workspace_admission_plan(true, false, &classification, None, true, true);
+        let nested = workspace_admission_plan(false, true, &classification, None, false, true);
 
         assert!(exec.bypass_outer_gate);
         assert!(!nested.bypass_outer_gate);
@@ -5327,7 +5895,10 @@ mod tests {
             }
         }
         assert_eq!(
-            session.services.git_workspace.workspace_evidence_capture_count(),
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_count(),
             captures
         );
     }
@@ -5345,7 +5916,10 @@ mod tests {
     #[test_case::test_case(false, "cancelled"; "direct_cancelled_poll")]
     #[test_case::test_case(true, "cancelled"; "nested_cancelled_poll")]
     #[tokio::test]
-    async fn stdin_passive_poll_releases_execution_without_promoting_evidence(nested: bool, mode: &str) {
+    async fn stdin_passive_poll_releases_execution_without_promoting_evidence(
+        nested: bool,
+        mode: &str,
+    ) {
         use crate::session::turn_context::TurnEnvironment;
         use codex_utils_absolute_path::AbsolutePathBuf;
         use codex_utils_path_uri::PathUri;
@@ -5356,14 +5930,20 @@ mod tests {
         }
         struct RetiredPoll(Arc<tokio::sync::Notify>);
         impl Drop for RetiredPoll {
-            fn drop(&mut self) { self.0.notify_one(); }
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
         }
         impl codex_tools::ToolExecutor<ToolInvocation> for ObservedPollHandler {
-            fn tool_name(&self) -> codex_tools::ToolName { codex_tools::ToolName::plain("write_stdin") }
+            fn tool_name(&self) -> codex_tools::ToolName {
+                codex_tools::ToolName::plain("write_stdin")
+            }
             fn spec(&self) -> codex_tools::ToolSpec {
                 crate::tools::handlers::WriteStdinHandler::default().spec()
             }
-            fn supports_parallel_tool_calls(&self) -> bool { true }
+            fn supports_parallel_tool_calls(&self) -> bool {
+                true
+            }
             fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
                 Box::pin(async move {
                     let handler = crate::tools::handlers::WriteStdinHandler::default();
@@ -5388,7 +5968,8 @@ mod tests {
                 crate::tools::handlers::WriteStdinHandler::default().matches_kind(payload)
             }
             fn permits_shared_workspace_observation(&self, payload: &ToolPayload) -> bool {
-                crate::tools::handlers::WriteStdinHandler::default().permits_shared_workspace_observation(payload)
+                crate::tools::handlers::WriteStdinHandler::default()
+                    .permits_shared_workspace_observation(payload)
             }
             fn controls_process(&self, payload: &ToolPayload) -> bool {
                 crate::tools::handlers::WriteStdinHandler::default().controls_process(payload)
@@ -5397,65 +5978,110 @@ mod tests {
 
         fn call(name: &str, id: &str, arguments: serde_json::Value) -> ToolCall {
             ToolCall {
-                tool_name: codex_tools::ToolName::plain(name), call_id: id.into(),
-                payload: ToolPayload::Function { arguments: arguments.to_string() },
+                tool_name: codex_tools::ToolName::plain(name),
+                call_id: id.into(),
+                payload: ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
             }
         }
         fn source(id: &str) -> ToolCallSource {
             ToolCallSource::CodeMode {
-                cell_id: "poll-cell".into(), parent_call_id: None,
-                runtime_tool_call_id: id.into(), cancellation_cause: None,
+                cell_id: "poll-cell".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: id.into(),
+                cancellation_cause: None,
                 nested_deadline: Some(Instant::now() + Duration::from_secs(60)),
             }
         }
         async fn json_call(runtime: &ToolCallRuntime, call: ToolCall) -> serde_json::Value {
             let source = source(&call.call_id);
-            let result = tokio::time::timeout(Duration::from_secs(20),
-                runtime.clone().handle_tool_call_with_source(call, source, CancellationToken::new()))
-                .await.expect("dispatch must complete independently of the silent poll")
-                .expect("handler result");
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                runtime.clone().handle_tool_call_with_source(
+                    call,
+                    source,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("dispatch must complete independently of the silent poll")
+            .expect("handler result");
             result.result.code_mode_result(&result.payload)
         }
         async fn wait_for(path: &std::path::Path) {
             tokio::time::timeout(Duration::from_secs(20), async {
-                while !path.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
-            }).await.expect("process handshake");
+                while !path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("process handshake");
         }
 
         let workspace = tempfile::tempdir().unwrap();
         // Control files are outside the workspace, so the no-mutation case
         // does not manufacture a workspace change to release the process.
         let control = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"])
-            .current_dir(workspace.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(workspace.path().join("read.txt"), "reader evidence\n").unwrap();
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
-        Arc::make_mut(&mut turn.config).cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+        Arc::make_mut(&mut turn.config).cwd =
+            AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
         turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         turn.environments.turn_environments = vec![TurnEnvironment::new(
             codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
             Arc::new(codex_exec_server::Environment::default_for_tests()),
-            PathUri::from_host_native_path(workspace.path()).unwrap(), None,
+            PathUri::from_host_native_path(workspace.path()).unwrap(),
+            None,
         )];
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let waiting = Arc::new(tokio::sync::Notify::new());
         let retired = Arc::new(tokio::sync::Notify::new());
-        let router = Arc::new(ToolRouter::from_parts(ToolRegistry::from_tools([
-            Arc::new(crate::tools::handlers::ExecCommandHandler::default()) as Arc<dyn CoreToolRuntime>,
-            Arc::new(ObservedPollHandler { waiting: Arc::clone(&waiting), retired: Arc::clone(&retired) }) as Arc<dyn CoreToolRuntime>,
-            Arc::new(crate::tools::handlers::ReadFileHandler) as Arc<dyn CoreToolRuntime>,
-        ]), Vec::new()));
-        let runtime = ToolCallRuntime::new(Arc::clone(&session),
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(crate::tools::handlers::ExecCommandHandler::default())
+                    as Arc<dyn CoreToolRuntime>,
+                Arc::new(ObservedPollHandler {
+                    waiting: Arc::clone(&waiting),
+                    retired: Arc::clone(&retired),
+                }) as Arc<dyn CoreToolRuntime>,
+                Arc::new(crate::tools::handlers::ReadFileHandler) as Arc<dyn CoreToolRuntime>,
+            ]),
+            Vec::new(),
+        ));
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
             StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router),
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())));
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
         let script = "import pathlib,sys,time\nc=pathlib.Path(sys.argv[1])\nend=time.monotonic()+60\ndef wait(name):\n while not (c/name).exists():\n  if time.monotonic()>end: raise RuntimeError('fixture deadline')\n  time.sleep(.01)\n";
-        let silent = format!("{script}wait('emit')\nprint('poll-output',flush=True)\n(c/'emitted').write_text('yes')\nwait('stop')\n");
-        let started = json_call(&runtime, call("exec_command", "silent", serde_json::json!({
-            "program":"python", "args":["-u", "-c", silent, control.path()],
-            "yield_time_ms":250, "stall_timeout_ms":0,
-        }))).await;
-        let process_id = started["session_id"].as_u64().expect("silent process remains alive");
+        let silent = format!(
+            "{script}wait('emit')\nprint('poll-output',flush=True)\n(c/'emitted').write_text('yes')\nwait('stop')\n"
+        );
+        let started = json_call(
+            &runtime,
+            call(
+                "exec_command",
+                "silent",
+                serde_json::json!({
+                    "program":"python", "args":["-u", "-c", silent, control.path()],
+                    "yield_time_ms":250, "stall_timeout_ms":0,
+                }),
+            ),
+        )
+        .await;
+        let process_id = started["session_id"]
+            .as_u64()
+            .expect("silent process remains alive");
         let incarnation = started["session_capabilities"]["incarnation"].clone();
         let arguments = serde_json::json!({"session_id":process_id, "incarnation":incarnation,
             "chars":"", "wait_for_output":true});
@@ -5465,10 +6091,16 @@ mod tests {
             let source = source(id);
             tokio::spawn(async move {
                 if nested {
-                    runtime.handle_tool_call_with_source(call, source, cancellation).await
-                        .expect("nested poll").into_response()
+                    runtime
+                        .handle_tool_call_with_source(call, source, cancellation)
+                        .await
+                        .expect("nested poll")
+                        .into_response()
                 } else {
-                    runtime.handle_tool_call(call, cancellation).await.expect("direct poll")
+                    runtime
+                        .handle_tool_call(call, cancellation)
+                        .await
+                        .expect("direct poll")
                 }
             })
         };
@@ -5477,29 +6109,59 @@ mod tests {
         // through an existing exclusive lease.
         let admission_guard = Arc::clone(&runtime.parallel_execution).write_owned().await;
         let cancellation = CancellationToken::new();
-        let mut poll = spawn_poll(if mode == "cancelled" { "cancelled-poll" } else { "poll" }, cancellation.clone());
+        let mut poll = spawn_poll(
+            if mode == "cancelled" {
+                "cancelled-poll"
+            } else {
+                "poll"
+            },
+            cancellation.clone(),
+        );
         tokio::time::timeout(Duration::from_secs(20), async {
-            while turn.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+            while turn
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 0
+            {
                 assert!(!poll.is_finished());
                 tokio::task::yield_now().await;
             }
-        }).await.expect("passive admission queues behind writer");
+        })
+        .await
+        .expect("passive admission queues behind writer");
         assert!(futures::poll!(Box::pin(waiting.notified())).is_pending());
         drop(admission_guard);
-        tokio::time::timeout(Duration::from_secs(20), waiting.notified()).await
+        tokio::time::timeout(Duration::from_secs(20), waiting.notified())
+            .await
             .expect("real write_stdin handler is waiting for process output");
         assert!(!poll.is_finished());
 
         if mode == "cancelled" {
             cancellation.cancel();
-            let cancelled = tokio::time::timeout(Duration::from_secs(10), poll).await.unwrap().unwrap();
-            let ResponseInputItem::FunctionCallOutput { output, .. } = cancelled else { panic!("poll response") };
+            let cancelled = tokio::time::timeout(Duration::from_secs(10), poll)
+                .await
+                .unwrap()
+                .unwrap();
+            let ResponseInputItem::FunctionCallOutput { output, .. } = cancelled else {
+                panic!("poll response")
+            };
             assert!(output.text_content().unwrap().contains("cancel"));
-            tokio::time::timeout(Duration::from_secs(10), retired.notified()).await
+            tokio::time::timeout(Duration::from_secs(10), retired.notified())
+                .await
                 .expect("cancelled observation retires without terminating its process");
-            assert!(session.services.unified_exec_manager.process_incarnation(process_id as u32).await.is_some());
+            assert!(
+                session
+                    .services
+                    .unified_exec_manager
+                    .process_incarnation(process_id as u32)
+                    .await
+                    .is_some()
+            );
             poll = spawn_poll("poll", CancellationToken::new());
-            tokio::time::timeout(Duration::from_secs(10), waiting.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+                .await
+                .unwrap();
             assert!(!poll.is_finished());
         }
 
@@ -5511,92 +6173,181 @@ mod tests {
             let writer = if long_lived {
                 format!("{script}wait('mutate')\n{write}wait('stop-writer')\n")
             } else {
-                format!("{script}{write}sys.exit({})\n", if mode == "failure" { 7 } else { 0 })
+                format!(
+                    "{script}{write}sys.exit({})\n",
+                    if mode == "failure" { 7 } else { 0 }
+                )
             };
-            let result = json_call(&runtime, call("exec_command", "writer", serde_json::json!({
-                "program":"python", "args":["-u", "-c", writer, control.path()],
-                "yield_time_ms":if long_lived {250} else {10000}, "stall_timeout_ms":0,
-            }))).await;
+            let result = json_call(
+                &runtime,
+                call(
+                    "exec_command",
+                    "writer",
+                    serde_json::json!({
+                        "program":"python", "args":["-u", "-c", writer, control.path()],
+                        "yield_time_ms":if long_lived {250} else {10000}, "stall_timeout_ms":0,
+                    }),
+                ),
+            )
+            .await;
             if long_lived {
                 assert_eq!(result["process_exited"], false);
                 // Crucially, write only AFTER exec_command returned a live
                 // handle: its terminal mutation revision cannot help this poll.
                 std::fs::write(control.path().join("mutate"), "go").unwrap();
                 wait_for(&control.path().join("mutated")).await;
-                assert_eq!(runtime.tracker.lock().await.current_mutation_revision(), revision_before);
+                assert_eq!(
+                    runtime.tracker.lock().await.current_mutation_revision(),
+                    revision_before
+                );
                 if mode == "interrupted" {
                     let stopped = json_call(&runtime, call("write_stdin", "interrupt-writer", serde_json::json!({
                         "session_id":result["session_id"], "incarnation":result["session_capabilities"]["incarnation"],
                         "terminate":true,
                     }))).await;
                     assert_eq!(stopped["process_exited"], true);
-                } else { live_writer = Some(result); }
+                } else {
+                    live_writer = Some(result);
+                }
             } else {
                 assert_eq!(result["process_exited"], true, "{result}");
-                assert_eq!(result["exit_code"], if mode == "failure" {7} else {0});
+                assert_eq!(result["exit_code"], if mode == "failure" { 7 } else { 0 });
             }
-            assert_eq!(std::fs::read_to_string(workspace.path().join("mutated.txt")).unwrap(), "after");
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("mutated.txt")).unwrap(),
+                "after"
+            );
             if mode != "live" {
-                assert!(runtime.tracker.lock().await.current_mutation_revision() > revision_before,
-                    "completed and failed/interrupted writers are accounted for");
+                assert!(
+                    runtime.tracker.lock().await.current_mutation_revision() > revision_before,
+                    "completed and failed/interrupted writers are accounted for"
+                );
             }
         }
-        assert!(!poll.is_finished(), "writer completes while the original poll is still waiting");
-        let read = json_call(&runtime, call("read_file", "reader", serde_json::json!({"path":"read.txt"}))).await;
+        assert!(
+            !poll.is_finished(),
+            "writer completes while the original poll is still waiting"
+        );
+        let read = json_call(
+            &runtime,
+            call(
+                "read_file",
+                "reader",
+                serde_json::json!({"path":"read.txt"}),
+            ),
+        )
+        .await;
         assert!(read.to_string().contains("reader evidence"));
-        assert!(!poll.is_finished(), "read-only handler also runs during the wait");
+        assert!(
+            !poll.is_finished(),
+            "read-only handler also runs during the wait"
+        );
 
         // Completion must not reacquire any workspace lease or perform a fresh
         // capture, even with an exclusive writer now holding admission closed.
-        let completion_guard = tokio::time::timeout(Duration::from_secs(10),
-            Arc::clone(&runtime.parallel_execution).write_owned()).await
-            .expect("passive poll must have released the execution lease");
-        let captures = session.services.git_workspace.workspace_evidence_capture_count();
-        let blocked_capture = session.services.git_workspace.pause_next_workspace_evidence_capture();
+        let completion_guard = tokio::time::timeout(
+            Duration::from_secs(10),
+            Arc::clone(&runtime.parallel_execution).write_owned(),
+        )
+        .await
+        .expect("passive poll must have released the execution lease");
+        let captures = session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count();
+        let blocked_capture = session
+            .services
+            .git_workspace
+            .pause_next_workspace_evidence_capture();
         std::fs::write(control.path().join("emit"), "go").unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(10), poll).await
-            .expect("poll output does not wait for a post-call lease/capture").unwrap();
-        let ResponseInputItem::FunctionCallOutput { output, .. } = &response else { panic!("poll output") };
+        let response = tokio::time::timeout(Duration::from_secs(10), poll)
+            .await
+            .expect("poll output does not wait for a post-call lease/capture")
+            .unwrap();
+        let ResponseInputItem::FunctionCallOutput { output, .. } = &response else {
+            panic!("poll output")
+        };
         assert!(output.text_content().unwrap().contains("poll-output"));
-        assert_eq!(session.services.git_workspace.workspace_evidence_capture_count(), captures);
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_count(),
+            captures
+        );
         // The cache retains its own Arc; dropping this handle does not release
         // the next capture used by generation settlement below.
         blocked_capture.release();
         drop(blocked_capture);
         drop(completion_guard);
 
-        let canonical: Arc<[ResponseItem]> = Arc::from(vec![ResponseItem::FunctionCall {
-            id: None, name: "write_stdin".into(), namespace: None, call_id: "poll".into(),
-            arguments: arguments.to_string(), internal_chat_message_metadata_passthrough: None,
-        }, ResponseItem::from(response)]);
+        let canonical: Arc<[ResponseItem]> = Arc::from(vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "write_stdin".into(),
+                namespace: None,
+                call_id: "poll".into(),
+                arguments: arguments.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::from(response),
+        ]);
         // Exercise both persistence/registration and generation settlement. No
         // path may replace the unavailable baseline with a fresh identity.
         runtime.flush_workspace_evidence_generation().await.unwrap();
         if nested {
-            session.register_code_mode_nested_evidence(
-                "poll-parent".into(), "poll".into(), "retained nested poll output".into(),
-            ).await;
+            session
+                .register_code_mode_nested_evidence(
+                    "poll-parent".into(),
+                    "poll".into(),
+                    "retained nested poll output".into(),
+                )
+                .await;
         }
         let history = session.clone_history().await;
         let state = history.tool_history_state();
         let saved = serde_json::to_value(&state).unwrap();
-        assert_eq!(saved["workspace_evidence"]["poll"]["source_dependencies_current"], false);
-        assert_eq!(saved["workspace_evidence"]["poll"]["revision"]["unavailable"], true);
+        assert_eq!(
+            saved["workspace_evidence"]["poll"]["source_dependencies_current"],
+            false
+        );
+        assert_eq!(
+            saved["workspace_evidence"]["poll"]["revision"]["unavailable"],
+            true
+        );
         if nested {
             // The nested ledger accepts only scoped evidence. Opaque process
             // output must be refused, not upgraded into a scoped child proof.
-            assert!(saved["code_mode_nested_evidence"].get("poll-parent").is_none());
+            assert!(
+                saved["code_mode_nested_evidence"]
+                    .get("poll-parent")
+                    .is_none()
+            );
         }
-        let identity = session.services.git_workspace.workspace_evidence_identity(workspace.path()).await;
-        let notices = crate::tool_history::tests::freshness_notices(&state, &canonical,
-            identity.as_ref(), session.services.git_workspace.as_ref());
+        let identity = session
+            .services
+            .git_workspace
+            .workspace_evidence_identity(workspace.path())
+            .await;
+        let notices = crate::tool_history::tests::freshness_notices(
+            &state,
+            &canonical,
+            identity.as_ref(),
+            session.services.git_workspace.as_ref(),
+        );
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0]["historical_authenticity"], "authenticated");
         assert_eq!(notices[0]["valid_for_current_workspace"], false);
         assert_eq!(notices[0]["workspace_evidence_freshness"], "unknown");
         if let Some(writer) = live_writer {
-            assert!(session.services.unified_exec_manager.process_incarnation(
-                writer["session_id"].as_u64().unwrap() as u32).await.is_some());
+            assert!(
+                session
+                    .services
+                    .unified_exec_manager
+                    .process_incarnation(writer["session_id"].as_u64().unwrap() as u32)
+                    .await
+                    .is_some()
+            );
             let stopped = json_call(&runtime, call("write_stdin", "stop-writer", serde_json::json!({
                 "session_id":writer["session_id"], "incarnation":writer["session_capabilities"]["incarnation"],
                 "terminate":true,
@@ -5606,30 +6357,54 @@ mod tests {
         // Termination retains the complete transcript, including bytes already
         // returned by a poll (and bytes following an interrupted observation).
         wait_for(&control.path().join("emitted")).await;
-        let stopped = json_call(&runtime, call("write_stdin", "stop-silent", serde_json::json!({
-            "session_id":process_id, "incarnation":incarnation, "terminate":true,
-        }))).await;
+        let stopped = json_call(
+            &runtime,
+            call(
+                "write_stdin",
+                "stop-silent",
+                serde_json::json!({
+                    "session_id":process_id, "incarnation":incarnation, "terminate":true,
+                }),
+            ),
+        )
+        .await;
         assert_eq!(stopped["process_exited"], true);
-        assert_eq!(stopped["stdout"].as_str().unwrap().replace("\r\n", "\n"), "poll-output\n");
+        assert_eq!(
+            stopped["stdout"].as_str().unwrap().replace("\r\n", "\n"),
+            "poll-output\n"
+        );
         assert!(stopped.get("session_id").is_none());
         // Completing timing seals acceptance, so inspect it only after the
         // final nested cleanup call has finished.
         if !matches!(mode, "none" | "cancelled") {
             let timings = turn.turn_timing_state.complete_snapshot().protocol_timing();
-            assert!(timings.tool_calls.iter().any(|call| call.call_id == "writer" && call.handler_entry_at_ms.is_some()),
-                "exclusive command actually entered its handler");
+            assert!(
+                timings
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.call_id == "writer" && call.handler_entry_at_ms.is_some()),
+                "exclusive command actually entered its handler"
+            );
         }
     }
 
     #[test]
     fn stdin_early_release_is_only_for_passive_process_polls() {
-        let router = ToolRouter::from_parts(ToolRegistry::from_tools([
-            Arc::new(crate::tools::handlers::WriteStdinHandler::default()) as Arc<dyn CoreToolRuntime>,
-            Arc::new(crate::tools::handlers::ReadFileHandler) as Arc<dyn CoreToolRuntime>,
-        ]), Vec::new());
+        let router = ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(crate::tools::handlers::WriteStdinHandler::default())
+                    as Arc<dyn CoreToolRuntime>,
+                Arc::new(crate::tools::handlers::ReadFileHandler) as Arc<dyn CoreToolRuntime>,
+            ]),
+            Vec::new(),
+        );
         for (name, arguments, expected) in [
             ("write_stdin", r#"{"session_id":7}"#, true),
-            ("write_stdin", r#"{"session_id":7,"chars":"","wait_for_output":false}"#, true),
+            (
+                "write_stdin",
+                r#"{"session_id":7,"chars":"","wait_for_output":false}"#,
+                true,
+            ),
             ("write_stdin", r#"{"session_id":7,"chars":"input"}"#, false),
             ("write_stdin", r#"{"session_id":7,"chars":"\u0003"}"#, false),
             ("write_stdin", r#"{"session_id":7,"terminate":true}"#, false),
@@ -5637,11 +6412,45 @@ mod tests {
             ("read_file", r#"{"path":"source.rs"}"#, false),
         ] {
             let call = ToolCall {
-                tool_name: codex_tools::ToolName::plain(name), call_id: "scope".into(),
-                payload: ToolPayload::Function { arguments: arguments.into() },
+                tool_name: codex_tools::ToolName::plain(name),
+                call_id: "scope".into(),
+                payload: ToolPayload::Function {
+                    arguments: arguments.into(),
+                },
             };
-            assert_eq!(is_passive_workspace_poll(&router, &call), expected, "{name} {arguments}");
+            assert_eq!(
+                is_passive_workspace_poll(&router, &call),
+                expected,
+                "{name} {arguments}"
+            );
         }
+    }
+
+    #[test]
+    fn read_only_list_agents_does_not_take_the_global_exclusive_gate() {
+        // A read-only agent snapshot previously fell through to the global
+        // exclusive gate, serializing independent siblings and stalling the
+        // shared write_stdin polls issued in the same batch.
+        use codex_tools::ToolExecutor as _;
+        let handler = crate::tools::handlers::multi_agents_v2::ListAgentsHandler;
+        assert!(
+            handler.supports_parallel_tool_calls(),
+            "list_agents must advertise parallel safety"
+        );
+        // list_agents is not workspace-capable, so advertising parallel safety
+        // routes it to the shared global gate rather than the exclusive one.
+        assert!(
+            workspace_tool_may_use_parallel_gate(
+                handler.supports_parallel_tool_calls(),
+                /*workspace_capable*/ false,
+            ),
+            "a parallel-safe non-workspace tool must use the shared gate"
+        );
+        // Guard the inverse so a future workspace-capable change is noticed.
+        assert!(!workspace_tool_may_use_parallel_gate(
+            handler.supports_parallel_tool_calls(),
+            /*workspace_capable*/ true,
+        ));
     }
 
     #[test]
@@ -5679,8 +6488,6 @@ mod tests {
         assert!(!admission("not json"));
     }
 
-
-
     #[tokio::test]
     async fn stdin_termination_reaches_handler_while_process_holds_workspace_gate() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -5700,7 +6507,9 @@ mod tests {
             let call = ToolCall {
                 tool_name: codex_tools::ToolName::plain("write_stdin"),
                 call_id: "admission".to_string(),
-                payload: ToolPayload::Function { arguments: arguments.to_string() },
+                payload: ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
             };
             assert_eq!(router.permits_shared_workspace_observation(&call), shared);
             assert_eq!(router.delegates_workspace_admission(&call), bypass);
@@ -5731,7 +6540,12 @@ mod tests {
         let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
             panic!("expected function output");
         };
-        assert!(output.text_content().unwrap().contains("process handle is stale or lacks its creation identity"));
+        assert!(
+            output
+                .text_content()
+                .unwrap()
+                .contains("process handle is stale or lacks its creation identity")
+        );
     }
 
     #[test]
@@ -5762,23 +6576,27 @@ mod tests {
 
     #[tokio::test]
     async fn evidence_reuse_native_dependencies_resolve_the_selected_environment() {
-        use std::collections::BTreeSet;
         use crate::environment_selection::TurnEnvironmentSnapshot;
         use crate::session::turn_context::TurnEnvironment;
         use crate::tool_history::SourceDependencyV1;
         use codex_utils_path_uri::PathUri;
+        use std::collections::BTreeSet;
 
         let primary = tempfile::tempdir().unwrap();
         let selected = tempfile::tempdir().unwrap();
         let environments = TurnEnvironmentSnapshot {
             turn_environments: vec![
                 TurnEnvironment::new(
-                    "primary".into(), Arc::new(codex_exec_server::Environment::default_for_tests()),
-                    PathUri::from_host_native_path(primary.path()).unwrap(), None,
+                    "primary".into(),
+                    Arc::new(codex_exec_server::Environment::default_for_tests()),
+                    PathUri::from_host_native_path(primary.path()).unwrap(),
+                    None,
                 ),
                 TurnEnvironment::new(
-                    "selected".into(), Arc::new(codex_exec_server::Environment::default_for_tests()),
-                    PathUri::from_host_native_path(selected.path()).unwrap(), None,
+                    "selected".into(),
+                    Arc::new(codex_exec_server::Environment::default_for_tests()),
+                    PathUri::from_host_native_path(selected.path()).unwrap(),
+                    None,
                 ),
             ],
             ..Default::default()
@@ -5793,20 +6611,40 @@ mod tests {
                 if let Some(id) = environment_id {
                     arguments["environment_id"] = serde_json::json!(id);
                 }
-                let payload = ToolPayload::Function { arguments: arguments.to_string() };
+                let payload = ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                };
                 let original = crate::tool_history::classify_workspace_tool_call(
-                    name, &payload, primary.path(),
+                    name,
+                    &payload,
+                    primary.path(),
                 );
-                let classified = native_file_classification(
-                    original.clone(), name, &payload, &environments,
+                let classified =
+                    native_file_classification(original.clone(), name, &payload, &environments);
+                assert_eq!(
+                    classified.source_dependencies,
+                    expected
+                        .map(|cwd| {
+                            BTreeSet::from([SourceDependencyV1::new(
+                                &cwd.join("source"),
+                                name == "list_files",
+                            )])
+                        })
+                        .unwrap_or_default()
                 );
-                assert_eq!(classified.source_dependencies, expected.map(|cwd| {
-                    BTreeSet::from([SourceDependencyV1::new(&cwd.join("source"), name == "list_files")])
-                }).unwrap_or_default());
                 // Hook-rewritten payloads must resolve through the same snapshot.
-                assert_eq!(executed_workspace_classification(
-                    &original, name, Some(&payload), primary.path(), &environments,
-                ).await.unwrap(), classified);
+                assert_eq!(
+                    executed_workspace_classification(
+                        &original,
+                        name,
+                        Some(&payload),
+                        primary.path(),
+                        &environments,
+                    )
+                    .await
+                    .unwrap(),
+                    classified
+                );
             }
         }
     }
@@ -5843,7 +6681,9 @@ mod tests {
             Some(&rewritten_read),
             default_cwd,
             &crate::environment_selection::TurnEnvironmentSnapshot::default(),
-        ).await.expect("executed payload classification");
+        )
+        .await
+        .expect("executed payload classification");
         assert!(executed_read.observes_workspace);
         assert_eq!(
             executed_read.workspace_cwd,
@@ -5879,7 +6719,9 @@ mod tests {
             }),
             default_cwd,
             &crate::environment_selection::TurnEnvironmentSnapshot::default(),
-        ).await.expect("executed payload classification");
+        )
+        .await
+        .expect("executed payload classification");
         assert!(!executed_mutation.observes_workspace);
         assert!(!workspace_evidence_baseline_is_compatible(
             &original_read,
@@ -5896,7 +6738,9 @@ mod tests {
                 None,
                 default_cwd,
                 &crate::environment_selection::TurnEnvironmentSnapshot::default(),
-            ).await.expect("executed payload classification"),
+            )
+            .await
+            .expect("executed payload classification"),
             original_read,
         );
     }
@@ -6115,8 +6959,6 @@ mod tests {
         }
     }
 
-
-
     #[tokio::test]
     async fn cancellation_before_dispatch_admission_logs_dispatch_only_timing() -> anyhow::Result<()>
     {
@@ -6262,10 +7104,17 @@ mod tests {
             cancellation_token.clone(),
         ));
         tokio::time::timeout(Duration::from_secs(5), async {
-            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+            while turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 0
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("dispatch must reach the held workspace gate");
+        })
+        .await
+        .expect("dispatch must reach the held workspace gate");
         cancellation_token.cancel();
         tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -6537,7 +7386,10 @@ mod tests {
             }) as Arc<dyn CoreToolRuntime>;
             let router = Arc::new(ToolRouter::from_parts(
                 ToolRegistry::from_unique_registered_tools([
-                    crate::tools::registry::RegisteredTool::new(handler, TypedToolClass::ReadSearch),
+                    crate::tools::registry::RegisteredTool::new(
+                        handler,
+                        TypedToolClass::ReadSearch,
+                    ),
                 ]),
                 Vec::new(),
             ));
@@ -6722,7 +7574,10 @@ mod tests {
     /// measurement. Promotion of nested replay requires these guards plus a
     /// matched end-to-end task measurement (including provider/recovery time).
     #[tokio::test]
-    #[expect(clippy::print_stderr, reason = "this baseline benchmark reports handler counts and dispatch timings")]
+    #[expect(
+        clippy::print_stderr,
+        reason = "this baseline benchmark reports handler counts and dispatch timings"
+    )]
     async fn native_read_replay_direct_and_nested_baseline() {
         use crate::session::turn_context::TurnEnvironment;
         use crate::session::turn_execution::{SamplingRequestSettledState, TurnExecutionControl};
@@ -6731,27 +7586,50 @@ mod tests {
 
         struct CountedNativeRead(Arc<AtomicUsize>);
         impl ToolExecutor<ToolInvocation> for CountedNativeRead {
-            fn tool_name(&self) -> codex_tools::ToolName { ReadFileHandler.tool_name() }
-            fn spec(&self) -> codex_tools::ToolSpec { ReadFileHandler.spec() }
-            fn supports_parallel_tool_calls(&self) -> bool { true }
+            fn tool_name(&self) -> codex_tools::ToolName {
+                ReadFileHandler.tool_name()
+            }
+            fn spec(&self) -> codex_tools::ToolSpec {
+                ReadFileHandler.spec()
+            }
+            fn supports_parallel_tool_calls(&self) -> bool {
+                true
+            }
             fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move { ReadFileHandler.handle(invocation).await })
             }
         }
         impl CoreToolRuntime for CountedNativeRead {
-            fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool { true }
+            fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool {
+                true
+            }
         }
         for nested in [false, true] {
-            for change in ["unchanged", "unrelated", "relevant", "permission", "selection"] {
+            for change in [
+                "unchanged",
+                "unrelated",
+                "relevant",
+                "permission",
+                "selection",
+            ] {
                 let workspace = tempfile::tempdir().unwrap();
-                assert!(std::process::Command::new("git").args(["init", "--quiet"])
-                    .current_dir(workspace.path()).status().unwrap().success());
+                assert!(
+                    std::process::Command::new("git")
+                        .args(["init", "--quiet"])
+                        .current_dir(workspace.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
                 let path = workspace.path().join("source.txt");
                 std::fs::write(&path, "original source\n").unwrap();
                 let (session, mut turn) = crate::session::tests::make_session_and_context().await;
                 Arc::make_mut(&mut turn.config).cwd =
-                    codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+                    codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                        workspace.path(),
+                    )
+                    .unwrap();
                 turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
                 turn.approval_policy = crate::config::Constrained::allow_any(
                     codex_protocol::protocol::AskForApproval::Never,
@@ -6759,17 +7637,22 @@ mod tests {
                 turn.environments.turn_environments = vec![TurnEnvironment::new(
                     codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
                     Arc::new(codex_exec_server::Environment::default_for_tests()),
-                    codex_utils_path_uri::PathUri::from_host_native_path(workspace.path()).unwrap(), None,
+                    codex_utils_path_uri::PathUri::from_host_native_path(workspace.path()).unwrap(),
+                    None,
                 )];
                 let mut turn = Arc::new(turn);
                 let session = Arc::new(session);
                 let reads = Arc::new(AtomicUsize::new(0));
-                let router = Arc::new(ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools([
-                    crate::tools::registry::RegisteredTool::new(
-                        Arc::new(CountedNativeRead(Arc::clone(&reads))) as Arc<dyn CoreToolRuntime>,
-                        TypedToolClass::ReadSearch,
-                    ),
-                ]), Vec::new()));
+                let router = Arc::new(ToolRouter::from_parts(
+                    ToolRegistry::from_unique_registered_tools([
+                        crate::tools::registry::RegisteredTool::new(
+                            Arc::new(CountedNativeRead(Arc::clone(&reads)))
+                                as Arc<dyn CoreToolRuntime>,
+                            TypedToolClass::ReadSearch,
+                        ),
+                    ]),
+                    Vec::new(),
+                ));
                 let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
                 let mut control = TurnExecutionControl::new();
                 let started = Instant::now();
@@ -6777,14 +7660,25 @@ mod tests {
                     if index == 1 {
                         match change {
                             "unrelated" | "relevant" => {
-                                let name = if change == "relevant" { "source.txt" } else { "unrelated.txt" };
-                                std::fs::write(workspace.path().join(name), "changed source\n").unwrap();
-                                session.services.git_workspace.note_host_workspace_mutation_paths(
-                                    workspace.path(), &[name.to_string()],
-                                ).await;
+                                let name = if change == "relevant" {
+                                    "source.txt"
+                                } else {
+                                    "unrelated.txt"
+                                };
+                                std::fs::write(workspace.path().join(name), "changed source\n")
+                                    .unwrap();
+                                session
+                                    .services
+                                    .git_workspace
+                                    .note_host_workspace_mutation_paths(
+                                        workspace.path(),
+                                        &[name.to_string()],
+                                    )
+                                    .await;
                             }
                             "permission" => {
-                                let turn = Arc::get_mut(&mut turn).expect("completed dispatch releases turn");
+                                let turn = Arc::get_mut(&mut turn)
+                                    .expect("completed dispatch releases turn");
                                 turn.approval_policy = crate::config::Constrained::allow_any(
                                     codex_protocol::protocol::AskForApproval::OnRequest,
                                 );
@@ -6794,45 +7688,101 @@ mod tests {
                     }
                     let baseline = control.baselines(0);
                     let collector = control.collector(&baseline);
-                    let runtime = ToolCallRuntime::new(Arc::clone(&session),
-                        StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(Arc::clone(&router)),
-                        Arc::clone(&tracker)).with_sampling_request_signals(collector.clone());
+                    let runtime = ToolCallRuntime::new(
+                        Arc::clone(&session),
+                        StepContext::for_test(Arc::clone(&turn))
+                            .with_tool_router_for_test(Arc::clone(&router)),
+                        Arc::clone(&tracker),
+                    )
+                    .with_sampling_request_signals(collector.clone());
                     let tool_name = codex_tools::ToolName::plain("read_file");
                     let arguments = if change == "selection" {
-                        if index == 0 { serde_json::json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}) }
-                        else { serde_json::json!({"path":path,"selectors":[{"kind":"search","query":"original source"}]}) }
-                    } else { serde_json::json!({"path":path}) };
-                    let payload = ToolPayload::Function { arguments: arguments.to_string() };
+                        if index == 0 {
+                            serde_json::json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]})
+                        } else {
+                            serde_json::json!({"path":path,"selectors":[{"kind":"search","query":"original source"}]})
+                        }
+                    } else {
+                        serde_json::json!({"path":path})
+                    };
+                    let payload = ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    };
                     let call_id = format!("read-{index}");
-                    let call = ToolCall { tool_name: tool_name.clone(), call_id: call_id.clone(), payload: payload.clone() };
+                    let call = ToolCall {
+                        tool_name: tool_name.clone(),
+                        call_id: call_id.clone(),
+                        payload: payload.clone(),
+                    };
                     let output = if nested {
-                        let result = runtime.clone().handle_tool_call_with_source(call, ToolCallSource::CodeMode {
-                            cell_id: "read-cell".into(), parent_call_id: None, runtime_tool_call_id: call_id.clone(),
-                            nested_deadline: None, cancellation_cause: None,
-                        }, CancellationToken::new()).await.unwrap();
+                        let result = runtime
+                            .clone()
+                            .handle_tool_call_with_source(
+                                call,
+                                ToolCallSource::CodeMode {
+                                    cell_id: "read-cell".into(),
+                                    parent_call_id: None,
+                                    runtime_tool_call_id: call_id.clone(),
+                                    nested_deadline: None,
+                                    cancellation_cause: None,
+                                },
+                                CancellationToken::new(),
+                            )
+                            .await
+                            .unwrap();
                         let signal = result.sampling_request_signal();
                         let source_dependencies = result.projected_source_dependencies().cloned();
                         let outcome_context = result.outcome_context();
                         let value = result.code_mode_result();
-                        runtime.record_code_mode_result(&call_id, CodeModeToolResult {
-                            cell_id: "read-cell", tool_name: &tool_name, payload: &payload,
-                            source_dependencies,
-                            outcome_context, signal: signal.as_ref(), result: &value,
-                            canonical_artifact_required: false,
-                        }, &[]);
+                        runtime.record_code_mode_result(
+                            &call_id,
+                            CodeModeToolResult {
+                                cell_id: "read-cell",
+                                tool_name: &tool_name,
+                                payload: &payload,
+                                source_dependencies,
+                                outcome_context,
+                                signal: signal.as_ref(),
+                                result: &value,
+                                canonical_artifact_required: false,
+                            },
+                            &[],
+                        );
                         value.to_string()
                     } else {
-                        let result = runtime.clone().handle_tool_call(call, CancellationToken::new()).await.unwrap();
+                        let result = runtime
+                            .clone()
+                            .handle_tool_call(call, CancellationToken::new())
+                            .await
+                            .unwrap();
                         serde_json::to_string(&result).unwrap()
                     };
-                    assert!(output.contains(if index == 1 && change == "relevant" { "changed source" } else { "original source" }));
-                    control.settle(&baseline, &collector, &SamplingRequestSettledState {
-                        mutation_revision: 0, attributed_mutation_revision: 0, tool_exposure_revision: 0,
-                    });
+                    assert!(output.contains(if index == 1 && change == "relevant" {
+                        "changed source"
+                    } else {
+                        "original source"
+                    }));
+                    control.settle(
+                        &baseline,
+                        &collector,
+                        &SamplingRequestSettledState {
+                            mutation_revision: 0,
+                            attributed_mutation_revision: 0,
+                            tool_exposure_revision: 0,
+                        },
+                    );
                 }
-                let expected = if nested || matches!(change, "relevant" | "permission") { 2 } else { 1 };
+                let expected = if nested || matches!(change, "relevant" | "permission") {
+                    2
+                } else {
+                    1
+                };
                 assert_eq!(reads.load(Ordering::SeqCst), expected, "{nested} {change}");
-                eprintln!("native-read-replay-baseline nested={nested} change={change} native_handler_calls={} dispatch_wall_us={} model_requests=0", reads.load(Ordering::SeqCst), started.elapsed().as_micros());
+                eprintln!(
+                    "native-read-replay-baseline nested={nested} change={change} native_handler_calls={} dispatch_wall_us={} model_requests=0",
+                    reads.load(Ordering::SeqCst),
+                    started.elapsed().as_micros()
+                );
             }
         }
     }
@@ -6977,8 +7927,15 @@ mod tests {
                 assert_eq!(stale["workspace_evidence_freshness"], "changed");
                 assert_eq!(stale["source_scope"]["dependency_scope"], "recorded");
                 // The record names the changed path, so its reason must not deny knowing it.
-                assert_eq!(stale["source_scope"]["dependencies"][0]["freshness"], "changed");
-                for key in ["historical_authenticity", "workspace_evidence_freshness", "source_scope"] {
+                assert_eq!(
+                    stale["source_scope"]["dependencies"][0]["freshness"],
+                    "changed"
+                );
+                for key in [
+                    "historical_authenticity",
+                    "workspace_evidence_freshness",
+                    "source_scope",
+                ] {
                     stale.as_object_mut().unwrap().remove(key);
                 }
                 assert_eq!(
@@ -7046,6 +8003,46 @@ mod tests {
         );
     }
 
+    /// Waits until no entry under `root` has changed for two seconds. The host
+    /// can still touch fresh Git metadata (for example by on-access scanning of
+    /// hook samples) shortly after `git init`, which a recursive `.git`
+    /// dependency captured in that window correctly reports as a change.
+    async fn wait_for_quiescent_tree(root: &std::path::Path) {
+        let snapshot = || {
+            let mut entries = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(path) = pending.pop() {
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_dir()
+                    && let Ok(children) = std::fs::read_dir(&path)
+                {
+                    pending.extend(children.filter_map(Result::ok).map(|entry| entry.path()));
+                }
+                entries.push((path, metadata.modified().ok(), metadata.len()));
+            }
+            entries.sort();
+            entries
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut previous = snapshot();
+        let mut stable_since = tokio::time::Instant::now();
+        while stable_since.elapsed() < Duration::from_secs(2) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never became quiescent",
+                root.display()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let current = snapshot();
+            if current != previous {
+                previous = current;
+                stable_since = tokio::time::Instant::now();
+            }
+        }
+    }
+
     #[test_case::test_case("Get-Content contract.txt", true; "scoped read")]
     #[test_case::test_case("git status --short", false; "unscoped read")]
     #[tokio::test]
@@ -7064,6 +8061,10 @@ mod tests {
                 .success()
         );
         std::fs::write(workspace.path().join("contract.txt"), "contract").unwrap();
+        if !scoped {
+            // The unscoped read depends on `.git` recursively; capture settled metadata.
+            wait_for_quiescent_tree(&workspace.path().join(".git")).await;
+        }
         Arc::make_mut(&mut turn_context.config).cwd =
             codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
                 .unwrap();
@@ -7097,11 +8098,15 @@ mod tests {
                 false,
             )])
         } else {
-            // A read-only git query observes the whole checkout.
-            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
-                &turn_context.config.cwd,
-                true,
-            )])
+            // A read-only git query observes the whole checkout and its Git
+            // metadata, whose events recursive worktree watches deliberately ignore.
+            std::collections::BTreeSet::from([
+                crate::tool_history::SourceDependencyV1::new(&turn_context.config.cwd, true),
+                crate::tool_history::SourceDependencyV1::new(
+                    &turn_context.config.cwd.join(".git"),
+                    true,
+                ),
+            ])
         };
         let result = runtime
             .clone()
@@ -7141,15 +8146,15 @@ mod tests {
         let revision = history
             .workspace_evidence_revision_for_test("nested-read")
             .expect("nested read registers workspace evidence");
+        let notices = crate::tool_history::tests::freshness_notices(
+            &history,
+            &canonical,
+            revision.as_ref(),
+            session.services.git_workspace.as_ref(),
+        );
         assert!(
-            crate::tool_history::tests::freshness_notices(
-                &history,
-                &canonical,
-                revision.as_ref(),
-                session.services.git_workspace.as_ref(),
-            )
-            .is_empty(),
-            "a successful nested read must remain current at its captured revision"
+            notices.is_empty(),
+            "a successful nested read must remain current at its captured revision: {notices:#?}"
         );
         let dependencies = result.projected_source_dependencies().cloned();
         let outcome_context = result.outcome_context();
@@ -7187,9 +8192,12 @@ mod tests {
         turn.model_info.truncation_policy =
             codex_protocol::openai_models::TruncationPolicyConfig::bytes(100);
         let revision = crate::git_workspace::WorkspaceEvidenceIdentity {
-            unavailable: false, repository_root: Some("fixture".into()),
-            head_identity: Some("head".into()), index_identity: Some("index".into()),
-            worktree_identity: Some("worktree".into()), path_fingerprints: None,
+            unavailable: false,
+            repository_root: Some("fixture".into()),
+            head_identity: Some("head".into()),
+            index_identity: Some("index".into()),
+            worktree_identity: Some("worktree".into()),
+            path_fingerprints: None,
         };
         let call = ResponseItem::FunctionCall {
             id: None,
@@ -7226,7 +8234,8 @@ mod tests {
                 source_scope_complete: true,
                 source_dependencies: std::collections::BTreeSet::from([
                     crate::tool_history::SourceDependencyV1::new(
-                        std::path::Path::new("fixture/source.rs"), false,
+                        std::path::Path::new("fixture/source.rs"),
+                        false,
                     ),
                 ]),
                 source_path_observations: Vec::new(),
@@ -7263,7 +8272,10 @@ mod tests {
             stored_verdict[0]["historical_authenticity"], "authenticated",
             "the observation must authenticate the payload history actually stores"
         );
-        assert_eq!(stored_verdict[0]["reason_code"], "workspace_freshness_unverified");
+        assert_eq!(
+            stored_verdict[0]["reason_code"],
+            "workspace_freshness_unverified"
+        );
         let mut altered = canonical.to_vec();
         let ResponseItem::FunctionCallOutput { output, .. } = altered.last_mut().unwrap() else {
             panic!("function output");
@@ -7281,8 +8293,6 @@ mod tests {
         assert_eq!(notices[0]["historical_authenticity"], "unverified");
         assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
-
-
 
     #[tokio::test]
     async fn non_workspace_evidence_skips_workspace_gate() {
@@ -7402,7 +8412,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "the fixture deliberately holds history state until notified to verify workspace leases release independently")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the fixture deliberately holds history state until notified to verify workspace leases release independently"
+    )]
     async fn workspace_lease_covers_identity_capture_but_not_history_projection() {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
@@ -7434,8 +8447,12 @@ mod tests {
                 }
             });
             state_held_rx.await.expect("session state should be held");
-            let pause = capture_after_call
-                .then(|| session.services.git_workspace.pause_next_workspace_evidence_capture());
+            let pause = capture_after_call.then(|| {
+                session
+                    .services
+                    .git_workspace
+                    .pause_next_workspace_evidence_capture()
+            });
             let guard = WorkspaceGateGuard::ResourceScoped {
                 _resource: WorkspaceResourceGateGuard::Exclusive {
                     _guard: Arc::clone(&resource).write_owned().await,
@@ -7487,12 +8504,10 @@ mod tests {
                 pause.release();
             }
             // Projection and publication wait for session state, not effects.
-            let writer = tokio::time::timeout(
-                Duration::from_secs(5),
-                Arc::clone(&resource).write_owned(),
-            )
-            .await
-            .expect("history projection must not retain the workspace lease");
+            let writer =
+                tokio::time::timeout(Duration::from_secs(5), Arc::clone(&resource).write_owned())
+                    .await
+                    .expect("history projection must not retain the workspace lease");
             let global_writer =
                 tokio::time::timeout(Duration::from_secs(5), Arc::clone(&global).write_owned())
                     .await
@@ -7526,8 +8541,14 @@ mod tests {
     /// it asserts completion only, never a timing threshold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "wall-clock benchmark; run explicitly with --ignored"]
-    #[expect(clippy::print_stderr, reason = "this benchmark reports latency percentiles for before/after comparisons")]
-    #[expect(clippy::await_holding_invalid_type, reason = "the fixture deliberately holds history state across a bounded sleep to measure contention")]
+    #[expect(
+        clippy::print_stderr,
+        reason = "this benchmark reports latency percentiles for before/after comparisons"
+    )]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the fixture deliberately holds history state across a bounded sleep to measure contention"
+    )]
     async fn kd4_latency_bench_evidence_registration_gate_scope() {
         use crate::session::turn_context::TurnEnvironment;
         use crate::tools::handlers::ReadFileHandler;
@@ -7547,19 +8568,31 @@ mod tests {
             release: Arc<tokio::sync::Semaphore>,
         }
         impl ToolExecutor<ToolInvocation> for GatedRead {
-            fn tool_name(&self) -> codex_tools::ToolName { ReadFileHandler.tool_name() }
-            fn spec(&self) -> codex_tools::ToolSpec { ReadFileHandler.spec() }
-            fn supports_parallel_tool_calls(&self) -> bool { true }
+            fn tool_name(&self) -> codex_tools::ToolName {
+                ReadFileHandler.tool_name()
+            }
+            fn spec(&self) -> codex_tools::ToolSpec {
+                ReadFileHandler.spec()
+            }
+            fn supports_parallel_tool_calls(&self) -> bool {
+                true
+            }
             fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
                 Box::pin(async move {
                     self.entered.fetch_add(1, Ordering::SeqCst);
-                    self.release.acquire().await.expect("release semaphore").forget();
+                    self.release
+                        .acquire()
+                        .await
+                        .expect("release semaphore")
+                        .forget();
                     ReadFileHandler.handle(invocation).await
                 })
             }
         }
         impl CoreToolRuntime for GatedRead {
-            fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool { true }
+            fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool {
+                true
+            }
         }
         // A serial tool, such as a mutating MCP call, takes the global gate.
         struct SerialWriter {
@@ -7568,16 +8601,26 @@ mod tests {
             entered: Arc<Mutex<Option<Instant>>>,
         }
         impl ToolExecutor<ToolInvocation> for SerialWriter {
-            fn tool_name(&self) -> codex_tools::ToolName { codex_tools::ToolName::plain(self.name) }
+            fn tool_name(&self) -> codex_tools::ToolName {
+                codex_tools::ToolName::plain(self.name)
+            }
             fn spec(&self) -> codex_tools::ToolSpec {
-                ImmediateHandler { tool_name: self.tool_name() }.spec()
+                ImmediateHandler {
+                    tool_name: self.tool_name(),
+                }
+                .spec()
             }
             fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
                 Box::pin(async move {
-                    *self.entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(Instant::now());
+                    *self
+                        .entered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
                     tokio::time::sleep(self.work).await;
-                    Ok(Box::new(FunctionToolOutput::from_text("written".to_string(), Some(true)))
+                    Ok(Box::new(FunctionToolOutput::from_text(
+                        "written".to_string(),
+                        Some(true),
+                    ))
                         as Box<dyn crate::tools::context::ToolOutput>)
                 })
             }
@@ -7595,7 +8638,8 @@ mod tests {
         }
         fn percentiles(mut samples: Vec<Duration>) -> String {
             samples.sort();
-            let at = |quantile: usize| samples[(samples.len() * quantile / 100).min(samples.len() - 1)];
+            let at =
+                |quantile: usize| samples[(samples.len() * quantile / 100).min(samples.len() - 1)];
             format!("p50={} p90={}", at(50).as_micros(), at(90).as_micros())
         }
 
@@ -7629,8 +8673,10 @@ mod tests {
         let writer_entered = Arc::new(Mutex::new(None));
         let router = Arc::new(ToolRouter::from_parts(
             ToolRegistry::from_tools([
-                Arc::new(GatedRead { entered: Arc::clone(&entered), release: Arc::clone(&release) })
-                    as Arc<dyn CoreToolRuntime>,
+                Arc::new(GatedRead {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }) as Arc<dyn CoreToolRuntime>,
                 Arc::new(SerialWriter {
                     name: "serial_writer",
                     work: Duration::ZERO,
@@ -7656,7 +8702,9 @@ mod tests {
                 ToolCall {
                     tool_name: codex_tools::ToolName::plain(tool),
                     call_id: call_id.clone(),
-                    payload: ToolPayload::Function { arguments: arguments.to_string() },
+                    payload: ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    },
                 },
                 ToolCallSource::CodeMode {
                     cell_id: "gate-scope-bench".into(),
@@ -7677,7 +8725,9 @@ mod tests {
             let mut batch_wall = Vec::new();
             for iteration in 0..ITERATIONS {
                 entered.store(0, Ordering::SeqCst);
-                *writer_entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                *writer_entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 let reads = (0..READS)
                     .map(|index| {
                         tokio::spawn(nested(
@@ -7715,7 +8765,10 @@ mod tests {
                 let released = Instant::now();
                 release.add_permits(READS);
                 if let Some(writer_task) = writer_task {
-                    writer_task.await.expect("writer joins").expect("writer succeeds");
+                    writer_task
+                        .await
+                        .expect("writer joins")
+                        .expect("writer succeeds");
                     let entry = writer_entered
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7730,7 +8783,11 @@ mod tests {
                     holder.await.expect("state holder joins");
                 }
             }
-            let scenario = if writer { "nested_reads_then_serial_writer" } else { "nested_reads_only" };
+            let scenario = if writer {
+                "nested_reads_then_serial_writer"
+            } else {
+                "nested_reads_only"
+            };
             let writer_entry = if writer_entry.is_empty() {
                 "n/a".to_string()
             } else {
@@ -7774,7 +8831,9 @@ mod tests {
                 ToolCall {
                     tool_name: codex_tools::ToolName::plain("slow_serial_writer"),
                     call_id: format!("direct-write-{iteration}"),
-                    payload: ToolPayload::Function { arguments: "{}".to_string() },
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
                 },
                 CancellationToken::new(),
             );
@@ -7787,7 +8846,11 @@ mod tests {
             let (writer_result, writer_done) = writer.await.expect("writer joins");
             writer_result.expect("writer succeeds");
             read_completion.push(read_done.saturating_duration_since(released));
-            batch_wall.push(read_done.max(writer_done).saturating_duration_since(released));
+            batch_wall.push(
+                read_done
+                    .max(writer_done)
+                    .saturating_duration_since(released),
+            );
         }
         eprintln!(
             "kd4-bench evidence-gate scenario=direct_read_then_queued_serial_writer writer_work_ms=100 iterations=10 read_completion_after_release_us {} batch_wall_us {}",
@@ -8358,10 +9421,17 @@ mod tests {
             ),
         );
         tokio::time::timeout(Duration::from_secs(5), async {
-            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+            while turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 0
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("dispatch must reach the held workspace gate");
+        })
+        .await
+        .expect("dispatch must reach the held workspace gate");
         assert_eq!(
             session
                 .services
@@ -8597,7 +9667,9 @@ mod tests {
             Some(&executed_payload),
             workspace.path(),
             &crate::environment_selection::TurnEnvironmentSnapshot::default(),
-        ).await.expect("executed payload classification");
+        )
+        .await
+        .expect("executed payload classification");
         let baseline = capture_workspace_evidence_baseline(
             &session.services.git_workspace,
             None,
@@ -8616,9 +9688,8 @@ mod tests {
                 &turn_context,
                 WorkspaceEvidenceAfterCall {
                     response: &response,
-                    baseline: workspace_evidence_baseline_is_compatible(
-                        &original, &executed
-                    ).then_some(baseline),
+                    baseline: workspace_evidence_baseline_is_compatible(&original, &executed)
+                        .then_some(baseline),
                     mutation_advanced: false,
                     source_dependencies_override: None,
                     classification: &executed,
@@ -8727,13 +9798,21 @@ mod tests {
                 },
                 CancellationToken::new(),
                 Some(Arc::clone(&admitted_revision)),
+                None,
             ),
         );
         tokio::time::timeout(Duration::from_secs(5), async {
-            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+            while turn_context
+                .turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count
+                == 0
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("dispatch must reach the held workspace gate");
+        })
+        .await
+        .expect("dispatch must reach the held workspace gate");
         assert_eq!(
             session
                 .services
@@ -8768,8 +9847,14 @@ mod tests {
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let repo = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"])
-            .current_dir(repo.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
         tracker.lock().await.record_unknown_mutation();
         let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
@@ -8779,16 +9864,21 @@ mod tests {
         let cache = &session.services.git_workspace;
         let count = cache.workspace_evidence_capture_count();
         let pause = cache.pause_next_workspace_evidence_capture();
-        batch.prefetch_identity_after_mutation(&session, &turn, repo.path(), 1).await;
+        batch
+            .prefetch_identity_after_mutation(&session, &turn, repo.path(), 1)
+            .await;
         tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
-            .await.expect("prefetch started");
+            .await
+            .expect("prefetch started");
         drop(batch);
         let barrier = session.flush_rollout_after_ordered_commits(&turn);
         tokio::pin!(barrier);
         assert!(futures::poll!(barrier.as_mut()).is_pending());
         pause.release();
         tokio::time::timeout(Duration::from_secs(10), barrier)
-            .await.expect("retirement joins prefetch").unwrap();
+            .await
+            .expect("retirement joins prefetch")
+            .unwrap();
         assert_eq!(cache.workspace_evidence_capture_count(), count + 1);
     }
 
@@ -8801,10 +9891,19 @@ mod tests {
         let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
         assert!(batch.register_call("patch"));
         assert!(batch.record_mutation("patch", cwd.path().to_path_buf(), None, false));
-        batch.prefetch_identity_after_mutation(&session, &turn, cwd.path(), 1).await;
+        batch
+            .prefetch_identity_after_mutation(&session, &turn, cwd.path(), 1)
+            .await;
         assert_eq!(batch.captured_identity(cwd.path(), 1).await, Some(None));
         assert!(batch.captured_identity(cwd.path(), 2).await.is_none());
-        assert_eq!(batch.flush(&session, &turn, &tracker).await.unwrap().authoritative_capture_count, 0);
+        assert_eq!(
+            batch
+                .flush(&session, &turn, &tracker)
+                .await
+                .unwrap()
+                .authoritative_capture_count,
+            0
+        );
     }
 
     #[tokio::test]
@@ -8862,22 +9961,42 @@ mod tests {
     #[tokio::test]
     async fn workspace_generation_reuses_unavailable_baseline_without_marking_current() {
         let cwd = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"])
-            .current_dir(cwd.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(cwd.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let oversized = std::fs::File::create(cwd.path().join("oversized.bin")).unwrap();
         oversized.set_len(65 * 1024 * 1024).unwrap();
         let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
         let batch = WorkspaceEvidenceGenerationBatch::new();
-        let first = batch.capture_baseline(&cache, None, cwd.path(), Default::default(), 0).await;
-        assert!(first.revision.as_ref().is_some_and(|identity| identity.unavailable));
-        let second = batch.capture_baseline(&cache, None, cwd.path(), Default::default(), 0).await;
+        let first = batch
+            .capture_baseline(&cache, None, cwd.path(), Default::default(), 0)
+            .await;
+        assert!(
+            first
+                .revision
+                .as_ref()
+                .is_some_and(|identity| identity.unavailable)
+        );
+        let second = batch
+            .capture_baseline(&cache, None, cwd.path(), Default::default(), 0)
+            .await;
         assert!(second.cache_hit);
         assert_eq!(second.revision, first.revision);
         assert_eq!(cache.workspace_evidence_capture_count(), 1);
         assert!(!finish_workspace_evidence_capture(&second, false).1);
         assert!(batch.captured_identity(cwd.path(), 1).await.is_none());
-        batch.record_captured_identity(cwd.path(), 1, first.revision.clone()).await;
-        assert_eq!(batch.captured_identity(cwd.path(), 1).await, Some(first.revision));
+        batch
+            .record_captured_identity(cwd.path(), 1, first.revision.clone())
+            .await;
+        assert_eq!(
+            batch.captured_identity(cwd.path(), 1).await,
+            Some(first.revision)
+        );
     }
 
     #[tokio::test]
@@ -9040,26 +10159,37 @@ mod tests {
     #[tokio::test]
     async fn verified_watched_reads_skip_git_capture_without_seeding_command_baselines() {
         let repo = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"])
-            .current_dir(repo.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let path = repo.path().join("source.rs");
         std::fs::write(&path, "fn item() {}\n").unwrap();
         let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
         let batch = WorkspaceEvidenceGenerationBatch::new();
         let classification = crate::tool_history::WorkspaceCallClassification {
             source_scope_complete: true,
-            observes_workspace: true, workspace_cwd: repo.path().to_path_buf(),
+            observes_workspace: true,
+            workspace_cwd: repo.path().to_path_buf(),
             source_dependencies: std::collections::BTreeSet::from([
                 crate::tool_history::SourceDependencyV1::new(&path, false),
             ]),
         };
         for tool in ["read_file", "list_files"] {
-            let baseline = batch.capture_baseline_for_tool(&cache, None, &classification, tool, 0).await;
+            let baseline = batch
+                .capture_baseline_for_tool(&cache, None, &classification, tool, 0)
+                .await;
             assert_eq!(baseline.source_path_observations.len(), 1);
             assert!(baseline.revision.unwrap().worktree_identity.is_none());
         }
         assert_eq!(cache.workspace_evidence_capture_count(), 0);
-        let command = batch.capture_baseline_for_tool(&cache, None, &classification, "exec_command", 0).await;
+        let command = batch
+            .capture_baseline_for_tool(&cache, None, &classification, "exec_command", 0)
+            .await;
         assert!(command.revision.unwrap().worktree_identity.is_some());
         assert_eq!(cache.workspace_evidence_capture_count(), 1);
     }
@@ -9184,13 +10314,18 @@ mod tests {
 
         let mut shell_prefix = true;
         let mut proven_prefix = true;
-        let read_exec = call_with_arguments("exec_command", r#"{"program":"rg","args":["--files"]}"#);
+        let read_exec =
+            call_with_arguments("exec_command", r#"{"program":"rg","args":["--files"]}"#);
         assert!(runtime.take_eager_read_eligibility_with_proof(
-            &read_exec, &mut proven_prefix, true,
+            &read_exec,
+            &mut proven_prefix,
+            true,
         ));
         let mut unproven_prefix = true;
         assert!(!runtime.take_eager_read_eligibility_with_proof(
-            &read_exec, &mut unproven_prefix, false,
+            &read_exec,
+            &mut unproven_prefix,
+            false,
         ));
         // Parallel capability alone cannot admit an unclassified shell payload.
         assert!(!runtime.take_eager_read_eligibility(&call("shell_command"), &mut shell_prefix));
@@ -9425,14 +10560,18 @@ mod tests {
         // measures cancellation during held discovery, not that setup phase.
         let discovery_started = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if timing.snapshot(TokioInstant::now()).lifecycle_events.iter().any(|event| {
-                    event.boundary == ToolLifecycleBoundary::ResourceResolutionStart
-                }) {
+                if timing
+                    .snapshot(TokioInstant::now())
+                    .lifecycle_events
+                    .iter()
+                    .any(|event| event.boundary == ToolLifecycleBoundary::ResourceResolutionStart)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await;
+        })
+        .await;
         cancellation.cancel();
         let response = tokio::time::timeout(Duration::from_secs(1), &mut response_task).await;
         let entered_before_release = entered.load(std::sync::atomic::Ordering::SeqCst);
@@ -9440,8 +10579,9 @@ mod tests {
         // Retain observations made under contention, but release and join the
         // fixture before any timeout/assertion can leave its worker behind.
         let released_before_watchdog = release_tx.send(()).is_ok();
-        let released = tokio::task::spawn_blocking(move || blocker.join().expect("cache holder joins"))
-            .await?;
+        let released =
+            tokio::task::spawn_blocking(move || blocker.join().expect("cache holder joins"))
+                .await?;
         if response.is_err() {
             response_task.abort();
             let _ = response_task.await;
@@ -9762,8 +10902,8 @@ mod tests {
             }) as Arc<dyn CoreToolRuntime>]),
             Vec::new(),
         ));
-        let step_context = StepContext::for_test(Arc::clone(&turn_context))
-            .with_tool_router_for_test(router);
+        let step_context =
+            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
         let runtime = ToolCallRuntime::new(
             Arc::clone(&session),
             step_context,
@@ -9814,11 +10954,19 @@ mod tests {
                 ("failed-start", "finish", Some(expected)),
             ]
         );
-        let timing = turn_context.turn_timing_state.complete_snapshot().protocol_timing();
-        let call = timing.tool_calls.iter()
+        let timing = turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .protocol_timing();
+        let call = timing
+            .tool_calls
+            .iter()
             .find(|call| call.call_id == "observer-panic-call")
             .expect("failed call timing");
-        assert!(call.handler_entry_at_ms.is_none(), "handler must not execute");
+        assert!(
+            call.handler_entry_at_ms.is_none(),
+            "handler must not execute"
+        );
         Ok(())
     }
 
@@ -9908,7 +11056,10 @@ mod tests {
         allow_cleanup.notify_one();
         session.terminal_tasks.close();
         tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
-        assert!(records.lock().unwrap().is_empty(), "cleanup must not publish another terminal");
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "cleanup must not publish another terminal"
+        );
 
         Ok(())
     }
@@ -10042,7 +11193,10 @@ mod tests {
         allow_cleanup.notify_one();
         session.terminal_tasks.close();
         tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
-        assert_eq!(records.lock().unwrap().as_slice(), &[ToolCallOutcome::Aborted]);
+        assert_eq!(
+            records.lock().unwrap().as_slice(),
+            &[ToolCallOutcome::Aborted]
+        );
 
         Ok(())
     }
@@ -10175,10 +11329,14 @@ mod tests {
 
     impl CoreToolRuntime for TracedCancellationCleanupHandler {
         fn cancellation_recovery(
-            &self, result: Option<&serde_json::Value>, error: Option<&str>,
+            &self,
+            result: Option<&serde_json::Value>,
+            error: Option<&str>,
         ) -> crate::tools::context::ToolEffectRecovery {
             match result {
-                Some(result) => crate::tools::context::ToolEffectRecovery::committed(result.clone()),
+                Some(result) => {
+                    crate::tools::context::ToolEffectRecovery::committed(result.clone())
+                }
                 None => crate::tools::context::ToolEffectRecovery::unknown(None, error),
             }
         }
@@ -10449,11 +11607,17 @@ mod tests {
                     .await?;
                     tokio::time::timeout(Duration::from_secs(5), async {
                         if !cancel {
-                            while !response.is_finished() { tokio::task::yield_now().await; }
+                            while !response.is_finished() {
+                                tokio::task::yield_now().await;
+                            }
                         }
-                    }).await?;
-                    assert_eq!(response.is_finished(), !cancel,
-                        "diagnostic persistence must not block handler completion");
+                    })
+                    .await?;
+                    assert_eq!(
+                        response.is_finished(),
+                        !cancel,
+                        "diagnostic persistence must not block handler completion"
+                    );
                     assert_eq!(dispatch_regression_events(&bundle, call_id)?, (0, vec![]));
                     if cancel {
                         cancellation.cancel();
@@ -10716,7 +11880,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Ok::<(), anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
         tokio::time::pause();
         assert_dispatch_regression_trace(
             &bundle,
@@ -11183,7 +12348,14 @@ mod tests {
         tokio::fs::write(&source, "before").await.unwrap();
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
         let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
-        for call_id in ["before", "after", "unknown", "unrelated", "incomplete", "late"] {
+        for call_id in [
+            "before",
+            "after",
+            "unknown",
+            "unrelated",
+            "incomplete",
+            "late",
+        ] {
             assert!(batch.register_call(call_id));
         }
         batch.record_workspace_observation("unregistered");
@@ -11269,8 +12441,11 @@ mod tests {
                     state["workspace_evidence"][call_id]["source_dependencies_current"], current,
                     "{call_id}"
                 );
-                assert_eq!(state["workspace_evidence"][call_id]["source_scope_complete"],
-                    call_id != "incomplete", "{call_id} completeness must survive queue and persistence");
+                assert_eq!(
+                    state["workspace_evidence"][call_id]["source_scope_complete"],
+                    call_id != "incomplete",
+                    "{call_id} completeness must survive queue and persistence"
+                );
             }
             assert!(state["workspace_evidence"].get("unregistered").is_none());
             assert!(state["workspace_evidence"].get("late").is_none());
@@ -11281,9 +12456,11 @@ mod tests {
     async fn direct_workspace_evidence_preserves_classified_source_completeness() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let root = tempfile::tempdir().unwrap();
-        let dependencies = std::collections::BTreeSet::from([
-            crate::tool_history::SourceDependencyV1::new(&root.path().join("source.txt"), false),
-        ]);
+        let dependencies =
+            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+                &root.path().join("source.txt"),
+                false,
+            )]);
         for complete in [false, true] {
             let call_id = format!("direct-complete-{complete}");
             let response = ResponseInputItem::FunctionCallOutput {
@@ -11291,22 +12468,38 @@ mod tests {
                 output: FunctionCallOutputPayload::from_text("observed source".into()),
             };
             let classification = crate::tool_history::WorkspaceCallClassification {
-                observes_workspace: true, workspace_cwd: root.path().to_path_buf(),
-                source_dependencies: dependencies.clone(), source_scope_complete: complete,
+                observes_workspace: true,
+                workspace_cwd: root.path().to_path_buf(),
+                source_dependencies: dependencies.clone(),
+                source_scope_complete: complete,
             };
             let mut baseline = admitted_test_baseline();
             baseline.source_dependencies = dependencies.clone();
-            ToolCallRuntime::register_workspace_evidence_after_call(&session, &turn,
+            ToolCallRuntime::register_workspace_evidence_after_call(
+                &session,
+                &turn,
                 WorkspaceEvidenceAfterCall {
-                    response: &response, baseline: Some(baseline), mutation_advanced: false,
-                    source_dependencies_override: None, classification: &classification,
+                    response: &response,
+                    baseline: Some(baseline),
+                    mutation_advanced: false,
+                    source_dependencies_override: None,
+                    classification: &classification,
                     workspace_gate_guard: None,
-                }, None, None,
-            ).await;
-            let state = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
-            assert_eq!(state["workspace_evidence"][&call_id]["source_scope_complete"], complete);
-            assert_eq!(state["workspace_evidence"][&call_id]["source_dependencies"],
-                serde_json::to_value(&dependencies).unwrap());
+                },
+                None,
+                None,
+            )
+            .await;
+            let state =
+                serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+            assert_eq!(
+                state["workspace_evidence"][&call_id]["source_scope_complete"],
+                complete
+            );
+            assert_eq!(
+                state["workspace_evidence"][&call_id]["source_dependencies"],
+                serde_json::to_value(&dependencies).unwrap()
+            );
         }
     }
 

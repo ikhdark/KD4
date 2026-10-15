@@ -139,7 +139,10 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
     let EventMsg::TurnComplete(turn) = event else {
         unreachable!("predicate accepts only turn completion");
     };
-    assert!(turn.error.is_none(), "remote-compaction turn failed: {turn:?}");
+    assert!(
+        turn.error.is_none(),
+        "remote-compaction turn failed: {turn:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -214,6 +217,138 @@ async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Re
         requests.requests().len(),
         2,
         "must not sample or compact again"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_remote_compaction_falls_back_to_local_compaction_and_continues() -> Result<()> {
+    require_network!();
+    let local_summary = "## Goal\nFinish the task\n\n## Current state\nRecovered from a failed remote compaction\n\n## Completed work\nThe first tool call ran\n\n## Unresolved work\nAnswer the user\n\n## Evidence\nThe test tool is unsupported\n\n## Next action\nAnswer the user";
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_auto_compact_token_limit = Some(200_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let requests = responses::mount_response_sequence(
+        harness.server(),
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_function_call("before-compact", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
+            ])),
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"detail": "remote compaction unavailable"})),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_assistant_message("local-compact", local_summary),
+                responses::ev_completed_with_tokens("local-compact", /*total_tokens*/ 10_000),
+            ])),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_assistant_message("final", "FINAL_AFTER_FALLBACK"),
+                responses::ev_completed_with_tokens("final", /*total_tokens*/ 11_000),
+            ])),
+        ],
+    )
+    .await;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "continue after the tool".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut warnings = Vec::new();
+    loop {
+        match wait_for_event_with_timeout(&codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
+            .await
+        {
+            EventMsg::Warning(event) => warnings.push(event.message),
+            EventMsg::Error(event) => {
+                panic!("a recovered compaction failure must not fail the turn: {event:?}")
+            }
+            EventMsg::TurnComplete(turn) => {
+                assert!(turn.error.is_none(), "turn failed: {turn:?}");
+                assert_eq!(
+                    turn.last_agent_message.as_deref(),
+                    Some("FINAL_AFTER_FALLBACK")
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("Remote compaction failed")
+                && warning.contains("Compacting locally instead")),
+        "the fallback must be visible: {warnings:?}"
+    );
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
+    );
+    assert!(
+        !requests[2]
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
+    );
+    assert!(requests[2].body_contains_text(codex_core::compact::SUMMARIZATION_PROMPT));
+    assert!(requests[3].body_contains_text(local_summary));
+    assert!(
+        requests[2]
+            .function_call_output_text("before-compact")
+            .is_none(),
+        "the local fallback summarizer must not consume the unread tool result"
+    );
+    let continuation = requests[3].input();
+    assert_eq!(
+        continuation
+            .iter()
+            .filter(|item| {
+                item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|part| part["text"] == "continue after the tool")
+                    })
+            })
+            .count(),
+        1,
+        "remote failure and local replacement must retain the exact original user request once"
+    );
+    for kind in ["function_call", "function_call_output"] {
+        assert_eq!(
+            continuation
+                .iter()
+                .filter(|item| item["type"] == kind && item["call_id"] == "before-compact")
+                .count(),
+            1,
+            "fallback must preserve the unread call/output pair: {kind}"
+        );
+    }
+    assert!(
+        requests[3]
+            .function_call_output_text("before-compact")
+            .expect("retained unread tool result")
+            .contains(DUMMY_FUNCTION_NAME),
+        "fallback must retain the actual unsupported-tool diagnostic, not a synthetic output"
     );
     Ok(())
 }

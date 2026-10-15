@@ -289,9 +289,20 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
             Some(root) => {
                 let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
-                let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
-                Some(crate::workspace_operation_gate::acquire_workspace_validation(root, &req.hook_command)
-                    .await.map_err(ToolError::Rejected)?)
+                let _phase =
+                    crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
+                Some(
+                    crate::workspace_operation_gate::acquire_workspace_validation(
+                        root,
+                        &req.hook_command,
+                        crate::workspace_operation_gate::ValidationOwner::for_command(
+                            ctx.session.thread_id(),
+                            &req.command_for_approval,
+                        ),
+                    )
+                    .await
+                    .map_err(ToolError::Rejected)?,
+                )
             }
             None => None,
         };
@@ -330,12 +341,20 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         })
         .await;
 
-        if ctx.turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+        if ctx
+            .turn
+            .config
+            .features
+            .enabled(codex_features::Feature::Kd4Runtime)
             && !req.turn_environment.environment.is_remote()
         {
             crate::tools::handlers::command_preflight::check_managed_cargo_lane(
-                &req.command_for_approval, req.cwd.as_path(), &env,
-            ).await.map_err(ToolError::Rejected)?;
+                &req.command_for_approval,
+                req.cwd.as_path(),
+                &env,
+            )
+            .await
+            .map_err(ToolError::Rejected)?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(

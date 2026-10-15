@@ -359,7 +359,10 @@ impl Expectation {
                     result.stdout
                 );
                 let file_contents = fs::read_to_string(&path)?;
-                assert_eq!(file_contents, *content, "created file must preserve exact bytes");
+                assert_eq!(
+                    file_contents, *content,
+                    "created file must preserve exact bytes"
+                );
                 let _ = fs::remove_file(path);
             }
             Expectation::FileCreatedNoExitCode { target, content } => {
@@ -374,7 +377,10 @@ impl Expectation {
                     result.stdout
                 );
                 let file_contents = fs::read_to_string(&path)?;
-                assert_eq!(file_contents, *content, "created file must preserve exact bytes");
+                assert_eq!(
+                    file_contents, *content,
+                    "created file must preserve exact bytes"
+                );
                 let _ = fs::remove_file(path);
             }
             Expectation::PatchApplied { target, content } => {
@@ -395,7 +401,11 @@ impl Expectation {
                     ),
                 }
                 let file_contents = fs::read_to_string(&path)?;
-                assert_eq!(file_contents, format!("{content}\n"), "patch adds one newline");
+                assert_eq!(
+                    file_contents,
+                    format!("{content}\n"),
+                    "patch adds one newline"
+                );
                 let _ = fs::remove_file(path);
             }
             Expectation::FileNotCreated {
@@ -467,7 +477,11 @@ impl Expectation {
                 );
             }
             Expectation::NetworkFailure { expect_tag } => {
-                assert_eq!(result.exit_code, Some(1), "the fetch fixture exits 1 on failure");
+                assert_eq!(
+                    result.exit_code,
+                    Some(1),
+                    "the fetch fixture exits 1 on failure"
+                );
                 assert!(
                     result.stdout.contains("ERR:"),
                     "stdout missing ERR prefix: {}",
@@ -759,7 +773,8 @@ async fn wait_for_completion(test: &TestCodex) {
         |event| matches!(event, EventMsg::TurnComplete(_)),
         APPROVAL_EVENT_TIMEOUT,
     )
-    .await else {
+    .await
+    else {
         unreachable!("completion predicate");
     };
     assert!(completed.error.is_none(), "{completed:?}");
@@ -1758,15 +1773,23 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         }
     };
 
-    if matches!(scenario.expectation,
-        Expectation::FileCreated { .. } | Expectation::FileCreatedNoExitCode { .. }
-        | Expectation::PatchApplied { .. } | Expectation::NetworkSuccess { .. }
-        | Expectation::NetworkSuccessNoExitCode { .. } | Expectation::CommandSuccess { .. }
-        | Expectation::CommandSuccessNoExitCode { .. })
-        && let Some(completion) = auto_command_end.as_ref()
+    if matches!(
+        scenario.expectation,
+        Expectation::FileCreated { .. }
+            | Expectation::FileCreatedNoExitCode { .. }
+            | Expectation::PatchApplied { .. }
+            | Expectation::NetworkSuccess { .. }
+            | Expectation::NetworkSuccessNoExitCode { .. }
+            | Expectation::CommandSuccess { .. }
+            | Expectation::CommandSuccessNoExitCode { .. }
+    ) && let Some(completion) = auto_command_end.as_ref()
     {
-        assert!(completion.required_tool_error.is_none(), "{}: {:?}",
-            scenario.name, completion.required_tool_error);
+        assert!(
+            completion.required_tool_error.is_none(),
+            "{}: {:?}",
+            scenario.name,
+            completion.required_tool_error
+        );
     }
     let result = if let Some(command_end) = auto_command_end
         .as_ref()
@@ -2007,7 +2030,11 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     )
     .await?;
     let completion = wait_for_completion_without_approval(&test).await;
-    assert!(completion.required_tool_error.is_none(), "{:?}", completion.required_tool_error);
+    assert!(
+        completion.required_tool_error.is_none(),
+        "{:?}",
+        completion.required_tool_error
+    );
     let command_end = completion
         .command_end
         .expect("the parent's rerun must actually execute under the amended policy");
@@ -2307,11 +2334,19 @@ allow_local_binding = true
     // A persisted deny must be enforced without asking again. A declined tool
     // request has no observed process exit code; requiring the script's exit 1
     // would incorrectly require execution instead of policy enforcement.
-    assert_eq!(command_end.status, ExecCommandStatus::Declined, "{command_end:?}");
+    assert_eq!(
+        command_end.status,
+        ExecCommandStatus::Declined,
+        "{command_end:?}"
+    );
     assert_eq!(command_end.exit_code, None, "{command_end:?}");
     assert!(
-        command_end.aggregated_output.contains("codex-network-test.invalid")
-            && command_end.aggregated_output.contains("explicitly denied by policy"),
+        command_end
+            .aggregated_output
+            .contains("codex-network-test.invalid")
+            && command_end
+                .aggregated_output
+                .contains("explicitly denied by policy"),
         "expected the persisted host policy denial, not an unrelated failure: {command_end:?}"
     );
 

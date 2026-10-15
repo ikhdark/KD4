@@ -13,9 +13,14 @@ const UNIFIED_EXEC_SESSION_ID_PREFIX: &str = "Process running with session ID ";
 /// Recovery is derived from the existing durable invocation/result stream, not
 /// handler-return notifications. A crash after effects but before result append
 /// therefore leaves an unresolved invocation visible on resume.
-pub(super) fn append_unsettled_tool_recovery(history: &mut Vec<ResponseItem>, items: &[RolloutItem]) {
+pub(super) fn append_unsettled_tool_recovery(
+    history: &mut Vec<ResponseItem>,
+    items: &[RolloutItem],
+) {
     let page = unsettled_tool_recovery_page(items, 0);
-    if page["unresolved_count"] == 0 { return; }
+    if page["unresolved_count"] == 0 {
+        return;
+    }
     history.push(ResponseItem::Message {
         id: None, role: "developer".into(), phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -25,19 +30,31 @@ pub(super) fn append_unsettled_tool_recovery(history: &mut Vec<ResponseItem>, it
     });
 }
 
-pub(super) fn unsettled_tool_recovery_page(items: &[RolloutItem], offset: usize) -> serde_json::Value {
-    use std::collections::BTreeMap;
+pub(super) fn unsettled_tool_recovery_page(
+    items: &[RolloutItem],
+    offset: usize,
+) -> serde_json::Value {
     use sha2::Digest;
+    use std::collections::BTreeMap;
     let mut pending = BTreeMap::new();
     let mut turn = "";
     let mut cwd = None;
     let bounded = |value: &str| value.chars().take(240).collect::<String>();
     let redacted_path = |value: &str| {
         if value.contains("://") {
-            url::Url::parse(value).ok()
-                .map(|url| format!("{}://{}", url.scheme(), url.host_str().unwrap_or("[redacted]")))
+            url::Url::parse(value)
+                .ok()
+                .map(|url| {
+                    format!(
+                        "{}://{}",
+                        url.scheme(),
+                        url.host_str().unwrap_or("[redacted]")
+                    )
+                })
                 .unwrap_or_else(|| "[redacted URI]".into())
-        } else { bounded(value) }
+        } else {
+            bounded(value)
+        }
     };
     for (index, item) in items.iter().enumerate() {
         let response = match item {
@@ -56,8 +73,12 @@ pub(super) fn unsettled_tool_recovery_page(items: &[RolloutItem], offset: usize)
                 // never pay argument decoding, hashing or redaction costs.
                 pending.insert((turn, call_id.as_str()), (index, cwd, response));
             }
-            ResponseItem::FunctionCallOutput { call_id, output, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            }
+            | ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
                 // Only the registry's complete delivery-loss placeholder is a
                 // recovery signal; quoted source/log text is still a result.
                 let unavailable = items.get(index + 1).is_some_and(|next|
@@ -66,7 +87,9 @@ pub(super) fn unsettled_tool_recovery_page(items: &[RolloutItem], offset: usize)
                     // Conservative compatibility with legacy host placeholders.
                     || output.body.to_text().is_some_and(|text|
                     text == "Tool execution completed, but its full result could not be preserved for model delivery.");
-                if !unavailable { pending.remove(&(turn, call_id.as_str())); }
+                if !unavailable {
+                    pending.remove(&(turn, call_id.as_str()));
+                }
             }
             _ => {}
         }
@@ -104,22 +127,36 @@ pub(super) fn unsettled_tool_recovery_page(items: &[RolloutItem], offset: usize)
 impl Session {
     /// Cold, explicitly requested recovery from the existing durable stream.
     /// No artifact writes or retained raw invocation copies are added to resume.
-    pub(crate) async fn read_unsettled_tool_recovery(&self, offset: usize, active_turn: &str) -> Result<String, String> {
-        let path = self.current_rollout_path().await.map_err(|error| error.to_string())?
+    pub(crate) async fn read_unsettled_tool_recovery(
+        &self,
+        offset: usize,
+        active_turn: &str,
+    ) -> Result<String, String> {
+        let path = self
+            .current_rollout_path()
+            .await
+            .map_err(|error| error.to_string())?
             .ok_or("unsettled recovery requires a durable session rollout")?;
-        let (mut items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
-            .await.map_err(|error| error.to_string())?;
+        let (mut items, _, parse_errors) =
+            codex_rollout::RolloutRecorder::load_rollout_items(&path)
+                .await
+                .map_err(|error| error.to_string())?;
         // Live calls have an owner and are not lost results. Bound all pages
         // at this turn's first context, including the recovery call itself.
-        if let Some(start) = items.iter().position(|item| matches!(item,
-            RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some(active_turn)))
-        { items.truncate(start); }
+        if let Some(start) = items.iter().position(|item| {
+            matches!(item,
+            RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some(active_turn))
+        }) {
+            items.truncate(start);
+        }
         tokio::task::spawn_blocking(move || {
             let mut page = unsettled_tool_recovery_page(&items, offset);
             page["rollout_parse_errors"] = serde_json::json!(parse_errors);
             page["history_complete"] = serde_json::json!(parse_errors == 0);
             page.to_string()
-        }).await.map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -127,12 +164,19 @@ impl Session {
 /// rolled-back spans. Those handles may still be present in retained receipts.
 pub(super) fn historical_process_ids(items: &[RolloutItem]) -> HashSet<u32> {
     fn text_ids(text: &str, ids: &mut HashSet<u32>) {
-        for prefix in [UNIFIED_EXEC_SESSION_ID_PREFIX, "Running command session_id: ",
-            "\"session_id\"", "\"polled_session_id\"", "\"process_id\""] {
+        for prefix in [
+            UNIFIED_EXEC_SESSION_ID_PREFIX,
+            "Running command session_id: ",
+            "\"session_id\"",
+            "\"polled_session_id\"",
+            "\"process_id\"",
+        ] {
             for (offset, _) in text.match_indices(prefix) {
                 let mut suffix = text[offset + prefix.len()..].trim_start();
                 if prefix.ends_with('"') {
-                    let Some(value) = suffix.strip_prefix(':') else { continue };
+                    let Some(value) = suffix.strip_prefix(':') else {
+                        continue;
+                    };
                     suffix = value.trim_start().trim_start_matches('"');
                 }
                 let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
@@ -146,7 +190,9 @@ pub(super) fn historical_process_ids(items: &[RolloutItem]) -> HashSet<u32> {
         match item {
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
-                if let Some(text) = output.body.to_text() { text_ids(&text, ids); }
+                if let Some(text) = output.body.to_text() {
+                    text_ids(&text, ids);
+                }
             }
             ResponseItem::FunctionCall { arguments, .. } => text_ids(arguments, ids),
             ResponseItem::CustomToolCall { input, .. } => text_ids(input, ids),
@@ -158,15 +204,24 @@ pub(super) fn historical_process_ids(items: &[RolloutItem]) -> HashSet<u32> {
         let id = match item {
             RolloutItem::EventMsg(EventMsg::ExecCommandBegin(event)) => event.process_id.as_deref(),
             RolloutItem::EventMsg(EventMsg::ExecCommandEnd(event)) => event.process_id.as_deref(),
-            RolloutItem::EventMsg(EventMsg::TerminalInteraction(event)) => Some(event.process_id.as_str()),
-            RolloutItem::ResponseItem(item) => { response_ids(item, &mut ids); None }
+            RolloutItem::EventMsg(EventMsg::TerminalInteraction(event)) => {
+                Some(event.process_id.as_str())
+            }
+            RolloutItem::ResponseItem(item) => {
+                response_ids(item, &mut ids);
+                None
+            }
             RolloutItem::Compacted(item) => {
-                for item in item.replacement_history.iter().flatten() { response_ids(item, &mut ids); }
+                for item in item.replacement_history.iter().flatten() {
+                    response_ids(item, &mut ids);
+                }
                 None
             }
             _ => None,
         };
-        if let Some(id) = id.and_then(|id| id.parse().ok()) { ids.insert(id); }
+        if let Some(id) = id.and_then(|id| id.parse().ok()) {
+            ids.insert(id);
+        }
     }
     ids
 }
@@ -228,23 +283,22 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
     let mut handles = std::collections::BTreeMap::new();
     let has_old_sessions = history.iter().fold(false, |found, item| {
         let current = match item {
-        ResponseItem::FunctionCallOutput {
-            call_id, output, ..
-        } if unified_exec_call_ids.contains(call_id.as_str()) => {
-            output.body.to_text().is_some_and(|output| {
-                collect_resume_handles(&output, false, &mut handles)
-            })
-        }
-        ResponseItem::CustomToolCallOutput {
-            call_id, output, ..
-        }
-        | ResponseItem::FunctionCallOutput {
-            call_id, output, ..
-        } if code_mode_call_ids.contains(call_id.as_str()) => output
-            .body
-            .to_text()
-            .is_some_and(|text| collect_resume_handles(&text, true, &mut handles)),
-        _ => false,
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if unified_exec_call_ids.contains(call_id.as_str()) => output
+                .body
+                .to_text()
+                .is_some_and(|output| collect_resume_handles(&output, false, &mut handles)),
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            }
+            | ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if code_mode_call_ids.contains(call_id.as_str()) => output
+                .body
+                .to_text()
+                .is_some_and(|text| collect_resume_handles(&text, true, &mut handles)),
+            _ => false,
         };
         found || current
     });
@@ -295,9 +349,12 @@ fn collect_command_receipt_handle(
 ) -> bool {
     // Raw command receipts omit these fields. Explicitly different owners are
     // not process handles, even when their JSON happens to contain session_id.
-    if value.get("tool").is_some_and(|tool|
-        !matches!(tool.as_str(), Some("exec_command" | "write_stdin")))
-        || value.get("namespace").is_some_and(|namespace| !namespace.is_null())
+    if value
+        .get("tool")
+        .is_some_and(|tool| !matches!(tool.as_str(), Some("exec_command" | "write_stdin")))
+        || value
+            .get("namespace")
+            .is_some_and(|namespace| !namespace.is_null())
     {
         return false;
     }
@@ -306,13 +363,20 @@ fn collect_command_receipt_handle(
     // A historical polled handle alone is live only without terminal exit.
     let id = value.get("session_id").and_then(valid_id).or_else(|| {
         (value["process_exited"].as_bool() == Some(false))
-            .then(|| value.get("polled_session_id").and_then(valid_id)).flatten()
+            .then(|| value.get("polled_session_id").and_then(valid_id))
+            .flatten()
     });
-    let Some(id) = id else { return false; };
-    let artifact = value["raw_output_artifact_id"].as_str()
-        .filter(|id| id.len() <= 160).map(str::to_string);
+    let Some(id) = id else {
+        return false;
+    };
+    let artifact = value["raw_output_artifact_id"]
+        .as_str()
+        .filter(|id| id.len() <= 160)
+        .map(str::to_string);
     let retained = handles.entry(id).or_default();
-    if artifact.is_some() { *retained = artifact; }
+    if artifact.is_some() {
+        *retained = artifact;
+    }
     true
 }
 
@@ -321,28 +385,36 @@ fn collect_resume_handles(
     nested: bool,
     handles: &mut std::collections::BTreeMap<u32, Option<String>>,
 ) -> bool {
-    fn live(states: &serde_json::Value, handles: &mut std::collections::BTreeMap<u32, Option<String>>) -> bool {
+    fn live(
+        states: &serde_json::Value,
+        handles: &mut std::collections::BTreeMap<u32, Option<String>>,
+    ) -> bool {
         states.as_array().is_some_and(|states| {
             states.iter().fold(false, |found, state| {
-                let current = matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
-                    && collect_command_receipt_handle(state, handles);
+                let current =
+                    matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
+                        && collect_command_receipt_handle(state, handles);
                 found || current
             })
         })
     }
-    let collect = |value: &serde_json::Value, handles: &mut std::collections::BTreeMap<u32, Option<String>>| {
-        let mut found = collect_command_receipt_handle(value, handles);
-        if nested {
-            for pointer in [
-            "/nested_commands",
-            "/essential/nested_commands",
-            "/result/essential/nested_commands",
-            ] {
-                found |= value.pointer(pointer).is_some_and(|states| live(states, handles));
+    let collect =
+        |value: &serde_json::Value,
+         handles: &mut std::collections::BTreeMap<u32, Option<String>>| {
+            let mut found = collect_command_receipt_handle(value, handles);
+            if nested {
+                for pointer in [
+                    "/nested_commands",
+                    "/essential/nested_commands",
+                    "/result/essential/nested_commands",
+                ] {
+                    found |= value
+                        .pointer(pointer)
+                        .is_some_and(|states| live(states, handles));
+                }
             }
-        }
-        found
-    };
+            found
+        };
     let mut found = false;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         found |= collect(&value, handles);
@@ -357,8 +429,13 @@ fn collect_resume_handles(
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             found |= collect(&value, handles);
         }
-        let status = line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
-            .or_else(|| nested.then(|| line.strip_prefix("Running command session_id: ")).flatten());
+        let status = line
+            .strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
+            .or_else(|| {
+                nested
+                    .then(|| line.strip_prefix("Running command session_id: "))
+                    .flatten()
+            });
         if let Some(status) = status {
             let id = status.split_once(';').map_or(status, |(id, _)| id);
             if let Ok(id) = id.trim().parse::<u32>() {
@@ -366,10 +443,14 @@ fn collect_resume_handles(
                 found = true;
             }
         }
-        found |= nested && line.strip_prefix("Script running with cell ID ")
-            .is_some_and(|id| !id.trim().is_empty());
+        found |= nested
+            && line
+                .strip_prefix("Script running with cell ID ")
+                .is_some_and(|id| !id.trim().is_empty());
     }
-    if !nested { return found; }
+    if !nested {
+        return found;
+    }
     let marker = "Nested command states (independent of script completion):\n";
     for (index, _) in text.match_indices(marker) {
         if index != 0 && !text[..index].ends_with('\n') {
@@ -551,10 +632,18 @@ impl Session {
         // last in that source. A fresh load supersedes a checkpoint's older notice.
         let reconstruction_notice = rollout_items.iter().rev().find_map(|item| match item {
             RolloutItem::ResponseItem(item)
-                if codex_rollout::is_rollout_reconstruction_notice(item) => Some(item),
-            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref()
-                .and_then(|items| items.iter().rev()
-                    .find(|item| codex_rollout::is_rollout_reconstruction_notice(item))),
+                if codex_rollout::is_rollout_reconstruction_notice(item) =>
+            {
+                Some(item)
+            }
+            RolloutItem::Compacted(compacted) => {
+                compacted.replacement_history.as_ref().and_then(|items| {
+                    items
+                        .iter()
+                        .rev()
+                        .find(|item| codex_rollout::is_rollout_reconstruction_notice(item))
+                })
+            }
             _ => None,
         });
         // Replay metadata should already match the shape of the future lazy reverse loader, even
@@ -573,22 +662,23 @@ impl Session {
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut plan = None;
         let mut plan_lineage = None;
-        let update_plan_call_ids =
-            rollout_items
-                .iter()
-                .filter_map(|item| match item {
-                    RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-                        name, namespace: None, call_id, ..
-                    }) if name == "update_plan" => Some(call_id.as_str()),
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-        let has_plan_updates = rollout_items
+        let update_plan_call_ids = rollout_items
             .iter()
-            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(_)))
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                    name,
+                    namespace: None,
+                    call_id,
+                    ..
+                }) if name == "update_plan" => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let has_plan_updates = rollout_items.iter().any(|item| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(_)))
                 || matches!(item, RolloutItem::ResponseItem(response)
-                    if crate::plan_store::plan_snapshot_from_item(response).is_some()))
-            || !update_plan_call_ids.is_empty();
+                    if crate::plan_store::plan_snapshot_from_item(response).is_some())
+        }) || !update_plan_call_ids.is_empty();
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
@@ -611,7 +701,10 @@ impl Session {
                     started_turn = None;
                 }
                 RolloutItem::EventMsg(EventMsg::TurnAborted(event))
-                    if event.turn_id.as_deref().is_none_or(|id| started_turn == Some(id)) =>
+                    if event
+                        .turn_id
+                        .as_deref()
+                        .is_none_or(|id| started_turn == Some(id)) =>
                 {
                     started_turn = None;
                 }
@@ -814,8 +907,12 @@ impl Session {
                     active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
                     if active_segment.plan_lineage.is_none()
-                        && let Some(snapshot) = crate::plan_store::plan_snapshot_from_item(response_item)
-                        && active_segment.plan.as_ref().is_none_or(|plan| plan == &snapshot.current_plan)
+                        && let Some(snapshot) =
+                            crate::plan_store::plan_snapshot_from_item(response_item)
+                        && active_segment
+                            .plan
+                            .as_ref()
+                            .is_none_or(|plan| plan == &snapshot.current_plan)
                     {
                         active_segment.plan = Some(snapshot.current_plan);
                         active_segment.plan_lineage = Some(snapshot.lineage);
@@ -830,12 +927,14 @@ impl Session {
                             call_id, output, ..
                         } = response_item
                         && update_plan_call_ids.contains(call_id.as_str())
-                        && let Some(response) = crate::plan_store::plan_response_from_tool_output(output)
+                        && let Some(response) =
+                            crate::plan_store::plan_response_from_tool_output(output)
                     {
                         active_segment.plan = Some(response.current_plan);
                         // Active projections must not eclipse the full
                         // durable snapshot earlier in this same turn.
-                        active_segment.plan_lineage = response.lineage_complete.then_some(response.lineage);
+                        active_segment.plan_lineage =
+                            response.lineage_complete.then_some(response.lineage);
                     }
                 }
                 RolloutItem::InterAgentCommunication(_) => {

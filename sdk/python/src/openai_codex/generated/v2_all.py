@@ -4374,6 +4374,35 @@ class ContextCompactionThreadItem(BaseModel):
         populate_by_name=True,
     )
     id: str
+    omitted_image_count: Annotated[
+        int | None,
+        Field(
+            alias="omittedImageCount",
+            description="Images dropped from the retained task input.",
+            ge=0,
+        ),
+    ] = None
+    omitted_text: Annotated[
+        bool | None,
+        Field(
+            alias="omittedText",
+            description="Whether earlier text was dropped rather than summarized in place.",
+        ),
+    ] = None
+    retained_image_count: Annotated[
+        int | None,
+        Field(
+            alias="retainedImageCount", description="Images kept in the retained task input.", ge=0
+        ),
+    ] = None
+    tokens_after: Annotated[
+        int | None,
+        Field(alias="tokensAfter", description="Active context tokens after the replacement."),
+    ] = None
+    tokens_before: Annotated[
+        int | None,
+        Field(alias="tokensBefore", description="Active context tokens before the replacement."),
+    ] = None
     type: Annotated[Literal["contextCompaction"], Field(title="ContextCompactionThreadItemType")]
 
 

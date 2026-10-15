@@ -449,7 +449,10 @@ async fn non_positive_context_budgets_are_rejected() {
                 Ok(_) => assert!(valid, "{field} = {value} must be rejected"),
                 Err(err) => {
                     assert!(!valid, "{field} = {value} must be accepted: {err}");
-                    assert_eq!(err.to_string(), format!("{field} must be greater than zero"));
+                    assert_eq!(
+                        err.to_string(),
+                        format!("{field} must be greater than zero")
+                    );
                 }
             }
         }
@@ -3109,7 +3112,11 @@ async fn cli_overrides_with_relative_paths_do_not_break_trust_check() -> std::io
 
     let dot_codex = project_root.join(".codex");
     tokio::fs::create_dir_all(&dot_codex).await?;
-    tokio::fs::write(dot_codex.join(CONFIG_TOML_FILE), "model = 'trusted-project'").await?;
+    tokio::fs::write(
+        dot_codex.join(CONFIG_TOML_FILE),
+        "model = 'trusted-project'",
+    )
+    .await?;
 
     let codex_home = tmp.path().join("home");
     tokio::fs::create_dir_all(&codex_home).await?;

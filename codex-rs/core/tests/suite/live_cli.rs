@@ -37,12 +37,20 @@ fn run_live(prompt: &str) -> anyhow::Result<(assert_cmd::assert::Assert, TempDir
         .arg("--skip-git-repo-check")
         .arg("--")
         .arg(prompt);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let output = runtime.block_on(core_test_support::process::capture_contained_command(
-        &mut command,
-        Duration::from_secs(5 * 60),
-        /*mirror_output*/ true,
-    )).map_err(|error| anyhow::anyhow!("live codex CLI should finish within its process/output deadline: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let output = runtime
+        .block_on(core_test_support::process::capture_contained_command(
+            &mut command,
+            Duration::from_secs(5 * 60),
+            /*mirror_output*/ true,
+        ))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "live codex CLI should finish within its process/output deadline: {error}"
+            )
+        })?;
     Ok((output.assert(), dir))
 }
 
@@ -79,7 +87,10 @@ fn live_print_working_directory() -> anyhow::Result<()> {
 async fn run_codex_times_out() {
     let command = |sleep: bool| {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-        command.arg("--exact").arg("suite::live_cli::timeout_test_child").arg("--nocapture")
+        command
+            .arg("--exact")
+            .arg("suite::live_cli::timeout_test_child")
+            .arg("--nocapture")
             .env_remove("CODEX_LIVE_CLI_TIMEOUT_CHILD");
         if sleep {
             command.env("CODEX_LIVE_CLI_TIMEOUT_CHILD", "1");
@@ -87,15 +98,25 @@ async fn run_codex_times_out() {
         command
     };
     let output = core_test_support::process::capture_contained_command(
-        &mut command(false), Duration::from_secs(30), false,
-    ).await.expect("exiting child should finish");
+        &mut command(false),
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .expect("exiting child should finish");
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-        "the exact child test must run; a zero-test invocation is not proof");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "the exact child test must run; a zero-test invocation is not proof"
+    );
     let started = Instant::now();
     let error = core_test_support::process::capture_contained_command(
-        &mut command(true), Duration::from_millis(100), false,
-    ).await.expect_err("sleeping child must time out");
+        &mut command(true),
+        Duration::from_millis(100),
+        false,
+    )
+    .await
+    .expect_err("sleeping child must time out");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10));
 }
@@ -114,14 +135,23 @@ async fn contained_capture_terminates_descendants_holding_both_pipes() {
         let dir = TempDir::new().unwrap();
         let pid_path = dir.path().join("descendant.pid");
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-        command.arg("--exact").arg("suite::live_cli::pipe_holding_test_child").arg("--nocapture")
+        command
+            .arg("--exact")
+            .arg("suite::live_cli::pipe_holding_test_child")
+            .arg("--nocapture")
             .env("CODEX_PIPE_HOLDER_ROLE", "root")
             .env("CODEX_PIPE_HOLDER_PID", &pid_path)
-            .env("CODEX_PIPE_HOLDER_WAIT", if wait_in_root { "1" } else { "0" });
+            .env(
+                "CODEX_PIPE_HOLDER_WAIT",
+                if wait_in_root { "1" } else { "0" },
+            );
         let started = Instant::now();
         let result = core_test_support::process::capture_contained_command(
-            &mut command, Duration::from_secs(5), false,
-        ).await;
+            &mut command,
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
         let stdout_line = format!("stdout:{}", "x".repeat(12_000));
         let stderr_line = format!("stderr:{}", "y".repeat(12_000));
         if wait_in_root {
@@ -133,12 +163,24 @@ async fn contained_capture_terminates_descendants_holding_both_pipes() {
         } else {
             let output = result.expect("root exit must close descendant pipes");
             assert!(output.status.success());
-            assert!(String::from_utf8(output.stdout).unwrap().lines().any(|line| line == stdout_line));
-            assert!(String::from_utf8(output.stderr).unwrap().lines().any(|line| line == stderr_line));
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == stdout_line)
+            );
+            assert!(
+                String::from_utf8(output.stderr)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == stderr_line)
+            );
         }
         assert!(started.elapsed() < Duration::from_secs(15));
         let pid = std::fs::read_to_string(&pid_path).expect("descendant was spawned");
-        core_test_support::process::wait_for_process_exit(&pid).await.unwrap();
+        core_test_support::process::wait_for_process_exit(&pid)
+            .await
+            .unwrap();
     }
 }
 
@@ -148,11 +190,20 @@ fn pipe_holding_test_child() {
     match std::env::var("CODEX_PIPE_HOLDER_ROLE").as_deref() {
         Ok("root") => {
             let descendant = Command::new(std::env::current_exe().unwrap())
-                .arg("--exact").arg("suite::live_cli::pipe_holding_test_child").arg("--nocapture")
+                .arg("--exact")
+                .arg("suite::live_cli::pipe_holding_test_child")
+                .arg("--nocapture")
                 .env("CODEX_PIPE_HOLDER_ROLE", "descendant")
-                .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-                .spawn().unwrap();
-            std::fs::write(std::env::var_os("CODEX_PIPE_HOLDER_PID").unwrap(), descendant.id().to_string()).unwrap();
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            std::fs::write(
+                std::env::var_os("CODEX_PIPE_HOLDER_PID").unwrap(),
+                descendant.id().to_string(),
+            )
+            .unwrap();
             println!("stdout:{}", "x".repeat(12_000));
             eprintln!("stderr:{}", "y".repeat(12_000));
             if std::env::var("CODEX_PIPE_HOLDER_WAIT").as_deref() == Ok("1") {

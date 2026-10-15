@@ -269,9 +269,6 @@ async fn responses_websocket_omits_item_ids_without_mutating_prompt() {
     server.shutdown().await;
 }
 
-
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_streams_with_system_proxy_feature() {
     require_network!();
@@ -486,12 +483,14 @@ async fn responses_websocket_turn_preconnect_is_owned_and_reused(wait_before_sen
     let mut session = harness.client.new_session();
     let metadata = websocket_connection_metadata(&harness);
     for _ in 0..2 {
-        session.start_websocket_preconnect(
-            &harness.model_info,
-            None,
-            &harness.session_telemetry,
-            &metadata,
-        ).await;
+        session
+            .start_websocket_preconnect(
+                &harness.model_info,
+                None,
+                &harness.session_telemetry,
+                &metadata,
+            )
+            .await;
     }
     if wait_before_send {
         assert!(server.wait_for_handshakes(1, Duration::from_secs(5)).await);
@@ -502,12 +501,14 @@ async fn responses_websocket_turn_preconnect_is_owned_and_reused(wait_before_sen
     drop(session);
 
     let mut next_turn = harness.client.new_session();
-    next_turn.start_websocket_preconnect(
-        &harness.model_info,
-        None,
-        &harness.session_telemetry,
-        &metadata,
-    ).await;
+    next_turn
+        .start_websocket_preconnect(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &metadata,
+        )
+        .await;
     stream_until_complete(&mut next_turn, &harness, &prompt).await;
     assert_eq!(server.handshakes().len(), 1);
     assert_eq!(server.single_connection().len(), 2);
@@ -809,14 +810,18 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     let rollout = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let rollout = replay_bundle(trace_dir.path()).expect("replay trace");
-            if rollout.inference_calls.values().any(|call| {
-                call.response_id.as_deref() == Some("resp-1")
-            }) {
+            if rollout
+                .inference_calls
+                .values()
+                .any(|call| call.response_id.as_deref() == Some("resp-1"))
+            {
                 break rollout;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.expect("first inference trace must finish asynchronously");
+    })
+    .await
+    .expect("first inference trace must finish asynchronously");
     let inference = rollout
         .inference_calls
         .values()
@@ -862,14 +867,18 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     let rollout = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let rollout = replay_bundle(trace_dir.path()).expect("replay continuation trace");
-            if rollout.inference_calls.values().any(|call| {
-                call.response_id.as_deref() == Some("resp-2")
-            }) {
+            if rollout
+                .inference_calls
+                .values()
+                .any(|call| call.response_id.as_deref() == Some("resp-2"))
+            {
                 break rollout;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.expect("second inference trace must finish asynchronously");
+    })
+    .await
+    .expect("second inference trace must finish asynchronously");
     assert_eq!(rollout.inference_calls.len(), 2);
     let next = rollout
         .inference_calls
@@ -902,8 +911,6 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     );
     server.shutdown().await;
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_sends_responses_lite_metadata_per_request() {
@@ -1460,8 +1467,6 @@ async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_di
     server.shutdown().await;
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_emits_rate_limit_events() {
     require_network!();
@@ -1683,7 +1688,8 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         error_event.message
     );
 
-    let completed = wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+    let completed =
+        wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completed) = completed else {
         unreachable!();
     };
@@ -1762,7 +1768,8 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
         error_event.message
     );
 
-    let completed = wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+    let completed =
+        wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completed) = completed else {
         unreachable!();
     };
@@ -1869,19 +1876,14 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
     let version = env!("CARGO_PKG_VERSION");
     let expected_user_agent = codex_login::default_client::get_codex_user_agent();
     let expected_user_agent = match codex_models_manager::source_build_client_version(version) {
-        Some(baseline) => expected_user_agent.replacen(
-            &format!("/{version} "),
-            &format!("/{baseline} "),
-            1,
-        ),
+        Some(baseline) => {
+            expected_user_agent.replacen(&format!("/{version} "), &format!("/{baseline} "), 1)
+        }
         None => expected_user_agent,
     };
     assert_eq!(
         handshake_user_agents,
-        vec![
-            Some(expected_user_agent.clone()),
-            Some(expected_user_agent),
-        ]
+        vec![Some(expected_user_agent.clone()), Some(expected_user_agent),]
     );
 
     server.shutdown().await;
@@ -2014,10 +2016,6 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
     server.shutdown().await;
 }
 
-
-
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
     require_network!();
@@ -2051,7 +2049,6 @@ async fn responses_websocket_creates_on_non_prefix() {
 
     server.shutdown().await;
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_when_non_input_request_fields_change() {
@@ -2571,10 +2568,12 @@ async fn stream_until_complete_with_metadata(
         .expect("websocket stream failed");
 
     while let Some(event) = stream.next().await {
-        if matches!(event.expect("websocket stream failed"), ResponseEvent::Completed { .. }) {
+        if matches!(
+            event.expect("websocket stream failed"),
+            ResponseEvent::Completed { .. }
+        ) {
             return;
         }
     }
     panic!("websocket stream ended before completion");
 }
-

@@ -90,7 +90,11 @@ fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() 
     for command in ["just ci", "make verify", "npm run e2e"] {
         for (extra, wait, stall) in [
             (serde_json::json!({}), 30_000, None),
-            (serde_json::json!({"yield_time_ms":500,"stall_timeout_ms":123}), 500, Some(123)),
+            (
+                serde_json::json!({"yield_time_ms":500,"stall_timeout_ms":123}),
+                500,
+                Some(123),
+            ),
             (serde_json::json!({"stall_timeout_ms":0}), 30_000, None),
         ] {
             let mut arguments = extra;
@@ -101,9 +105,10 @@ fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() 
             assert_eq!(decoded.stall_timeout_ms, stall);
         }
     }
-    for (command, direct_default, interactive_default) in
-        [("rg --files", 2_000, 10_000), ("cargo build", 30_000, 30_000)]
-    {
+    for (command, direct_default, interactive_default) in [
+        ("rg --files", 2_000, 10_000),
+        ("cargo build", 30_000, 30_000),
+    ] {
         for tty in [false, true] {
             let mut arguments = serde_json::json!({"cmd": command, "tty": tty});
             let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
@@ -131,15 +136,29 @@ fn exec_command_boundary_reports_ignored_deadlines_and_fields() {
             arguments[field] = serde_json::json!(value);
             arguments["legacy_option"] = serde_json::json!(true);
             let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
-            assert!(decoded.argument_notices.iter().any(|notice| notice.contains(field)));
-            assert!(decoded.argument_notices.iter().any(|notice| notice.contains("legacy_option")));
+            assert!(
+                decoded
+                    .argument_notices
+                    .iter()
+                    .any(|notice| notice.contains(field))
+            );
+            assert!(
+                decoded
+                    .argument_notices
+                    .iter()
+                    .any(|notice| notice.contains("legacy_option"))
+            );
         }
     }
 }
 
 #[test]
 fn stall_timeout_exec_command_defaults_and_overrides() {
-    for (requested, expected) in [(None, Some(60_000)), (Some(0), None), (Some(125), Some(125))] {
+    for (requested, expected) in [
+        (None, Some(60_000)),
+        (Some(0), None),
+        (Some(125), Some(125)),
+    ] {
         let mut arguments = serde_json::json!({"cmd": "long-running"});
         if let Some(requested) = requested {
             arguments["stall_timeout_ms"] = serde_json::json!(requested);
@@ -147,9 +166,12 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
         let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
         assert_eq!(decoded.stall_timeout_ms, expected);
     }
-    assert!(validate_exec_command_arguments(
-        &serde_json::json!({"cmd": "must-not-run", "stall_timeout_ms": -1}).to_string()
-    ).is_err());
+    assert!(
+        validate_exec_command_arguments(
+            &serde_json::json!({"cmd": "must-not-run", "stall_timeout_ms": -1}).to_string()
+        )
+        .is_err()
+    );
     for command in [
         "cd x && cargo build",
         "npm install",
@@ -159,14 +181,20 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
         "python -m pytest library | ForEach-Object { $_ | ConvertFrom-Json }; exit $LASTEXITCODE",
         "cargo test -p codex-core | ForEach-Object { $_ }",
     ] {
-        let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
+        let decoded: ExecCommandArgs =
+            parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
         assert_eq!(decoded.stall_timeout_ms, None, "{command}");
-        let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command, "stall_timeout_ms": 123}).to_string()).unwrap();
+        let decoded: ExecCommandArgs = parse_arguments(
+            &serde_json::json!({"cmd": command, "stall_timeout_ms": 123}).to_string(),
+        )
+        .unwrap();
         assert_eq!(decoded.stall_timeout_ms, Some(123));
     }
     let decoded: ExecCommandArgs = parse_arguments(
-        &serde_json::json!({"cmd": "Write-Output 'cargo test' | ForEach-Object { $_ }"}).to_string(),
-    ).unwrap();
+        &serde_json::json!({"cmd": "Write-Output 'cargo test' | ForEach-Object { $_ }"})
+            .to_string(),
+    )
+    .unwrap();
     assert_eq!(decoded.stall_timeout_ms, Some(60_000));
 }
 
@@ -179,7 +207,10 @@ fn publishing_exec_command_preserves_explicit_observation_and_stall_overrides() 
     ] {
         let decoded: ExecCommandArgs = parse_arguments(&command.to_string()).unwrap();
         assert_eq!(decoded.stall_timeout_ms, None);
-        assert_eq!(decoded.yield_time_ms, crate::unified_exec::MAX_YIELD_TIME_MS);
+        assert_eq!(
+            decoded.yield_time_ms,
+            crate::unified_exec::MAX_YIELD_TIME_MS
+        );
         for (requested, expected) in [(0, None), (123, Some(123))] {
             let mut explicit = command.clone();
             explicit["yield_time_ms"] = serde_json::json!(1000);
@@ -199,17 +230,26 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
             "args": ["-c", "import time; print('ready', flush=True); time.sleep(8)"],
             "stall_timeout_ms": 3500,
             "yield_time_ms": 250,
-        }).to_string(),
+        })
+        .to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "stall-timeout-start", payload.clone(),
-    ).await;
+        "exec_command",
+        "stall-timeout-start",
+        payload.clone(),
+    )
+    .await;
     let session = Arc::clone(&invocation.session);
     let step_context = invocation.step_context.clone();
     let tracker = Arc::clone(&invocation.tracker);
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&payload);
-    let process_id = result["session_id"].as_u64().expect("initial yield returns a live session");
+    let process_id = result["session_id"]
+        .as_u64()
+        .expect("initial yield returns a live session");
     assert_eq!(result["process_exited"], false);
     let initial_output = result["output"].as_str().unwrap().to_string();
     // No polling or input keeps the watchdog alive: the process owns it.
@@ -230,9 +270,17 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
         .handle(poll)
         .await
         .expect("stalled command returns its live session");
-    assert_eq!(output.outcome_for_logging(), codex_tools::ToolOutputOutcome::Yielded);
+    assert_eq!(
+        output.outcome_for_logging(),
+        codex_tools::ToolOutputOutcome::Yielded
+    );
     let result = output.code_mode_result(&payload);
-    assert!(result["output"].as_str().unwrap().contains("no output observed for 3500 milliseconds"));
+    assert!(
+        result["output"]
+            .as_str()
+            .unwrap()
+            .contains("no output observed for 3500 milliseconds")
+    );
     assert_eq!(result["execution_state"], "running");
     assert_eq!(result["process_exited"], false);
     assert_eq!(result["session_id"], process_id);
@@ -240,14 +288,20 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
     let wait_payload = ToolPayload::Function {
         arguments: serde_json::json!({"session_id":process_id, "incarnation":result["session_capabilities"]["incarnation"], "wait_for_output":true}).to_string(),
     };
-    let completed = WriteStdinHandler::default().handle(ToolInvocation {
-        session, step_context, tracker,
-        call_id: "stall-timeout-completion".into(),
-        tool_name: codex_tools::ToolName::plain("write_stdin"),
-        source: ToolCallSource::Direct,
-        payload: wait_payload.clone(),
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-    }).await.unwrap().code_mode_result(&wait_payload);
+    let completed = WriteStdinHandler::default()
+        .handle(ToolInvocation {
+            session,
+            step_context,
+            tracker,
+            call_id: "stall-timeout-completion".into(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: wait_payload.clone(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        })
+        .await
+        .unwrap()
+        .code_mode_result(&wait_payload);
     assert_eq!(completed["exit_code"], 0);
     assert_eq!(completed["execution_state"], "exited");
     assert_eq!(completed["stdout"].as_str().unwrap().trim(), "ready");
@@ -278,12 +332,16 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     assert!(mixed_branch.contains("`argv` branch"), "{mixed_branch}");
     assert!(mixed_branch.contains("$.cmd"), "{mixed_branch}");
 
-    let adjusted: ExecCommandArgs = parse_arguments(
-        &serde_json::json!({"cmd": "rg --files", "yield_time_ms": 50}).to_string(),
-    )
-    .unwrap();
+    let adjusted: ExecCommandArgs =
+        parse_arguments(&serde_json::json!({"cmd": "rg --files", "yield_time_ms": 50}).to_string())
+            .unwrap();
     assert_eq!(adjusted.yield_time_ms, 250);
-    assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("250")));
+    assert!(
+        adjusted
+            .argument_notices
+            .iter()
+            .any(|notice| notice.contains("250"))
+    );
 }
 
 #[tokio::test]
@@ -301,11 +359,15 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
                 "args": ["-c", "import sys; sys.stdout.buffer.write(b'output line\\n' * 1000)"],
                 "yield_time_ms": 30000,
                 "max_output_tokens": cap,
-            }).to_string(),
+            })
+            .to_string(),
         };
         let mut invocation = invocation_for_payload_without_sandbox(
-            "exec_command", "nested-output-cap", payload.clone(),
-        ).await;
+            "exec_command",
+            "nested-output-cap",
+            payload.clone(),
+        )
+        .await;
         if nested {
             invocation.source = ToolCallSource::CodeMode {
                 cell_id: "output-cap-cell".into(),
@@ -317,20 +379,33 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
         }
         let home = invocation.step_context.turn.config.codex_home.clone();
         let thread_id = invocation.session.thread_id.to_string();
-        let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        let output = ExecCommandHandler::default()
+            .handle(invocation)
+            .await
+            .unwrap();
         let result = output.code_mode_result(&payload);
         assert_eq!(result["exit_code"], 0);
-        assert_eq!(result["output_reduced"], reduced, "nested={nested}, cap={cap:?}");
+        assert_eq!(
+            result["output_reduced"], reduced,
+            "nested={nested}, cap={cap:?}"
+        );
         if let Some(cap) = cap {
             // The documented approximation is UTF-8 bytes / 4, rounded up.
             assert!(result["output"].as_str().unwrap().len().div_ceil(4) <= cap);
-            assert_eq!(output.projection_metadata().unwrap().requested_limit, Some(cap));
+            assert_eq!(
+                output.projection_metadata().unwrap().requested_limit,
+                Some(cap)
+            );
         }
         if reduced {
-            let id = result["raw_output_artifact_id"].as_str().expect("reduced output is recoverable");
+            let id = result["raw_output_artifact_id"]
+                .as_str()
+                .expect("reduced output is recoverable");
             let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
                 &home, &thread_id, id,
-            ).await.expect("read the advertised artifact through the real recovery owner");
+            )
+            .await
+            .expect("read the advertised artifact through the real recovery owner");
             assert_eq!(retained, b"output line\n".repeat(1000));
         }
         if !reduced {
@@ -354,19 +429,28 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
         }).to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "exact-json-streams", payload.clone(),
-    ).await;
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        "exec_command",
+        "exact-json-streams",
+        payload.clone(),
+    )
+    .await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&payload);
     assert_eq!(result["process_exited"], true);
     assert_eq!(result["streams_complete"], true);
     assert_eq!(result["output_reduced"], true);
-    let parsed: serde_json::Value = serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["value"], "x".repeat(120_000));
     assert_eq!(result["stderr"].as_str().unwrap().trim(), "progress");
     let visible = codex_code_mode::model_visible_tool_result(
-        &codex_tools::ToolName::plain("exec_command"), &result,
-    ).unwrap();
+        &codex_tools::ToolName::plain("exec_command"),
+        &result,
+    )
+    .unwrap();
     assert!(visible.get("stdout").is_none());
     assert!(visible.get("stderr").is_none());
     assert_eq!(visible["output"], result["output"]);
@@ -374,7 +458,11 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     assert_eq!(visible["current_chunk_display_complete"], false);
     assert_eq!(visible["cumulative_streams_complete"], true);
     for (name, value) in visible.as_object().unwrap() {
-        assert_eq!(result.get(name), Some(value), "printed field {name} is not on the result");
+        assert_eq!(
+            result.get(name),
+            Some(value),
+            "printed field {name} is not on the result"
+        );
     }
     let tty_payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -382,12 +470,19 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
             "args": ["-c", "import sys; print('out'); print('err', file=sys.stderr)"],
             "tty": true,
             "yield_time_ms": 30000,
-        }).to_string(),
+        })
+        .to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "merged-terminal-streams", tty_payload.clone(),
-    ).await;
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        "exec_command",
+        "merged-terminal-streams",
+        tty_payload.clone(),
+    )
+    .await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&tty_payload);
     assert_eq!(result["process_exited"], true);
     assert_eq!(result["streams_complete"], false);
@@ -409,9 +504,15 @@ async fn powershell_script_piped_to_python_keeps_exact_json_stdout() {
         .to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "powershell-script-json-stdout", payload.clone(),
-    ).await;
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        "exec_command",
+        "powershell-script-json-stdout",
+        payload.clone(),
+    )
+    .await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&payload);
     assert_eq!(result["exit_code"], 0, "{result}");
     assert_eq!(result["process_exited"], true, "{result}");
@@ -435,8 +536,14 @@ fn exec_command_boundary_accepts_long_observation_without_a_process_deadline() {
     )
     .unwrap();
     assert_eq!(adjusted.yield_time_ms, 300_000);
-    assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("300000")));
-    let negative: ExecCommandArgs = parse_arguments(r#"{"cmd":"echo ok","yield_time_ms":-1}"#).unwrap();
+    assert!(
+        adjusted
+            .argument_notices
+            .iter()
+            .any(|notice| notice.contains("300000"))
+    );
+    let negative: ExecCommandArgs =
+        parse_arguments(r#"{"cmd":"echo ok","yield_time_ms":-1}"#).unwrap();
     assert_eq!(negative.yield_time_ms, 250);
 }
 
@@ -583,7 +690,13 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
         .unified_exec_manager
         .release_process_id(process_id)
         .await;
-    assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
+    assert!(
+        !session
+            .services
+            .unified_exec_manager
+            .has_process_reservations_for_test()
+            .await
+    );
 }
 
 #[tokio::test]
@@ -830,7 +943,10 @@ async fn invocation_for_payload_without_sandbox(
 }
 
 #[tokio::test]
-#[expect(clippy::print_stderr, reason = "reports passive-poll timing and observation count without adding scheduler-sensitive timing assertions")]
+#[expect(
+    clippy::print_stderr,
+    reason = "reports passive-poll timing and observation count without adding scheduler-sensitive timing assertions"
+)]
 async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -838,22 +954,30 @@ async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
             "args": ["-c", "import time; time.sleep(60)"],
             "yield_time_ms": 250,
             "stall_timeout_ms": 0,
-        }).to_string(),
+        })
+        .to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "passive-margin-start", payload.clone(),
-    ).await;
+        "exec_command",
+        "passive-margin-start",
+        payload.clone(),
+    )
+    .await;
     let session = Arc::clone(&invocation.session);
     let step_context = Arc::clone(&invocation.step_context);
     let tracker = Arc::clone(&invocation.tracker);
-    let started = ExecCommandHandler::default().handle(invocation).await.unwrap()
+    let started = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap()
         .code_mode_result(&payload);
     let process_id = started["session_id"].as_u64().expect("live silent process");
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "session_id": process_id, "wait_for_output": true,
             "incarnation": started["session_capabilities"]["incarnation"],
-        }).to_string(),
+        })
+        .to_string(),
     };
     let started_at = tokio::time::Instant::now();
     let timing = Arc::new(crate::tools::tool_dispatch_trace::ToolDispatchTiming::new(
@@ -863,26 +987,36 @@ async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
     let result = crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
         Arc::clone(&timing),
         handler.handle(ToolInvocation {
-            session: Arc::clone(&session), step_context, tracker,
+            session: Arc::clone(&session),
+            step_context,
+            tracker,
             call_id: "passive-margin-poll".into(),
             tool_name: codex_tools::ToolName::plain("write_stdin"),
             source: ToolCallSource::CodeMode {
                 cell_id: "passive-margin-cell".into(),
                 parent_call_id: None,
                 runtime_tool_call_id: "passive-margin-tool".into(),
-                nested_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3)),
+                nested_deadline: Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                ),
                 cancellation_cause: None,
             },
             payload: payload.clone(),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         }),
-    ).await;
+    )
+    .await;
     let elapsed = started_at.elapsed();
     let snapshot = timing.snapshot(tokio::time::Instant::now());
     // Clean up before assertions, including when the old handler exhausts the
     // wrapper budget. No timed-out process is left behind by the regression.
-    assert!(session.services.unified_exec_manager
-        .terminate_process_for_poll(u32::try_from(process_id).unwrap()).await);
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .terminate_process_for_poll(u32::try_from(process_id).unwrap())
+            .await
+    );
     let result = result.unwrap().code_mode_result(&payload);
     assert_eq!(result["session_id"], process_id);
     assert_eq!(result["process_exited"], false);
@@ -895,7 +1029,10 @@ async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
         }
         previous_sequence = wait.sequence;
     }
-    eprintln!("passive nested poll: observations={observations}, elapsed_ms={}", elapsed.as_millis());
+    eprintln!(
+        "passive nested poll: observations={observations}, elapsed_ms={}",
+        elapsed.as_millis()
+    );
     // Assert actual manager entries, not a scheduler-sensitive timing bound.
     // The manager already reserved its return margin; the handler must not
     // spend it starting more empty observations.
@@ -912,88 +1049,146 @@ async fn write_stdin_terminates_non_pty_process_and_retains_output() {
             "args": ["-u", "-c", "import time; print('termination-output'); time.sleep(60)"],
             "yield_time_ms": 250,
             "tty": false,
-        }).to_string(),
+        })
+        .to_string(),
     };
     let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "termination-start", payload.clone(),
-    ).await;
+        "exec_command",
+        "termination-start",
+        payload.clone(),
+    )
+    .await;
     let session = Arc::clone(&invocation.session);
     let step_context = Arc::clone(&invocation.step_context);
     let tracker = Arc::clone(&invocation.tracker);
-    let started = ExecCommandHandler::default().handle(invocation).await.unwrap()
+    let started = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap()
         .code_mode_result(&payload);
     let process_id = started["session_id"].as_u64().expect("live session");
     assert_eq!(started["session_capabilities"]["cancellation"], true);
-    if !started["output"].as_str().unwrap().contains("termination-output") {
+    if !started["output"]
+        .as_str()
+        .unwrap()
+        .contains("termination-output")
+    {
         let ready_payload = ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id, "wait_for_output": true,
                 "incarnation": started["session_capabilities"]["incarnation"],
-            }).to_string(),
+            })
+            .to_string(),
         };
-        let ready = WriteStdinHandler::default().handle(ToolInvocation {
-            session: Arc::clone(&session),
-            step_context: Arc::clone(&step_context),
-            tracker: Arc::clone(&tracker),
-            call_id: "termination-ready".to_string(),
-            tool_name: codex_tools::ToolName::plain("write_stdin"),
-            source: ToolCallSource::Direct,
-            payload: ready_payload.clone(),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-        }).await.unwrap().code_mode_result(&ready_payload);
-        assert!(ready["output"].as_str().unwrap().contains("termination-output"));
+        let ready = WriteStdinHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: Arc::clone(&step_context),
+                tracker: Arc::clone(&tracker),
+                call_id: "termination-ready".to_string(),
+                tool_name: codex_tools::ToolName::plain("write_stdin"),
+                source: ToolCallSource::Direct,
+                payload: ready_payload.clone(),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+            })
+            .await
+            .unwrap()
+            .code_mode_result(&ready_payload);
+        assert!(
+            ready["output"]
+                .as_str()
+                .unwrap()
+                .contains("termination-output")
+        );
     }
     let mut reviewer_step = (*step_context).clone();
-    let mut reviewer_turn = step_context.turn.with_model(
-        step_context.turn.model_info.slug.clone(),
-        &session.services.models_manager,
-    ).await;
-    reviewer_turn.session_source =
-        codex_protocol::protocol::SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Review);
+    let mut reviewer_turn = step_context
+        .turn
+        .with_model(
+            step_context.turn.model_info.slug.clone(),
+            &session.services.models_manager,
+        )
+        .await;
+    reviewer_turn.session_source = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::Review,
+    );
     reviewer_step.turn = Arc::new(reviewer_turn);
-    let rejected = WriteStdinHandler::default().handle(ToolInvocation {
-        session: Arc::clone(&session), step_context: Arc::new(reviewer_step),
-        tracker: Arc::clone(&tracker), call_id: "reviewer-termination".into(),
-        tool_name: codex_tools::ToolName::plain("write_stdin"), source: ToolCallSource::Direct,
-        payload: ToolPayload::Function { arguments: serde_json::json!({
-            "session_id": process_id, "terminate": true,
-            "incarnation": started["session_capabilities"]["incarnation"],
-        }).to_string() },
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-    }).await;
-    assert!(matches!(rejected, Err(crate::FunctionCallError::RespondToModel(ref text))
-        if text.contains("independent reviewers may only poll")));
-    assert!(!session.services.unified_exec_manager.list_processes().await.is_empty());
+    let rejected = WriteStdinHandler::default()
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: Arc::new(reviewer_step),
+            tracker: Arc::clone(&tracker),
+            call_id: "reviewer-termination".into(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "session_id": process_id, "terminate": true,
+                    "incarnation": started["session_capabilities"]["incarnation"],
+                })
+                .to_string(),
+            },
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        })
+        .await;
+    assert!(
+        matches!(rejected, Err(crate::FunctionCallError::RespondToModel(ref text))
+        if text.contains("independent reviewers may only poll"))
+    );
+    assert!(
+        !session
+            .services
+            .unified_exec_manager
+            .list_processes()
+            .await
+            .is_empty()
+    );
     for chars in ["must-not-be-written", ""] {
         let payload = ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id, "terminate": true, "chars": chars,
                 "incarnation": started["session_capabilities"]["incarnation"],
-            }).to_string(),
+            })
+            .to_string(),
         };
-        let result = WriteStdinHandler::default().handle(ToolInvocation {
-            session: Arc::clone(&session),
-            step_context: Arc::clone(&step_context),
-            tracker: Arc::clone(&tracker),
-            call_id: format!("termination-{chars}"),
-            tool_name: codex_tools::ToolName::plain("write_stdin"),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-        }).await;
+        let result = WriteStdinHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: Arc::clone(&step_context),
+                tracker: Arc::clone(&tracker),
+                call_id: format!("termination-{chars}"),
+                tool_name: codex_tools::ToolName::plain("write_stdin"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+            })
+            .await;
         if !chars.is_empty() {
-            assert!(matches!(result, Err(crate::FunctionCallError::RespondToModel(ref message))
-                if message.contains("terminate requires empty chars")));
+            assert!(
+                matches!(result, Err(crate::FunctionCallError::RespondToModel(ref message))
+                if message.contains("terminate requires empty chars"))
+            );
             continue;
         }
         let completed = result.unwrap().code_mode_result(&payload);
         assert_eq!(completed["execution_state"], "exited");
         assert_eq!(completed["process_exited"], true);
         assert!(completed.get("session_id").is_none());
-        assert!(completed["stdout"].as_str().unwrap().contains("termination-output"));
+        assert!(
+            completed["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("termination-output")
+        );
     }
-    assert!(session.services.unified_exec_manager
-        .list_processes().await.is_empty());
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .list_processes()
+            .await
+            .is_empty()
+    );
 }
 
 async fn invocation_for_payload_with_shellless_remote(
@@ -1198,8 +1393,14 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
             ("rg", vec!["missing-needle", "fixture.txt"], true, false, ""),
         ] {
             let args = if program == "rg" {
-                [vec!["--no-config", "--no-ignore-global", "--no-ignore-parent"], args].concat()
-            } else { args };
+                [
+                    vec!["--no-config", "--no-ignore-global", "--no-ignore-parent"],
+                    args,
+                ]
+                .concat()
+            } else {
+                args
+            };
             let mut arguments = serde_json::json!({
                 "kind": "argv", "program": program, "args": args,
                 "workdir": repository.path(),
@@ -1233,7 +1434,8 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
             assert_eq!(
                 output.success_for_logging(),
                 expected_success,
-                "{tool}: {args:?}: {}", output.log_preview()
+                "{tool}: {args:?}: {}",
+                output.log_preview()
             );
             let signal = output
                 .sampling_request_signal()
@@ -1528,8 +1730,12 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
             )
             .await;
             let cached = run_exec_command_for_test(
-                &session, &turn, "alternate-repository-cached-miss", payload.clone(),
-            ).await;
+                &session,
+                &turn,
+                "alternate-repository-cached-miss",
+                payload.clone(),
+            )
+            .await;
             assert!(cached.log_preview().contains("execution was suppressed"));
             tokio::fs::write(&search_target, "after\n")
                 .await
@@ -1900,7 +2106,13 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
     assert!(code_mode.to_string().contains("ripgrep"));
 
     // Ids are never reused, so the next id alone cannot show the release.
-    assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
+    assert!(
+        !session
+            .services
+            .unified_exec_manager
+            .has_process_reservations_for_test()
+            .await
+    );
     let process_id = session
         .services
         .unified_exec_manager
@@ -1961,36 +2173,182 @@ async fn missing_rg_path_advisory_reaches_the_model_without_hiding_results_or_er
             "args": ["--no-config", "-n", "needle", "spec.rs", "spec_plan.rs"],
             "workdir": fixture.path(),
             "yield_time_ms": 10_000,
-        }).to_string(),
+        })
+        .to_string(),
     };
-    let invocation = invocation_for_payload_without_sandbox(
-        "exec_command", "missing-rg-path", payload.clone(),
-    ).await;
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let invocation =
+        invocation_for_payload_without_sandbox("exec_command", "missing-rg-path", payload.clone())
+            .await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&payload);
     assert_eq!(result["exit_code"], 2, "{result}");
     let notice = result["repair"].as_str().unwrap();
     assert!(notice.contains("rg_missing_path"), "{notice}");
     assert!(notice.contains("spec_plan.rs"), "{notice}");
     assert!(notice.contains("command is unchanged"), "{notice}");
-    assert!(!notice.contains("Hint: `rg`"), "the post-execution fallback must not duplicate preflight: {notice}");
+    assert!(
+        !notice.contains("Hint: `rg`"),
+        "the post-execution fallback must not duplicate preflight: {notice}"
+    );
     let text = result["output"].as_str().unwrap();
     assert!(text.contains("needle"), "{result}");
     assert!(text.contains("spec.rs"), "{result}");
-    assert!(!text.contains("rg_missing_path"), "advisories must not alter raw output");
+    assert!(
+        !text.contains("rg_missing_path"),
+        "advisories must not alter raw output"
+    );
     assert!(result.get("session_id").is_none(), "{result}");
+}
+
+#[tokio::test]
+async fn native_rg_advisories_respect_restricted_read_policy() {
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::ManagedFileSystemPermissions;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let public = fixture.path().join("public");
+    let private = fixture.path().join("private");
+    std::fs::create_dir(&public).unwrap();
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("spec_private.rs"), "private contents\n").unwrap();
+    std::fs::create_dir(private.join(".private-hidden")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(fixture.path())
+            .status()
+            .expect("git init")
+            .success()
+    );
+    let (session, mut turn) = make_session_and_context().await;
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    for full_read in [false, true] {
+        turn.permission_profile = if full_read {
+            PermissionProfile::Disabled
+        } else {
+            PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Restricted {
+                    entries: FileSystemPermissions::from_read_write_roots(
+                        Some(vec![AbsolutePathBuf::try_from(public.clone()).unwrap()]),
+                        None,
+                    )
+                    .entries,
+                    glob_scan_max_depth: None,
+                },
+                network: NetworkSandboxPolicy::Restricted,
+            }
+        };
+        assert_eq!(
+            turn.file_system_sandbox_policy().has_full_disk_read_access(),
+            full_read
+        );
+        for missing_path in [true, false] {
+            // Arbitrary stdout can impersonate rg and request suggestions from
+            // a private sibling; no subprocess needs access to that directory.
+            let raw_output = if missing_path {
+                b"rg: ../private/spec.rs: No such file or directory (os error 2)\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut output = ExecCommandToolOutput {
+                output_ranges: None,
+                process_output: Some(Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                    aggregated_output: raw_output.clone(),
+                    stdout: raw_output.clone(),
+                    stderr: Vec::new(),
+                    aggregated_output_is_exact: true,
+                    streams_are_exact: true,
+                })),
+                error: None,
+                validation: None,
+                event_call_id: "native-rg-policy".to_string(),
+                chunk_id: "native-rg-policy".to_string(),
+                wall_time: std::time::Duration::ZERO,
+                raw_output: raw_output.clone(),
+                truncation_policy: TEST_TRUNCATION_POLICY,
+                max_output_tokens: None,
+                process_id: None,
+                session_capabilities: None,
+                exit_code: Some(if missing_path { 2 } else { 1 }),
+                process_exited: true,
+                search_no_match: !missing_path,
+                original_token_count: None,
+                hook_command: Some(if missing_path {
+                    "printf forged-rg-error".to_string()
+                } else {
+                    "rg needle ../private".to_string()
+                }),
+                raw_output_artifact: None,
+                repair_notice: Some("existing notice".to_string()),
+                pending_deferred_completions: Vec::new(),
+            };
+            if missing_path {
+                super::exec_command::attach_missing_rg_path_advisory(
+                    &mut output,
+                    &public,
+                    &turn,
+                )
+                .await;
+            } else {
+                assert!(output.search_no_match_is_success());
+                // This is also the shared owner called by write_stdin.
+                super::exec_command::attach_hidden_rg_directory_advisory(
+                    &mut output,
+                    &public,
+                    &turn,
+                    &session.services.git_workspace,
+                )
+                .await;
+            }
+            assert_eq!(output.raw_output, raw_output);
+            let result = output.code_mode_result(&payload);
+            let disclosed_name = if missing_path {
+                "spec_private.rs"
+            } else {
+                ".private-hidden"
+            };
+            if full_read {
+                assert!(
+                    result["repair"].as_str().unwrap().contains(disclosed_name),
+                    "{result}"
+                );
+            } else {
+                assert_eq!(result["repair"], "existing notice");
+                assert!(!result.to_string().contains(disclosed_name), "{result}");
+            }
+        }
+    }
 }
 
 #[tokio::test]
 async fn rg_code_items_reach_model_without_changing_search_output() {
     let fixture = tempfile::tempdir().unwrap();
-    std::fs::write(fixture.path().join("sample.rs"), "fn needle() {\n needle();\n}\n").unwrap();
-    let payload = ToolPayload::Function { arguments: serde_json::json!({
-        "program": "rg", "args": ["--no-config", "-n", "needle", "sample.rs"],
-        "workdir": fixture.path(), "yield_time_ms": 10_000,
-    }).to_string() };
-    let invocation = invocation_for_payload_without_sandbox("exec_command", "rg-code-items", payload.clone()).await;
-    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    std::fs::write(
+        fixture.path().join("sample.rs"),
+        "fn needle() {\n needle();\n}\n",
+    )
+    .unwrap();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "rg", "args": ["--no-config", "-n", "needle", "sample.rs"],
+            "workdir": fixture.path(), "yield_time_ms": 10_000,
+        })
+        .to_string(),
+    };
+    let invocation =
+        invocation_for_payload_without_sandbox("exec_command", "rg-code-items", payload.clone())
+            .await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .unwrap();
     let result = output.code_mode_result(&payload);
     assert_eq!(result["exit_code"], 0);
     let text = result["output"].as_str().unwrap();
@@ -2022,7 +2380,10 @@ async fn ignored_deadlines_execute_once_and_report_the_adjustment() {
         )
         .await;
         let payload = invocation.payload.clone();
-        let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        let output = ExecCommandHandler::default()
+            .handle(invocation)
+            .await
+            .unwrap();
         let value = output.code_mode_result(&payload);
         assert_eq!(value["exit_code"], 0);
         assert!(value["repair"].as_str().unwrap().contains(field));
@@ -2076,7 +2437,13 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
             .unified_exec_manager
             .release_process_id(process_id)
             .await;
-        assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
+        assert!(
+            !session
+                .services
+                .unified_exec_manager
+                .has_process_reservations_for_test()
+                .await
+        );
     }
 
     let payload_with_output_only_change = ToolPayload::Function {
@@ -2289,8 +2656,11 @@ async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .expect("Python is required by the KD4 test environment");
-    let spill_bytes = crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1;
-    let script = format!("import time; print('X' * {spill_bytes}, flush=True); time.sleep(6); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)");
+    let spill_bytes =
+        crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1;
+    let script = format!(
+        "import time; print('X' * {spill_bytes}, flush=True); time.sleep(6); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)"
+    );
     let program = python.to_string_lossy().into_owned();
     let command = vec![program.clone(), "-c".to_string(), script.to_string()];
     let (session, turn) = make_session_and_context().await;
@@ -2460,10 +2830,17 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
         .await
         .expect("read raw output artifact");
     let expected = [
-        b"BEGIN\n".to_vec(), vec![b'A'; segment_bytes], b"\nMIDDLE_MARKER\n".to_vec(),
-        vec![b'B'; segment_bytes], b"\nEND\n".to_vec(),
-    ].concat();
-    assert_eq!(artifact, expected, "every producer byte must survive retention");
+        b"BEGIN\n".to_vec(),
+        vec![b'A'; segment_bytes],
+        b"\nMIDDLE_MARKER\n".to_vec(),
+        vec![b'B'; segment_bytes],
+        b"\nEND\n".to_vec(),
+    ]
+    .concat();
+    assert_eq!(
+        artifact, expected,
+        "every producer byte must survive retention"
+    );
     assert!(artifact.starts_with(b"BEGIN"));
     assert!(
         artifact
@@ -2524,14 +2901,12 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     assert_eq!(command.last().map(String::as_str), Some("echo hello"));
     assert_eq!(resolved.shell_type, ShellType::PowerShell);
     std::fs::remove_file(&powershell_path)?;
-    let missing = get_command(
-        &args, Arc::new(default_user_shell()), true, false,
-    ).expect_err("a missing explicit shell must not fall back to another installation");
+    let missing = get_command(&args, Arc::new(default_user_shell()), true, false)
+        .expect_err("a missing explicit shell must not fall back to another installation");
     assert!(missing.contains("stage=shell_metadata"), "{missing}");
     std::fs::create_dir(&powershell_path)?;
-    let directory = get_command(
-        &args, Arc::new(default_user_shell()), true, false,
-    ).expect_err("a directory cannot be used as the requested shell");
+    let directory = get_command(&args, Arc::new(default_user_shell()), true, false)
+        .expect_err("a directory cannot be used as the requested shell");
     assert!(directory.contains("is not a file"), "{directory}");
     Ok(())
 }
@@ -2814,14 +3189,6 @@ async fn exec_command_post_tool_use_payload_requires_completion_for_each_tty_mod
     }
 }
 
-
-
-
-
-
-
-
-
 #[tokio::test]
 async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separate() {
     let payload = ToolPayload::Function {
@@ -3033,8 +3400,10 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
         Err(error) => error,
     };
     assert!(matches!(error, crate::FunctionCallError::Fatal(_)));
-    assert!(error.to_string().contains("MUTATION_FINISHED"),
-        "fatal durability failure must retain already-observed command output: {error}");
+    assert!(
+        error.to_string().contains("MUTATION_FINISHED"),
+        "fatal durability failure must retain already-observed command output: {error}"
+    );
     assert_eq!(
         tokio::fs::read_to_string(&changed_path).await.unwrap(),
         "after"
@@ -3223,9 +3592,8 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     assert_eq!(code_mode["output_reduced"], true);
     assert_eq!(code_mode["output_complete"], false);
     assert!(!text.contains("stdin-notice-0128"));
-    let response =
-        serde_json::to_value(completed.to_response_item("notice-write_stdin", &payload))
-            .expect("model response");
+    let response = serde_json::to_value(completed.to_response_item("notice-write_stdin", &payload))
+        .expect("model response");
     let direct: serde_json::Value =
         serde_json::from_str(response["output"].as_str().expect("direct output"))
             .expect("direct stdin result");

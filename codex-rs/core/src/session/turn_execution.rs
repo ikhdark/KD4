@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 
 #[cfg(test)]
-#[path = "turn_execution_evidence_tests.rs"]
-mod evidence_tests;
-#[cfg(test)]
 #[path = "turn_execution_cycle_tests.rs"]
 mod cycle_tests;
+#[cfg(test)]
+#[path = "turn_execution_evidence_tests.rs"]
+mod evidence_tests;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -45,13 +45,30 @@ use crate::validation::classify_validation;
 
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
-const LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS: u32 = 3;
-/// A handoff whose model-visible output filled this much of an exec cell's
-/// default budget could not have batched another comparable read, so it is
-/// output-bound rather than orchestration overhead. Four bytes approximate one
-/// token, as in the local input estimator.
+const LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS: u32 = 2;
+/// A handoff whose model-visible output filled half of an exec cell's default
+/// budget could not have batched another comparable read, so it is output-bound
+/// rather than orchestration overhead. Smaller reads still fit two to a cell.
+/// Four bytes approximate one token, as in the local input estimator.
 const OUTPUT_BOUND_HANDOFF_BYTES: usize =
-    codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 * 2 / 5;
+    codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 2;
+/// Most paths one completion message names; the rest are counted.
+const MAX_LISTED_COMPLETION_PATHS: usize = 10;
+
+/// Joins at most ten paths and counts the rest, so a large change set cannot
+/// flood a completion message.
+pub(crate) fn bounded_path_list(paths: &[String]) -> String {
+    let listed = paths
+        .iter()
+        .take(MAX_LISTED_COMPLETION_PATHS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match paths.len().saturating_sub(MAX_LISTED_COMPLETION_PATHS) {
+        0 => listed,
+        more => format!("{listed}, and {more} more"),
+    }
+}
 /// Advisory-only policy. Production keeps these defaults; replay fixtures can
 /// compare alternatives without changing completion, recovery or cancellation
 /// invariants. This does not select models or alter reasoning effort.
@@ -239,11 +256,14 @@ impl RunnerTestEvidence {
     fn from_signal(signal: &Value) -> Option<Self> {
         let receipt = signal.get("runner_execution_receipt")?;
         let context = &signal["command_validation"]["execution_context"];
-        let configuration = receipt.get("execution_configuration").filter(|value| value.is_object())?;
+        let configuration = receipt
+            .get("execution_configuration")
+            .filter(|value| value.is_object())?;
         // Selection/command spelling may change; execution environment, runner
         // inputs and the settled source revision may not silently change.
         let input_context = serialized_evidence_identity(&(
-            context["environment_id"].as_str()?, context["cwd"].as_str()?,
+            context["environment_id"].as_str()?,
+            context["cwd"].as_str()?,
             context["environment_fingerprint"].as_str()?,
             receipt["runner_input_fingerprint"].as_str()?,
             receipt["dependency_manifest"]["execution_context_sha256"].as_str()?,
@@ -252,8 +272,13 @@ impl RunnerTestEvidence {
         Some(Self {
             input_context,
             passed: crate::validation::runner_test_identities(&receipt["executions"])?,
-            required: if receipt["required_executions"].is_null() { None }
-                else { Some(crate::validation::runner_test_identities(&receipt["required_executions"])?) },
+            required: if receipt["required_executions"].is_null() {
+                None
+            } else {
+                Some(crate::validation::runner_test_identities(
+                    &receipt["required_executions"],
+                )?)
+            },
         })
     }
 }
@@ -279,17 +304,29 @@ pub(crate) fn validation_scope_signal(
 ) -> Option<Value> {
     let arguments = canonical_tool_action(payload).value;
     let original_signal = signal;
-    let mut signal = original_signal.clone().unwrap_or_else(|| serde_json::json!({}));
-    let execution_context = signal.get("command_validation")
-        .and_then(|validation| validation.get("execution_context")).filter(|value| value.is_object()).cloned();
-    let execution_cwd = execution_context.as_ref()
-        .and_then(|context| context.get("cwd")).and_then(Value::as_str).map(std::path::PathBuf::from);
+    let mut signal = original_signal
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let execution_context = signal
+        .get("command_validation")
+        .and_then(|validation| validation.get("execution_context"))
+        .filter(|value| value.is_object())
+        .cloned();
+    let execution_cwd = execution_context
+        .as_ref()
+        .and_then(|context| context.get("cwd"))
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
     if execution_context.is_some() && execution_cwd.is_none() {
-        signal["validation_scope_unavailable"] = serde_json::json!("Remote or non-native validation inputs are not proven by host filesystem evidence.");
+        signal["validation_scope_unavailable"] = serde_json::json!(
+            "Remote or non-native validation inputs are not proven by host filesystem evidence."
+        );
         return Some(signal);
     }
-    let environment_id = execution_context.as_ref()
-        .and_then(|context| context["environment_id"].as_str()).unwrap_or(environment_id);
+    let environment_id = execution_context
+        .as_ref()
+        .and_then(|context| context["environment_id"].as_str())
+        .unwrap_or(environment_id);
     let default_cwd = execution_cwd.as_deref().unwrap_or(default_cwd);
     if tool_name_matches(tool_name, "write_stdin") {
         if let Some(process_id) = arguments.get("session_id").and_then(Value::as_u64) {
@@ -300,27 +337,38 @@ pub(crate) fn validation_scope_signal(
             if !paths.is_empty() {
                 signal["validation_scope"] = serde_json::json!(ValidationScope {
                     behavioral_paths: BTreeSet::new(),
-                    environment_id: environment_id.to_string(), dependency_scope: None, paths, test_execution: true,
+                    environment_id: environment_id.to_string(),
+                    dependency_scope: None,
+                    paths,
+                    test_execution: true,
                 });
             }
         }
         return Some(signal);
     }
-    let (_, mut proof, mut test_execution) = validation_status_from_arguments(tool_name, &arguments);
+    let (_, mut proof, mut test_execution) =
+        validation_status_from_arguments(tool_name, &arguments);
     if let Some(validation) = signal.get("command_validation") {
         proof = validation["proof"] == true;
         test_execution = validation["tests"] == true;
     }
-    if !proof || arguments.get("environment_id").and_then(Value::as_str)
-        .is_some_and(|selected| selected != environment_id)
+    if !proof
+        || arguments
+            .get("environment_id")
+            .and_then(Value::as_str)
+            .is_some_and(|selected| selected != environment_id)
     {
         return original_signal;
     }
-    let cwd = if execution_context.is_some() { default_cwd.to_path_buf() } else { arguments.get("workdir").or_else(|| arguments.get("cwd"))
-        .and_then(Value::as_str).map_or_else(
-            || default_cwd.to_path_buf(),
-            |path| default_cwd.join(path),
-        ) };
+    let cwd = if execution_context.is_some() {
+        default_cwd.to_path_buf()
+    } else {
+        arguments
+            .get("workdir")
+            .or_else(|| arguments.get("cwd"))
+            .and_then(Value::as_str)
+            .map_or_else(|| default_cwd.to_path_buf(), |path| default_cwd.join(path))
+    };
     let mut paths = if execution_context.is_some() {
         // Classification may have happened against the primary environment.
         // Rebase from the execution owner's resolved cwd, without applying a
@@ -332,7 +380,10 @@ pub(crate) fn validation_scope_signal(
             arguments.remove("environment_id");
         }
         crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
-            &tool_name.name, payload, Some(&executed_arguments), &cwd,
+            &tool_name.name,
+            payload,
+            Some(&executed_arguments),
+            &cwd,
         )
     } else {
         dependencies.cloned().unwrap_or_default()
@@ -345,26 +396,35 @@ pub(crate) fn validation_scope_signal(
         let graph = crate::tool_history::runner_receipt_dependencies(receipt, &cwd);
         paths.extend(graph);
     }
-    if let Some(declared) = arguments.get("validation")
-        .and_then(|validation| validation.get("covered_paths")).and_then(Value::as_array)
+    if let Some(declared) = arguments
+        .get("validation")
+        .and_then(|validation| validation.get("covered_paths"))
+        .and_then(Value::as_array)
     {
         let root = codex_git_utils::get_git_repo_root(&cwd).unwrap_or(cwd);
-        let declared = declared.iter().filter_map(Value::as_str)
+        let declared = declared
+            .iter()
+            .filter_map(Value::as_str)
             .map(|path| SourceDependencyV1::new(&root.join(path), true))
             .collect::<BTreeSet<_>>();
         // Caller assertions can narrow owner-derived attribution, but cannot
         // manufacture it when command dependencies are unknown. Trusted runner
         // receipts above can supply that missing scope.
         if !paths.is_empty() {
-            paths = declared.iter().flat_map(|declared| paths.iter().filter_map(move |scope| {
-                if source_scope_contains(scope, &declared.path) {
-                    Some(declared.clone())
-                } else if source_scope_contains(declared, &scope.path) {
-                    Some(scope.clone())
-                } else {
-                    None
-                }
-            })).collect();
+            paths = declared
+                .iter()
+                .flat_map(|declared| {
+                    paths.iter().filter_map(move |scope| {
+                        if source_scope_contains(scope, &declared.path) {
+                            Some(declared.clone())
+                        } else if source_scope_contains(declared, &scope.path) {
+                            Some(scope.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
         }
     }
     if !paths.is_empty() || signal.get("background_process_id").is_some() {
@@ -381,9 +441,11 @@ pub(crate) fn validation_scope_signal(
 }
 
 fn source_scope_contains(scope: &SourceDependencyV1, path: &str) -> bool {
-    path == scope.path || scope.recursive
-        && path.strip_prefix(&scope.path).is_some_and(|suffix|
-            scope.path.ends_with('/') || suffix.starts_with('/'))
+    path == scope.path
+        || scope.recursive
+            && path
+                .strip_prefix(&scope.path)
+                .is_some_and(|suffix| scope.path.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn documentation_only_path(path: &std::path::Path) -> bool {
@@ -391,13 +453,21 @@ fn documentation_only_path(path: &std::path::Path) -> bool {
     let components = normalized.split('/').collect::<Vec<_>>();
     // This repository's prompt crate embeds templates into runtime requests.
     // Instruction files also control the harness; neither is a README.
-    let runtime_input = components.iter().any(|component| matches!(*component, "prompts" | "templates"))
+    let runtime_input = components
+        .iter()
+        .any(|component| matches!(*component, "prompts" | "templates"))
         || components.last().is_some_and(|name| {
-            ["AGENTS.md", "AGENTS.override.md", "SKILL.md"].iter()
+            ["AGENTS.md", "AGENTS.override.md", "SKILL.md"]
+                .iter()
                 .any(|instruction| name.eq_ignore_ascii_case(instruction))
         });
-    !runtime_input && path.extension().and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "md" | "rst"))
+    !runtime_input
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "md" | "rst")
+            })
 }
 
 impl SamplingToolOutcome {
@@ -429,18 +499,27 @@ impl SamplingToolOutcome {
                 .is_some(),
             tests_executed: signal
                 .and_then(|signal| signal.get("runner_execution_receipt"))
-                .is_some_and(|receipt| receipt["executed_tests"].as_u64().is_some_and(|count| count > 0)
-                    && receipt["exit_code"].as_i64() == Some(0)),
-            tests_attributed: signal.is_some_and(|signal|
-                signal["validation_summary_tests"].as_u64().is_some_and(|count| count > 0)),
+                .is_some_and(|receipt| {
+                    receipt["executed_tests"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+                        && receipt["exit_code"].as_i64() == Some(0)
+                }),
+            tests_attributed: signal.is_some_and(|signal| {
+                signal["validation_summary_tests"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            }),
             runner_test_evidence: signal.and_then(RunnerTestEvidence::from_signal),
             process_observation_progress: signal
                 .is_some_and(|signal| signal["process_observation_progress"] == true),
-            validation_scope: signal.and_then(|signal| signal.get("validation_scope"))
+            validation_scope: signal
+                .and_then(|signal| signal.get("validation_scope"))
                 .and_then(|scope| serde_json::from_value(scope.clone()).ok()),
             validation_mutation_revision: signal
                 .and_then(|signal| signal["validation_mutation_revision"].as_u64()),
-            background_process_id: signal.and_then(|signal| signal["background_process_id"].as_u64()),
+            background_process_id: signal
+                .and_then(|signal| signal["background_process_id"].as_u64()),
             observed_process_id: signal.and_then(|signal| signal["observed_process_id"].as_u64()),
         }
     }
@@ -555,7 +634,10 @@ struct SuccessfulReplayEvidence {
 }
 
 impl SuccessfulReplayGuard {
-    pub(crate) fn authorization_payload<'a>(&'a self, requested: &'a ToolPayload) -> &'a ToolPayload {
+    pub(crate) fn authorization_payload<'a>(
+        &'a self,
+        requested: &'a ToolPayload,
+    ) -> &'a ToolPayload {
         // The candidate has already proved equal native read scope. Recheck the
         // original invocation under today's permissions, not a broadened key.
         self.evidence.read_payload.as_ref().unwrap_or(requested)
@@ -577,13 +659,20 @@ impl SuccessfulReplayGuard {
         workspace_revision: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> bool {
         let same_workspace = if self.evidence.path_scoped {
-            self.evidence.workspace_revision.as_ref().map(|revision| &revision.repository_root)
+            self.evidence
+                .workspace_revision
+                .as_ref()
+                .map(|revision| &revision.repository_root)
                 == workspace_revision.map(|revision| &revision.repository_root)
         } else {
             self.evidence.workspace_revision.as_ref() == workspace_revision
         };
         same_workspace
-            && self.evidence.workspace_revision.as_ref().is_none_or(|revision| !revision.unavailable)
+            && self
+                .evidence
+                .workspace_revision
+                .as_ref()
+                .is_none_or(|revision| !revision.unavailable)
             && workspace_revision.is_none_or(|revision| !revision.unavailable)
             && (self.evidence.path_scoped || self.evidence.mutation_revision == mutation_revision)
             && !self.evidence.source_paths.is_empty()
@@ -594,11 +683,18 @@ impl SuccessfulReplayGuard {
                 .all(|path| cache.source_path_change_observation_is_current(path))
     }
 
-    pub(crate) fn matches_source_dependencies(&self, dependencies: &BTreeSet<SourceDependencyV1>) -> bool {
+    pub(crate) fn matches_source_dependencies(
+        &self,
+        dependencies: &BTreeSet<SourceDependencyV1>,
+    ) -> bool {
         !dependencies.is_empty()
-            && self.evidence.source_paths.iter()
+            && self
+                .evidence
+                .source_paths
+                .iter()
                 .map(crate::git_workspace::SourcePathChangeObservation::source_dependency)
-                .collect::<BTreeSet<_>>() == *dependencies
+                .collect::<BTreeSet<_>>()
+                == *dependencies
     }
 
     /// A restart loses watcher proof, not the authenticated source fingerprint.
@@ -610,14 +706,23 @@ impl SuccessfulReplayGuard {
     ) -> Option<(String, u64)> {
         let prior = self.evidence.workspace_revision.as_ref()?;
         let workspace = workspace?;
-        if !self.evidence.path_scoped || self.evidence.read_payload.is_none()
-            || prior.unavailable || workspace.unavailable
-            || prior.repository_root.is_none() || prior.repository_root != workspace.repository_root
+        if !self.evidence.path_scoped
+            || self.evidence.read_payload.is_none()
+            || prior.unavailable
+            || workspace.unavailable
+            || prior.repository_root.is_none()
+            || prior.repository_root != workspace.repository_root
             || self.evidence.source_paths.len() != 1
             || !cache.source_observation_is_from_prior_watcher(&self.evidence.source_paths[0])
-        { return None; }
-        let ResponseInputItem::FunctionCallOutput { output, .. } = &self.response else { return None };
-        let codex_protocol::models::FunctionCallOutputBody::Text(text) = &output.body else { return None };
+        {
+            return None;
+        }
+        let ResponseInputItem::FunctionCallOutput { output, .. } = &self.response else {
+            return None;
+        };
+        let codex_protocol::models::FunctionCallOutputBody::Text(text) = &output.body else {
+            return None;
+        };
         let value: Value = serde_json::from_str(text).ok()?;
         let hash = value["source_sha256"].as_str()?;
         let bytes = value["canonical_bytes"].as_u64()?;
@@ -787,7 +892,12 @@ impl SamplingRequestSignalState {
         // check. Keep this separate from identities eligible for result replay.
         let mut arguments = arguments.clone();
         if let Some(arguments) = arguments.as_object_mut() {
-            for key in ["force_fresh", "max_output_tokens", "yield_time_ms", "validation"] {
+            for key in [
+                "force_fresh",
+                "max_output_tokens",
+                "yield_time_ms",
+                "validation",
+            ] {
                 arguments.remove(key);
             }
         }
@@ -800,11 +910,14 @@ impl SamplingRequestSignalState {
         let Some(validation) = signal.and_then(|signal| signal.get("command_validation")) else {
             return;
         };
-        if let Some(context) = validation.get("execution_context").filter(|context|
-            context["cwd"].is_string() && context["environment_id"].is_string()
+        if let Some(context) = validation.get("execution_context").filter(|context| {
+            context["cwd"].is_string()
+                && context["environment_id"].is_string()
                 && context["environment_fingerprint"].is_string()
-                && context["command"].as_array().is_some_and(|argv| !argv.is_empty()))
-            && let Some(identity) = serialized_evidence_identity(context)
+                && context["command"]
+                    .as_array()
+                    .is_some_and(|argv| !argv.is_empty())
+        }) && let Some(identity) = serialized_evidence_identity(context)
         {
             self.validation_check_identities.insert(ordinal, identity);
         }
@@ -820,15 +933,20 @@ impl SamplingRequestSignalState {
         }
     }
     fn wrapper_ordinals(&self) -> BTreeSet<u64> {
-        self.outcomes.iter()
+        self.outcomes
+            .iter()
             .filter_map(|outcome| outcome.code_mode_cell_id.as_ref())
             .filter_map(|cell| self.code_mode_cell_owners.get(cell))
             .copied()
-            .filter(|ordinal| self.outcomes.iter().any(|outcome| {
-                outcome.ordinal == *ordinal
-                    && (matches!(outcome.kind, SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded)
-                        || outcome.wraps_nested_terminal)
-            }))
+            .filter(|ordinal| {
+                self.outcomes.iter().any(|outcome| {
+                    outcome.ordinal == *ordinal
+                        && (matches!(
+                            outcome.kind,
+                            SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
+                        ) || outcome.wraps_nested_terminal)
+                })
+            })
             .collect()
     }
 
@@ -922,13 +1040,24 @@ impl SamplingRequestSignalCollector {
         tool_name: &ToolName,
         semantics: crate::tools::registry::ToolSemanticCapabilities,
     ) {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .runtime_semantics.insert(tool_name.clone(), semantics);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime_semantics
+            .insert(tool_name.clone(), semantics);
     }
 
-    fn runtime_semantics(&self, tool_name: &ToolName) -> crate::tools::registry::ToolSemanticCapabilities {
-        if let Some(semantics) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .runtime_semantics.get(tool_name).copied()
+    fn runtime_semantics(
+        &self,
+        tool_name: &ToolName,
+    ) -> crate::tools::registry::ToolSemanticCapabilities {
+        if let Some(semantics) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime_semantics
+            .get(tool_name)
+            .copied()
         {
             return semantics;
         }
@@ -939,8 +1068,10 @@ impl SamplingRequestSignalCollector {
             use crate::tools::registry::CommandArgumentFormat;
             return crate::tools::registry::ToolSemanticCapabilities {
                 mutation: matches!(tool_name.name.as_str(), "apply_patch" | "apply_patch_tool"),
-                coordination: matches!(tool_name.name.as_str(),
-                    "spawn_agent" | "send_message" | "followup_task" | "wait_agent"),
+                coordination: matches!(
+                    tool_name.name.as_str(),
+                    "spawn_agent" | "send_message" | "followup_task" | "wait_agent"
+                ),
                 command: match tool_name.name.as_str() {
                     "exec_command" | "unified_exec" => Some(CommandArgumentFormat::Exec),
                     "shell_command" => Some(CommandArgumentFormat::Shell),
@@ -951,13 +1082,22 @@ impl SamplingRequestSignalCollector {
         crate::tools::registry::ToolSemanticCapabilities::default()
     }
 
-    fn validation_semantics(&self, tool_name: &ToolName, arguments: &Value) -> (bool, bool, bool, bool) {
+    fn validation_semantics(
+        &self,
+        tool_name: &ToolName,
+        arguments: &Value,
+    ) -> (bool, bool, bool, bool) {
         let Some(format) = self.runtime_semantics(tool_name).command else {
             return (false, false, false, false);
         };
         let wire_name = format.canonical_name();
         let (validation, proof, tests) = validation_status_from_arguments(&wire_name, arguments);
-        (validation, proof, tests, final_diff_status_from_arguments(&wire_name, arguments))
+        (
+            validation,
+            proof,
+            tests,
+            final_diff_status_from_arguments(&wire_name, arguments),
+        )
     }
 
     pub(crate) fn completion_evidence_key(&self) -> Option<String> {
@@ -971,8 +1111,10 @@ impl SamplingRequestSignalCollector {
             .filter(|outcome| !state.replayed_ordinals.contains(&outcome.ordinal))
             // Unrelated reads are not progress against a completion blocker.
             // The turn owner separately keys the actual candidate and revisions.
-            .filter(|outcome| state.validation_proof_ordinals.contains(&outcome.ordinal)
-                || outcome.validation_scope.is_some())
+            .filter(|outcome| {
+                state.validation_proof_ordinals.contains(&outcome.ordinal)
+                    || outcome.validation_scope.is_some()
+            })
             .map(|outcome| {
                 format!(
                     "{:?}:{:?}:{:?}:{}:{:?}",
@@ -1031,8 +1173,12 @@ impl SamplingRequestSignalCollector {
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
         let canonical = canonical_tool_action(payload);
         let wait = is_wait_tool(tool_name)
-            || (live_process_poll && canonical.value.get("chars")
-                .and_then(Value::as_str).is_none_or(str::is_empty));
+            || (live_process_poll
+                && canonical
+                    .value
+                    .get("chars")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty));
         let action_identity = deterministic_action_identity(tool_name, &canonical);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
@@ -1094,25 +1240,46 @@ impl SamplingRequestSignalCollector {
         // unrelated registrations. Dispatch still rechecks freshness and auth.
         let replayed_success = structured_action.as_ref().and_then(|action| {
             candidates.iter().find_map(|gate| {
-                                // Path-scoped evidence is re-proven fresh by the
-                                // dispatcher, so turn-local revisions do not gate it.
-                                if gate.state_revision != self.request_state_revision
-                                    && !gate.evidence.path_scoped { return None; }
-                                let response = if gate.action_identity == action.identity {
-                                    gate.response.clone()
-                                } else if tool_name_matches(tool_name, "read_file") {
-                                    let ToolPayload::Function { arguments: previous } = gate.evidence.read_payload.as_ref()? else { return None; };
-                                    let ToolPayload::Function { arguments: requested } = payload else { return None; };
-                                    let output = gate.evidence.read_output.as_ref()?;
-                                    let output = crate::tools::handlers::reselect_read_file_output(previous, requested, output)?;
-                                    let text = serde_json::to_string(&output).ok()?;
-                                    if text.len() > SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT { return None; }
-                                    ResponseInputItem::FunctionCallOutput {
-                                        call_id: current_call_id.to_owned(),
-                                        output: codex_protocol::models::FunctionCallOutputPayload::from_text(text),
-                                    }
-                                } else { return None; };
-                                Some(SuccessfulReplayGuard { response, evidence: gate.evidence.clone() })
+                // Path-scoped evidence is re-proven fresh by the
+                // dispatcher, so turn-local revisions do not gate it.
+                if gate.state_revision != self.request_state_revision && !gate.evidence.path_scoped
+                {
+                    return None;
+                }
+                let response = if gate.action_identity == action.identity {
+                    gate.response.clone()
+                } else if tool_name_matches(tool_name, "read_file") {
+                    let ToolPayload::Function {
+                        arguments: previous,
+                    } = gate.evidence.read_payload.as_ref()?
+                    else {
+                        return None;
+                    };
+                    let ToolPayload::Function {
+                        arguments: requested,
+                    } = payload
+                    else {
+                        return None;
+                    };
+                    let output = gate.evidence.read_output.as_ref()?;
+                    let output = crate::tools::handlers::reselect_read_file_output(
+                        previous, requested, output,
+                    )?;
+                    let text = serde_json::to_string(&output).ok()?;
+                    if text.len() > SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT {
+                        return None;
+                    }
+                    ResponseInputItem::FunctionCallOutput {
+                        call_id: current_call_id.to_owned(),
+                        output: codex_protocol::models::FunctionCallOutputPayload::from_text(text),
+                    }
+                } else {
+                    return None;
+                };
+                Some(SuccessfulReplayGuard {
+                    response,
+                    evidence: gate.evidence.clone(),
+                })
             })
         });
 
@@ -1121,7 +1288,9 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.registered_count = state.registered_count.saturating_add(1);
-        state.call_ordinals.insert(current_call_id.to_string(), ordinal);
+        state
+            .call_ordinals
+            .insert(current_call_id.to_string(), ordinal);
         if tool_name_matches(tool_name, "read_file") && structured_action.is_some() {
             while state.read_payloads.len() >= SUCCESSFUL_REPLAY_GATE_LIMIT {
                 state.read_payloads.pop_first();
@@ -1139,11 +1308,15 @@ impl SamplingRequestSignalCollector {
         }
         if direct_code_mode_exec {
             state.direct_code_mode_exec_count = state.direct_code_mode_exec_count.saturating_add(1);
-            state.code_mode_call_ordinals.insert(current_call_id.to_string(), ordinal);
+            state
+                .code_mode_call_ordinals
+                .insert(current_call_id.to_string(), ordinal);
         } else if crate::tools::code_mode::is_orchestration_tool_name(tool_name)
             && let Some(cell_id) = canonical.value.get("cell_id").and_then(Value::as_str)
         {
-            state.code_mode_cell_owners.insert(cell_id.to_string(), ordinal);
+            state
+                .code_mode_cell_owners
+                .insert(cell_id.to_string(), ordinal);
         }
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_validation |= validation;
@@ -1203,7 +1376,9 @@ impl SamplingRequestSignalCollector {
         if state.child_runtime_by_call.contains_key(call_id) {
             return;
         }
-        state.child_runtime_by_call.insert(call_id.to_string(), runtime_ms);
+        state
+            .child_runtime_by_call
+            .insert(call_id.to_string(), runtime_ms);
         state.child_runtime_ms = state.child_runtime_ms.saturating_add(runtime_ms);
         state.child_runtime_sample_count = state.child_runtime_sample_count.saturating_add(1);
     }
@@ -1304,14 +1479,23 @@ impl SamplingRequestSignalCollector {
             return;
         }
         self.record_registered_owner_result(
-            "multi_agent_v2", tool_name, payload, signal,
-            canonical_authoritative_result(response).as_ref(), false,
+            "multi_agent_v2",
+            tool_name,
+            payload,
+            signal,
+            canonical_authoritative_result(response).as_ref(),
+            false,
         );
     }
 
     pub(crate) fn record_registered_owner_result(
-        &self, adapter: &str, tool_name: &ToolName, payload: &ToolPayload,
-        signal: Option<&Value>, result: Option<&Value>, nested: bool,
+        &self,
+        adapter: &str,
+        tool_name: &ToolName,
+        payload: &ToolPayload,
+        signal: Option<&Value>,
+        result: Option<&Value>,
+        nested: bool,
     ) {
         // A nested report/export completes its own operation, not the
         // enclosing cell's assignment. Only that cell may opt in to delivery
@@ -1319,13 +1503,9 @@ impl SamplingRequestSignalCollector {
         if nested && matches!(adapter, "agent_job_report" | "agent_job_csv_export") {
             return;
         }
-        let Some(observation) = authoritative_wait_observation(
-            adapter,
-            tool_name,
-            payload,
-            signal,
-            result,
-        ) else {
+        let Some(observation) =
+            authoritative_wait_observation(adapter, tool_name, payload, signal, result)
+        else {
             return;
         };
         let mut state = self
@@ -1339,9 +1519,17 @@ impl SamplingRequestSignalCollector {
     }
 
     pub(crate) fn record_code_mode_parent(&self, cell_id: &str, parent_call_id: Option<&str>) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(ordinal) = parent_call_id.and_then(|parent| state.code_mode_call_ordinals.get(parent)).copied() {
-            state.code_mode_cell_owners.insert(cell_id.to_string(), ordinal);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ordinal) = parent_call_id
+            .and_then(|parent| state.code_mode_call_ordinals.get(parent))
+            .copied()
+        {
+            state
+                .code_mode_cell_owners
+                .insert(cell_id.to_string(), ordinal);
         }
     }
 
@@ -1396,13 +1584,33 @@ impl SamplingRequestSignalCollector {
         if let Some(call_id) = call_id {
             state.call_ordinals.insert(call_id.to_string(), ordinal);
         }
-        if is_wait_tool(tool_name) || (tool_name_matches(tool_name, "write_stdin")
-            && canonical.value.get("chars").and_then(Value::as_str).is_none_or(str::is_empty))
+        if is_wait_tool(tool_name)
+            || (tool_name_matches(tool_name, "write_stdin")
+                && canonical
+                    .value
+                    .get("chars")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty))
         {
             state.wait_call_count = state.wait_call_count.saturating_add(1);
         }
         if tool_name_matches(tool_name, "write_stdin") {
             state.process_monitor_ordinals.insert(ordinal);
+        }
+        // A nested read is the same path-scoped observation as a direct one: the
+        // enclosing cell is only its carrier. Record the identity the replay
+        // ledger needs so a later identical read can reuse these exact bytes
+        // instead of re-delivering an unchanged file. This grants no freshness:
+        // the dispatcher still re-proves the hash and source paths under its own
+        // workspace read lease before any reuse.
+        if tool_name_matches(tool_name, "read_file") && structured_action.is_some() {
+            while state.read_payloads.len() >= SUCCESSFUL_REPLAY_GATE_LIMIT {
+                state.read_payloads.pop_first();
+            }
+            state.read_payloads.insert(ordinal, payload.clone());
+        }
+        if tool_name_matches(tool_name, "read_file") || tool_name_matches(tool_name, "list_files") {
+            state.path_scoped_ordinals.insert(ordinal);
         }
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
@@ -1448,6 +1656,17 @@ impl SamplingRequestSignalCollector {
         ) {
             state.authoritative_wait_observations.push(observation);
         }
+    }
+
+    /// Ordinal already registered for `call_id`, for an owner that must attach
+    /// evidence to a call it recorded rather than minting a new identity.
+    pub(crate) fn ordinal_for_call(&self, call_id: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .call_ordinals
+            .get(call_id)
+            .copied()
     }
 
     pub(crate) fn code_mode_source_dependencies(
@@ -1530,16 +1749,24 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let plan_calls = state.outcomes.iter().filter(|outcome|
-            outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_some()
-        ).count();
+        let plan_calls = state
+            .outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_some()
+            })
+            .count();
         let observation = state.authoritative_wait_observations.first()?;
         let owner_calls = state.authoritative_wait_observations.len();
         // Identical owner/revision/action/acceptance receipts can be joined
         // without another semantic decision. Different owners or partial
         // receipts require an explicit parent (for example an opt-in delivery
         // cell that awaits every dependency and constructs the final result).
-        if !state.authoritative_wait_observations.iter().all(|other| other == observation) {
+        if !state
+            .authoritative_wait_observations
+            .iter()
+            .all(|other| other == observation)
+        {
             return None;
         }
         let direct_owner = state.registered_count == owner_calls + plan_calls
@@ -1554,11 +1781,21 @@ impl SamplingRequestSignalCollector {
             return None;
         }
         if observation.disposition == AuthoritativeWaitDisposition::Terminal
-            && !matches!(observation.result.adapter.as_str(), "multi_agent_v2" | "code_mode_cell")
+            && !matches!(
+                observation.result.adapter.as_str(),
+                "multi_agent_v2" | "code_mode_cell"
+            )
         {
-            let expected = state.registered_count.saturating_add(state.code_mode_nested_tool_count);
-            let observed = state.outcomes.iter().map(|outcome| outcome.ordinal).collect::<BTreeSet<_>>();
-            if state.outcomes.len() != expected || observed.len() != expected
+            let expected = state
+                .registered_count
+                .saturating_add(state.code_mode_nested_tool_count);
+            let observed = state
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.ordinal)
+                .collect::<BTreeSet<_>>();
+            if state.outcomes.len() != expected
+                || observed.len() != expected
                 || state.outcomes.iter().any(|outcome| {
                     outcome.kind != SamplingToolOutcomeKind::Success
                         || outcome.canonical_artifact_required
@@ -1635,14 +1872,51 @@ impl SamplingRequestSignalCollector {
     /// Model projections can replace text with line counts. Only the native
     /// owner's exact, bounded result may seed selector-level reuse.
     pub(crate) fn record_read_replay_output(&self, ordinal: u64, output: Value) {
-        if !serde_json::to_vec(&output).is_ok_and(|bytes| bytes.len() <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT) {
+        if !serde_json::to_vec(&output)
+            .is_ok_and(|bytes| bytes.len() <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT)
+        {
             return;
         }
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(evidence) = state.successful_replay_evidence.get_mut(&ordinal)
             && evidence.read_payload.is_some()
         {
             evidence.read_output = Some(output);
+        }
+    }
+
+    /// Attach the native read response to its already recorded nested outcome.
+    /// Recording a second outcome would make the ordinal ambiguous and deny reuse.
+    pub(crate) fn record_nested_read_replay_response(
+        &self,
+        ordinal: u64,
+        response: &ResponseInputItem,
+    ) {
+        if !response_has_replayable_call_id(response)
+            || !response_replay_text_size(response)
+                .is_some_and(|size| size <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT)
+        {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.successful_replay_evidence.get(&ordinal).is_some_and(|evidence| {
+            evidence.read_payload.is_some() && evidence.read_output.is_some()
+        }) || !state.outcomes.iter().any(|outcome| {
+            outcome.ordinal == ordinal
+                && outcome.nested_in_code_mode
+                && outcome.kind == SamplingToolOutcomeKind::Success
+        }) {
+            return;
+        }
+        state.successful_replay_responses.insert(ordinal, response.clone());
+        while state.successful_replay_responses.len() > SUCCESSFUL_REPLAY_GATE_LIMIT {
+            state.successful_replay_responses.pop_first();
         }
     }
 
@@ -1676,14 +1950,21 @@ impl SamplingRequestSignalCollector {
                 .code_mode_call_ordinals
                 .values()
                 .any(|value| *value == ordinal)
-                || state.code_mode_cell_owners.values().any(|value| *value == ordinal))
+                || state
+                    .code_mode_cell_owners
+                    .values()
+                    .any(|value| *value == ordinal))
             && let Some(message) = signal
                 .as_ref()
                 .and_then(|signal| signal.get("explicit_completion_message"))
                 .and_then(Value::as_str)
                 .filter(|message| !message.trim().is_empty())
         {
-            if state.explicit_completion.as_ref().is_some_and(|(owner, _)| *owner != ordinal) {
+            if state
+                .explicit_completion
+                .as_ref()
+                .is_some_and(|(owner, _)| *owner != ordinal)
+            {
                 state.conflicting_explicit_completions = true;
             }
             state.explicit_completion = Some((ordinal, message.to_string()));
@@ -1744,9 +2025,12 @@ impl SamplingRequestSignalCollector {
     }
 
     pub(crate) fn record_replay_authorization(&self, ordinal: u64, identity: Option<String>) {
-        if let Some(evidence) = self.state.lock()
+        if let Some(evidence) = self
+            .state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .successful_replay_evidence.get_mut(&ordinal)
+            .successful_replay_evidence
+            .get_mut(&ordinal)
         {
             evidence.authorization_identity = identity;
         }
@@ -1758,40 +2042,49 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ordinal, message) = state.explicit_completion.as_ref()?;
-        let admitted_cell = |outcome: &SamplingToolOutcome| outcome.nested_in_code_mode
-            && outcome.code_mode_cell_id.as_ref().and_then(|cell| state.code_mode_cell_owners.get(cell)) == Some(ordinal);
+        let admitted_cell = |outcome: &SamplingToolOutcome| {
+            outcome.nested_in_code_mode
+                && outcome
+                    .code_mode_cell_id
+                    .as_ref()
+                    .and_then(|cell| state.code_mode_cell_owners.get(cell))
+                    == Some(ordinal)
+        };
         // A model-authored delivery intent is an explicit final response, not a
         // guess that an arbitrary successful tool completed the user's task.
         // Every registered sibling and nested call must be accounted for. A
         // yielded command is settled only by a later successful observation of
         // that same process; its original running receipt remains evidence.
         // A count alone would let duplicate outcomes hide pending work.
-        let expected = state.registered_count.saturating_add(state.code_mode_nested_tool_count);
-        let observed = state.outcomes.iter().map(|outcome| outcome.ordinal).collect::<BTreeSet<_>>();
+        let expected = state
+            .registered_count
+            .saturating_add(state.code_mode_nested_tool_count);
+        let observed = state
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.ordinal)
+            .collect::<BTreeSet<_>>();
         if state.conflicting_explicit_completions
             || state.outcomes.len() != expected
             || observed.len() != expected
-            || state
-                .outcomes
-                .iter()
-                .any(|outcome| {
-                    let successful_terminal = outcome.kind == SamplingToolOutcomeKind::Success
-                        && outcome.background_process_id.is_none();
-                    let consumed_process = outcome.kind == SamplingToolOutcomeKind::Yielded
-                        && outcome.background_process_id.is_some_and(|process_id| {
-                            state.outcomes.iter().any(|later| {
-                                later.ordinal > outcome.ordinal
-                                    && later.observed_process_id == Some(process_id)
-                                    && later.kind == SamplingToolOutcomeKind::Success
-                                    && later.background_process_id.is_none()
-                                    && (!later.canonical_artifact_required || admitted_cell(later))
-                            })
-                        });
-                    (!successful_terminal && !consumed_process)
+            || state.outcomes.iter().any(|outcome| {
+                let successful_terminal = outcome.kind == SamplingToolOutcomeKind::Success
+                    && outcome.background_process_id.is_none();
+                let consumed_process = outcome.kind == SamplingToolOutcomeKind::Yielded
+                    && outcome.background_process_id.is_some_and(|process_id| {
+                        state.outcomes.iter().any(|later| {
+                            later.ordinal > outcome.ordinal
+                                && later.observed_process_id == Some(process_id)
+                                && later.kind == SamplingToolOutcomeKind::Success
+                                && later.background_process_id.is_none()
+                                && (!later.canonical_artifact_required || admitted_cell(later))
+                        })
+                    });
+                (!successful_terminal && !consumed_process)
                         // The cell owner admits nested evidence using recovered
                         // coverage, which survives empty-yield packet rollover.
                         || (outcome.canonical_artifact_required && !admitted_cell(outcome))
-                })
+            })
             || state
                 .outcomes
                 .iter()
@@ -1864,7 +2157,8 @@ impl SamplingRequestSignalCollector {
             });
         }
         let wrappers = state.wrapper_ordinals();
-        let expected_outcomes = state.registered_count + state.code_mode_nested_tool_count - wrappers.len();
+        let expected_outcomes =
+            state.registered_count + state.code_mode_nested_tool_count - wrappers.len();
         let outcomes = state
             .outcomes
             .iter()
@@ -1890,27 +2184,26 @@ impl SamplingRequestSignalCollector {
             // Nested diagnostics belong to the actual nested action, never the
             // surrounding script. A script can contain other effectful work,
             // so it must not become a failure-suppression target.
-            let repeated_action_identity = if failures.len() == 1
-                && !failures[0].nested_in_code_mode
-            {
-                state
-                    .structured_actions
-                    .get(&failures[0].ordinal)
-                    .map(|action| action.identity.clone())
-            } else {
-                None
-            };
+            let repeated_action_identity =
+                if failures.len() == 1 && !failures[0].nested_in_code_mode {
+                    state
+                        .structured_actions
+                        .get(&failures[0].ordinal)
+                        .map(|action| action.identity.clone())
+                } else {
+                    None
+                };
             let mut failure_action_bindings = failures
-                    .iter()
-                    .map(|outcome| {
-                        let action_identity = state
-                            .structured_actions
-                            .get(&outcome.ordinal)
-                            .map(|action| action.evidence_identity.clone())?;
-                        let fingerprint = outcome.failure_fingerprint.as_deref()?.to_string();
-                        Some((action_identity, fingerprint))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
+                .iter()
+                .map(|outcome| {
+                    let action_identity = state
+                        .structured_actions
+                        .get(&outcome.ordinal)
+                        .map(|action| action.evidence_identity.clone())?;
+                    let fingerprint = outcome.failure_fingerprint.as_deref()?.to_string();
+                    Some((action_identity, fingerprint))
+                })
+                .collect::<Option<Vec<_>>>()?;
             failure_action_bindings.sort_unstable();
             let failure_action_identity = format!(
                 "{:x}",
@@ -1943,12 +2236,16 @@ impl SamplingRequestSignalCollector {
         // no-progress reasoning attempt. Actual write/poll errors were handled
         // by the failure branch above and remain eligible for deduplication.
         if !outcomes.is_empty()
-            && outcomes.iter().all(|outcome| state.process_monitor_ordinals.contains(&outcome.ordinal))
+            && outcomes
+                .iter()
+                .all(|outcome| state.process_monitor_ordinals.contains(&outcome.ordinal))
         {
             return None;
         }
         if outcomes.len() != expected_outcomes
-            || !outcomes.iter().all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
+            || !outcomes
+                .iter()
+                .all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
         {
             return None;
         }
@@ -2037,7 +2334,9 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let calls = state.registered_count.saturating_sub(state.direct_code_mode_exec_count)
+        let calls = state
+            .registered_count
+            .saturating_sub(state.direct_code_mode_exec_count)
             .saturating_add(state.code_mode_nested_tool_count);
         calls > 0 && state.wait_call_count == calls
     }
@@ -2066,20 +2365,25 @@ impl SamplingRequestSignalCollector {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let wrappers = state.wrapper_ordinals();
         let expected = state.registered_count + state.code_mode_nested_tool_count - wrappers.len();
-        let outcomes = state.outcomes.iter()
+        let outcomes = state
+            .outcomes
+            .iter()
             .filter(|outcome| !wrappers.contains(&outcome.ordinal))
             .collect::<Vec<_>>();
-        expected > 0 && outcomes.len() == expected && outcomes.iter().all(|outcome| {
-            let eligible = if yielded_only {
-                outcome.kind == SamplingToolOutcomeKind::Yielded
-            } else {
-                state.process_monitor_ordinals.contains(&outcome.ordinal) && matches!(
-                outcome.kind,
-                SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
-                )
-            };
-            eligible && outcome.process_observation_progress
-        })
+        expected > 0
+            && outcomes.len() == expected
+            && outcomes.iter().all(|outcome| {
+                let eligible = if yielded_only {
+                    outcome.kind == SamplingToolOutcomeKind::Yielded
+                } else {
+                    state.process_monitor_ordinals.contains(&outcome.ordinal)
+                        && matches!(
+                            outcome.kind,
+                            SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
+                        )
+                };
+                eligible && outcome.process_observation_progress
+            })
     }
 
     #[cfg(test)]
@@ -2129,8 +2433,12 @@ impl SamplingRequestSignalCollector {
         } else if state.saw_coordination {
             Some(TurnTimingGenerationPurpose::Coordination)
         } else if state.wait_call_count > 0
-            && state.wait_call_count == state.registered_count.saturating_sub(state.direct_code_mode_exec_count)
-                .saturating_add(state.code_mode_nested_tool_count) {
+            && state.wait_call_count
+                == state
+                    .registered_count
+                    .saturating_sub(state.direct_code_mode_exec_count)
+                    .saturating_add(state.code_mode_nested_tool_count)
+        {
             Some(TurnTimingGenerationPurpose::Wait)
         } else if observed_new_failure {
             Some(TurnTimingGenerationPurpose::FailureDiagnosis)
@@ -2272,23 +2580,26 @@ struct CanonicalToolAction {
 
 fn canonical_tool_action(payload: &ToolPayload) -> CanonicalToolAction {
     match payload {
-        ToolPayload::Function { arguments } => match crate::tools::handlers::parsed_function_argument_value(arguments)
-            .unwrap_or_else(|| serde_json::from_str::<Value>(arguments).map_err(|err| err.to_string())) {
-            Ok(arguments) => {
-                let value = canonicalize_json(&arguments);
-                let identity_payload = serde_json::to_string(&value).ok();
-                CanonicalToolAction {
-                    kind: "function",
-                    value,
-                    identity_payload,
+        ToolPayload::Function { arguments } => {
+            match crate::tools::handlers::parsed_function_argument_value(arguments).unwrap_or_else(
+                || serde_json::from_str::<Value>(arguments).map_err(|err| err.to_string()),
+            ) {
+                Ok(arguments) => {
+                    let value = canonicalize_json(&arguments);
+                    let identity_payload = serde_json::to_string(&value).ok();
+                    CanonicalToolAction {
+                        kind: "function",
+                        value,
+                        identity_payload,
+                    }
                 }
+                Err(_) => CanonicalToolAction {
+                    kind: "function",
+                    value: Value::String(arguments.clone()),
+                    identity_payload: None,
+                },
             }
-            Err(_) => CanonicalToolAction {
-                kind: "function",
-                value: Value::String(arguments.clone()),
-                identity_payload: None,
-            },
-        },
+        }
         ToolPayload::ToolSearch { arguments } => CanonicalToolAction {
             kind: "tool_search",
             value: Value::String(arguments.query.clone()),
@@ -2349,9 +2660,13 @@ fn structured_action_identity_from_canonical(
     if canonical.identity_payload.is_none() {
         // Retain invalid bytes only for argument-error diagnosis. Do not give
         // malformed input a successful replay or wait identity.
-        let identity = format!("{:x}", Sha256::digest(
-            serde_json::to_vec(&(tool_name, "invalid_function_arguments", &canonical.value)).ok()?
-        ));
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(tool_name, "invalid_function_arguments", &canonical.value))
+                    .ok()?
+            )
+        );
         return Some(StructuredActionIdentity {
             evidence_identity: identity.clone(),
             identity,
@@ -2371,23 +2686,37 @@ fn structured_action_identity_from_canonical(
     } else {
         None
     };
-    let normalized_payload = normalized_read.as_ref().map(serde_json::to_string).transpose().ok()?;
-    let action =
-        serde_json::to_string(&(tool_name, normalized_payload.as_deref()
-            .or(canonical.identity_payload.as_deref())?)).ok()?;
+    let normalized_payload = normalized_read
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .ok()?;
+    let action = serde_json::to_string(&(
+        tool_name,
+        normalized_payload
+            .as_deref()
+            .or(canonical.identity_payload.as_deref())?,
+    ))
+    .ok()?;
     let identity = format!("{:x}", Sha256::digest(action.as_bytes()));
     let mut evidence_arguments = normalized_read.unwrap_or_else(|| canonical.value.clone());
-    if ["exec_command", "shell_command", "write_stdin"].iter()
+    if ["exec_command", "shell_command", "write_stdin"]
+        .iter()
         .any(|name| tool_name_matches(tool_name, name))
         && let Some(arguments) = evidence_arguments.as_object_mut()
     {
         arguments.remove("max_output_tokens");
         arguments.remove("yield_time_ms");
     }
-    let evidence_identity = format!("{:x}", Sha256::digest(
-        serde_json::to_vec(&(tool_name, evidence_arguments)).ok()?
-    ));
-    Some(StructuredActionIdentity { identity, evidence_identity, class })
+    let evidence_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(tool_name, evidence_arguments)).ok()?)
+    );
+    Some(StructuredActionIdentity {
+        identity,
+        evidence_identity,
+        class,
+    })
 }
 
 struct Sha256Writer(Sha256);
@@ -2506,7 +2835,10 @@ fn code_mode_result_failure_fingerprint(
         "result": canonicalize_json(&diagnostic_result),
     }))
     .unwrap_or_default();
-    format!("code_mode.nested_tool.{:x}", Sha256::digest(canonical.as_bytes()))
+    format!(
+        "code_mode.nested_tool.{:x}",
+        Sha256::digest(canonical.as_bytes())
+    )
 }
 
 fn canonical_response_body(response: &ResponseInputItem) -> Option<Value> {
@@ -2603,7 +2935,8 @@ fn authoritative_wait_observation(
     let action = canonical_tool_action(payload);
     let result = canonicalize_json(result?);
     let action_identity = format!(
-        "{}\n{}", serde_json::to_string(tool_name).ok()?,
+        "{}\n{}",
+        serde_json::to_string(tool_name).ok()?,
         action.identity_payload.as_deref()?,
     );
     let identity = serde_json::to_vec(&serde_json::json!({
@@ -2696,11 +3029,13 @@ fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> 
             ..
         } if !leaves.is_empty() => (
             true,
-            exit_code_is_authoritative && leaves.iter().all(|leaf| leaf.mode.can_prove_validation()),
-            leaves
-                .iter()
-                .any(|leaf| leaf.operation == ValidationOperation::Test
-                    && leaf.mode == codex_shell_command::validation::ValidationExecutionMode::Execution),
+            exit_code_is_authoritative
+                && leaves.iter().all(|leaf| leaf.mode.can_prove_validation()),
+            leaves.iter().any(|leaf| {
+                leaf.operation == ValidationOperation::Test
+                    && leaf.mode
+                        == codex_shell_command::validation::ValidationExecutionMode::Execution
+            }),
         ),
         _ => (false, false, false),
     }
@@ -2960,7 +3295,6 @@ pub(crate) struct TurnExecutionControl {
     directive_issued: bool,
     proven_loop_active: bool,
 
-
     turn_efficiency_guard: Option<TurnEfficiencyGuardHandle>,
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
@@ -3001,16 +3335,26 @@ pub(crate) struct SessionValidationUncertainty {
 
 impl Drop for TurnExecutionControl {
     fn drop(&mut self) {
-        let Some(owner) = &self.session_validation_uncertainty else { return; };
-        let mut retained = owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(owner) = &self.session_validation_uncertainty else {
+            return;
+        };
+        let mut retained = owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         retained.failed_checks = std::mem::take(&mut self.failed_validation_checks);
         retained.failed_tests = std::mem::take(&mut self.failed_validation_tests);
         retained.check_orders = std::mem::take(&mut self.validation_check_orders);
         retained.next_request = self.next_validation_request.load(Ordering::Relaxed);
         retained.pending = std::mem::take(&mut self.pending_validation_coverage);
-        let pending_checks = retained.pending.values().map(|pending| pending.check.clone()).collect::<BTreeSet<_>>();
+        let pending_checks = retained
+            .pending
+            .values()
+            .map(|pending| pending.check.clone())
+            .collect::<BTreeSet<_>>();
         let failed_checks = retained.failed_checks.clone();
-        retained.check_orders.retain(|check, _| failed_checks.contains(check) || pending_checks.contains(check));
+        retained
+            .check_orders
+            .retain(|check, _| failed_checks.contains(check) || pending_checks.contains(check));
     }
 }
 
@@ -3030,37 +3374,63 @@ impl SessionPathReplays {
         history: &crate::tool_history::ToolHistoryState,
     ) {
         use codex_protocol::models::ResponseItem;
-        let mut gates = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gates = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !gates.is_empty() {
             return;
         }
         let recent = &items[items.len().saturating_sub(256)..];
-        let calls = recent.iter().filter_map(|item| match item {
-            ResponseItem::FunctionCall { name, namespace: None, arguments, call_id, .. }
-                if matches!(name.as_str(), "read_file" | "list_files") =>
-            {
-                Some((call_id, (name, arguments)))
-            }
-            _ => None,
-        }).collect::<BTreeMap<_, _>>();
+        let calls = recent
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCall {
+                    name,
+                    namespace: None,
+                    arguments,
+                    call_id,
+                    ..
+                } if matches!(name.as_str(), "read_file" | "list_files") => {
+                    Some((call_id, (name, arguments)))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         for item in recent {
-            let ResponseItem::FunctionCallOutput { call_id, output, .. } = item else {
+            let ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } = item
+            else {
                 continue;
             };
             if output.success == Some(false) {
                 continue;
             }
-            let Some((name, arguments)) = calls.get(call_id) else { continue };
-            let payload = ToolPayload::Function { arguments: (*arguments).clone() };
-            let Some(action) = structured_action_identity_from_canonical(
-                &ToolName::plain((*name).clone()), &payload, &canonical_tool_action(&payload),
-            ) else { continue };
-            let Some((workspace_revision, source_paths, authorization_identity)) = history.read_replay_provenance(item)
-            else { continue };
-            let response = ResponseInputItem::FunctionCallOutput {
-                call_id: call_id.clone(), output: output.clone(),
+            let Some((name, arguments)) = calls.get(call_id) else {
+                continue;
             };
-            if !serde_json::to_vec(&response).ok()
+            let payload = ToolPayload::Function {
+                arguments: (*arguments).clone(),
+            };
+            let Some(action) = structured_action_identity_from_canonical(
+                &ToolName::plain((*name).clone()),
+                &payload,
+                &canonical_tool_action(&payload),
+            ) else {
+                continue;
+            };
+            let Some((workspace_revision, source_paths, authorization_identity)) =
+                history.read_replay_provenance(item)
+            else {
+                continue;
+            };
+            let response = ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: output.clone(),
+            };
+            if !serde_json::to_vec(&response)
+                .ok()
                 .is_some_and(|bytes| bytes.len() <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT)
             {
                 continue;
@@ -3096,7 +3466,10 @@ impl SessionPathReplays {
     }
 
     fn retain(&self, gate: &Arc<SuccessfulReplayGate>) {
-        let mut gates = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gates = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         gates.retain(|existing| existing.action_identity != gate.action_identity);
         gates.push_back(gate.clone());
         while gates.len() > SUCCESSFUL_REPLAY_GATE_LIMIT {
@@ -3138,7 +3511,6 @@ impl TurnExecutionControl {
             directive_issued: false,
             proven_loop_active: false,
 
-
             turn_efficiency_guard: None,
             turn_efficiency_tool_calls: 0,
             turn_efficiency_child_runtime_ms: 0,
@@ -3162,7 +3534,10 @@ impl TurnExecutionControl {
         }
     }
 
-    pub(crate) fn with_active_plan(mut self, plan: Option<crate::plan_store::PlanExecutionSnapshot>) -> Self {
+    pub(crate) fn with_active_plan(
+        mut self,
+        plan: Option<crate::plan_store::PlanExecutionSnapshot>,
+    ) -> Self {
         self.refresh_plan(plan);
         self.plan_updated_since_input = false;
         self
@@ -3182,9 +3557,15 @@ impl TurnExecutionControl {
     /// changes after its last passing validation, or its plan left unfinished.
     /// The revision is the last settled request's. The turn owner separately
     /// reports the post-validation boundary of a mutating finalizer.
-    fn completion_assessment(&self, settled_mutation_revision: u64) -> codex_protocol::protocol::TurnCompletionAssessment {
+    fn completion_assessment(
+        &self,
+        settled_mutation_revision: u64,
+    ) -> codex_protocol::protocol::TurnCompletionAssessment {
         let mut assessment = codex_protocol::protocol::TurnCompletionAssessment::default();
-        let current_failures = self.failed_validation_checks.len().saturating_sub(self.inherited_validation_checks.len());
+        let current_failures = self
+            .failed_validation_checks
+            .len()
+            .saturating_sub(self.inherited_validation_checks.len());
         if !self.inherited_validation_checks.is_empty() {
             assessment.advisories.push(format!(
                 "{} earlier validation failure(s) remain unresolved; relevance to this request is not established. This is not a rerun request.",
@@ -3195,12 +3576,19 @@ impl TurnExecutionControl {
             assessment.failed_checks.push(format!(
                 "{current_failures} validation check(s) failed without a later passing execution or current per-test repairs.",
             ));
-            for (_, failed) in self.failed_validation_tests.iter().filter(|(check, _)| !self.inherited_validation_checks.contains(*check)) {
+            for (_, failed) in self
+                .failed_validation_tests
+                .iter()
+                .filter(|(check, _)| !self.inherited_validation_checks.contains(*check))
+            {
                 if let Some(required) = &failed.evidence.required {
-                    let unresolved = required.difference(&failed.evidence.passed)
+                    let unresolved = required
+                        .difference(&failed.evidence.passed)
                         .map(|test| format!("{} {:?} {}", test.binary, test.helpers, test.test))
                         .collect::<Vec<_>>();
-                    assessment.failed_checks.push(format!("Unfulfilled test IDs: {}.", unresolved.join(", ")));
+                    assessment
+                        .failed_checks
+                        .push(format!("Unfulfilled test IDs: {}.", unresolved.join(", ")));
                 }
             }
         }
@@ -3208,28 +3596,42 @@ impl TurnExecutionControl {
             .validated_mutation_revision
             .is_some_and(|validated| validated != settled_mutation_revision)
             && !(self.validation_coverage_revision == Some(settled_mutation_revision)
-                && self.validated_check.as_ref().is_some_and(|check|
-                    self.validation_coverage.contains_key(check)))
+                && self
+                    .validated_check
+                    .as_ref()
+                    .is_some_and(|check| self.validation_coverage.contains_key(check)))
         {
             assessment.verification_gaps.push(
                 "The workspace changed after the last passing validation in this turn.".to_string(),
             );
         }
-        if let Some(plan) = self.plan.as_ref().filter(|plan| !plan.obligations.unresolved.is_empty()) {
+        if let Some(plan) = self
+            .plan
+            .as_ref()
+            .filter(|plan| !plan.obligations.unresolved.is_empty())
+        {
             let unfinished = plan.obligations.unresolved.len();
             assessment.advisories.push(format!(
                 "The plan still has {unfinished} unresolved obligation(s)."
             ));
         }
         if !self.pending_validation_coverage.is_empty() {
-            let current = self.pending_validation_coverage.values().filter(|pending| !pending.inherited).count();
-            if current != 0 { assessment.verification_gaps.push(format!(
-                "{current} validation process(es) still await a consumed terminal result.",
-            )); }
+            let current = self
+                .pending_validation_coverage
+                .values()
+                .filter(|pending| !pending.inherited)
+                .count();
+            if current != 0 {
+                assessment.verification_gaps.push(format!(
+                    "{current} validation process(es) still await a consumed terminal result.",
+                ));
+            }
             let inherited = self.pending_validation_coverage.len() - current;
-            if inherited != 0 { assessment.advisories.push(format!(
+            if inherited != 0 {
+                assessment.advisories.push(format!(
                 "{inherited} earlier validation process(es) still lack a consumed terminal result; they are not proof for this turn."
-            )); }
+            ));
+            }
         }
         assessment
     }
@@ -3246,7 +3648,9 @@ impl TurnExecutionControl {
         }
         if let Some(changed_paths) = changed_paths {
             let documentation = documentation_only_path;
-            let docs = changed_paths.iter().filter(|(_, path)| documentation(path))
+            let docs = changed_paths
+                .iter()
+                .filter(|(_, path)| documentation(path))
                 .map(|(environment, path)| format!("{environment}:{}", path.display()))
                 .collect::<Vec<_>>();
             // A test passing at this revision attributes the inputs its owner derived.
@@ -3254,20 +3658,35 @@ impl TurnExecutionControl {
             // attribution because only behavioral_paths proves an exercised surface.
             let mut uncovered = Vec::new();
             let mut input_attributed = Vec::new();
-            for (environment, path) in changed_paths.iter().filter(|(_, path)| !documentation(path)) {
+            for (environment, path) in changed_paths
+                .iter()
+                .filter(|(_, path)| !documentation(path))
+            {
                 let normalized = SourceDependencyV1::new(path, false).path;
-                let covered = |behavioral: bool| self.validation_coverage_revision == Some(settled_mutation_revision)
-                    && self.validation_coverage.values().any(|scope| {
-                        let paths = if behavioral { &scope.behavioral_paths } else { &scope.paths };
-                        scope.environment_id == *environment
-                            && scope.test_execution
-                            && paths.iter().any(|scope| source_scope_contains(scope, &normalized))
-                    });
+                let covered = |behavioral: bool| {
+                    self.validation_coverage_revision == Some(settled_mutation_revision)
+                        && self.validation_coverage.values().any(|scope| {
+                            let paths = if behavioral {
+                                &scope.behavioral_paths
+                            } else {
+                                &scope.paths
+                            };
+                            scope.environment_id == *environment
+                                && scope.test_execution
+                                && paths
+                                    .iter()
+                                    .any(|scope| source_scope_contains(scope, &normalized))
+                        })
+                };
                 if covered(true) {
                     continue;
                 }
                 let changed = format!("{environment}:{}", path.display());
-                if covered(false) { input_attributed.push(changed); } else { uncovered.push(changed); }
+                if covered(false) {
+                    input_attributed.push(changed);
+                } else {
+                    uncovered.push(changed);
+                }
             }
             if !uncovered.is_empty() {
                 // With nothing attributed at all, the likeliest cause is a
@@ -3282,40 +3701,61 @@ impl TurnExecutionControl {
                 };
                 assessment.verification_gaps.push(format!(
                     "Changed paths without a passing test execution attributed to them: {}.{unrecognized} Non-test checks and declared paths are not test coverage; behavior remains unverified. Inspection or intentionally omitted validation must be reported.",
-                    uncovered.join(", ")
+                    bounded_path_list(&uncovered)
                 ));
             }
             if !input_attributed.is_empty() {
                 assessment.advisories.push(format!(
                     "Passing test executions took these changed paths as inputs: {}. Input attribution is not proof that the changed behavior was exercised.",
-                    input_attributed.join(", ")
+                    bounded_path_list(&input_attributed)
                 ));
             }
             if self.validation_coverage_revision == Some(settled_mutation_revision)
-                && self.validation_coverage.values().any(|scope| !scope.test_execution)
+                && self
+                    .validation_coverage
+                    .values()
+                    .any(|scope| !scope.test_execution)
             {
                 assessment.advisories.push("Non-test checks passed (for example formatting or static checks); behavior unverified by those checks.".to_string());
             }
-            if !docs.is_empty() {
-                assessment.advisories.push(format!("Documentation-only paths (inspection, not test attribution): {}.", docs.join(", ")));
+            // Separating documentation only informs a change set that also has
+            // code; one that is all documentation has nothing to separate it from.
+            if !docs.is_empty() && docs.len() < changed_paths.len() {
+                assessment.advisories.push(format!(
+                    "Documentation-only paths (inspection, not test attribution): {}.",
+                    bounded_path_list(&docs)
+                ));
             }
         }
         assessment
     }
 
-
     #[cfg(test)]
     fn completion_gaps(&self, revision: u64) -> Vec<String> {
         let report = self.completion_assessment(revision);
-        report.failed_checks.into_iter().chain(report.verification_gaps).chain(report.advisories).collect()
+        report
+            .failed_checks
+            .into_iter()
+            .chain(report.verification_gaps)
+            .chain(report.advisories)
+            .collect()
     }
 
     #[cfg(test)]
-    fn completion_gaps_with_changed_paths(&self, revision: u64, paths: Option<&[(String, std::path::PathBuf)]>, untracked: bool) -> Vec<String> {
+    fn completion_gaps_with_changed_paths(
+        &self,
+        revision: u64,
+        paths: Option<&[(String, std::path::PathBuf)]>,
+        untracked: bool,
+    ) -> Vec<String> {
         let report = self.completion_assessment_with_changed_paths(revision, paths, untracked);
-        report.failed_checks.into_iter().chain(report.verification_gaps).chain(report.advisories).collect()
+        report
+            .failed_checks
+            .into_iter()
+            .chain(report.verification_gaps)
+            .chain(report.advisories)
+            .collect()
     }
-
 
     pub(crate) fn batching_advisory(&self, is_continuation: bool) -> Option<String> {
         (is_continuation
@@ -3328,9 +3768,11 @@ impl TurnExecutionControl {
 
     /// Owner-derived checklist accounting only, never proof of task completion.
     pub(crate) fn plan_completed(&self) -> bool {
-        self.plan_updated_since_input && self.plan
-            .as_ref()
-            .is_some_and(|plan| plan.has_steps && plan.obligations.unresolved.is_empty())
+        self.plan_updated_since_input
+            && self
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.has_steps && plan.obligations.unresolved.is_empty())
     }
 
     pub(crate) fn take_soft_convergence_directive(
@@ -3381,9 +3823,9 @@ impl TurnExecutionControl {
                 process_progress |= outcome.process_observation_progress;
                 continue;
             }
-            if let Some(novel) = outcome.source_evidence.as_ref()
-                    .and_then(|evidence| self.observe_delivered_coverage(evidence, outcome.source_artifact_id.as_deref()))
-            {
+            if let Some(novel) = outcome.source_evidence.as_ref().and_then(|evidence| {
+                self.observe_delivered_coverage(evidence, outcome.source_artifact_id.as_deref())
+            }) {
                 if novel {
                     progress.push(TurnTimingProgressKind::NewSourceEvidence);
                 }
@@ -3413,7 +3855,8 @@ impl TurnExecutionControl {
                 let evidence = if outcome.is_failure_evidence() {
                     format!("failure:{evidence}")
                 } else if !outcome.source_evidence.as_ref().is_some_and(|evidence| {
-                    evidence.get("source").is_some() && evidence.get("scope").is_some()
+                    evidence.get("source").is_some()
+                        && evidence.get("scope").is_some()
                         && evidence.get("identity").is_some()
                 }) {
                     format!(
@@ -3461,7 +3904,10 @@ impl TurnExecutionControl {
             && settled.tool_exposure_revision == baselines.tool_exposure_revision
             && self.input_revision == baselines.input_revision
             && !state.outcomes.is_empty()
-            && state.outcomes.iter().filter(|outcome| !wrappers.contains(&outcome.ordinal))
+            && state
+                .outcomes
+                .iter()
+                .filter(|outcome| !wrappers.contains(&outcome.ordinal))
                 .all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success);
         self.lightweight_handoffs = if lightweight {
             self.lightweight_handoffs.saturating_add(1)
@@ -3479,7 +3925,11 @@ impl TurnExecutionControl {
 
     /// Native file snapshots and their retained artifacts share delivered bytes,
     /// not freshness. A new source hash or path always starts independent coverage.
-    fn observe_delivered_coverage(&mut self, evidence: &Value, artifact_id: Option<&str>) -> Option<bool> {
+    fn observe_delivered_coverage(
+        &mut self,
+        evidence: &Value,
+        artifact_id: Option<&str>,
+    ) -> Option<bool> {
         let source = evidence["source"].as_str()?;
         if !matches!(source, "read_file" | "artifact") {
             return None;
@@ -3487,22 +3937,30 @@ impl TurnExecutionControl {
         let identity = evidence.get("identity")?;
         let sha256 = identity["sha256"].as_str()?;
         let scope = evidence.get("scope")?;
-        let ranges = identity["ranges"].as_array()?.iter().map(|range| {
-            let range = range.as_array()?;
-            if range.len() != 2 {
-                return None;
-            }
-            let start = range[0].as_u64()?;
-            let end = range[1].as_u64()?;
-            (start <= end).then_some((start, end))
-        }).collect::<Option<Vec<_>>>()?;
+        let ranges = identity["ranges"]
+            .as_array()?
+            .iter()
+            .map(|range| {
+                let range = range.as_array()?;
+                if range.len() != 2 {
+                    return None;
+                }
+                let start = range[0].as_u64()?;
+                let end = range[1].as_u64()?;
+                (start <= end).then_some((start, end))
+            })
+            .collect::<Option<Vec<_>>>()?;
         let values = identity["values"].as_array()?;
         let key = value_evidence_identity(&serde_json::json!([source, scope, sha256]))?;
         let delivered = DeliveredSourceCoverage {
             ranges,
             query_proofs: values.iter().filter_map(value_evidence_identity).collect(),
         };
-        let sources = self.artifact_source_coverage.get(&key).cloned().unwrap_or_default();
+        let sources = self
+            .artifact_source_coverage
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         // Alias propagation can change the digest even without novel source bytes.
         self.evidence_fingerprint.take();
         // Other reads may have filled holes since this artifact was created.
@@ -3510,23 +3968,40 @@ impl TurnExecutionControl {
         if source == "artifact" {
             for source in &sources {
                 if let Some(coverage) = self.delivered_coverage.get(source).cloned() {
-                    self.delivered_coverage.entry(key.clone()).or_default().merge(&coverage);
+                    self.delivered_coverage
+                        .entry(key.clone())
+                        .or_default()
+                        .merge(&coverage);
                 }
             }
         }
-        let novel = self.delivered_coverage.entry(key.clone()).or_default().merge(&delivered);
+        let novel = self
+            .delivered_coverage
+            .entry(key.clone())
+            .or_default()
+            .merge(&delivered);
         if source == "read_file" {
             if let Some(id) = artifact_id {
-                let artifact_key = value_evidence_identity(&serde_json::json!(["artifact", id, sha256]))?;
+                let artifact_key =
+                    value_evidence_identity(&serde_json::json!(["artifact", id, sha256]))?;
                 let coverage = self.delivered_coverage.get(&key)?.clone();
-                self.delivered_coverage.entry(artifact_key.clone()).or_default().merge(&coverage);
-                self.artifact_source_coverage.entry(artifact_key).or_default().insert(key);
+                self.delivered_coverage
+                    .entry(artifact_key.clone())
+                    .or_default()
+                    .merge(&coverage);
+                self.artifact_source_coverage
+                    .entry(artifact_key)
+                    .or_default()
+                    .insert(key);
             }
         } else {
             // Recovery delivered the exact bytes of these authenticated snapshots.
             // It does not refresh their paths or authorize replay of stale files.
             for source in sources {
-                self.delivered_coverage.entry(source).or_default().merge(&delivered);
+                self.delivered_coverage
+                    .entry(source)
+                    .or_default()
+                    .merge(&delivered);
             }
         }
         Some(novel)
@@ -3539,7 +4014,9 @@ impl TurnExecutionControl {
         signals: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) -> bool {
-        !self.observe_progress(baselines, signals, settled).is_empty()
+        !self
+            .observe_progress(baselines, signals, settled)
+            .is_empty()
     }
 
     #[cfg(test)]
@@ -3640,7 +4117,8 @@ impl TurnExecutionControl {
             purpose: collector.generation_purpose(baselines, settled, has_pending_input, false),
             sampling: SamplingGenerationDisposition::DecisionBearing,
             relevant_state_fingerprint,
-            failure_fingerprint: analysis.deterministic_cycle()
+            failure_fingerprint: analysis
+                .deterministic_cycle()
                 .and_then(|cycle| cycle.failure_fingerprint.clone()),
             terminal_completion_only: false,
         }
@@ -3685,43 +4163,61 @@ impl TurnExecutionControl {
         let mut diagnoses = BTreeMap::new();
         for item in recent {
             match item {
-                ResponseItem::FunctionCall { name, namespace: None, arguments, call_id, .. } => {
-                    let payload = ToolPayload::Function { arguments: arguments.clone() };
+                ResponseItem::FunctionCall {
+                    name,
+                    namespace: None,
+                    arguments,
+                    call_id,
+                    ..
+                } => {
+                    let payload = ToolPayload::Function {
+                        arguments: arguments.clone(),
+                    };
                     let canonical = canonical_tool_action(&payload);
                     if canonical.identity_payload.is_none()
                         && let Some(action) = structured_action_identity_from_canonical(
-                            &ToolName::plain(name.clone()), &payload, &canonical,
+                            &ToolName::plain(name.clone()),
+                            &payload,
+                            &canonical,
                         )
                     {
                         calls.insert(call_id, action.identity);
                     }
                 }
-                ResponseItem::FunctionCallOutput { call_id, output, .. }
-                    if output.success == Some(false) =>
-                {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } if output.success == Some(false) => {
                     if let Some(identity) = calls.get(call_id) {
-                        diagnoses.insert(identity.clone(), format!("json-argument-syntax-v1:{identity}"));
+                        diagnoses.insert(
+                            identity.clone(),
+                            format!("json-argument-syntax-v1:{identity}"),
+                        );
                     }
                 }
                 _ => {}
             }
         }
-        self.dispatch_ledger.lock()
+        self.dispatch_ledger
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .argument_syntax_failures = diagnoses;
     }
 
     /// Transfer unresolved questions without importing prior-turn proof.
     pub(crate) fn with_session_validation_uncertainty(
-        mut self, owner: Arc<Mutex<SessionValidationUncertainty>>,
+        mut self,
+        owner: Arc<Mutex<SessionValidationUncertainty>>,
     ) -> Self {
         {
-            let mut retained = owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retained = owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.failed_validation_checks = std::mem::take(&mut retained.failed_checks);
             self.inherited_validation_checks = self.failed_validation_checks.clone();
             self.failed_validation_tests = std::mem::take(&mut retained.failed_tests);
             self.validation_check_orders = std::mem::take(&mut retained.check_orders);
-            self.next_validation_request.store(retained.next_request, Ordering::Relaxed);
+            self.next_validation_request
+                .store(retained.next_request, Ordering::Relaxed);
             self.pending_validation_coverage = std::mem::take(&mut retained.pending);
         }
         // Mutation revisions are turn-local. Preserve the question, not an old
@@ -3734,7 +4230,11 @@ impl TurnExecutionControl {
             pending.revision = 0;
             pending.inherited = true;
         }
-        self.validation_check_revisions.extend(self.validation_check_orders.keys().map(|check| (check.clone(), 0)));
+        self.validation_check_revisions.extend(
+            self.validation_check_orders
+                .keys()
+                .map(|check| (check.clone(), 0)),
+        );
         self.session_validation_uncertainty = Some(owner);
         self
     }
@@ -3779,7 +4279,11 @@ impl TurnExecutionControl {
         let collector = analysis.collector;
         // Required validation remains turn-owned across request collectors.
         // Background services without validation ownership do not gate delivery.
-        if self.pending_validation_coverage.values().any(|pending| !pending.inherited) {
+        if self
+            .pending_validation_coverage
+            .values()
+            .any(|pending| !pending.inherited)
+        {
             return SamplingConvergenceDecision::default();
         }
         if self.input_revision == baselines.input_revision
@@ -3796,7 +4300,9 @@ impl TurnExecutionControl {
         // Presentation/write-consistency revisions are not execution progress.
         let settled_revision = format!(
             "mutation={};input={};tool_exposure={}",
-            settled.attributed_mutation_revision, self.input_revision, settled.tool_exposure_revision,
+            settled.attributed_mutation_revision,
+            self.input_revision,
+            settled.tool_exposure_revision,
         );
         // Validation proves only its observed execution. It cannot prove that
         // all user-requested changes, checks, or child lifecycle actions are done.
@@ -3834,9 +4340,9 @@ impl TurnExecutionControl {
             .then(|| analysis.deterministic_cycle())
             .flatten();
         let request_deterministic_cycle = request_cycle.as_ref().map(|cycle| cycle.key.clone());
-        let repeated_cycle = request_cycle.as_ref().is_some_and(|cycle| {
-            self.recent_cycles.contains(&cycle.key)
-        });
+        let repeated_cycle = request_cycle
+            .as_ref()
+            .is_some_and(|cycle| self.recent_cycles.contains(&cycle.key));
         // Keep a bounded set of observations, not just the adjacent one.
         // Relevant state changes above invalidate the entire window.
         if let Some(cycle) = request_cycle.as_ref()
@@ -4010,7 +4516,6 @@ impl TurnExecutionControl {
         }
 
         if collector.suppressed_blocked_wait() {
-
             self.last_state_revision = Some(settled_revision);
             self.directive_issued = true;
             self.proven_loop_active = true;
@@ -4130,7 +4635,6 @@ impl TurnExecutionControl {
         self.reset_turn_efficiency_guard();
     }
 
-
     fn reset_turn_efficiency_guard(&mut self) {
         self.turn_efficiency_guard = None;
         self.turn_efficiency_tool_calls = 0;
@@ -4155,63 +4659,120 @@ impl TurnExecutionControl {
         revision: u64,
         tracker: &crate::turn_diff_tracker::TurnDiffTracker,
     ) {
-        let Some(before) = self.validation_coverage_revision else { return; };
-        if before == revision || tracker.current_mutation_revision() != revision { return; }
-        let Some(changes) = tracker.validation_changes_since(before) else { return; };
+        let Some(before) = self.validation_coverage_revision else {
+            return;
+        };
+        if before == revision || tracker.current_mutation_revision() != revision {
+            return;
+        }
+        let Some(changes) = tracker.validation_changes_since(before) else {
+            return;
+        };
         self.validation_coverage.retain(|_, scope| {
             scope.dependency_scope.as_ref().is_some_and(|dependencies| {
-                !dependencies.is_empty() && !changes.iter().any(|(environment, path)| {
-                    if *environment != scope.environment_id { return false; }
-                    let path = SourceDependencyV1::new(path, false);
-                    dependencies.iter().any(|dependency| source_scope_contains(dependency, &path.path))
-                })
+                !dependencies.is_empty()
+                    && !changes.iter().any(|(environment, path)| {
+                        if *environment != scope.environment_id {
+                            return false;
+                        }
+                        let path = SourceDependencyV1::new(path, false);
+                        dependencies
+                            .iter()
+                            .any(|dependency| source_scope_contains(dependency, &path.path))
+                    })
             })
         });
         for failed in self.failed_validation_tests.values_mut() {
-            let independent = failed.scope.as_ref().and_then(|scope|
-                scope.dependency_scope.as_ref().map(|dependencies| (scope, dependencies)))
-                .is_some_and(|(scope, dependencies)| !dependencies.is_empty()
-                    && !changes.iter().any(|(environment, path)| *environment == scope.environment_id
-                        && dependencies.iter().any(|dependency|
-                            source_scope_contains(dependency, &SourceDependencyV1::new(path, false).path))));
-            if !independent { failed.evidence.passed.clear(); }
+            let independent = failed
+                .scope
+                .as_ref()
+                .and_then(|scope| {
+                    scope
+                        .dependency_scope
+                        .as_ref()
+                        .map(|dependencies| (scope, dependencies))
+                })
+                .is_some_and(|(scope, dependencies)| {
+                    !dependencies.is_empty()
+                        && !changes.iter().any(|(environment, path)| {
+                            *environment == scope.environment_id
+                                && dependencies.iter().any(|dependency| {
+                                    source_scope_contains(
+                                        dependency,
+                                        &SourceDependencyV1::new(path, false).path,
+                                    )
+                                })
+                        })
+                });
+            if !independent {
+                failed.evidence.passed.clear();
+            }
             failed.revision = revision;
         }
         self.validation_coverage_revision = Some(revision);
     }
 
-    fn reconcile_test_repairs(&mut self, check: &str, revision: u64,
-        execution_order: (u64, u64), scope: Option<ValidationScope>, evidence: &RunnerTestEvidence, failed: bool)
-    {
-        if failed && evidence.required.as_ref().is_some_and(|required|
-            !required.is_empty() && !required.is_subset(&evidence.passed))
+    fn reconcile_test_repairs(
+        &mut self,
+        check: &str,
+        revision: u64,
+        execution_order: (u64, u64),
+        scope: Option<ValidationScope>,
+        evidence: &RunnerTestEvidence,
+        failed: bool,
+    ) {
+        if failed
+            && evidence.required.as_ref().is_some_and(|required| {
+                !required.is_empty() && !required.is_subset(&evidence.passed)
+            })
         {
-            self.failed_validation_tests.insert(check.to_string(), FailedTestValidation {
-                evidence: evidence.clone(), revision, execution_order, scope,
-            });
+            self.failed_validation_tests.insert(
+                check.to_string(),
+                FailedTestValidation {
+                    evidence: evidence.clone(),
+                    revision,
+                    execution_order,
+                    scope,
+                },
+            );
         }
-        for previous in self.failed_validation_tests.values_mut()
-            .filter(|previous| previous.revision == revision
-                && previous.execution_order <= execution_order
-                && previous.evidence.input_context == evidence.input_context)
+        for previous in self
+            .failed_validation_tests
+            .values_mut()
+            .filter(|previous| {
+                previous.revision == revision
+                    && previous.execution_order <= execution_order
+                    && previous.evidence.input_context == evidence.input_context
+            })
         {
             if failed {
                 if let Some(required) = &evidence.required {
-                    previous.evidence.passed.retain(|test| !required.contains(test));
+                    previous
+                        .evidence
+                        .passed
+                        .retain(|test| !required.contains(test));
                 } else {
                     previous.evidence.passed.clear();
                 }
             }
-            previous.evidence.passed.extend(evidence.passed.iter().cloned());
+            previous
+                .evidence
+                .passed
+                .extend(evidence.passed.iter().cloned());
             previous.execution_order = execution_order;
         }
-        if failed { return; }
+        if failed {
+            return;
+        }
         self.failed_validation_tests.retain(|check, previous| {
             let repaired = previous.revision == revision
                 && previous.execution_order <= execution_order
                 && previous.evidence.input_context == evidence.input_context
-                && previous.evidence.required.as_ref().is_some_and(|required|
-                    required.is_subset(&previous.evidence.passed));
+                && previous
+                    .evidence
+                    .required
+                    .as_ref()
+                    .is_some_and(|required| required.is_subset(&previous.evidence.passed));
             if repaired {
                 self.failed_validation_checks.remove(check);
                 self.inherited_validation_checks.remove(check);
@@ -4237,44 +4798,84 @@ impl TurnExecutionControl {
             }
         }
         {
-            let state = collector.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = collector
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut outcomes = state.outcomes.iter().collect::<Vec<_>>();
             outcomes.sort_by_key(|outcome| outcome.ordinal);
             for outcome in outcomes {
-                if state.replayed_ordinals.contains(&outcome.ordinal) || outcome.failure_diagnosis_reused {
+                if state.replayed_ordinals.contains(&outcome.ordinal)
+                    || outcome.failure_diagnosis_reused
+                {
                     continue;
                 }
-                let pending = outcome.observed_process_id
+                let pending = outcome
+                    .observed_process_id
                     .and_then(|id| self.pending_validation_coverage.get(&id).cloned());
-                let scope = outcome.validation_scope.clone()
+                let scope = outcome
+                    .validation_scope
+                    .clone()
                     .or_else(|| pending.as_ref().and_then(|pending| pending.scope.clone()));
-                let check = pending.as_ref().map(|pending| pending.check.clone())
-                    .or_else(|| state.validation_check_identities.get(&outcome.ordinal).cloned());
-                if let Some(check) = check.filter(|_| pending.is_some() || scope.is_some()
-                    || state.validation_proof_ordinals.contains(&outcome.ordinal))
-                {
+                let check = pending
+                    .as_ref()
+                    .map(|pending| pending.check.clone())
+                    .or_else(|| {
+                        state
+                            .validation_check_identities
+                            .get(&outcome.ordinal)
+                            .cloned()
+                    });
+                if let Some(check) = check.filter(|_| {
+                    pending.is_some()
+                        || scope.is_some()
+                        || state.validation_proof_ordinals.contains(&outcome.ordinal)
+                }) {
                     // A poll's admitted revision describes observation, not
                     // when the background validation actually executed.
-                    let revision = pending.as_ref().map(|pending| pending.revision)
+                    let revision = pending
+                        .as_ref()
+                        .map(|pending| pending.revision)
                         .or(outcome.validation_mutation_revision)
                         .unwrap_or(collector.request_mutation_revision);
                     let test_execution = state.test_validation_ordinals.contains(&outcome.ordinal)
                         || scope.as_ref().is_some_and(|scope| scope.test_execution)
-                        || pending.as_ref().is_some_and(|pending| pending.test_execution);
+                        || pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.test_execution);
                     // Keep launch order across polls. A workspace revision alone
                     // cannot order contradictory executions against the same inputs.
-                    let execution_order = pending.as_ref().map(|pending| pending.execution_order)
+                    let execution_order = pending
+                        .as_ref()
+                        .map(|pending| pending.execution_order)
                         .unwrap_or((collector.request_ordinal, outcome.ordinal));
                     let inherited = pending.as_ref().is_some_and(|pending| pending.inherited);
                     if let Some(id) = outcome.background_process_id {
-                        self.pending_validation_coverage.insert(id, PendingValidation {
-                            revision, execution_order, inherited, check, scope, test_execution,
-                        });
+                        self.pending_validation_coverage.insert(
+                            id,
+                            PendingValidation {
+                                revision,
+                                execution_order,
+                                inherited,
+                                check,
+                                scope,
+                                test_execution,
+                            },
+                        );
                         continue;
                     }
-                    if self.validation_check_revisions.get(&check).is_some_and(|latest|
-                        *latest > revision || *latest == revision
-                            && self.validation_check_orders.get(&check).is_some_and(|order| *order > execution_order)) {
+                    if self
+                        .validation_check_revisions
+                        .get(&check)
+                        .is_some_and(|latest| {
+                            *latest > revision
+                                || *latest == revision
+                                    && self
+                                        .validation_check_orders
+                                        .get(&check)
+                                        .is_some_and(|order| *order > execution_order)
+                        })
+                    {
                         // The diagnostic remains in history; only its active
                         // proof bookkeeping is superseded by the newer run.
                         if let Some(id) = outcome.observed_process_id {
@@ -4289,9 +4890,15 @@ impl TurnExecutionControl {
                         // Retain the revision actually tested even when settlement
                         // advanced without a mutation ordinal. A later delivery
                         // must still see that validation gap.
-                        self.validation_check_revisions.insert(check.clone(), revision);
-                        self.validation_check_orders.insert(check.clone(), execution_order);
-                        if !inherited && self.validated_mutation_revision.is_none_or(|latest| revision >= latest) {
+                        self.validation_check_revisions
+                            .insert(check.clone(), revision);
+                        self.validation_check_orders
+                            .insert(check.clone(), execution_order);
+                        if !inherited
+                            && self
+                                .validated_mutation_revision
+                                .is_none_or(|latest| revision >= latest)
+                        {
                             self.validated_mutation_revision = Some(revision);
                             self.validated_check = None;
                         }
@@ -4305,14 +4912,22 @@ impl TurnExecutionControl {
                                 self.validation_coverage.insert(check.clone(), scope);
                             }
                         }
-                    } else if matches!(outcome.kind, SamplingToolOutcomeKind::Failure
-                        | SamplingToolOutcomeKind::Timeout | SamplingToolOutcomeKind::RecoverableCancellation)
-                    {
-                        self.validation_check_revisions.insert(check.clone(), revision);
-                        self.validation_check_orders.insert(check.clone(), execution_order);
+                    } else if matches!(
+                        outcome.kind,
+                        SamplingToolOutcomeKind::Failure
+                            | SamplingToolOutcomeKind::Timeout
+                            | SamplingToolOutcomeKind::RecoverableCancellation
+                    ) {
+                        self.validation_check_revisions
+                            .insert(check.clone(), revision);
+                        self.validation_check_orders
+                            .insert(check.clone(), execution_order);
                         self.failed_validation_checks.insert(check.clone());
-                        if inherited { self.inherited_validation_checks.insert(check.clone()); }
-                        else { self.inherited_validation_checks.remove(&check); }
+                        if inherited {
+                            self.inherited_validation_checks.insert(check.clone());
+                        } else {
+                            self.inherited_validation_checks.remove(&check);
+                        }
                         self.failed_validation_tests.remove(&check);
                         if inherited {
                             // Historical failure is not evidence against a
@@ -4330,34 +4945,62 @@ impl TurnExecutionControl {
                             }
                         }
                         let previous = self.validation_coverage.remove(&check);
-                        if let Some(failed) = scope.filter(|scope| !scope.paths.is_empty())
+                        if let Some(failed) = scope
+                            .filter(|scope| !scope.paths.is_empty())
                             .or(previous.filter(|scope| !scope.paths.is_empty()))
                         {
-                            for (_, coverage) in self.validation_coverage.iter_mut()
-                                .filter(|(check, coverage)| coverage.environment_id == failed.environment_id
-                                    && self.validation_check_revisions.get(*check).is_none_or(|latest| *latest <= revision))
+                            for (_, coverage) in
+                                self.validation_coverage
+                                    .iter_mut()
+                                    .filter(|(check, coverage)| {
+                                        coverage.environment_id == failed.environment_id
+                                            && self
+                                                .validation_check_revisions
+                                                .get(*check)
+                                                .is_none_or(|latest| *latest <= revision)
+                                    })
                             {
-                                coverage.paths.retain(|path| !failed.paths.iter().any(|failed|
-                                    source_scope_contains(failed, &path.path)
-                                        || source_scope_contains(path, &failed.path)));
-                                coverage.behavioral_paths.retain(|path| !failed.paths.iter().any(|failed|
-                                    source_scope_contains(failed, &path.path)
-                                        || source_scope_contains(path, &failed.path)));
+                                coverage.paths.retain(|path| {
+                                    !failed.paths.iter().any(|failed| {
+                                        source_scope_contains(failed, &path.path)
+                                            || source_scope_contains(path, &failed.path)
+                                    })
+                                });
+                                coverage.behavioral_paths.retain(|path| {
+                                    !failed.paths.iter().any(|failed| {
+                                        source_scope_contains(failed, &path.path)
+                                            || source_scope_contains(path, &failed.path)
+                                    })
+                                });
                             }
-                            self.validation_coverage.retain(|_, coverage| !coverage.paths.is_empty());
+                            self.validation_coverage
+                                .retain(|_, coverage| !coverage.paths.is_empty());
                         } else {
                             // No dependency attribution can prove another scope
                             // independent of this failed execution.
-                            self.validation_coverage.retain(|check, _|
-                                self.validation_check_revisions.get(check).is_some_and(|latest| *latest > revision));
+                            self.validation_coverage.retain(|check, _| {
+                                self.validation_check_revisions
+                                    .get(check)
+                                    .is_some_and(|latest| *latest > revision)
+                            });
                         }
                     }
-                    if !inherited && revision == settled.mutation_revision
-                        && matches!(outcome.kind, SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Failure)
+                    if !inherited
+                        && revision == settled.mutation_revision
+                        && matches!(
+                            outcome.kind,
+                            SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Failure
+                        )
                         && let Some(evidence) = &outcome.runner_test_evidence
                     {
-                        self.reconcile_test_repairs(&check, revision, execution_order, repair_scope, evidence,
-                            outcome.kind == SamplingToolOutcomeKind::Failure);
+                        self.reconcile_test_repairs(
+                            &check,
+                            revision,
+                            execution_order,
+                            repair_scope,
+                            evidence,
+                            outcome.kind == SamplingToolOutcomeKind::Failure,
+                        );
                     }
                 }
                 if outcome.kind != SamplingToolOutcomeKind::Yielded
@@ -4415,13 +5058,18 @@ mod tests {
         let path = directory.path().join("source.txt");
         std::fs::write(&path, "retained").unwrap();
         let previous = GitWorkspaceCache::with_noop_watcher_for_tests();
-        let old_paths = previous.begin_source_path_change_observations(
-            directory.path(), &[(path.clone(), false)],
-        ).await.unwrap();
+        let old_paths = previous
+            .begin_source_path_change_observations(directory.path(), &[(path.clone(), false)])
+            .await
+            .unwrap();
         let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
         let workspace = WorkspaceEvidenceIdentity {
-            unavailable: false, repository_root: Some(directory.path().to_string_lossy().into_owned()),
-            head_identity: None, index_identity: None, worktree_identity: None, path_fingerprints: None,
+            unavailable: false,
+            repository_root: Some(directory.path().to_string_lossy().into_owned()),
+            head_identity: None,
+            index_identity: None,
+            worktree_identity: None,
+            path_fingerprints: None,
         };
         let hash = crate::tool_history::sha256(b"retained");
         let guard = super::SuccessfulReplayGuard {
@@ -4429,7 +5077,8 @@ mod tests {
                 call_id: "old-read".into(),
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text(
-                        serde_json::json!({"source_sha256":hash,"canonical_bytes":8}).to_string()),
+                        serde_json::json!({"source_sha256":hash,"canonical_bytes":8}).to_string(),
+                    ),
                     success: Some(true),
                 },
             },
@@ -4438,18 +5087,29 @@ mod tests {
                 read_payload: Some(super::ToolPayload::Function {
                     arguments: serde_json::json!({"path":path}).to_string(),
                 }),
-                read_output: None, path_scoped: true, mutation_revision: 0,
-                workspace_revision: Some(workspace.clone()), source_paths: old_paths,
+                read_output: None,
+                path_scoped: true,
+                mutation_revision: 0,
+                workspace_revision: Some(workspace.clone()),
+                source_paths: old_paths,
             },
         };
         assert!(!guard.is_fresh(0, &cache, Some(&workspace)));
-        assert_eq!(guard.cold_read_fingerprint(&cache, Some(&workspace)), Some((hash, 8)));
-        let paths = cache.begin_source_path_change_observations(
-            directory.path(), &[(path, false)],
-        ).await.unwrap();
+        assert_eq!(
+            guard.cold_read_fingerprint(&cache, Some(&workspace)),
+            Some((hash, 8))
+        );
+        let paths = cache
+            .begin_source_path_change_observations(directory.path(), &[(path, false)])
+            .await
+            .unwrap();
         let refreshed = guard.with_validated_source_paths(paths, Some(workspace.clone()), 0);
         assert!(refreshed.is_fresh(0, &cache, Some(&workspace)));
-        assert!(refreshed.cold_read_fingerprint(&cache, Some(&workspace)).is_none());
+        assert!(
+            refreshed
+                .cold_read_fingerprint(&cache, Some(&workspace))
+                .is_none()
+        );
         // A mutation after the bounded hash read but before installation rejects replay.
         cache.note_host_workspace_mutation();
         assert!(!refreshed.is_fresh(0, &cache, Some(&workspace)));
@@ -4528,7 +5188,9 @@ mod tests {
         collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(outcome),
-            validation_invocation_status(&tool_name, &payload).2.then(test_execution_signal),
+            validation_invocation_status(&tool_name, &payload)
+                .2
+                .then(test_execution_signal),
             &if validation_invocation_status(&tool_name, &payload).2 {
                 runner_tool_response(call_id, "Ran 1 test in 0.001s\nOK")
             } else {
@@ -4578,7 +5240,8 @@ mod tests {
 
     fn settle_plan(control: &mut TurnExecutionControl, plan: UpdatePlanArgs) {
         control.refresh_plan(Some(crate::plan_store::PlanExecutionSnapshot::new(
-            &plan, &crate::plan_store::PlanLineage::default(),
+            &plan,
+            &crate::plan_store::PlanLineage::default(),
         )));
         let baselines = control.baselines(0);
         let collector = SamplingRequestSignalCollector::default();
@@ -4593,13 +5256,26 @@ mod tests {
     #[test]
     fn status_only_plan_update_refreshes_owner_revision_and_obligations() {
         let mut control = TurnExecutionControl::new();
-        settle_plan(&mut control, plan(&[StepStatus::InProgress, StepStatus::Pending]));
+        settle_plan(
+            &mut control,
+            plan(&[StepStatus::InProgress, StepStatus::Pending]),
+        );
         let revision = control.plan_revision;
-        settle_plan(&mut control, plan(&[StepStatus::Completed, StepStatus::Completed]));
+        settle_plan(
+            &mut control,
+            plan(&[StepStatus::Completed, StepStatus::Completed]),
+        );
         assert!(control.plan_completed());
         assert!(control.completion_gaps(0).is_empty());
         assert_eq!(control.plan_revision, revision + 1);
-        settle_plan(&mut control, plan(&[StepStatus::Completed, StepStatus::Completed, StepStatus::Pending]));
+        settle_plan(
+            &mut control,
+            plan(&[
+                StepStatus::Completed,
+                StepStatus::Completed,
+                StepStatus::Pending,
+            ]),
+        );
         assert!(!control.plan_completed());
         assert_eq!(control.plan_revision, revision + 2);
     }
@@ -4607,16 +5283,23 @@ mod tests {
     #[test]
     fn plan_completion_hint_does_not_survive_new_input_or_turn_inheritance() {
         let completed = plan(&[StepStatus::Completed]);
-        let snapshot = crate::plan_store::PlanExecutionSnapshot::new(&completed, &Default::default());
+        let snapshot =
+            crate::plan_store::PlanExecutionSnapshot::new(&completed, &Default::default());
         let mut control = TurnExecutionControl::new().with_active_plan(Some(snapshot.clone()));
         assert!(!control.plan_completed());
-        assert!(control.completion_gaps(0).is_empty(), "completed history is not new task debt");
+        assert!(
+            control.completion_gaps(0).is_empty(),
+            "completed history is not new task debt"
+        );
         settle_plan(&mut control, plan(&[StepStatus::Pending]));
         settle_plan(&mut control, completed);
         assert!(control.plan_completed());
         control.accepted_user_input();
         control.refresh_plan(Some(snapshot));
-        assert!(!control.plan_completed(), "unchanged old completion cannot qualify a new request");
+        assert!(
+            !control.plan_completed(),
+            "unchanged old completion cannot qualify a new request"
+        );
     }
 
     fn lightweight_handoff_collector(
@@ -4641,9 +5324,12 @@ mod tests {
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
-                    crate::tools::context::successful_command_evidence(output.as_bytes(), None)
-                ))),
+                Some(crate::tools::context::semantic_evidence_sampling_signal(
+                    json!(crate::tools::context::successful_command_evidence(
+                        output.as_bytes(),
+                        None
+                    )),
+                )),
                 &successful_tool_response(&id, &output),
                 false,
             );
@@ -4655,12 +5341,18 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::print_stderr, reason = "this policy replay emits machine-readable deterministic measurements")]
+    #[expect(
+        clippy::print_stderr,
+        reason = "this policy replay emits machine-readable deterministic measurements"
+    )]
     fn lightweight_handoff_advisory_preserves_novel_progress_and_tool_access() {
         let mut measurements = Vec::new();
         for generations in [2, 3, 4] {
             for negligible_runtime_ms_per_call in [250, 500, 1_000] {
-                let policy = HandoffEfficiencyPolicy { generations, negligible_runtime_ms_per_call };
+                let policy = HandoffEfficiencyPolicy {
+                    generations,
+                    negligible_runtime_ms_per_call,
+                };
                 let mut control = TurnExecutionControl::new();
                 control.handoff_policy = policy;
                 // Replay the same producer evidence through the real control
@@ -4668,21 +5360,35 @@ mod tests {
                 let (baselines, settled) = unchanged_state(&control);
                 for generation in 1..=generations as usize {
                     let collector = lightweight_handoff_collector(
-                        &control, &baselines, generation, 1, Some(100), 0,
+                        &control,
+                        &baselines,
+                        generation,
+                        1,
+                        Some(100),
+                        0,
                     );
                     assert_eq!(
                         control.observe_progress(&baselines, &collector, &settled),
                         vec![TurnTimingProgressKind::NewSourceEvidence],
                     );
-                    assert_eq!(control.batching_advisory(true).is_some(),
-                        generation == generations as usize);
+                    assert_eq!(
+                        control.batching_advisory(true).is_some(),
+                        generation == generations as usize
+                    );
                     assert!(control.batching_advisory(false).is_none());
                     let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-                    assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+                    assert_eq!(
+                        decision.continuation,
+                        ContinuationDisposition::ModelRequired
+                    );
                     assert!(!decision.proven_loop_activated);
-                    assert!(!control.continuation_generation_request(
-                        &baselines, &collector, &settled, false,
-                    ).terminal_completion_only);
+                    assert!(
+                        !control
+                            .continuation_generation_request(
+                                &baselines, &collector, &settled, false,
+                            )
+                            .terminal_completion_only
+                    );
                 }
                 let directive = control.batching_advisory(true).unwrap();
                 assert!(directive.contains("Do not skip required reading"));
@@ -4693,7 +5399,12 @@ mod tests {
                 assert!(control.batching_advisory(true).is_none());
                 let (baselines, settled) = unchanged_state(&control);
                 let slow = lightweight_handoff_collector(
-                    &control, &baselines, 99, 1, Some(negligible_runtime_ms_per_call + 1), 0,
+                    &control,
+                    &baselines,
+                    99,
+                    1,
+                    Some(negligible_runtime_ms_per_call + 1),
+                    0,
                 );
                 control.observe_progress(&baselines, &slow, &settled);
                 assert_eq!(control.lightweight_handoffs, 0);
@@ -4709,40 +5420,84 @@ mod tests {
         // Deterministic observations, not an estimate of model latency or a
         // production tuning recommendation. The gate pairs these with recovery
         // and cancellation regressions; no candidate changes safety budgets.
-        eprintln!("{}", json!({"kind": "handoff_policy_replay_v1", "measurements": measurements}));
+        eprintln!(
+            "{}",
+            json!({"kind": "handoff_policy_replay_v1", "measurements": measurements})
+        );
     }
 
     #[test]
     fn lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work() {
+        let threshold = LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS as usize;
         for (calls, runtime, mutation_revision, output_bytes) in [
             (1, None, 0, 0),
             (1, Some(501), 0, 0),
             (3, Some(100), 0, 0),
             (1, Some(100), 1, 0),
-            // A fast read that already filled the cell budget leaves nothing to batch.
+            // A fast read that filled half the cell budget leaves no room for a
+            // comparable second read.
             (1, Some(100), 0, OUTPUT_BOUND_HANDOFF_BYTES),
         ] {
             let mut control = TurnExecutionControl::new();
             settle_plan(&mut control, plan(&[StepStatus::InProgress]));
             let baselines = control.baselines(0);
-            for generation in 0..2 {
+            // Had the boundary counted, it would complete the window.
+            for generation in 0..threshold - 1 {
                 let collector = lightweight_handoff_collector(
-                    &control, &baselines, generation, 1, Some(100), 0,
+                    &control,
+                    &baselines,
+                    generation,
+                    1,
+                    Some(100),
+                    0,
                 );
                 control.observe_progress(&baselines, &collector, &settled(0));
             }
             let boundary = lightweight_handoff_collector(
-                &control, &baselines, 2, calls, runtime, output_bytes,
+                &control,
+                &baselines,
+                threshold - 1,
+                calls,
+                runtime,
+                output_bytes,
             );
             control.observe_progress(&baselines, &boundary, &settled(mutation_revision));
             assert!(control.batching_advisory(true).is_none());
-            for generation in 3..6 {
+            for step in 1..=threshold + 1 {
                 let collector = lightweight_handoff_collector(
-                    &control, &baselines, generation, 1, Some(100), 0,
+                    &control,
+                    &baselines,
+                    threshold + step,
+                    1,
+                    Some(100),
+                    0,
                 );
                 control.observe_progress(&baselines, &collector, &settled(0));
-                assert_eq!(control.batching_advisory(true).is_some(), generation == 5);
+                assert_eq!(control.batching_advisory(true).is_some(), step >= threshold);
             }
+        }
+    }
+
+    #[test]
+    fn two_single_read_handoffs_that_fit_one_cell_trigger_the_batching_advisory() {
+        // Each read fills a little over two fifths of the cell budget: two fit
+        // in one cell, so the second separate handoff is orchestration overhead.
+        let cell_bytes = codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4;
+        let read_bytes = cell_bytes * 2 / 5 + 1_000;
+        assert!(2 * read_bytes < cell_bytes);
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        for generation in 1..=2 {
+            let collector = lightweight_handoff_collector(
+                &control,
+                &baselines,
+                generation,
+                1,
+                Some(100),
+                read_bytes,
+            );
+            control.observe_progress(&baselines, &collector, &settled);
+            assert_eq!(control.batching_advisory(true).is_some(), generation == 2);
         }
     }
 
@@ -4931,7 +5686,8 @@ mod tests {
         .enumerate()
         {
             let evidence_before = control.baselines(0).relevant_state_fingerprint();
-            let mut pending = (index > 0).then_some(crate::turn_timing::ContinuationCause::ToolResult);
+            let mut pending =
+                (index > 0).then_some(crate::turn_timing::ContinuationCause::ToolResult);
             timing.begin_model_generation_with_metadata(
                 &mut pending,
                 &codex_protocol::protocol::SessionSource::Cli,
@@ -4952,9 +5708,12 @@ mod tests {
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
-                    crate::tools::context::successful_command_evidence(text.as_bytes(), None)
-                ))),
+                Some(crate::tools::context::semantic_evidence_sampling_signal(
+                    json!(crate::tools::context::successful_command_evidence(
+                        text.as_bytes(),
+                        None
+                    )),
+                )),
                 &successful_tool_response(&call_id, text),
                 false,
             );
@@ -5323,14 +6082,27 @@ mod tests {
 
     #[test]
     fn nonexecuting_validation_modes_cannot_establish_collector_proof() {
-        for command in ["cargo bench --no-run", "cargo test --no-run", "cargo fuzz list",
-            "cargo fmt", "just --dry-run test", "cargo test -- --list"] {
+        for command in [
+            "cargo bench --no-run",
+            "cargo test --no-run",
+            "cargo fuzz list",
+            "cargo fmt",
+            "just --dry-run test",
+            "cargo test -- --list",
+        ] {
             let collector = SamplingRequestSignalCollector::default();
-            let payload = ToolPayload::Function { arguments:json!({"cmd":command}).to_string() };
+            let payload = ToolPayload::Function {
+                arguments: json!({"cmd":command}).to_string(),
+            };
             let status = validation_invocation_status(&ToolName::plain("exec_command"), &payload);
             assert_eq!(status, (true, false, false), "{command}");
-            record_invocation_result(&collector, ToolName::plain("exec_command"), payload,
-                "nonexecuting", ToolOutputOutcome::Success);
+            record_invocation_result(
+                &collector,
+                ToolName::plain("exec_command"),
+                payload,
+                "nonexecuting",
+                ToolOutputOutcome::Success,
+            );
             let state = collector.state.lock().unwrap();
             assert!(state.validation_proof_ordinals.is_empty(), "{command}");
             assert!(state.test_validation_ordinals.is_empty(), "{command}");
@@ -5343,23 +6115,35 @@ mod tests {
         use crate::tools::registry::ToolSemanticCapabilities;
         let collector = SamplingRequestSignalCollector::default();
         let alias = ToolName::new(Some("local".to_string()), "check_project".to_string());
-        collector.register_runtime_semantics(&alias, ToolSemanticCapabilities {
-            command: Some(CommandArgumentFormat::Exec),
-            ..Default::default()
-        });
+        collector.register_runtime_semantics(
+            &alias,
+            ToolSemanticCapabilities {
+                command: Some(CommandArgumentFormat::Exec),
+                ..Default::default()
+            },
+        );
         record_invocation_result(
-            &collector, alias,
-            ToolPayload::Function { arguments: r#"{"cmd":"cargo check -p codex-core"}"#.into() },
-            "alias-check", ToolOutputOutcome::Success,
+            &collector,
+            alias,
+            ToolPayload::Function {
+                arguments: r#"{"cmd":"cargo check -p codex-core"}"#.into(),
+            },
+            "alias-check",
+            ToolOutputOutcome::Success,
         );
         collector.record_child_runtime_for_call("alias-check", 25);
         collector.register_runtime_semantics(
-            &ToolName::plain("exec_command"), ToolSemanticCapabilities::default(),
+            &ToolName::plain("exec_command"),
+            ToolSemanticCapabilities::default(),
         );
         record_invocation_result(
-            &collector, ToolName::plain("exec_command"),
-            ToolPayload::Function { arguments: r#"{"cmd":"cargo check -p codex-core"}"#.into() },
-            "not-a-command-runtime", ToolOutputOutcome::Success,
+            &collector,
+            ToolName::plain("exec_command"),
+            ToolPayload::Function {
+                arguments: r#"{"cmd":"cargo check -p codex-core"}"#.into(),
+            },
+            "not-a-command-runtime",
+            ToolOutputOutcome::Success,
         );
         {
             // Only the alias with command semantics is classified as validation.
@@ -5368,12 +6152,22 @@ mod tests {
             assert_eq!(state.child_runtime_by_call.get("alias-check"), Some(&25));
         }
         let edit = ToolName::plain("custom_editor");
-        collector.register_runtime_semantics(&edit, ToolSemanticCapabilities {
-            mutation: true, coordination: true, command: None,
-        });
+        collector.register_runtime_semantics(
+            &edit,
+            ToolSemanticCapabilities {
+                mutation: true,
+                coordination: true,
+                command: None,
+            },
+        );
         record_invocation_result(
-            &collector, edit, ToolPayload::Function { arguments: "{}".into() },
-            "custom-edit", ToolOutputOutcome::Success,
+            &collector,
+            edit,
+            ToolPayload::Function {
+                arguments: "{}".into(),
+            },
+            "custom-edit",
+            ToolOutputOutcome::Success,
         );
         let state = collector.state.lock().unwrap();
         assert!(state.saw_mutation && state.saw_coordination);
@@ -5411,14 +6205,8 @@ mod tests {
     fn recognized_validation_records_proof_across_shapes_without_required_metadata() {
         for (tool, arguments) in [
             ("exec_command", json!({"cmd": "python -m unittest -q"})),
-            (
-                "exec_command",
-                json!({"cmd": "just test"}),
-            ),
-            (
-                "exec_command",
-                json!({"cmd": "npm run test:unit"}),
-            ),
+            ("exec_command", json!({"cmd": "just test"})),
+            ("exec_command", json!({"cmd": "npm run test:unit"})),
             ("exec_command", json!({"cmd": "uv run pytest -q"})),
             (
                 "exec_command",
@@ -5586,7 +6374,8 @@ mod tests {
     #[test]
     fn metadata_cannot_turn_non_validation_commands_into_proof() {
         let root = tempfile::tempdir().unwrap();
-        let dependencies = BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
+        let dependencies =
+            BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
         let tool = ToolName::plain("exec_command");
         for command in [
             "git status --short",
@@ -5609,7 +6398,12 @@ mod tests {
             // dependencies let a declared path become a scope that settlement
             // would admit as proof.
             let signal = validation_scope_signal(
-                &tool, &payload, None, Some(&dependencies), root.path(), "local",
+                &tool,
+                &payload,
+                None,
+                Some(&dependencies),
+                root.path(),
+                "local",
             );
             let ordinal = collector
                 .register_deterministic_tool_call(&tool, &payload, "not-validation")
@@ -5623,7 +6417,12 @@ mod tests {
             );
             control.settle(&baselines, &collector, &settled_state);
             assert!(
-                collector.state.lock().unwrap().validation_ordinals.is_empty(),
+                collector
+                    .state
+                    .lock()
+                    .unwrap()
+                    .validation_ordinals
+                    .is_empty(),
                 "{command}"
             );
             assert!(control.validated_mutation_revision.is_none(), "{command}");
@@ -5720,7 +6519,12 @@ mod tests {
                 ToolOutputOutcome::Success,
             );
             assert_eq!(
-                collector.state.lock().unwrap().final_verification_ordinals.len(),
+                collector
+                    .state
+                    .lock()
+                    .unwrap()
+                    .final_verification_ordinals
+                    .len(),
                 usize::from(final_verification),
                 "executable: {program}"
             );
@@ -5801,7 +6605,12 @@ mod tests {
 
             // Only the exact read-only pair counts as a final verification.
             assert_eq!(
-                collector.state.lock().unwrap().final_verification_ordinals.len(),
+                collector
+                    .state
+                    .lock()
+                    .unwrap()
+                    .final_verification_ordinals
+                    .len(),
                 1
             );
         }
@@ -5873,7 +6682,14 @@ mod tests {
                 // Give the read the dependencies needed for retention, so a
                 // broken force_fresh bypass would actually seed a replay.
                 record_test_replay_dependencies(&collector, registration.ordinal);
-                assert!(collector.state.lock().unwrap().structured_actions.is_empty());
+                assert!(
+                    collector
+                        .state
+                        .lock()
+                        .unwrap()
+                        .structured_actions
+                        .is_empty()
+                );
                 collector.record_response_result(
                     registration.ordinal,
                     ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
@@ -6202,7 +7018,10 @@ mod tests {
     #[test]
     fn uncertain_native_read_commands_and_namespaced_lookalikes_execute_normally() {
         for (tool, arguments) in [
-            (ToolName::plain("exec_command"), r#"{"cmd":"echo complete"}"#),
+            (
+                ToolName::plain("exec_command"),
+                r#"{"cmd":"echo complete"}"#,
+            ),
             (
                 ToolName::plain("exec_command"),
                 r#"{"cmd":"git diff --output=report.txt"}"#,
@@ -6328,8 +7147,6 @@ mod tests {
             assert_eq!(keys.len(), 3);
         }
     }
-
-
 
     #[test]
     fn unfinished_plan_does_not_invalidate_fresh_validation_evidence() {
@@ -6552,7 +7369,12 @@ mod tests {
             state.direct_wait_agent_count = 2;
         }
         assert!(collector.authoritative_wait_observation().is_some());
-        collector.state.lock().unwrap().authoritative_wait_observations[1].state_revision = "other".into();
+        collector
+            .state
+            .lock()
+            .unwrap()
+            .authoritative_wait_observations[1]
+            .state_revision = "other".into();
         assert!(collector.authoritative_wait_observation().is_none());
     }
 
@@ -6560,48 +7382,92 @@ mod tests {
     fn native_receipt_requires_settled_success_not_plan_bookkeeping() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
-        let collector = authoritative_wait_collector(&control, &baselines, "native", false, Some("{}"));
-        collector.state.lock().unwrap().authoritative_wait_observations[0].result.adapter =
-            "agent_job_report".into();
-        assert!(collector.authoritative_wait_observation().is_none(), "pending producer");
-        collector.state.lock().unwrap().outcomes.push(
-            SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None),
+        let collector =
+            authoritative_wait_collector(&control, &baselines, "native", false, Some("{}"));
+        collector
+            .state
+            .lock()
+            .unwrap()
+            .authoritative_wait_observations[0]
+            .result
+            .adapter = "agent_job_report".into();
+        assert!(
+            collector.authoritative_wait_observation().is_none(),
+            "pending producer"
         );
+        collector
+            .state
+            .lock()
+            .unwrap()
+            .outcomes
+            .push(SamplingToolOutcome::plain(
+                0,
+                SamplingToolOutcomeKind::Success,
+                None,
+            ));
         assert!(collector.authoritative_wait_observation().is_some());
         {
             let mut state = collector.state.lock().unwrap();
-            state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+            state.outcomes.push(SamplingToolOutcome::plain(
+                0,
+                SamplingToolOutcomeKind::Success,
+                None,
+            ));
             assert_eq!(state.outcomes.len(), 2);
         }
-        assert!(collector.authoritative_wait_observation().is_none(), "duplicate is not another completion");
+        assert!(
+            collector.authoritative_wait_observation().is_none(),
+            "duplicate is not another completion"
+        );
         {
             let mut state = collector.state.lock().unwrap();
             state.outcomes.pop();
             state.outcomes[0].kind = SamplingToolOutcomeKind::Failure;
         }
-        assert!(collector.authoritative_wait_observation().is_none(), "failed producer");
+        assert!(
+            collector.authoritative_wait_observation().is_none(),
+            "failed producer"
+        );
         collector.state.lock().unwrap().outcomes[0].kind = SamplingToolOutcomeKind::Success;
-        assert_eq!(control.evaluate_convergence(&baselines, &collector, &settled).continuation,
-            ContinuationDisposition::SurfaceExistingResult);
+        assert_eq!(
+            control
+                .evaluate_convergence(&baselines, &collector, &settled)
+                .continuation,
+            ContinuationDisposition::SurfaceExistingResult
+        );
         settle_plan(&mut control, plan(&[StepStatus::InProgress]));
         let baselines = control.baselines(settled.mutation_revision);
-        assert_eq!(control.evaluate_convergence(&baselines, &collector, &settled).continuation,
-            ContinuationDisposition::SurfaceExistingResult);
+        assert_eq!(
+            control
+                .evaluate_convergence(&baselines, &collector, &settled)
+                .continuation,
+            ContinuationDisposition::SurfaceExistingResult
+        );
     }
 
     #[test]
     fn explicit_delivery_requires_consumed_process_and_complete_evidence() {
-        for scenario in ["complete", "running", "failed", "unrelated", "missing",
-                         "duplicate", "truncated", "out-of-order"] {
+        for scenario in [
+            "complete",
+            "running",
+            "failed",
+            "unrelated",
+            "missing",
+            "duplicate",
+            "truncated",
+            "out-of-order",
+        ] {
             let collector = SamplingRequestSignalCollector::default();
             {
                 let mut state = collector.state.lock().unwrap();
                 state.registered_count = 1;
                 state.code_mode_nested_tool_count = 2;
                 state.explicit_completion = Some((0, "verified answer".into()));
-                let mut started = SamplingToolOutcome::plain(1, SamplingToolOutcomeKind::Yielded, None);
+                let mut started =
+                    SamplingToolOutcome::plain(1, SamplingToolOutcomeKind::Yielded, None);
                 started.background_process_id = Some(7);
-                let mut observed = SamplingToolOutcome::plain(2, SamplingToolOutcomeKind::Success, None);
+                let mut observed =
+                    SamplingToolOutcome::plain(2, SamplingToolOutcomeKind::Success, None);
                 observed.observed_process_id = Some(7);
                 match scenario {
                     "running" => {
@@ -6626,7 +7492,11 @@ mod tests {
                     state.outcomes.push(observed);
                 }
             }
-            assert_eq!(collector.explicit_completion().is_some(), scenario == "complete", "{scenario}");
+            assert_eq!(
+                collector.explicit_completion().is_some(),
+                scenario == "complete",
+                "{scenario}"
+            );
         }
     }
 
@@ -6635,11 +7505,20 @@ mod tests {
         let mut control = TurnExecutionControl::new();
         let baseline = control.baselines(0);
         let launch = control.collector(&baseline);
-        let ordinal = launch.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &validation_proof_payload(), "validation",
-        ).ordinal;
-        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
-            Some(json!({"background_process_id": 7})), &successful_tool_response("validation", "running"), false);
+        let ordinal = launch
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "validation",
+            )
+            .ordinal;
+        launch.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+            Some(json!({"background_process_id": 7})),
+            &successful_tool_response("validation", "running"),
+            false,
+        );
         control.settle(&baseline, &launch, &settled(0));
         assert_eq!(control.pending_validation_coverage.len(), 1);
         let delivery = control.collector(&baseline);
@@ -6647,21 +7526,45 @@ mod tests {
             let mut state = delivery.state.lock().unwrap();
             state.registered_count = 1;
             state.explicit_completion = Some((0, "answer".into()));
-            state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+            state.outcomes.push(SamplingToolOutcome::plain(
+                0,
+                SamplingToolOutcomeKind::Success,
+                None,
+            ));
         }
-        assert_ne!(control.evaluate_convergence(&baseline, &delivery, &settled(0)).continuation,
-            ContinuationDisposition::SurfaceExistingResult);
+        assert_ne!(
+            control
+                .evaluate_convergence(&baseline, &delivery, &settled(0))
+                .continuation,
+            ContinuationDisposition::SurfaceExistingResult
+        );
         let poll = control.collector(&baseline);
-        let ordinal = poll.register_deterministic_tool_call(&ToolName::plain("write_stdin"),
-            &ToolPayload::Function { arguments: json!({"session_id":7}).to_string() }, "poll").ordinal;
+        let ordinal = poll
+            .register_deterministic_tool_call(
+                &ToolName::plain("write_stdin"),
+                &ToolPayload::Function {
+                    arguments: json!({"session_id":7}).to_string(),
+                },
+                "poll",
+            )
+            .ordinal;
         let mut signal = test_execution_signal();
         signal["observed_process_id"] = json!(7);
-        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            Some(signal), &successful_tool_response("poll", "passed"), false);
+        poll.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal),
+            &successful_tool_response("poll", "passed"),
+            false,
+        );
         control.settle(&baseline, &poll, &settled(0));
         assert!(control.pending_validation_coverage.is_empty());
-        assert_eq!(control.evaluate_convergence(&baseline, &delivery, &settled(0)).continuation,
-            ContinuationDisposition::SurfaceExistingResult);
+        assert_eq!(
+            control
+                .evaluate_convergence(&baseline, &delivery, &settled(0))
+                .continuation,
+            ContinuationDisposition::SurfaceExistingResult
+        );
     }
 
     #[test]
@@ -6672,23 +7575,43 @@ mod tests {
         let report = control.completion_assessment_with_changed_paths(0, Some(&docs), false);
         assert!(report.failed_checks.is_empty());
         assert!(report.verification_gaps.is_empty());
-        assert_eq!(report.advisories.len(), 2);
+        // An all-documentation change set has no code to separate it from.
+        let no_docs_separation = |advisories: &[String]| {
+            !advisories
+                .iter()
+                .any(|advisory| advisory.starts_with("Documentation-only paths"))
+        };
+        assert_eq!(report.advisories.len(), 1);
+        assert!(no_docs_separation(&report.advisories));
         let baseline = control.baselines(0);
         let failed = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Failure);
         control.settle(&baseline, &failed, &settled(0));
         let report = control.completion_assessment_with_changed_paths(0, Some(&docs), true);
         assert!(!report.failed_checks.is_empty());
         assert_eq!(report.verification_gaps.len(), 1);
-        assert_eq!(report.advisories.len(), 2);
+        assert_eq!(report.advisories.len(), 1);
+        assert!(no_docs_separation(&report.advisories));
     }
 
     #[test]
     fn completion_boundary_unrelated_tool_output_is_not_hook_repair_evidence() {
         let collector = SamplingRequestSignalCollector::default();
-        let ordinal = collector.register_deterministic_tool_call(&ToolName::plain("read_file"),
-            &ToolPayload::Function { arguments: json!({"path":"unrelated.txt"}).to_string() }, "read").ordinal;
-        collector.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            None, &successful_tool_response("read", "new but unrelated"), false);
+        let ordinal = collector
+            .register_deterministic_tool_call(
+                &ToolName::plain("read_file"),
+                &ToolPayload::Function {
+                    arguments: json!({"path":"unrelated.txt"}).to_string(),
+                },
+                "read",
+            )
+            .ordinal;
+        collector.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("read", "new but unrelated"),
+            false,
+        );
         assert!(collector.completion_evidence_key().is_none());
     }
 
@@ -6708,14 +7631,26 @@ mod tests {
                 let mut state = collector.state.lock().unwrap();
                 state.registered_count = 1;
                 state.explicit_completion = Some((0, "verified answer".into()));
-                state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+                state.outcomes.push(SamplingToolOutcome::plain(
+                    0,
+                    SamplingToolOutcomeKind::Success,
+                    None,
+                ));
             }
-            if new_input { control.input_revision += 1; }
+            if new_input {
+                control.input_revision += 1;
+            }
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.continuation == ContinuationDisposition::SurfaceExistingResult,
-                expected, "{status:?}, new_input={new_input}");
+            assert_eq!(
+                decision.continuation == ContinuationDisposition::SurfaceExistingResult,
+                expected,
+                "{status:?}, new_input={new_input}"
+            );
             if !expected {
-                assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+                assert_eq!(
+                    decision.continuation,
+                    ContinuationDisposition::ModelRequired
+                );
             }
         }
     }
@@ -6727,7 +7662,8 @@ mod tests {
         for mode in ["explicit", "native-text"] {
             let mut control = TurnExecutionControl::new();
             let before = control.baselines(0);
-            let validation = recorded_validation_collector(&control, &before, ToolOutputOutcome::Success);
+            let validation =
+                recorded_validation_collector(&control, &before, ToolOutputOutcome::Success);
             control.settle(&before, &validation, &settled(0));
             // Validation exists, but a later settled change invalidates it.
             let baselines = control.baselines(1);
@@ -6737,17 +7673,30 @@ mod tests {
                     let mut state = collector.state.lock().unwrap();
                     state.registered_count = 1;
                     state.explicit_completion = Some((0, "verified answer".into()));
-                    state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+                    state.outcomes.push(SamplingToolOutcome::plain(
+                        0,
+                        SamplingToolOutcomeKind::Success,
+                        None,
+                    ));
                 }
                 collector
             } else {
                 let collector = authoritative_wait_collector(
-                    &control, &baselines, "native", false, Some("verified answer"),
+                    &control,
+                    &baselines,
+                    "native",
+                    false,
+                    Some("verified answer"),
                 );
                 {
                     let mut state = collector.state.lock().unwrap();
-                    state.authoritative_wait_observations[0].result.adapter = "agent_job_report".into();
-                    state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+                    state.authoritative_wait_observations[0].result.adapter =
+                        "agent_job_report".into();
+                    state.outcomes.push(SamplingToolOutcome::plain(
+                        0,
+                        SamplingToolOutcomeKind::Success,
+                        None,
+                    ));
                 }
                 collector
             };
@@ -6756,19 +7705,36 @@ mod tests {
             assert!(!control.completion_gaps(1).is_empty());
             assert_eq!(stale.continuation, expected);
             assert_eq!(stale.directive, None, "{mode}");
-            let failed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Failure);
+            let failed =
+                recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Failure);
             control.settle(&baselines, &failed, &settled(1));
-            assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
-                expected, "failed validation remains a reportable gap, not an automatic continuation");
+            assert_eq!(
+                control
+                    .evaluate_convergence(&baselines, &receipt, &settled(1))
+                    .continuation,
+                expected,
+                "failed validation remains a reportable gap, not an automatic continuation"
+            );
             assert!(!control.completion_gaps(1).is_empty());
-            let passed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
+            let passed =
+                recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
             control.settle(&baselines, &passed, &settled(1));
-            assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
-                expected, "fresh evidence surfaces the existing receipt");
+            assert_eq!(
+                control
+                    .evaluate_convergence(&baselines, &receipt, &settled(1))
+                    .continuation,
+                expected,
+                "fresh evidence surfaces the existing receipt"
+            );
             settle_plan(&mut control, plan(&[StepStatus::Pending]));
             let pending = control.baselines(1);
-            assert_eq!(control.evaluate_convergence(&pending, &receipt, &settled(1)).continuation,
-                expected, "unfinished plan bookkeeping must not override explicit delivery: {mode}");
+            assert_eq!(
+                control
+                    .evaluate_convergence(&pending, &receipt, &settled(1))
+                    .continuation,
+                expected,
+                "unfinished plan bookkeeping must not override explicit delivery: {mode}"
+            );
         }
     }
 
@@ -7298,8 +8264,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn cosmetic_plan_revisions_do_not_reset_repeated_read_convergence() {
         let mut control = TurnExecutionControl::new();
@@ -7309,10 +8273,14 @@ mod tests {
             checklist.plan.reverse();
             checklist.explanation = Some(format!("presentation {generation}"));
             control.refresh_plan(Some(crate::plan_store::PlanExecutionSnapshot::new(
-                &checklist, &crate::plan_store::PlanLineage::default(),
+                &checklist,
+                &crate::plan_store::PlanLineage::default(),
             )));
             let (collector, _) = read_only_pass_collector(
-                &control, &baselines, r#"{"artifact_id":"same-source"}"#, "same-evidence",
+                &control,
+                &baselines,
+                r#"{"artifact_id":"same-source"}"#,
+                "same-evidence",
             );
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(decision.directive.is_some(), generation > 0);
@@ -7324,11 +8292,17 @@ mod tests {
         let store = crate::plan_store::PlanStore::default();
         let checklist = plan(&[StepStatus::Completed]);
         let mut lineage = crate::plan_store::PlanLineage::default();
-        lineage.requirements.insert("orphan".into(), crate::plan_store::PlanRequirement {
-            text: "unmapped remaining obligation".into(), status: StepStatus::Pending,
-            superseded_reason: None,
-        });
-        store.restore_with_lineage(Some(checklist.clone()), Some(lineage)).await;
+        lineage.requirements.insert(
+            "orphan".into(),
+            crate::plan_store::PlanRequirement {
+                text: "unmapped remaining obligation".into(),
+                status: StepStatus::Pending,
+                superseded_reason: None,
+            },
+        );
+        store
+            .restore_with_lineage(Some(checklist.clone()), Some(lineage))
+            .await;
         let snapshot = store.execution_snapshot().await.unwrap();
         for reverse in [false, true] {
             let mut control = TurnExecutionControl::new().with_active_plan(Some(snapshot.clone()));
@@ -7336,14 +8310,22 @@ mod tests {
             let collector = control.collector(&baselines);
             for ordinal in if reverse { [100, 0] } else { [0, 100] } {
                 collector.push(SamplingToolOutcome::plain(
-                    ordinal, SamplingToolOutcomeKind::Success, Some(checklist.clone()),
+                    ordinal,
+                    SamplingToolOutcomeKind::Success,
+                    Some(checklist.clone()),
                 ));
             }
             control.refresh_plan(store.execution_snapshot().await);
             control.settle(&baselines, &collector, &settled);
-            assert!(!control.plan_completed(), "compaction must not infer completion from checklist alone");
+            assert!(
+                !control.plan_completed(),
+                "compaction must not infer completion from checklist alone"
+            );
             assert_eq!(control.plan.as_ref(), Some(&snapshot));
-            assert_eq!(control.completion_gaps(0), vec!["The plan still has 1 unresolved obligation(s)."]);
+            assert_eq!(
+                control.completion_gaps(0),
+                vec!["The plan still has 1 unresolved obligation(s)."]
+            );
             control.refresh_plan(None); // The Plan Mode settlement path suspends execution.
             assert!(control.completion_gaps(0).is_empty());
             assert!(!control.plan_completed());
@@ -7366,9 +8348,9 @@ mod tests {
                 .directive;
             assert_eq!(directive.is_some(), generation > 1);
             assert_eq!(
-                control.continuation_generation_request(
-                    &baselines, &collector, &settled, false,
-                ).timing_disposition(),
+                control
+                    .continuation_generation_request(&baselines, &collector, &settled, false,)
+                    .timing_disposition(),
                 TurnTimingGenerationDisposition::DecisionBearing,
             );
         }
@@ -7527,8 +8509,6 @@ mod tests {
                 .expect("complete actions")
         );
     }
-
-
 
     #[test]
     fn action_identities_share_one_canonical_function_payload() {
@@ -7708,12 +8688,22 @@ mod tests {
     fn partial_recovery_progress_tracks_bytes_independently_of_repeated_errors() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
-        for (start, new_source, new_failure) in [(0, true, true), (10, true, false), (20, true, false), (10, false, false)] {
+        for (start, new_source, new_failure) in [
+            (0, true, true),
+            (10, true, false),
+            (20, true, false),
+            (10, false, false),
+        ] {
             let collector = control.collector(&baselines);
             let registration = collector.register_deterministic_tool_call(
                 &ToolName::plain("read_tool_output"),
-                &ToolPayload::Function { arguments: json!({"artifact_id":"snapshot", "selectors":[
-                    {"kind":"bytes", "start":start, "end":start + 10}]}).to_string() }, "page");
+                &ToolPayload::Function {
+                    arguments: json!({"artifact_id":"snapshot", "selectors":[
+                    {"kind":"bytes", "start":start, "end":start + 10}]})
+                    .to_string(),
+                },
+                "page",
+            );
             collector.record_response_result(registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
                 Some(json!({"outcome":"failure", "failure_signature":"same-selection-error",
@@ -7721,8 +8711,14 @@ mod tests {
                         "identity":{"sha256":"source", "ranges":[[start, start + 10]], "values":[]}}})),
                 &successful_tool_response("page", "partial recovery"), false);
             let progress = control.observe_progress(&baselines, &collector, &settled);
-            assert_eq!(progress.contains(&TurnTimingProgressKind::NewSourceEvidence), new_source);
-            assert_eq!(progress.contains(&TurnTimingProgressKind::FailureObservation), new_failure);
+            assert_eq!(
+                progress.contains(&TurnTimingProgressKind::NewSourceEvidence),
+                new_source
+            );
+            assert_eq!(
+                progress.contains(&TurnTimingProgressKind::FailureObservation),
+                new_failure
+            );
         }
     }
 
@@ -7817,32 +8813,30 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn yielded_write_stdin_with_new_output_refunds_a_generation() {
         for progress in [false, true] {
-        let control = TurnExecutionControl::new();
-        let (baselines, _) = unchanged_state(&control);
-        let collector = control.collector(&baselines);
-        let registration = collector.register_deterministic_tool_call(
-            &ToolName::plain("write_stdin"),
-            &ToolPayload::Function {
-                arguments: r#"{"session_id":7,"chars":"","yield_time_ms":30000}"#.to_string(),
-            },
-            "poll-yielded",
-        );
-        collector.record_response_result(
-            registration.ordinal,
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
-            Some(json!({"process_observation_progress": progress})),
-            &successful_tool_response("poll-yielded", r#"{"session_id":7,"running":true}"#),
-            false,
-        );
+            let control = TurnExecutionControl::new();
+            let (baselines, _) = unchanged_state(&control);
+            let collector = control.collector(&baselines);
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("write_stdin"),
+                &ToolPayload::Function {
+                    arguments: r#"{"session_id":7,"chars":"","yield_time_ms":30000}"#.to_string(),
+                },
+                "poll-yielded",
+            );
+            collector.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+                Some(json!({"process_observation_progress": progress})),
+                &successful_tool_response("poll-yielded", r#"{"session_id":7,"running":true}"#),
+                false,
+            );
 
-        assert!(collector.has_process_monitor());
-        assert_eq!(collector.observed_successful_process_monitor(), progress);
-        assert_eq!(collector.observed_yielded_execution(), progress);
+            assert!(collector.has_process_monitor());
+            assert_eq!(collector.observed_successful_process_monitor(), progress);
+            assert_eq!(collector.observed_yielded_execution(), progress);
         }
     }
 
@@ -7907,25 +8901,51 @@ mod tests {
 
     #[test]
     fn verified_evidence_failure_fingerprints_preserve_structured_values_and_invocations() {
-        let fingerprint = |args: Value, result: Value| code_mode_result_failure_fingerprint(
-            &ToolName::plain("fixture"),
-            &ToolPayload::Function { arguments: args.to_string() },
-            &result,
-        );
+        let fingerprint = |args: Value, result: Value| {
+            code_mode_result_failure_fingerprint(
+                &ToolName::plain("fixture"),
+                &ToolPayload::Function {
+                    arguments: args.to_string(),
+                },
+                &result,
+            )
+        };
         let base = serde_json::json!({"actual":7, "port":8080, "timeout":"7s", "error":"src/a.rs:12:3: failed"});
         let expected = fingerprint(serde_json::json!({"port":8080}), base.clone());
-        for (key, value) in [("actual", serde_json::json!(9)), ("port", serde_json::json!(8081)),
-            ("timeout", serde_json::json!("9s")), ("error", serde_json::json!("timeout after 9s"))] {
+        for (key, value) in [
+            ("actual", serde_json::json!(9)),
+            ("port", serde_json::json!(8081)),
+            ("timeout", serde_json::json!("9s")),
+            ("error", serde_json::json!("timeout after 9s")),
+        ] {
             let mut changed = base.clone();
             changed[key] = value;
-            assert_ne!(expected, fingerprint(serde_json::json!({"port":8080}), changed), "{key}");
+            assert_ne!(
+                expected,
+                fingerprint(serde_json::json!({"port":8080}), changed),
+                "{key}"
+            );
         }
-        assert_ne!(expected, fingerprint(serde_json::json!({"port":8081}), base.clone()));
+        assert_ne!(
+            expected,
+            fingerprint(serde_json::json!({"port":8081}), base.clone())
+        );
         let mut moved = base;
         moved["error"] = serde_json::json!("src/a.rs:99:8: failed");
-        assert_eq!(expected, fingerprint(serde_json::json!({"port":8080}), moved));
-        assert_ne!(fingerprint(serde_json::json!({}), serde_json::json!({"error":"timeout after 7s"})),
-            fingerprint(serde_json::json!({}), serde_json::json!({"error":"timeout after 9s"})));
+        assert_eq!(
+            expected,
+            fingerprint(serde_json::json!({"port":8080}), moved)
+        );
+        assert_ne!(
+            fingerprint(
+                serde_json::json!({}),
+                serde_json::json!({"error":"timeout after 7s"})
+            ),
+            fingerprint(
+                serde_json::json!({}),
+                serde_json::json!({"error":"timeout after 9s"})
+            )
+        );
     }
 
     #[test]
@@ -8010,14 +9030,16 @@ mod tests {
         let control = TurnExecutionControl::new();
         let (baselines, _) = unchanged_state(&control);
         let first = direct_failure_collector(&control, &baselines, "io.locked")
-            .deterministic_cycle_key().expect("failure cycle");
+            .deterministic_cycle_key()
+            .expect("failure cycle");
         for (artifact, signature) in [
             ("artifact-1", "schema.invalid"),
             ("artifact-2", "io.locked"),
         ] {
-            let changed = direct_failure_collector_for_artifact(
-                &control, &baselines, artifact, signature,
-            ).deterministic_cycle_key().expect("changed failure cycle");
+            let changed =
+                direct_failure_collector_for_artifact(&control, &baselines, artifact, signature)
+                    .deterministic_cycle_key()
+                    .expect("changed failure cycle");
             assert_ne!(first, changed, "{artifact}: {signature}");
         }
     }
@@ -8030,8 +9052,7 @@ mod tests {
         for (artifact_id, fingerprint) in [
             ("artifact-1", "io.locked"),
             ("artifact-2", "schema.invalid"),
-        ]
-        {
+        ] {
             let collector = direct_failure_collector_for_artifact(
                 &control,
                 &baselines,
@@ -8067,8 +9088,7 @@ mod tests {
         for (artifact_id, fingerprint) in [
             ("artifact-1", "io.locked"),
             ("artifact-2", "schema.invalid"),
-        ]
-        {
+        ] {
             let collector = direct_failure_collector_for_artifact(
                 &control,
                 &baselines,
@@ -8356,8 +9376,6 @@ mod tests {
         assert!(terminal.proven_loop_activated);
     }
 
-
-
     #[test]
     fn changed_tiny_call_cycles_remain_recoverable_without_efficiency_advisory() {
         let mut control = TurnExecutionControl::new();
@@ -8385,16 +9403,27 @@ mod tests {
         let (baselines, settled) = unchanged_state(&control);
         for _ in 0..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD {
             let collector = structured_tool_pass_collector(
-                &control, &baselines, r#"{"command":"inspect"}"#, "same-evidence",
+                &control,
+                &baselines,
+                r#"{"command":"inspect"}"#,
+                "same-evidence",
             );
-            collector.record_child_runtime(
-                TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL + 1,
-            );
+            collector
+                .record_child_runtime(TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL + 1);
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+            assert_eq!(
+                decision.continuation,
+                ContinuationDisposition::ModelRequired
+            );
             assert!(control.turn_efficiency_guard.is_none());
             assert_eq!(control.turn_efficiency_tool_calls, 0);
-            assert!(!decision.directive.as_deref().unwrap_or_default().starts_with("Turn-efficiency"));
+            assert!(
+                !decision
+                    .directive
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("Turn-efficiency")
+            );
         }
     }
 
@@ -8537,23 +9566,36 @@ mod tests {
         blocked_wait(&collector, "receipt-1");
         let registration = collector.register_deterministic_tool_call(
             &ToolName::plain("update_plan"),
-            &ToolPayload::Function { arguments: r#"{"plan":[]}"#.into() },
+            &ToolPayload::Function {
+                arguments: r#"{"plan":[]}"#.into(),
+            },
             "plan",
         );
         collector.push(SamplingToolOutcome::plain(
-            registration.ordinal, SamplingToolOutcomeKind::Success,
+            registration.ordinal,
+            SamplingToolOutcomeKind::Success,
             Some(plan(&[StepStatus::InProgress])),
         ));
         control.settle(&baselines, &collector, &settled);
         let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-        assert!(matches!(decision.authoritative_wait, Some(AuthoritativeWaitResolution::Blocked(_))));
+        assert!(matches!(
+            decision.authoritative_wait,
+            Some(AuthoritativeWaitResolution::Blocked(_))
+        ));
         assert!(!decision.proven_loop_activated);
         let repeated = control.collector(&control.baselines(7));
-        assert!(repeated.register_deterministic_tool_call(
-            &ToolName::plain("wait_agent"),
-            &ToolPayload::Function { arguments: r#"{"cursor":"cursor-1"}"#.into() },
-            "repeat",
-        ).blocked_wait_guard.is_some());
+        assert!(
+            repeated
+                .register_deterministic_tool_call(
+                    &ToolName::plain("wait_agent"),
+                    &ToolPayload::Function {
+                        arguments: r#"{"cursor":"cursor-1"}"#.into()
+                    },
+                    "repeat",
+                )
+                .blocked_wait_guard
+                .is_some()
+        );
     }
 
     #[test]
@@ -8672,8 +9714,15 @@ mod tests {
             assert_eq!(collector.snapshot()[0].kind, expected, "{signal_name}");
             {
                 let state = collector.state.lock().unwrap();
-                assert!(state.successful_replay_evidence.contains_key(&registration.ordinal));
-                assert!(state.successful_replay_responses.is_empty(), "{signal_name}");
+                assert!(
+                    state
+                        .successful_replay_evidence
+                        .contains_key(&registration.ordinal)
+                );
+                assert!(
+                    state.successful_replay_responses.is_empty(),
+                    "{signal_name}"
+                );
             }
             control.settle(&baselines, &collector, &settled(0));
             assert_eq!(
@@ -8892,7 +9941,10 @@ mod tests {
         );
         let mutation_settled = settled(1);
         validated_after_mutation.settle(&baselines, &collector, &mutation_settled);
-        assert_eq!(validated_after_mutation.validated_mutation_revision, Some(1));
+        assert_eq!(
+            validated_after_mutation.validated_mutation_revision,
+            Some(1)
+        );
         assert!(validated_after_mutation.completion_gaps(1).is_empty());
         assert_eq!(
             validated_after_mutation
@@ -8926,7 +9978,10 @@ mod tests {
         );
         let mutation_settled = settled(1);
         mutated_after_validation.settle(&baselines, &collector, &mutation_settled);
-        assert_eq!(mutated_after_validation.validated_mutation_revision, Some(0));
+        assert_eq!(
+            mutated_after_validation.validated_mutation_revision,
+            Some(0)
+        );
         assert!(
             mutated_after_validation
                 .completion_gaps(1)
@@ -8956,7 +10011,10 @@ mod tests {
         );
         let settled_state = settled(0);
         observed_after_validation.settle(&baselines, &collector, &settled_state);
-        assert_eq!(observed_after_validation.validated_mutation_revision, Some(0));
+        assert_eq!(
+            observed_after_validation.validated_mutation_revision,
+            Some(0)
+        );
         assert!(observed_after_validation.completion_gaps(0).is_empty());
         assert_eq!(
             observed_after_validation
@@ -8977,24 +10035,42 @@ mod tests {
         let baselines = control.baselines(0);
         let collector = control.collector(&baselines);
         control.settle(&baselines, &collector, &settled(0));
-        assert_eq!(control.completion_gaps(0), vec!["The plan still has 1 unresolved obligation(s)."]);
+        assert_eq!(
+            control.completion_gaps(0),
+            vec!["The plan still has 1 unresolved obligation(s)."]
+        );
     }
 
     #[test]
     fn failed_only_runner_repairs_require_current_inputs_and_execution_identity() {
-        for variant in ["unchanged", "changed", "helpers", "binary", "environment", "profile"] {
+        for variant in [
+            "unchanged",
+            "changed",
+            "helpers",
+            "binary",
+            "environment",
+            "profile",
+        ] {
             let mut control = TurnExecutionControl::new();
-            let record = |control: &mut TurnExecutionControl, revision, passed: bool, test: &str| {
+            let record = |control: &mut TurnExecutionControl,
+                          revision,
+                          passed: bool,
+                          test: &str| {
                 let baseline = control.baselines(revision);
                 let collector = control.collector(&baseline);
-                let payload = ToolPayload::Function { arguments: json!({
-                    "cmd": format!("cargo test {test}")
-                }).to_string() };
-                let identity = |name: &str| json!({
-                    "binary": if passed && variant == "binary" { "other" } else { "core" },
-                    "helpers": if passed && variant == "helpers" { vec!["helper"] } else { vec![] },
-                    "test": name,
-                });
+                let payload = ToolPayload::Function {
+                    arguments: json!({
+                        "cmd": format!("cargo test {test}")
+                    })
+                    .to_string(),
+                };
+                let identity = |name: &str| {
+                    json!({
+                        "binary": if passed && variant == "binary" { "other" } else { "core" },
+                        "helpers": if passed && variant == "helpers" { vec!["helper"] } else { vec![] },
+                        "test": name,
+                    })
+                };
                 let signal = json!({
                     "command_validation": {"validation": true, "proof": true, "tests": true,
                         "execution_context": {"cwd": "/repo", "environment_id": "local",
@@ -9008,19 +10084,42 @@ mod tests {
                         "required_executions": if passed { json!([identity(test)]) } else { json!([identity("A"), identity("B")]) },
                     }
                 });
-                let ordinal = collector.register_deterministic_tool_call(&ToolName::plain("exec_command"), &payload, test).ordinal;
-                collector.record_response_result(ordinal, ToolOutputOutcomeContext::new(if passed {
-                    ToolOutputOutcome::Success
-                } else { ToolOutputOutcome::Failure }), Some(signal), &runner_tool_response(test, "test result"), false);
+                let ordinal = collector
+                    .register_deterministic_tool_call(
+                        &ToolName::plain("exec_command"),
+                        &payload,
+                        test,
+                    )
+                    .ordinal;
+                collector.record_response_result(
+                    ordinal,
+                    ToolOutputOutcomeContext::new(if passed {
+                        ToolOutputOutcome::Success
+                    } else {
+                        ToolOutputOutcome::Failure
+                    }),
+                    Some(signal),
+                    &runner_tool_response(test, "test result"),
+                    false,
+                );
                 control.settle(&baseline, &collector, &settled(revision));
             };
             record(&mut control, 0, false, "A+B");
             assert_eq!(control.failed_validation_checks.len(), 1);
             let revision = u64::from(variant == "changed");
             record(&mut control, revision, true, "A");
-            assert_eq!(control.failed_validation_checks.is_empty(), variant == "unchanged", "{variant}");
+            assert_eq!(
+                control.failed_validation_checks.is_empty(),
+                variant == "unchanged",
+                "{variant}"
+            );
             if variant == "changed" {
-                assert!(control.completion_gaps(revision).iter().any(|gap| gap.contains("Unfulfilled test IDs") && gap.contains('B')));
+                assert!(
+                    control
+                        .completion_gaps(revision)
+                        .iter()
+                        .any(|gap| gap.contains("Unfulfilled test IDs") && gap.contains('B'))
+                );
                 record(&mut control, revision, true, "B");
                 assert!(control.failed_validation_checks.is_empty());
             }
@@ -9034,38 +10133,75 @@ mod tests {
         for test_execution in [false, true] {
             let mut control = TurnExecutionControl::new();
             control.validation_coverage_revision = Some(0);
-            control.validation_coverage.insert("check".into(), ValidationScope {
-                environment_id: "local".into(), test_execution,
-                paths: BTreeSet::from([SourceDependencyV1::new(root.path(), true)]),
-                behavioral_paths: BTreeSet::new(), dependency_scope: None,
-            });
+            control.validation_coverage.insert(
+                "check".into(),
+                ValidationScope {
+                    environment_id: "local".into(),
+                    test_execution,
+                    paths: BTreeSet::from([SourceDependencyV1::new(root.path(), true)]),
+                    behavioral_paths: BTreeSet::new(),
+                    dependency_scope: None,
+                },
+            );
             let report = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
             // Only a passing test execution attributes its inputs, and it says so.
-            assert_eq!(report.verification_gaps.iter().any(|gap| gap.contains("unrelated.rs")
-                && gap.contains("behavior remains unverified")), !test_execution);
-            assert_eq!(report.advisories.iter().any(|note| note.contains("unrelated.rs")
-                && note.contains("not proof that the changed behavior was exercised")), test_execution);
-            assert_eq!(report.advisories.iter().any(|gap| gap.contains("Non-test checks passed")), !test_execution);
+            assert_eq!(
+                report
+                    .verification_gaps
+                    .iter()
+                    .any(|gap| gap.contains("unrelated.rs")
+                        && gap.contains("behavior remains unverified")),
+                !test_execution
+            );
+            assert_eq!(
+                report
+                    .advisories
+                    .iter()
+                    .any(|note| note.contains("unrelated.rs")
+                        && note.contains("not proof that the changed behavior was exercised")),
+                test_execution
+            );
+            assert_eq!(
+                report
+                    .advisories
+                    .iter()
+                    .any(|gap| gap.contains("Non-test checks passed")),
+                !test_execution
+            );
             // An owner-proved surface needs no caveat, and is still insufficient for a non-test check.
-            control.validation_coverage.get_mut("check").unwrap().behavioral_paths =
-                BTreeSet::from([SourceDependencyV1::new(&changed[0].1, false)]);
+            control
+                .validation_coverage
+                .get_mut("check")
+                .unwrap()
+                .behavioral_paths = BTreeSet::from([SourceDependencyV1::new(&changed[0].1, false)]);
             let proved = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
             assert_eq!(proved.verification_gaps.is_empty(), test_execution);
-            assert!(!proved.advisories.iter().any(|note| note.contains("unrelated.rs")));
+            assert!(
+                !proved
+                    .advisories
+                    .iter()
+                    .any(|note| note.contains("unrelated.rs"))
+            );
         }
     }
 
     #[test]
     fn validation_path_attribution_does_not_promote_package_graph_to_complete_inputs() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("Cargo.toml"),
-            "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n[workspace]\n").unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n[workspace]\n",
+        )
+        .unwrap();
         let dependencies = BTreeSet::from([SourceDependencyV1::new(root.path(), true)]);
         for tool in ["cargo_test", "exec_command", "write_stdin"] {
-            let payload = ToolPayload::Function { arguments: json!({
-                "package": "fixture", "program": "cargo", "args": ["test", "-p", "fixture"],
-                "session_id": 1,
-            }).to_string() };
+            let payload = ToolPayload::Function {
+                arguments: json!({
+                    "package": "fixture", "program": "cargo", "args": ["test", "-p", "fixture"],
+                    "session_id": 1,
+                })
+                .to_string(),
+            };
             let signal = json!({
                 "command_validation": {"proof": true, "tests": true},
                 "runner_execution_receipt": {
@@ -9073,12 +10209,29 @@ mod tests {
                     "workspace_root": root.path(),
                 },
             });
-            let result = validation_scope_signal(&ToolName::plain(tool), &payload,
-                Some(signal), Some(&dependencies), root.path(), "local").unwrap();
-            let scope: ValidationScope = serde_json::from_value(result["validation_scope"].clone()).unwrap();
-            assert!(!scope.paths.is_empty(), "attribution remains useful for {tool}");
-            assert!(scope.behavioral_paths.is_empty(), "input graphs do not prove exercised surfaces");
-            assert!(scope.dependency_scope.is_none(), "{tool} cannot prove arbitrary external inputs absent");
+            let result = validation_scope_signal(
+                &ToolName::plain(tool),
+                &payload,
+                Some(signal),
+                Some(&dependencies),
+                root.path(),
+                "local",
+            )
+            .unwrap();
+            let scope: ValidationScope =
+                serde_json::from_value(result["validation_scope"].clone()).unwrap();
+            assert!(
+                !scope.paths.is_empty(),
+                "attribution remains useful for {tool}"
+            );
+            assert!(
+                scope.behavioral_paths.is_empty(),
+                "input graphs do not prove exercised surfaces"
+            );
+            assert!(
+                scope.dependency_scope.is_none(),
+                "{tool} cannot prove arbitrary external inputs absent"
+            );
         }
     }
 
@@ -9087,24 +10240,48 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let secondary = root.path().join("secondary");
         std::fs::create_dir(&secondary).unwrap();
-        let payload = ToolPayload::Function { arguments: serde_json::json!({
-            "program": "pytest", "args": [], "environment_id": "secondary",
-            "workdir": "secondary",
-        }).to_string() };
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "program": "pytest", "args": [], "environment_id": "secondary",
+                "workdir": "secondary",
+            })
+            .to_string(),
+        };
         let dependencies = BTreeSet::from([SourceDependencyV1::new(root.path(), true)]);
         let signal = serde_json::json!({"command_validation": {
             "proof": true, "tests": false,
             "execution_context": {"environment_id": "secondary", "cwd": secondary},
         }});
-        let attributed = validation_scope_signal(&ToolName::plain("exec_command"), &payload,
-            Some(signal.clone()), Some(&dependencies), root.path(), "primary").unwrap();
-        assert_eq!(attributed["validation_scope"]["environment_id"], "secondary");
-        let scope: ValidationScope = serde_json::from_value(attributed["validation_scope"].clone()).unwrap();
-        assert_eq!(scope.paths, BTreeSet::from([SourceDependencyV1::new(&secondary, true)]));
+        let attributed = validation_scope_signal(
+            &ToolName::plain("exec_command"),
+            &payload,
+            Some(signal.clone()),
+            Some(&dependencies),
+            root.path(),
+            "primary",
+        )
+        .unwrap();
+        assert_eq!(
+            attributed["validation_scope"]["environment_id"],
+            "secondary"
+        );
+        let scope: ValidationScope =
+            serde_json::from_value(attributed["validation_scope"].clone()).unwrap();
+        assert_eq!(
+            scope.paths,
+            BTreeSet::from([SourceDependencyV1::new(&secondary, true)])
+        );
         let mut remote = signal;
         remote["command_validation"]["execution_context"]["cwd"] = Value::Null;
-        let unavailable = validation_scope_signal(&ToolName::plain("exec_command"), &payload,
-            Some(remote), Some(&dependencies), root.path(), "primary").unwrap();
+        let unavailable = validation_scope_signal(
+            &ToolName::plain("exec_command"),
+            &payload,
+            Some(remote),
+            Some(&dependencies),
+            root.path(),
+            "primary",
+        )
+        .unwrap();
         assert!(unavailable.get("validation_scope").is_none());
         assert!(unavailable.get("validation_scope_unavailable").is_some());
     }
@@ -9142,12 +10319,18 @@ mod tests {
         control.settle(&baselines, &revalidation, &settled(1));
         assert!(control.completion_gaps(1).is_empty());
 
-        settle_plan(&mut control, plan(&[StepStatus::Completed, StepStatus::Pending]));
+        settle_plan(
+            &mut control,
+            plan(&[StepStatus::Completed, StepStatus::Pending]),
+        );
         assert_eq!(
             control.completion_gaps(1),
             vec!["The plan still has 1 unresolved obligation(s)."]
         );
-        settle_plan(&mut control, plan(&[StepStatus::Completed, StepStatus::Completed]));
+        settle_plan(
+            &mut control,
+            plan(&[StepStatus::Completed, StepStatus::Completed]),
+        );
         assert!(control.completion_gaps(1).is_empty());
     }
 
@@ -9159,19 +10342,33 @@ mod tests {
             arguments: json!({
                 "cmd": "opaque-check",
                 "validation": {"covered_paths": ["unrelated.rs"]}
-            }).to_string(),
+            })
+            .to_string(),
         };
         let original = json!({"command_validation": {"proof": true, "tests": false}});
         for dependencies in [None, Some(BTreeSet::new())] {
             let signal = validation_scope_signal(
-                &tool, &payload, Some(original.clone()), dependencies.as_ref(), root.path(), "local",
-            ).unwrap();
+                &tool,
+                &payload,
+                Some(original.clone()),
+                dependencies.as_ref(),
+                root.path(),
+                "local",
+            )
+            .unwrap();
             assert!(signal.get("validation_scope").is_none(), "{signal}");
         }
-        let dependencies = BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
+        let dependencies =
+            BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
         let signal = validation_scope_signal(
-            &tool, &payload, Some(original), Some(&dependencies), root.path(), "local",
-        ).unwrap();
+            &tool,
+            &payload,
+            Some(original),
+            Some(&dependencies),
+            root.path(),
+            "local",
+        )
+        .unwrap();
         assert!(signal.get("validation_scope").is_none(), "{signal}");
     }
 
@@ -9182,17 +10379,33 @@ mod tests {
             ("local".to_string(), root.path().join("src/lib.rs")),
             ("local".to_string(), root.path().join("other/lib.rs")),
         ];
-        let dependencies = BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
+        let dependencies =
+            BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
         for nested in [false, true] {
-            for scenario in ["passed", "summary", "failed", "skipped", "zero_tests", "stale", "background", "after_edit"] {
+            for scenario in [
+                "passed",
+                "summary",
+                "failed",
+                "skipped",
+                "zero_tests",
+                "stale",
+                "background",
+                "after_edit",
+            ] {
                 let mut control = TurnExecutionControl::new();
                 let baseline = control.baselines(0);
                 let collector = control.collector(&baseline);
                 let payload = validation_proof_payload();
                 let tool = ToolName::plain("exec_command");
                 let mut signal = validation_scope_signal(
-                    &tool, &payload, None, Some(&dependencies), root.path(), "local",
-                ).unwrap();
+                    &tool,
+                    &payload,
+                    None,
+                    Some(&dependencies),
+                    root.path(),
+                    "local",
+                )
+                .unwrap();
                 if scenario == "after_edit" {
                     signal["validation_mutation_revision"] = json!(1);
                 }
@@ -9205,8 +10418,11 @@ mod tests {
                     }
                     _ => ToolOutputOutcome::Success,
                 };
-                let output = if scenario == "zero_tests" { "Ran 0 tests\nOK" }
-                    else { "Ran 1 test in 0.001s\nOK" };
+                let output = if scenario == "zero_tests" {
+                    "Ran 0 tests\nOK"
+                } else {
+                    "Ran 1 test in 0.001s\nOK"
+                };
                 if scenario == "summary" {
                     signal["validation_summary_tests"] = json!(98);
                 } else if scenario != "zero_tests" && scenario != "background" {
@@ -9215,17 +10431,25 @@ mod tests {
                 }
                 if nested {
                     collector.record_code_mode_result(CodeModeToolResult {
-                        cell_id: "coverage-cell", tool_name: &tool, payload: &payload,
+                        cell_id: "coverage-cell",
+                        tool_name: &tool,
+                        payload: &payload,
                         source_dependencies: Some(dependencies.clone()),
                         outcome_context: ToolOutputOutcomeContext::new(outcome),
-                        signal: Some(&signal), result: &json!({"output": output}),
+                        signal: Some(&signal),
+                        result: &json!({"output": output}),
                         canonical_artifact_required: false,
                     });
                 } else {
-                    let ordinal = collector.register_deterministic_tool_call(&tool, &payload, "coverage").ordinal;
+                    let ordinal = collector
+                        .register_deterministic_tool_call(&tool, &payload, "coverage")
+                        .ordinal;
                     collector.record_response_result(
-                        ordinal, ToolOutputOutcomeContext::new(outcome), Some(signal),
-                        &runner_tool_response("coverage", output), false,
+                        ordinal,
+                        ToolOutputOutcomeContext::new(outcome),
+                        Some(signal),
+                        &runner_tool_response("coverage", output),
+                        false,
                     );
                 }
                 let revision = u64::from(matches!(scenario, "stale" | "after_edit"));
@@ -9237,32 +10461,57 @@ mod tests {
                     let payload = ToolPayload::Function {
                         arguments: json!({"session_id": 7}).to_string(),
                     };
-                    let mut signal = validation_scope_signal(
-                        &tool, &payload, None, None, root.path(), "local",
-                    ).unwrap_or_else(|| json!({}));
+                    let mut signal =
+                        validation_scope_signal(&tool, &payload, None, None, root.path(), "local")
+                            .unwrap_or_else(|| json!({}));
                     signal["runner_execution_receipt"] =
                         test_execution_signal()["runner_execution_receipt"].clone();
-                    let ordinal = collector.register_deterministic_tool_call(&tool, &payload, "poll").ordinal;
+                    let ordinal = collector
+                        .register_deterministic_tool_call(&tool, &payload, "poll")
+                        .ordinal;
                     collector.record_response_result(
-                        ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success), Some(signal),
-                        &runner_tool_response("poll", output), false,
+                        ordinal,
+                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                        Some(signal),
+                        &runner_tool_response("poll", output),
+                        false,
                     );
                     control.settle(&baseline, &collector, &settled(0));
                 }
-                let revision_gaps = control.completion_gaps_with_changed_paths(revision, None, false);
-                assert_eq!(revision_gaps.len(), usize::from(matches!(scenario, "failed" | "stale")),
-                    "{nested} {scenario}: {revision_gaps:?}");
-                let gaps = control.completion_gaps_with_changed_paths(revision, Some(&changed), false);
-                let attributed = matches!(scenario, "passed" | "summary" | "background" | "after_edit");
-                assert_eq!(gaps.len(), 1 + usize::from(attributed) + revision_gaps.len(), "{nested} {scenario}: {gaps:?}");
-                let path_gap = gaps.iter().find(|gap| gap.starts_with("Changed paths")).unwrap();
+                let revision_gaps =
+                    control.completion_gaps_with_changed_paths(revision, None, false);
+                assert_eq!(
+                    revision_gaps.len(),
+                    usize::from(matches!(scenario, "failed" | "stale")),
+                    "{nested} {scenario}: {revision_gaps:?}"
+                );
+                let gaps =
+                    control.completion_gaps_with_changed_paths(revision, Some(&changed), false);
+                let attributed =
+                    matches!(scenario, "passed" | "summary" | "background" | "after_edit");
+                assert_eq!(
+                    gaps.len(),
+                    1 + usize::from(attributed) + revision_gaps.len(),
+                    "{nested} {scenario}: {gaps:?}"
+                );
+                let path_gap = gaps
+                    .iter()
+                    .find(|gap| gap.starts_with("Changed paths"))
+                    .unwrap();
                 assert!(path_gap.contains(&changed[1].1.display().to_string()));
-                assert_eq!(path_gap.contains(&changed[0].1.display().to_string()), !attributed,
-                    "only a fresh passing test execution attributes its inputs: {nested} {scenario}: {gaps:?}");
+                assert_eq!(
+                    path_gap.contains(&changed[0].1.display().to_string()),
+                    !attributed,
+                    "only a fresh passing test execution attributes its inputs: {nested} {scenario}: {gaps:?}"
+                );
                 // Attribution is reported as such, never as exercised behavior.
-                assert_eq!(gaps.iter().any(|gap| gap.contains(&changed[0].1.display().to_string())
-                    && gap.contains("not proof that the changed behavior was exercised")), attributed,
-                    "{nested} {scenario}: {gaps:?}");
+                assert_eq!(
+                    gaps.iter()
+                        .any(|gap| gap.contains(&changed[0].1.display().to_string())
+                            && gap.contains("not proof that the changed behavior was exercised")),
+                    attributed,
+                    "{nested} {scenario}: {gaps:?}"
+                );
                 // Only a turn with no attribution at all points at runner declaration.
                 assert_eq!(
                     path_gap.contains("No passing validation was attributed"),
@@ -9294,11 +10543,17 @@ mod tests {
             ContinuationDisposition::TerminalCompletionRequired,
         );
         assert_eq!(control.validated_mutation_revision, Some(0));
-        assert!(control.completion_gaps(1).iter().any(|gap| gap.contains("workspace changed")));
+        assert!(
+            control
+                .completion_gaps(1)
+                .iter()
+                .any(|gap| gap.contains("workspace changed"))
+        );
         assert_delivery_retains_validation_gap(&mut control, 1);
 
         let baselines = control.baselines(1);
-        let validation = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
+        let validation =
+            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &validation, &settled(1));
         assert!(control.completion_gaps(1).is_empty());
     }
@@ -9310,10 +10565,14 @@ mod tests {
             let old_baseline = control.baselines(0);
             let old = recorded_validation_collector(&control, &old_baseline, outcome);
             let baseline = control.baselines(1);
-            let fresh = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Success);
+            let fresh =
+                recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Success);
             let scope = ValidationScope {
                 environment_id: "local".into(),
-                paths: BTreeSet::from([SourceDependencyV1::new(std::path::Path::new("src/lib.rs"), false)]),
+                paths: BTreeSet::from([SourceDependencyV1::new(
+                    std::path::Path::new("src/lib.rs"),
+                    false,
+                )]),
                 test_execution: true,
                 behavioral_paths: BTreeSet::new(),
                 dependency_scope: None,
@@ -9339,11 +10598,14 @@ mod tests {
                 for passed in [false, true] {
                     let collector = control.collector(&baseline);
                     let tool = ToolName::plain("exec_command");
-                    let payload = ToolPayload::Function { arguments: if passed {
-                        json!({"program": "sh", "args": ["-c", "python -m unittest tests.a"]})
-                    } else {
-                        json!({"cmd": "python -m unittest tests.a", "shell": "sh"})
-                    }.to_string() };
+                    let payload = ToolPayload::Function {
+                        arguments: if passed {
+                            json!({"program": "sh", "args": ["-c", "python -m unittest tests.a"]})
+                        } else {
+                            json!({"cmd": "python -m unittest tests.a", "shell": "sh"})
+                        }
+                        .to_string(),
+                    };
                     let mut signal = test_execution_signal();
                     signal["command_validation"] = json!({
                         "validation": true, "proof": true, "tests": true,
@@ -9356,23 +10618,41 @@ mod tests {
                             "environment_fingerprint": if passed && variant == "environment" { "changed" } else { "original" }
                         }
                     });
-                    let outcome = if passed { ToolOutputOutcome::Success } else { ToolOutputOutcome::Failure };
+                    let outcome = if passed {
+                        ToolOutputOutcome::Success
+                    } else {
+                        ToolOutputOutcome::Failure
+                    };
                     if nested {
                         collector.record_code_mode_result(CodeModeToolResult {
-                            cell_id: "checks", tool_name: &tool, payload: &payload,
+                            cell_id: "checks",
+                            tool_name: &tool,
+                            payload: &payload,
                             source_dependencies: None,
                             outcome_context: ToolOutputOutcomeContext::new(outcome),
-                            signal: Some(&signal), result: &json!({"exit_code": if passed { 0 } else { 1 }}),
+                            signal: Some(&signal),
+                            result: &json!({"exit_code": if passed { 0 } else { 1 }}),
                             canonical_artifact_required: false,
                         });
                     } else {
-                        let ordinal = collector.register_deterministic_tool_call(&tool, &payload, "check").ordinal;
-                        collector.record_response_result(ordinal, ToolOutputOutcomeContext::new(outcome),
-                            Some(signal), &runner_tool_response("check", "Ran 1 test"), false);
+                        let ordinal = collector
+                            .register_deterministic_tool_call(&tool, &payload, "check")
+                            .ordinal;
+                        collector.record_response_result(
+                            ordinal,
+                            ToolOutputOutcomeContext::new(outcome),
+                            Some(signal),
+                            &runner_tool_response("check", "Ran 1 test"),
+                            false,
+                        );
                     }
                     control.settle(&baseline, &collector, &settled(0));
                 }
-                assert_eq!(control.failed_validation_checks.is_empty(), variant == "same", "{nested} {variant}");
+                assert_eq!(
+                    control.failed_validation_checks.is_empty(),
+                    variant == "same",
+                    "{nested} {variant}"
+                );
             }
         }
     }
@@ -9380,82 +10660,123 @@ mod tests {
     fn assert_delivery_retains_validation_gap(control: &mut TurnExecutionControl, revision: u64) {
         let baselines = control.baselines(revision);
         let delivery = control.collector(&baselines);
-        let ordinal = delivery.register_deterministic_tool_call(
-            &ToolName::plain("exec"),
-            &ToolPayload::Custom { input: "text('validation remains unverified')".into() },
-            "later-delivery",
-        ).ordinal;
+        let ordinal = delivery
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec"),
+                &ToolPayload::Custom {
+                    input: "text('validation remains unverified')".into(),
+                },
+                "later-delivery",
+            )
+            .ordinal;
         delivery.record_response_result(
-            ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             Some(json!({"explicit_completion_message": "validation remains unverified"})),
-            &successful_tool_response("later-delivery", "validation remains unverified"), false,
+            &successful_tool_response("later-delivery", "validation remains unverified"),
+            false,
         );
         let before = control.completion_gaps(revision);
         assert!(!before.is_empty());
         control.settle(&baselines, &delivery, &settled(revision));
         // A truthful report may be surfaced, but cannot erase the evidence gap
         // passed to the shared finalization/stop-hook policy.
-        assert_eq!(control.evaluate_convergence(&baselines, &delivery, &settled(revision)).continuation,
-            ContinuationDisposition::SurfaceExistingResult);
+        assert_eq!(
+            control
+                .evaluate_convergence(&baselines, &delivery, &settled(revision))
+                .continuation,
+            ContinuationDisposition::SurfaceExistingResult
+        );
         assert_eq!(control.completion_gaps(revision), before);
     }
 
     #[test]
     fn later_failed_validation_retracts_only_affected_coverage_across_delivery() {
         let root = tempfile::tempdir().unwrap();
-        let changed = ["a/lib.rs", "b/lib.rs", "shared/lib.rs"].map(|path|
-            ("local".to_string(), root.path().join(path)));
+        let changed = ["a/lib.rs", "b/lib.rs", "shared/lib.rs"]
+            .map(|path| ("local".to_string(), root.path().join(path)));
         for nested in [false, true] {
             for separate_request in [false, true] {
                 for failure_has_scope in [false, true] {
                     let mut control = TurnExecutionControl::new();
                     let baseline = control.baselines(0);
                     let collector = control.collector(&baseline);
-                    let record = |collector: &SamplingRequestSignalCollector, check: &str, passed: bool| {
-                        let tool = ToolName::plain("exec_command");
-                        let mut arguments = json!({"cmd": format!("python -m unittest tests.{check}")});
-                        if !passed {
-                            arguments["force_fresh"] = json!(true);
-                            arguments["max_output_tokens"] = json!(100);
-                        }
-                        let payload = ToolPayload::Function { arguments: arguments.to_string() };
-                        let paths = BTreeSet::from([
-                            SourceDependencyV1::new(&root.path().join(check), true),
-                            SourceDependencyV1::new(&root.path().join("shared"), true),
-                        ]);
-                        let mut signal = test_execution_signal();
-                        if passed || failure_has_scope {
-                            signal["validation_scope"] = json!(ValidationScope {
-                                behavioral_paths: paths.clone(),
-                                environment_id: "local".into(), paths: paths.clone(), test_execution: true, dependency_scope: None,
-                            });
-                        }
-                        let outcome = if passed { ToolOutputOutcome::Success } else { ToolOutputOutcome::Failure };
-                        if nested {
-                            collector.record_code_mode_result(CodeModeToolResult {
-                                cell_id: "checks", tool_name: &tool, payload: &payload,
-                                source_dependencies: Some(paths),
-                                outcome_context: ToolOutputOutcomeContext::new(outcome),
-                                signal: Some(&signal), result: &json!({"exit_code": if passed { 0 } else { 1 }}),
-                                canonical_artifact_required: false,
-                            });
-                        } else {
-                            let ordinal = collector.register_deterministic_tool_call(&tool, &payload, check).ordinal;
-                            collector.record_response_result(ordinal, ToolOutputOutcomeContext::new(outcome),
-                                Some(signal), &runner_tool_response(check, "Ran 1 test"), false);
-                        }
-                    };
+                    let record =
+                        |collector: &SamplingRequestSignalCollector, check: &str, passed: bool| {
+                            let tool = ToolName::plain("exec_command");
+                            let mut arguments =
+                                json!({"cmd": format!("python -m unittest tests.{check}")});
+                            if !passed {
+                                arguments["force_fresh"] = json!(true);
+                                arguments["max_output_tokens"] = json!(100);
+                            }
+                            let payload = ToolPayload::Function {
+                                arguments: arguments.to_string(),
+                            };
+                            let paths = BTreeSet::from([
+                                SourceDependencyV1::new(&root.path().join(check), true),
+                                SourceDependencyV1::new(&root.path().join("shared"), true),
+                            ]);
+                            let mut signal = test_execution_signal();
+                            if passed || failure_has_scope {
+                                signal["validation_scope"] = json!(ValidationScope {
+                                    behavioral_paths: paths.clone(),
+                                    environment_id: "local".into(),
+                                    paths: paths.clone(),
+                                    test_execution: true,
+                                    dependency_scope: None,
+                                });
+                            }
+                            let outcome = if passed {
+                                ToolOutputOutcome::Success
+                            } else {
+                                ToolOutputOutcome::Failure
+                            };
+                            if nested {
+                                collector.record_code_mode_result(CodeModeToolResult {
+                                    cell_id: "checks",
+                                    tool_name: &tool,
+                                    payload: &payload,
+                                    source_dependencies: Some(paths),
+                                    outcome_context: ToolOutputOutcomeContext::new(outcome),
+                                    signal: Some(&signal),
+                                    result: &json!({"exit_code": if passed { 0 } else { 1 }}),
+                                    canonical_artifact_required: false,
+                                });
+                            } else {
+                                let ordinal = collector
+                                    .register_deterministic_tool_call(&tool, &payload, check)
+                                    .ordinal;
+                                collector.record_response_result(
+                                    ordinal,
+                                    ToolOutputOutcomeContext::new(outcome),
+                                    Some(signal),
+                                    &runner_tool_response(check, "Ran 1 test"),
+                                    false,
+                                );
+                            }
+                        };
                     record(&collector, "a", true);
                     record(&collector, "b", true);
                     let failure = if separate_request {
                         control.settle(&baseline, &collector, &settled(0));
-                        assert!(control.completion_gaps_with_changed_paths(0, Some(&changed), false).is_empty());
+                        assert!(
+                            control
+                                .completion_gaps_with_changed_paths(0, Some(&changed), false)
+                                .is_empty()
+                        );
                         control.collector(&baseline)
-                    } else { collector };
+                    } else {
+                        collector
+                    };
                     record(&failure, "a", false);
                     control.settle(&baseline, &failure, &settled(0));
                     let gaps = control.completion_gaps_with_changed_paths(0, Some(&changed), false);
-                    assert_eq!(gaps.len(), 2, "{nested} {separate_request} {failure_has_scope}: {gaps:?}");
+                    assert_eq!(
+                        gaps.len(),
+                        2,
+                        "{nested} {separate_request} {failure_has_scope}: {gaps:?}"
+                    );
                     assert!(gaps[0].contains("1 validation check(s) failed"));
                     assert!(gaps[1].contains(&changed[0].1.display().to_string()));
                     assert!(!gaps[1].contains(&changed[1].1.display().to_string()));
@@ -9469,7 +10790,11 @@ mod tests {
                     let repair = control.collector(&baseline);
                     record(&repair, "a", true);
                     control.settle(&baseline, &repair, &settled(0));
-                    assert!(control.completion_gaps_with_changed_paths(0, Some(&changed), false).is_empty());
+                    assert!(
+                        control
+                            .completion_gaps_with_changed_paths(0, Some(&changed), false)
+                            .is_empty()
+                    );
                 }
             }
         }
@@ -9482,20 +10807,38 @@ mod tests {
         let passed = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Success);
         control.settle(&baseline, &passed, &settled(0));
         let launch = control.collector(&baseline);
-        let ordinal = launch.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &validation_proof_payload(), "background-check",
-        ).ordinal;
-        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+        let ordinal = launch
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "background-check",
+            )
+            .ordinal;
+        launch.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
             Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
-            &successful_tool_response("background-check", "running"), false);
+            &successful_tool_response("background-check", "running"),
+            false,
+        );
         control.settle(&baseline, &launch, &settled(0));
         let poll = control.collector(&baseline);
-        let ordinal = poll.register_deterministic_tool_call(
-            &ToolName::plain("write_stdin"),
-            &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "poll",
-        ).ordinal;
-        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-            Some(json!({"observed_process_id": 7})), &successful_tool_response("poll", "FAILED"), false);
+        let ordinal = poll
+            .register_deterministic_tool_call(
+                &ToolName::plain("write_stdin"),
+                &ToolPayload::Function {
+                    arguments: json!({"session_id": 7}).to_string(),
+                },
+                "poll",
+            )
+            .ordinal;
+        poll.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+            Some(json!({"observed_process_id": 7})),
+            &successful_tool_response("poll", "FAILED"),
+            false,
+        );
         control.settle(&baseline, &poll, &settled(0));
         assert!(control.pending_validation_coverage.is_empty());
         assert_delivery_retains_validation_gap(&mut control, 0);
@@ -9509,26 +10852,44 @@ mod tests {
         let mut control = TurnExecutionControl::new();
         let baseline = control.baselines(0);
         let launch = control.collector(&baseline);
-        let ordinal = launch.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &validation_proof_payload(), "old-check",
-        ).ordinal;
-        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+        let ordinal = launch
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "old-check",
+            )
+            .ordinal;
+        launch.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
             Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
-            &successful_tool_response("old-check", "running"), false);
+            &successful_tool_response("old-check", "running"),
+            false,
+        );
         control.settle(&baseline, &launch, &settled(0));
 
         let newer = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Failure);
         control.settle(&baseline, &newer, &settled(0));
         assert_eq!(control.failed_validation_checks.len(), 1);
         let poll = control.collector(&baseline);
-        let ordinal = poll.register_deterministic_tool_call(
-            &ToolName::plain("write_stdin"),
-            &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "old-poll",
-        ).ordinal;
+        let ordinal = poll
+            .register_deterministic_tool_call(
+                &ToolName::plain("write_stdin"),
+                &ToolPayload::Function {
+                    arguments: json!({"session_id": 7}).to_string(),
+                },
+                "old-poll",
+            )
+            .ordinal;
         let mut signal = test_execution_signal();
         signal["observed_process_id"] = json!(7);
-        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            Some(signal), &runner_tool_response("old-poll", "Ran 1 test"), false);
+        poll.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal),
+            &runner_tool_response("old-poll", "Ran 1 test"),
+            false,
+        );
         control.settle(&baseline, &poll, &settled(0));
         assert!(control.pending_validation_coverage.is_empty());
         assert_eq!(control.failed_validation_checks.len(), 1);
@@ -9542,20 +10903,30 @@ mod tests {
     #[test]
     fn uncertainty_turn_boundary_retains_questions_not_passing_proof() {
         let owner = Arc::new(Mutex::new(SessionValidationUncertainty::default()));
-        let mut first = TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
+        let mut first =
+            TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
         let baseline = first.baselines(0);
         let failure = recorded_validation_collector(&first, &baseline, ToolOutputOutcome::Failure);
         first.settle(&baseline, &failure, &settled(0));
         let launch = first.collector(&baseline);
-        let ordinal = launch.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &validation_proof_payload(), "carry-check",
-        ).ordinal;
-        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+        let ordinal = launch
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "carry-check",
+            )
+            .ordinal;
+        launch.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
             Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
-            &successful_tool_response("carry-check", "running"), false);
+            &successful_tool_response("carry-check", "running"),
+            false,
+        );
         first.settle(&baseline, &launch, &settled(0));
         drop(first); // Cancellation also takes this path.
-        let mut next = TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
+        let mut next =
+            TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
         assert_eq!(next.failed_validation_checks.len(), 1);
         assert_eq!(next.pending_validation_coverage.len(), 1);
         let assessment = next.completion_assessment(0);
@@ -9564,12 +10935,24 @@ mod tests {
         assert!(assessment.verification_gaps.is_empty());
         let baseline = next.baselines(0);
         let poll = next.collector(&baseline);
-        let ordinal = poll.register_deterministic_tool_call(&ToolName::plain("write_stdin"),
-            &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "carry-poll").ordinal;
+        let ordinal = poll
+            .register_deterministic_tool_call(
+                &ToolName::plain("write_stdin"),
+                &ToolPayload::Function {
+                    arguments: json!({"session_id": 7}).to_string(),
+                },
+                "carry-poll",
+            )
+            .ordinal;
         let mut signal = test_execution_signal();
         signal["observed_process_id"] = json!(7);
-        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            Some(signal), &runner_tool_response("carry-poll", "Ran 1 test"), false);
+        poll.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal),
+            &runner_tool_response("carry-poll", "Ran 1 test"),
+            false,
+        );
         next.settle(&baseline, &poll, &settled(0));
         assert!(next.pending_validation_coverage.is_empty());
         assert!(next.failed_validation_checks.is_empty());
@@ -9589,29 +10972,49 @@ mod tests {
         let mut control = TurnExecutionControl::new();
         let baseline = control.baselines(0);
         let launch = control.collector(&baseline);
-        let ordinal = launch.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &validation_proof_payload(), "background-check",
-        ).ordinal;
-        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+        let ordinal = launch
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "background-check",
+            )
+            .ordinal;
+        launch.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
             Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
-            &successful_tool_response("background-check", "running"), false);
+            &successful_tool_response("background-check", "running"),
+            false,
+        );
         control.settle(&baseline, &launch, &settled(0));
         for revision in [1, 2] {
             let baseline = control.baselines(revision);
             let poll = control.collector(&baseline);
-            let ordinal = poll.register_deterministic_tool_call(
-                &ToolName::plain("write_stdin"),
-                &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "poll",
-            ).ordinal;
+            let ordinal = poll
+                .register_deterministic_tool_call(
+                    &ToolName::plain("write_stdin"),
+                    &ToolPayload::Function {
+                        arguments: json!({"session_id": 7}).to_string(),
+                    },
+                    "poll",
+                )
+                .ordinal;
             let mut signal = test_execution_signal();
             signal["observed_process_id"] = json!(7);
             signal["validation_mutation_revision"] = json!(revision);
             let outcome = if revision == 1 {
                 signal["background_process_id"] = json!(7);
                 ToolOutputOutcome::Yielded
-            } else { ToolOutputOutcome::Success };
-            poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(outcome),
-                Some(signal), &runner_tool_response("poll", "Ran 1 test"), false);
+            } else {
+                ToolOutputOutcome::Success
+            };
+            poll.record_response_result(
+                ordinal,
+                ToolOutputOutcomeContext::new(outcome),
+                Some(signal),
+                &runner_tool_response("poll", "Ran 1 test"),
+                false,
+            );
             control.settle(&baseline, &poll, &settled(revision));
         }
         assert_eq!(control.validated_mutation_revision, Some(0));
@@ -9624,24 +11027,47 @@ mod tests {
         let control = TurnExecutionControl::new();
         let paths = vec![("local".into(), std::path::PathBuf::from("src/changed.rs"))];
         let gaps = control.completion_gaps_with_changed_paths(0, Some(&paths), true);
-        assert!(gaps.iter().any(|gap| gap.contains("Untracked changes exist")));
-        assert!(gaps.iter().any(|gap| gap.contains("src") && gap.contains("changed.rs")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("Untracked changes exist"))
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("src") && gap.contains("changed.rs"))
+        );
         let unknown = control.completion_gaps_with_changed_paths(0, None, true);
-        assert!(unknown.iter().any(|gap| gap.contains("Untracked changes exist")));
+        assert!(
+            unknown
+                .iter()
+                .any(|gap| gap.contains("Untracked changes exist"))
+        );
     }
 
     #[test]
     fn uncertainty_skill_instructions_are_not_documentation_only() {
-        for path in ["skills/demo/SKILL.md", "skills/demo/skill.md", r"skills\demo\SKILL.md",
-            "AGENTS.md", "AGENTS.override.md", "codex-rs/prompts/templates/compact/prompt.md",
+        for path in [
+            "skills/demo/SKILL.md",
+            "skills/demo/skill.md",
+            r"skills\demo\SKILL.md",
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "codex-rs/prompts/templates/compact/prompt.md",
             "codex-rs/protocol/src/prompts/base_instructions/default.md",
-            "codex-rs/models-manager/templates/collaboration_mode/plan.md"]
-        {
-            assert!(!documentation_only_path(std::path::Path::new(path)), "{path}");
+            "codex-rs/models-manager/templates/collaboration_mode/plan.md",
+        ] {
+            assert!(
+                !documentation_only_path(std::path::Path::new(path)),
+                "{path}"
+            );
         }
-        assert!(documentation_only_path(std::path::Path::new("docs/README.md")));
+        assert!(documentation_only_path(std::path::Path::new(
+            "docs/README.md"
+        )));
         let control = TurnExecutionControl::new();
-        let changed = vec![("local".into(), std::path::PathBuf::from("skills/demo/SKILL.md"))];
+        let changed = vec![(
+            "local".into(),
+            std::path::PathBuf::from("skills/demo/SKILL.md"),
+        )];
         let assessment = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
         assert_eq!(assessment.verification_gaps.len(), 1);
         assert!(assessment.advisories.is_empty());
@@ -9656,62 +11082,112 @@ mod tests {
         let record = |control: &mut TurnExecutionControl, check: &str, revision: u64| {
             let baseline = control.baselines(revision);
             let collector = control.collector(&baseline);
-            let payload = ToolPayload::Function { arguments: json!({"cmd": format!("python -m unittest tests.{check}")}).to_string() };
-            let ordinal = collector.register_deterministic_tool_call(&ToolName::plain("exec_command"), &payload, check).ordinal;
+            let payload = ToolPayload::Function {
+                arguments: json!({"cmd": format!("python -m unittest tests.{check}")}).to_string(),
+            };
+            let ordinal = collector
+                .register_deterministic_tool_call(&ToolName::plain("exec_command"), &payload, check)
+                .ordinal;
             let paths = BTreeSet::from([SourceDependencyV1::new(&root.path().join(check), true)]);
-            let dependency_scope = Some(paths.iter().cloned().chain([
-                SourceDependencyV1::new(&root.path().join("shared"), true),
-                SourceDependencyV1::new(&root.path().join("Cargo.toml"), false),
-                SourceDependencyV1::new(&root.path().join("generated"), true),
-            ]).collect());
+            let dependency_scope = Some(
+                paths
+                    .iter()
+                    .cloned()
+                    .chain([
+                        SourceDependencyV1::new(&root.path().join("shared"), true),
+                        SourceDependencyV1::new(&root.path().join("Cargo.toml"), false),
+                        SourceDependencyV1::new(&root.path().join("generated"), true),
+                    ])
+                    .collect(),
+            );
             let mut signal = test_execution_signal();
             signal["validation_mutation_revision"] = json!(revision);
             signal["validation_scope"] = json!(ValidationScope {
                 behavioral_paths: paths.clone(),
-                environment_id: "local".into(), paths, test_execution: true, dependency_scope,
+                environment_id: "local".into(),
+                paths,
+                test_execution: true,
+                dependency_scope,
             });
-            collector.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                Some(signal), &runner_tool_response(check, "Ran 1 test"), false);
+            collector.record_response_result(
+                ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                Some(signal),
+                &runner_tool_response(check, "Ran 1 test"),
+                false,
+            );
             control.settle(&baseline, &collector, &settled(revision));
         };
         // Carry a completed check across a disjoint documentation edit without
         // pretending that the check executed at the later revision.
         for (path, survives) in [
-            ("README.md", true), ("a/lib.rs", false),
-            ("Cargo.toml", false), ("generated/input.rs", false),
+            ("README.md", true),
+            ("a/lib.rs", false),
+            ("Cargo.toml", false),
+            ("generated/input.rs", false),
         ] {
             let mut control = TurnExecutionControl::new();
             let mut tracker = crate::turn_diff_tracker::TurnDiffTracker::new();
             record(&mut control, "a", 0);
             let patch = format!("*** Begin Patch\n*** Add File: {path}\n+changed\n*** End Patch");
-            let delta = codex_apply_patch::apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(),
-                codex_exec_server::LOCAL_FS.as_ref(), None).await.unwrap();
+            let delta = codex_apply_patch::apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                codex_exec_server::LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
             tracker.track_delta("local", &delta);
             let revision = tracker.current_mutation_revision();
             control.retain_validation_across_changes(revision, &tracker);
             let baseline = control.baselines(revision);
             control.settle(&baseline, &control.collector(&baseline), &settled(revision));
             assert_eq!(control.validated_mutation_revision, Some(0));
-            assert_eq!(control.completion_gaps(revision).is_empty(), survives, "{path}");
+            assert_eq!(
+                control.completion_gaps(revision).is_empty(),
+                survives,
+                "{path}"
+            );
             assert_eq!(!control.validation_coverage.is_empty(), survives, "{path}");
         }
         record(&mut control, "a", 0);
         for (path, retains_a) in [("b/lib.rs", true), ("shared/lib.rs", false)] {
             let patch = format!("*** Begin Patch\n*** Add File: {path}\n+changed\n*** End Patch");
-            let delta = codex_apply_patch::apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(),
-                codex_exec_server::LOCAL_FS.as_ref(), None).await.unwrap();
+            let delta = codex_apply_patch::apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                codex_exec_server::LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
             tracker.track_delta("local", &delta);
             let revision = tracker.current_mutation_revision();
             control.retain_validation_across_changes(revision, &tracker);
-            if retains_a { record(&mut control, "b", revision); }
-            else {
+            if retains_a {
+                record(&mut control, "b", revision);
+            } else {
                 let baseline = control.baselines(revision);
                 let collector = control.collector(&baseline);
                 control.settle(&baseline, &collector, &settled(revision));
             }
-            assert_eq!(control.validation_coverage.values().any(|scope|
-                scope.paths.contains(&SourceDependencyV1::new(&root.path().join("a"), true))), retains_a);
-            if !retains_a { assert!(control.validation_coverage.is_empty(), "shared dependency invalidates both checks"); }
+            assert_eq!(
+                control.validation_coverage.values().any(|scope| scope
+                    .paths
+                    .contains(&SourceDependencyV1::new(&root.path().join("a"), true))),
+                retains_a
+            );
+            if !retains_a {
+                assert!(
+                    control.validation_coverage.is_empty(),
+                    "shared dependency invalidates both checks"
+                );
+            }
         }
         record(&mut control, "a", tracker.current_mutation_revision());
         tracker.record_unknown_mutation();
@@ -9725,19 +11201,63 @@ mod tests {
     #[test]
     fn documentation_is_listed_separately_from_validation_gaps() {
         let control = TurnExecutionControl::new();
-        let paths = vec![("local".into(), std::path::PathBuf::from("README.md")),
+        let paths = vec![
+            ("local".into(), std::path::PathBuf::from("README.md")),
             ("local".into(), std::path::PathBuf::from("AGENTS.md")),
-            ("local".into(), std::path::PathBuf::from("skills/example/SKILL.md")),
-            ("local".into(), std::path::PathBuf::from("codex-rs/prompts/templates/compact/prompt.md")),
-            ("local".into(), std::path::PathBuf::from("src/lib.rs"))];
+            (
+                "local".into(),
+                std::path::PathBuf::from("skills/example/SKILL.md"),
+            ),
+            (
+                "local".into(),
+                std::path::PathBuf::from("codex-rs/prompts/templates/compact/prompt.md"),
+            ),
+            ("local".into(), std::path::PathBuf::from("src/lib.rs")),
+        ];
         let gaps = control.completion_gaps_with_changed_paths(0, Some(&paths), false);
-        let code = gaps.iter().find(|gap| gap.starts_with("Changed paths")).unwrap();
+        let code = gaps
+            .iter()
+            .find(|gap| gap.starts_with("Changed paths"))
+            .unwrap();
         assert!(!code.contains("README.md"));
         assert!(code.contains("AGENTS.md"));
         assert!(code.contains("SKILL.md"));
         assert!(code.contains("prompt.md"));
-        assert!(gaps.iter().any(|gap| gap.starts_with("Documentation-only") && gap.contains("README.md") && !gap.contains("prompt.md")));
-        assert!(!gaps.iter().any(|gap| gap.contains("No recognized validation command passed")));
+        assert!(gaps.iter().any(|gap| gap.starts_with("Documentation-only")
+            && gap.contains("README.md")
+            && !gap.contains("prompt.md")));
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.contains("No recognized validation command passed"))
+        );
+    }
+
+    #[test]
+    fn completion_path_lists_are_bounded_and_all_documentation_needs_no_advisory() {
+        let control = TurnExecutionControl::new();
+        let docs = vec![
+            ("local".into(), std::path::PathBuf::from("README.md")),
+            ("local".into(), std::path::PathBuf::from("docs/guide.md")),
+        ];
+        let gaps = control.completion_gaps_with_changed_paths(0, Some(&docs), false);
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.starts_with("Documentation-only") || gap.starts_with("Changed paths")),
+            "{gaps:?}"
+        );
+        let code = (0..12)
+            .map(|index| ("local".to_string(), std::path::PathBuf::from(format!("src/m{index}.rs"))))
+            .collect::<Vec<_>>();
+        let gaps = control.completion_gaps_with_changed_paths(0, Some(&code), false);
+        let gap = gaps
+            .iter()
+            .find(|gap| gap.starts_with("Changed paths"))
+            .unwrap();
+        assert!(gap.contains("local:src/m9.rs"), "{gap}");
+        assert!(!gap.contains("local:src/m10.rs"), "{gap}");
+        assert!(gap.contains("and 2 more"), "{gap}");
     }
 
     #[test]
@@ -9772,11 +11292,7 @@ mod tests {
                 );
             }
             control.settle(&baselines, &collector, &settled(0));
-            assert_eq!(
-                control.validated_mutation_revision,
-                Some(0),
-                "{commands:?}"
-            );
+            assert_eq!(control.validated_mutation_revision, Some(0), "{commands:?}");
             assert!(control.completion_gaps(0).is_empty(), "{commands:?}");
             assert_eq!(
                 control
@@ -9828,9 +11344,15 @@ mod tests {
 
         let outcomes = collector.snapshot();
         assert_eq!(outcomes.len(), 2);
-        let nested = outcomes.iter().find(|outcome| outcome.nested_in_code_mode).unwrap();
+        let nested = outcomes
+            .iter()
+            .find(|outcome| outcome.nested_in_code_mode)
+            .unwrap();
         assert_eq!(nested.plan.as_ref(), Some(&nested_plan));
-        assert_eq!(nested.source_evidence, Some(json!({"identity": "source-v1"})));
+        assert_eq!(
+            nested.source_evidence,
+            Some(json!({"identity": "source-v1"}))
+        );
         assert!(nested.canonical_artifact_required);
         assert_eq!(
             collector.generation_purpose(&baseline, &settled(0), false, false,),

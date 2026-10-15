@@ -111,7 +111,9 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), resolved);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 36);
             assert_eq!(
-                resolve_installation_id(&codex_home.path().abs()).await.unwrap(),
+                resolve_installation_id(&codex_home.path().abs())
+                    .await
+                    .unwrap(),
                 resolved,
                 "repaired identity must survive the next resolution"
             );

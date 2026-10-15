@@ -147,6 +147,8 @@ pub enum Feature {
     DeferredExecutor,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
+    /// Persist intermediate reasoning, plan, tool progress, and phase events in rollouts.
+    RolloutActivity,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -932,6 +934,12 @@ define_features! {
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::RolloutActivity,
+        key: "rollout_activity",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::LocalThreadStoreCompression,
         key: "local_thread_store_compression",
         stage: Stage::Stable,
@@ -1200,6 +1208,28 @@ pub fn unknown_features_warning_event(
     effective_features: Option<&Table>,
     config_path: &str,
 ) -> Option<Event> {
+    unknown_features_warning_event_with_origins(effective_features, config_path, |_| None)
+}
+
+/// As [`unknown_features_warning_event`], but attributing each key to the
+/// configuration layer that actually set it.
+///
+/// `feature_key_origin` maps a feature key to a rendered layer description (for
+/// example `"enterprise-managed (Acme, 42)"`), or `None` when the key came from
+/// the user's own `config_path`. The layering forbids a direct dependency here
+/// — `codex-config` already depends on `codex-features` — so the caller, which
+/// holds the `ConfigLayerStack`, resolves provenance via `origins()` and
+/// `format_config_layer_source` and passes the result in.
+///
+/// Without this, every unknown key was reported against the user's
+/// `config.toml` and advised "check the spelling", even for keys injected by a
+/// managed or bundled layer that the user cannot edit — unactionable advice
+/// pointing at the wrong file.
+pub fn unknown_features_warning_event_with_origins(
+    effective_features: Option<&Table>,
+    config_path: &str,
+    feature_key_origin: impl Fn(&str) -> Option<String>,
+) -> Option<Event> {
     let unknown = effective_features?
         .keys()
         .filter(|key| canonical_feature_for_key(key).is_none())
@@ -1208,25 +1238,52 @@ pub fn unknown_features_warning_event(
     if unknown.is_empty() {
         return None;
     }
+    let origins = unknown
+        .iter()
+        .map(|key| (key.clone(), feature_key_origin(key)))
+        .collect::<BTreeMap<_, _>>();
     // Classify only migrations established by this registry. Never guess a
     // replacement from spelling similarity or silently change user settings.
     let compatibility = unknown.iter().map(|key| {
+        // `apps_mcp_path_override` is parsed by a dedicated removed-key field
+        // (`FeaturesToml::removed_apps_mcp_path_override`), which already logs
+        // that it is removed and ignored. Classifying it as "unknown" here told
+        // the user to check their spelling for a key the parser recognizes.
         let removed = matches!(key.as_str(), "memories" | "memory_tool" | "auto_review"
-            | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation");
+            | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation"
+            | "apps_mcp_path_override");
+        let origin = origins.get(key).and_then(Option::as_deref);
         serde_json::json!({
             "key": key,
             "classification": if removed { "removed" } else { "unknown" },
-            "suggested_action": if removed { "review removal of this inactive setting" }
-                else { "check the configuration owner and spelling; no automatic migration is known" },
+            "source": origin.unwrap_or(config_path),
+            "suggested_action": if removed {
+                    "review removal of this inactive setting".to_string()
+                } else if let Some(origin) = origin {
+                    // The user cannot edit this layer, so do not advise a spelling fix.
+                    format!("set by {origin}; contact that configuration's owner")
+                } else {
+                    "check the configuration owner and spelling; no automatic migration is known"
+                        .to_string()
+                },
             "applied": false,
         })
     }).collect::<Vec<_>>();
+    // Name the layer each key came from, so the warning points at something the
+    // reader can actually change.
+    let keys = unknown
+        .iter()
+        .map(|key| match origins.get(key).and_then(Option::as_deref) {
+            Some(origin) => format!("{key} (from {origin})"),
+            None => key.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(Event {
         id: String::new(),
         msg: EventMsg::Warning(WarningEvent {
             message: format!(
-                "Unknown feature keys in {config_path}: {}. These settings have no effect in this build. Compatibility preview (no settings changed): {}",
-                unknown.into_iter().collect::<Vec<_>>().join(", "),
+                "Unknown feature keys in {config_path}: {keys}. These settings have no effect in this build. Compatibility preview (no settings changed): {}",
                 serde_json::Value::Array(compatibility),
             ),
         }),

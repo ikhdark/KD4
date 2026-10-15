@@ -119,7 +119,11 @@ fn canonicalizes_powershell_wrappers_without_crossing_profile_modes() {
         "-Command".to_string(),
         script.to_string(),
     ];
-    let command_b = vec![powershell.clone(), "-Command".to_string(), script.to_string()];
+    let command_b = vec![
+        powershell.clone(),
+        "-Command".to_string(),
+        script.to_string(),
+    ];
 
     assert_eq!(
         canonicalize_command_for_approval(&command_a),

@@ -558,9 +558,27 @@ async fn resume_skips_invalid_utf8_without_fabricating_or_losing_history() -> st
         else {
             panic!("expected resumed history");
         };
+        let resumed = history.history.as_ref();
+        assert_eq!(resumed.len(), items.len());
         assert_eq!(
-            serde_json::to_value(history.history.as_ref())?,
-            serde_json::to_value(&items)?
+            serde_json::to_value(&resumed[..items.len() - 1])?,
+            serde_json::to_value(&items[..items.len() - 1])?
+        );
+        // Each read mints a fresh notice identity and never persists it, so
+        // resume must carry the same gap evidence under its own ID.
+        let resumed_notice = resumed.last().unwrap();
+        assert_reconstruction_gap(resumed_notice, 2);
+        let without_id = |item: &RolloutItem| {
+            let RolloutItem::ResponseItem(item) = item else {
+                panic!("expected a reconstruction notice");
+            };
+            let mut item = item.clone();
+            item.set_id(None);
+            item
+        };
+        assert_eq!(
+            without_id(resumed_notice),
+            without_id(items.last().unwrap())
         );
     }
     assert_eq!(fs::read(home.path().join("original.jsonl"))?, bytes);

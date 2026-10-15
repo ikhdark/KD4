@@ -314,9 +314,7 @@ fn instruction_fragments_in_items(items: &[Value]) -> Vec<String> {
 }
 
 fn expected_instruction_fragment(contents: &str) -> String {
-    format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
-    )
+    format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
 #[track_caller]
@@ -879,7 +877,10 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     assert_eq!(input["hook_event_name"], "PostCompact");
     assert_eq!(input["trigger"], "manual");
     assert!(input.get("compact_summary").is_none());
-    assert_eq!(input["compaction_summary"], summary_with_prefix(SUMMARY_TEXT));
+    assert_eq!(
+        input["compaction_summary"],
+        summary_with_prefix(SUMMARY_TEXT)
+    );
     assert!(input.get("status").is_none());
     assert!(input.get("error").is_none());
     assert!(input.get("reason").is_none());
@@ -1264,7 +1265,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             .function_call_output_text(call_id)
             .expect("post-compaction request must retain the shell result")
             .replace("\r\n", "\n");
-        let (header, stdout) = output.split_once("\nOutput:\n").expect("shell output envelope");
+        let (header, stdout) = output
+            .split_once("\nOutput:\n")
+            .expect("shell output envelope");
         assert!(header.starts_with("Exit code: 0\nWall time: "), "{output}");
         assert_eq!(stdout, expected_stdout);
     }
@@ -1384,7 +1387,11 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     assert_eq!(recovery["complete"], true);
                     assert_eq!(recovery["summary_is_lossless"], false);
                     assert_eq!(recovery["source_selector"]["pointer"], "/summarized_items");
-                    assert!(recovery["artifact_id"].as_str().is_some_and(|id| !id.is_empty()));
+                    assert!(
+                        recovery["artifact_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
                 }
                 Some("tool_history_artifact_pins") => {
                     assert_eq!(recovery["version"], 1);
@@ -1664,9 +1671,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     // conversation text independently of its generated ID.
                     if let Some(content) = value["content"].as_array_mut() {
                         content.retain(|item| {
-                            !item["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok())
-                                .is_some_and(|recovery| matches!(recovery["kind"].as_str(),
-                                    Some("local_compaction_text_recovery" | "tool_history_artifact_pins")))
+                            !item["text"]
+                                .as_str()
+                                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                                .is_some_and(|recovery| {
+                                    matches!(
+                                        recovery["kind"].as_str(),
+                                        Some(
+                                            "local_compaction_text_recovery"
+                                                | "tool_history_artifact_pins"
+                                        )
+                                    )
+                                })
                         });
                     }
                     value
@@ -1694,7 +1710,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // test 3: the number of requests should be 7
     assert_eq!(requests_payloads.len(), 7);
-    codex.submit(Op::Shutdown).await.expect("shutdown shell session");
+    codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown shell session");
     wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 }
 
@@ -1976,14 +1995,20 @@ async fn auto_compact_emits_context_compaction_items() {
                     item: TurnItem::ContextCompaction(item),
                     ..
                 }) => {
-                    assert!(completed_item.is_none(), "only one compaction should complete");
+                    assert!(
+                        completed_item.is_none(),
+                        "only one compaction should complete"
+                    );
                     completed_item = Some(item);
                 }
                 EventMsg::ContextCompacted(_) => {
                     legacy_event = true;
                 }
                 EventMsg::TurnComplete(turn) if !event.id.starts_with("auto-compact-") => {
-                    assert!(turn.error.is_none(), "auto-compaction turn failed: {turn:?}");
+                    assert!(
+                        turn.error.is_none(),
+                        "auto-compaction turn failed: {turn:?}"
+                    );
                     break;
                 }
                 _ => {}
@@ -1996,7 +2021,6 @@ async fn auto_compact_emits_context_compaction_items() {
     assert_eq!(started_item.id, completed_item.id);
     assert!(legacy_event);
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
@@ -3238,10 +3262,17 @@ async fn auto_compact_persists_rollout_entries() {
         turn_context_count, 3,
         "rollout should contain one TurnContext entry per real user turn"
     );
-    assert_eq!(compacted.len(), 1, "auto-compaction must persist one checkpoint");
+    assert_eq!(
+        compacted.len(),
+        1,
+        "auto-compaction must persist one checkpoint"
+    );
     assert_eq!(compacted[0].message, summary_with_prefix(AUTO_SUMMARY_TEXT));
     let replacement = serde_json::to_value(
-        compacted[0].replacement_history.as_ref().expect("replacement history"),
+        compacted[0]
+            .replacement_history
+            .as_ref()
+            .expect("replacement history"),
     )
     .unwrap();
     for user in [FIRST_AUTO_MSG, SECOND_AUTO_MSG] {
@@ -3313,10 +3344,17 @@ async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history
     assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
     // A later explicit compact observes the untouched live history; inspecting
     // only the failed request would also pass after destructive error handling.
-    codex.submit(Op::Compact).await.expect("retry compact explicitly");
+    codex
+        .submit(Op::Compact)
+        .await
+        .expect("retry compact explicitly");
     wait_for_successful_turn_complete(codex).await;
     let requests = request_log.requests();
-    assert_eq!(requests.len(), 3, "only the explicit compact may add a request");
+    assert_eq!(
+        requests.len(),
+        3,
+        "only the explicit compact may add a request"
+    );
     assert_eq!(
         requests[2]
             .message_input_texts("user")
@@ -3411,10 +3449,17 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
     assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
     // A later explicit compact observes the untouched live history; inspecting
     // only the failed request would also pass after destructive error handling.
-    codex.submit(Op::Compact).await.expect("retry compact explicitly");
+    codex
+        .submit(Op::Compact)
+        .await
+        .expect("retry compact explicitly");
     wait_for_successful_turn_complete(codex).await;
     let requests = request_log.requests();
-    assert_eq!(requests.len(), 3, "only the explicit compact may add a request");
+    assert_eq!(
+        requests.len(),
+        3,
+        "only the explicit compact may add a request"
+    );
     assert_eq!(
         requests[2]
             .message_input_texts("user")
@@ -4147,7 +4192,10 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     );
 
     assert!(
-        auto_compact_mock.single_request().function_call_output_text(DUMMY_CALL_ID).is_none(),
+        auto_compact_mock
+            .single_request()
+            .function_call_output_text(DUMMY_CALL_ID)
+            .is_none(),
         "unread tool results must not be interpreted by the summarizer"
     );
     let function_call_output = post_auto_compact_mock
@@ -4254,11 +4302,15 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_usage("r1", /*input_tokens*/ 60_000, /*output_tokens*/ 50),
+        ev_completed_with_usage(
+            "r1", /*input_tokens*/ 60_000, /*output_tokens*/ 50,
+        ),
     ]);
     let second_turn = sse(vec![
         ev_assistant_message("m2", SECOND_LARGE_REPLY),
-        ev_completed_with_usage("r2", /*input_tokens*/ 70_000, /*output_tokens*/ 50),
+        ev_completed_with_usage(
+            "r2", /*input_tokens*/ 70_000, /*output_tokens*/ 50,
+        ),
     ]);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
@@ -4266,7 +4318,9 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
     ]);
     let post_compact_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_usage("r4", /*input_tokens*/ 75_000, /*output_tokens*/ 20),
+        ev_completed_with_usage(
+            "r4", /*input_tokens*/ 75_000, /*output_tokens*/ 20,
+        ),
     ]);
     let request_log = mount_sse_sequence(
         &server,

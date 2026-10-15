@@ -68,7 +68,12 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
     // Untrusted producer lineage cannot erase distinct command evidence.
     for (command, scope, identity, novel) in [
         ("tool scan", Some("query-1"), "snapshot-1", true),
-        ("tool render --retained", Some("query-1"), "snapshot-1", true),
+        (
+            "tool render --retained",
+            Some("query-1"),
+            "snapshot-1",
+            true,
+        ),
         ("tool scan", Some("query-1"), "snapshot-2", true),
         ("tool scan", Some("query-2"), "snapshot-2", true),
         ("tool scan", None, "snapshot-3", true),
@@ -93,7 +98,8 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
             raw_output: serde_json::to_vec(&json!({
                 "rendered_by": command,
                 "evidence_lineage": lineage,
-            })).unwrap(),
+            }))
+            .unwrap(),
             truncation_policy: TruncationPolicy::Tokens(10_000),
             max_output_tokens: None,
             process_id: None,
@@ -110,21 +116,28 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
         let collector = control.collector(&baseline);
         record(&collector, "exec_command", &payload, &result, "lineage");
         assert_eq!(
-            control.observe_progress(&baseline, &collector, &settled())
+            control
+                .observe_progress(&baseline, &collector, &settled())
                 .contains(&TurnTimingProgressKind::NewSourceEvidence),
-            novel, "{command} {scope:?} {identity}",
+            novel,
+            "{command} {scope:?} {identity}",
         );
         for markdown in [false, true] {
             let mut file_lineage = lineage.clone();
             let bytes = if markdown {
                 let body = "# Report\n";
-                file_lineage["content_sha256"] = json!(crate::tool_history::sha256(body.as_bytes()));
-                format!("<!-- codex-evidence: {} -->\n# Report\n",
-                    json!({"evidence_lineage": file_lineage})).into_bytes()
+                file_lineage["content_sha256"] =
+                    json!(crate::tool_history::sha256(body.as_bytes()));
+                format!(
+                    "<!-- codex-evidence: {} -->\n# Report\n",
+                    json!({"evidence_lineage": file_lineage})
+                )
+                .into_bytes()
             } else {
                 let mut document = json!({"rendered_by": command});
                 file_lineage["content_sha256"] = json!(crate::tool_history::sha256(
-                    &serde_json::to_vec(&document).unwrap()));
+                    &serde_json::to_vec(&document).unwrap()
+                ));
                 document["evidence_lineage"] = file_lineage;
                 serde_json::to_vec(&document).unwrap()
             };
@@ -133,19 +146,42 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
             let call = invocation("read_file", json!({"path":path})).await;
             let read = ReadFileHandler.handle(call.clone()).await.unwrap();
             let collector = control.collector(&baseline);
-            record(&collector, "read_file", &call.payload, read.as_ref(), "report");
-            assert_eq!(control.observe_progress(&baseline, &collector, &settled())
-                .contains(&TurnTimingProgressKind::NewSourceEvidence), file_is_novel,
-                "producer attribution must not erase the native file identity");
+            record(
+                &collector,
+                "read_file",
+                &call.payload,
+                read.as_ref(),
+                "report",
+            );
+            assert_eq!(
+                control
+                    .observe_progress(&baseline, &collector, &settled())
+                    .contains(&TurnTimingProgressKind::NewSourceEvidence),
+                file_is_novel,
+                "producer attribution must not erase the native file identity"
+            );
             // Even a selected projection retains attribution, not a new source
             // identity. Byte coverage still belongs to the ordinary read result.
-            let call = invocation("read_file", json!({"path":path,
-                "selectors":[{"kind":"lines","start":1,"end":1}]})).await;
+            let call = invocation(
+                "read_file",
+                json!({"path":path,
+                "selectors":[{"kind":"lines","start":1,"end":1}]}),
+            )
+            .await;
             let read = ReadFileHandler.handle(call.clone()).await.unwrap();
             let collector = control.collector(&baseline);
-            record(&collector, "read_file", &call.payload, read.as_ref(), "selection");
-            assert!(!control.observe_progress(&baseline, &collector, &settled())
-                .contains(&TurnTimingProgressKind::NewSourceEvidence));
+            record(
+                &collector,
+                "read_file",
+                &call.payload,
+                read.as_ref(),
+                "selection",
+            );
+            assert!(
+                !control
+                    .observe_progress(&baseline, &collector, &settled())
+                    .contains(&TurnTimingProgressKind::NewSourceEvidence)
+            );
         }
     }
 }
@@ -154,9 +190,16 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
 async fn repository_runners_require_committed_declarations_and_supply_execution_proof() {
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
-        let result = std::process::Command::new("git").current_dir(dir.path())
-            .args(args).output().unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let result = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     };
     git(&["init", "-q"]);
     std::fs::create_dir(dir.path().join(".codex")).unwrap();
@@ -168,58 +211,109 @@ async fn repository_runners_require_committed_declarations_and_supply_execution_
     let manifest = dir.path().join(".codex/test-runners.json");
     std::fs::write(&manifest, config.to_string()).unwrap();
     let resolve = |command: &str| CommandInvocation::Script(command.to_string());
-    assert!(crate::validation::resolve_command_validation(&resolve("just ci"),
-        Some(dir.path()), None).await.is_none());
+    assert!(
+        crate::validation::resolve_command_validation(&resolve("just ci"), Some(dir.path()), None)
+            .await
+            .is_none()
+    );
     git(&["add", ".codex/test-runners.json"]);
-    git(&["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-        "commit", "-qm", "declare runners"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "declare runners",
+    ]);
     // A worktree/index edit cannot introduce a trusted echo producer.
-    std::fs::write(&manifest, json!({"version":1,"runners":[
-        {"programs":["echo"],"prefixes":[["fake"]],"operations":["test"],"receipt_runner":"ci"}
-    ]}).to_string()).unwrap();
+    std::fs::write(
+        &manifest,
+        json!({"version":1,"runners":[
+            {"programs":["echo"],"prefixes":[["fake"]],"operations":["test"],"receipt_runner":"ci"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
     git(&["add", ".codex/test-runners.json"]);
-    assert!(crate::validation::resolve_command_validation(&resolve("echo fake"),
-        Some(dir.path()), None).await.is_none());
+    assert!(
+        crate::validation::resolve_command_validation(
+            &resolve("echo fake"),
+            Some(dir.path()),
+            None
+        )
+        .await
+        .is_none()
+    );
 
     let receipt = json!({"kind":"codex_test_execution_v1","runner":"ci","exit_code":0,
         "selected_targets":["suite"],"runner_input_fingerprint":"a".repeat(64),
         "completed_tests":{"suite":["case"]},"executed_tests":1});
     for command in ["just ci", "make verify", "npm run e2e"] {
-        let validation = crate::validation::resolve_command_validation(&resolve(command),
-            Some(dir.path()), None).await.unwrap();
+        let validation = crate::validation::resolve_command_validation(
+            &resolve(command),
+            Some(dir.path()),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(validation.is_test());
         for nested in [false, true] {
             let mut control = TurnExecutionControl::new();
             let baseline = control.baselines(0);
             let collector = control.collector(&baseline);
-            let payload = ToolPayload::Function { arguments: json!({"cmd":command}).to_string() };
+            let payload = ToolPayload::Function {
+                arguments: json!({"cmd":command}).to_string(),
+            };
             let output = ExecCommandToolOutput {
                 output_ranges: None,
-                process_output: None, error: None, validation: Some(validation.clone()),
-                event_call_id: "runner".into(), chunk_id: "chunk".into(),
-                wall_time: std::time::Duration::ZERO, raw_output: receipt.to_string().into_bytes(),
-                truncation_policy: TruncationPolicy::Tokens(1000), max_output_tokens: None,
-                process_id: None, session_capabilities: None, exit_code: Some(0),
-                process_exited: true, search_no_match: false, original_token_count: None,
-                hook_command: Some(command.into()), raw_output_artifact: None, repair_notice: None,
+                process_output: None,
+                error: None,
+                validation: Some(validation.clone()),
+                event_call_id: "runner".into(),
+                chunk_id: "chunk".into(),
+                wall_time: std::time::Duration::ZERO,
+                raw_output: receipt.to_string().into_bytes(),
+                truncation_policy: TruncationPolicy::Tokens(1000),
+                max_output_tokens: None,
+                process_id: None,
+                session_capabilities: None,
+                exit_code: Some(0),
+                process_exited: true,
+                search_no_match: false,
+                original_token_count: None,
+                hook_command: Some(command.into()),
+                raw_output_artifact: None,
+                repair_notice: None,
                 pending_deferred_completions: Vec::new(),
             };
             if nested {
                 let signal = output.sampling_request_signal();
                 let value = output.code_mode_result(&payload);
                 collector.record_code_mode_result(CodeModeToolResult {
-                    cell_id: "cell", tool_name: &ToolName::plain("exec_command"),
-                    payload: &payload, source_dependencies: None,
-                    outcome_context: output.outcome_context(), signal: signal.as_ref(),
-                    result: &value, canonical_artifact_required: false,
+                    cell_id: "cell",
+                    tool_name: &ToolName::plain("exec_command"),
+                    payload: &payload,
+                    source_dependencies: None,
+                    outcome_context: output.outcome_context(),
+                    signal: signal.as_ref(),
+                    result: &value,
+                    canonical_artifact_required: false,
                 });
             } else {
                 record(&collector, "exec_command", &payload, &output, "runner");
             }
-            assert!(control.observe_progress(&baseline, &collector, &settled())
-                .contains(&TurnTimingProgressKind::ValidationResult));
+            assert!(
+                control
+                    .observe_progress(&baseline, &collector, &settled())
+                    .contains(&TurnTimingProgressKind::ValidationResult)
+            );
             control.settle(&baseline, &collector, &settled());
-            assert_eq!(control.validated_mutation_revision, Some(0), "{command} nested={nested}");
+            assert_eq!(
+                control.validated_mutation_revision,
+                Some(0),
+                "{command} nested={nested}"
+            );
         }
         for (field, value) in [
             ("executed_tests", json!(0)),
@@ -230,19 +324,42 @@ async fn repository_runners_require_committed_declarations_and_supply_execution_
             let mut bad = receipt.clone();
             bad[field] = value;
             let mut signal = json!({});
-            crate::tools::context::attach_command_validation(&mut signal,
-                bad.to_string().as_bytes(), Some(&validation), Some(0), true);
+            crate::tools::context::attach_command_validation(
+                &mut signal,
+                bad.to_string().as_bytes(),
+                Some(&validation),
+                Some(0),
+                true,
+            );
             assert!(signal.get("runner_execution_receipt").is_none());
         }
     }
-    for command in ["echo fake", "just ci; echo fake", "just ci && echo fake",
-        "just ci | cat", "just ci > receipt.json", "just ci --help"] {
-        let validation = crate::validation::resolve_command_validation(&resolve(command),
-            Some(dir.path()), None).await;
+    for command in [
+        "echo fake",
+        "just ci; echo fake",
+        "just ci && echo fake",
+        "just ci | cat",
+        "just ci > receipt.json",
+        "just ci --help",
+    ] {
+        let validation = crate::validation::resolve_command_validation(
+            &resolve(command),
+            Some(dir.path()),
+            None,
+        )
+        .await;
         let mut signal = json!({});
-        crate::tools::context::attach_command_validation(&mut signal, receipt.to_string().as_bytes(),
-            validation.as_ref(), Some(0), true);
-        assert!(signal.get("runner_execution_receipt").is_none(), "{command}");
+        crate::tools::context::attach_command_validation(
+            &mut signal,
+            receipt.to_string().as_bytes(),
+            validation.as_ref(),
+            Some(0),
+            true,
+        );
+        assert!(
+            signal.get("runner_execution_receipt").is_none(),
+            "{command}"
+        );
     }
 }
 
@@ -258,25 +375,47 @@ async fn evidence_reuse_preserves_unscoped_commands_and_substantive_bytes() {
         ("if ready:\nact()\n", true),
         ("timeout = 10ms\n", true),
         ("timeout = 20ms\n", true),
-        ("diff --git a/a b/a\nold mode 100644\nnew mode 100755\n", true),
-        ("diff --git a/b b/b\nold mode 100644\nnew mode 100755\n", true),
-        ("diff --git a/b b/b\nold mode 100755\nnew mode 100644\n", true),
+        (
+            "diff --git a/a b/a\nold mode 100644\nnew mode 100755\n",
+            true,
+        ),
+        (
+            "diff --git a/b b/b\nold mode 100644\nnew mode 100755\n",
+            true,
+        ),
+        (
+            "diff --git a/b b/b\nold mode 100755\nnew mode 100644\n",
+            true,
+        ),
     ] {
         let mut result = command_result("exec_command", &path, text, 100).await;
         result.source_dependencies = None;
         let collector = control.collector(&baseline);
         let registration = collector.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"), &result.payload, &result.call_id,
+            &ToolName::plain("exec_command"),
+            &result.payload,
+            &result.call_id,
         );
-        assert!(result.sampling_request_signal().unwrap().get("semantic_evidence").is_some());
+        assert!(
+            result
+                .sampling_request_signal()
+                .unwrap()
+                .get("semantic_evidence")
+                .is_some()
+        );
         collector.record_response_result(
-            registration.ordinal, result.outcome_context(), result.sampling_request_signal(),
-            &result.response(), false,
+            registration.ordinal,
+            result.outcome_context(),
+            result.sampling_request_signal(),
+            &result.response(),
+            false,
         );
         assert_eq!(
-            control.observe_progress(&baseline, &collector, &settled())
+            control
+                .observe_progress(&baseline, &collector, &settled())
                 .contains(&TurnTimingProgressKind::NewSourceEvidence),
-            novel, "{text}",
+            novel,
+            "{text}",
         );
     }
 }
@@ -286,25 +425,58 @@ async fn evidence_reuse_accumulates_native_and_artifact_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.txt");
     std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
-    let mut call = invocation("read_file", json!({
-        "path":path, "selectors":[{"kind":"lines","start":1,"end":1}]
-    })).await;
+    let mut call = invocation(
+        "read_file",
+        json!({
+            "path":path, "selectors":[{"kind":"lines","start":1,"end":1}]
+        }),
+    )
+    .await;
     let initial = ReadFileHandler.handle(call.clone()).await.unwrap();
     let artifact = initial.code_mode_result(&call.payload)["artifact_id"].clone();
     assert!(artifact.is_string());
     let mut control = TurnExecutionControl::new();
     let baseline = control.baselines(0);
     let collector = control.collector(&baseline);
-    record(&collector, "read_file", &call.payload, initial.as_ref(), "initial");
-    assert!(control.observe_progress(&baseline, &collector, &settled())
-        .contains(&TurnTimingProgressKind::NewSourceEvidence));
+    record(
+        &collector,
+        "read_file",
+        &call.payload,
+        initial.as_ref(),
+        "initial",
+    );
+    assert!(
+        control
+            .observe_progress(&baseline, &collector, &settled())
+            .contains(&TurnTimingProgressKind::NewSourceEvidence)
+    );
     for (name, selector, novel) in [
-        ("read_tool_output", json!({"kind":"lines","start":1,"end":1}), false),
-        ("read_tool_output", json!({"kind":"lines","start":2,"end":2}), true),
-        ("read_file", json!({"kind":"lines","start":1,"end":2}), false),
+        (
+            "read_tool_output",
+            json!({"kind":"lines","start":1,"end":1}),
+            false,
+        ),
+        (
+            "read_tool_output",
+            json!({"kind":"lines","start":2,"end":2}),
+            true,
+        ),
+        (
+            "read_file",
+            json!({"kind":"lines","start":1,"end":2}),
+            false,
+        ),
         ("read_file", json!({"kind":"lines","start":2,"end":3}), true),
-        ("read_tool_output", json!({"kind":"bytes","start":0,"end":19}), false),
-        ("read_file", json!({"kind":"bytes","start":7,"end":9}), false),
+        (
+            "read_tool_output",
+            json!({"kind":"bytes","start":0,"end":19}),
+            false,
+        ),
+        (
+            "read_file",
+            json!({"kind":"bytes","start":7,"end":9}),
+            false,
+        ),
     ] {
         call.tool_name = ToolName::plain(name);
         call.payload = ToolPayload::Function {
@@ -312,7 +484,8 @@ async fn evidence_reuse_accumulates_native_and_artifact_coverage() {
                 json!({"path":path,"selectors":[selector]})
             } else {
                 json!({"artifact_id":artifact,"selectors":[selector]})
-            }.to_string(),
+            }
+            .to_string(),
         };
         let output = if name == "read_file" {
             ReadFileHandler.handle(call.clone()).await.unwrap()
@@ -322,8 +495,13 @@ async fn evidence_reuse_accumulates_native_and_artifact_coverage() {
         assert!(output.success_for_logging());
         let collector = control.collector(&baseline);
         record(&collector, name, &call.payload, output.as_ref(), "coverage");
-        assert_eq!(control.observe_progress(&baseline, &collector, &settled())
-            .contains(&TurnTimingProgressKind::NewSourceEvidence), novel, "{name}: {selector}");
+        assert_eq!(
+            control
+                .observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence),
+            novel,
+            "{name}: {selector}"
+        );
     }
     // A fresh hash must reopen coverage, even at an already-covered path/range.
     std::fs::write(&path, "changed\n").unwrap();
@@ -332,9 +510,18 @@ async fn evidence_reuse_accumulates_native_and_artifact_coverage() {
     };
     let output = ReadFileHandler.handle(call.clone()).await.unwrap();
     let collector = control.collector(&baseline);
-    record(&collector, "read_file", &call.payload, output.as_ref(), "changed");
-    assert!(control.observe_progress(&baseline, &collector, &settled())
-        .contains(&TurnTimingProgressKind::NewSourceEvidence));
+    record(
+        &collector,
+        "read_file",
+        &call.payload,
+        output.as_ref(),
+        "changed",
+    );
+    assert!(
+        control
+            .observe_progress(&baseline, &collector, &settled())
+            .contains(&TurnTimingProgressKind::NewSourceEvidence)
+    );
 }
 
 #[tokio::test]
@@ -346,9 +533,15 @@ async fn evidence_reuse_search_hydration_counts_as_delivered_coverage() {
     let mut control = TurnExecutionControl::new();
     let baseline = control.baselines(0);
     for (selector, novel) in [
-        (json!({"kind":"search","query":"needle","context_lines":1}), true),
+        (
+            json!({"kind":"search","query":"needle","context_lines":1}),
+            true,
+        ),
         (json!({"kind":"lines","start":1,"end":3}), false),
-        (json!({"kind":"search","query":"needle","context_lines":1}), false),
+        (
+            json!({"kind":"search","query":"needle","context_lines":1}),
+            false,
+        ),
         (json!({"kind":"search","query":"absent"}), true),
         (json!({"kind":"search","query":"absent"}), false),
     ] {
@@ -357,9 +550,20 @@ async fn evidence_reuse_search_hydration_counts_as_delivered_coverage() {
         };
         let output = ReadFileHandler.handle(call.clone()).await.unwrap();
         let collector = control.collector(&baseline);
-        record(&collector, "read_file", &call.payload, output.as_ref(), "search");
-        assert_eq!(control.observe_progress(&baseline, &collector, &settled())
-            .contains(&TurnTimingProgressKind::NewSourceEvidence), novel, "{selector}");
+        record(
+            &collector,
+            "read_file",
+            &call.payload,
+            output.as_ref(),
+            "search",
+        );
+        assert_eq!(
+            control
+                .observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence),
+            novel,
+            "{selector}"
+        );
     }
 }
 
@@ -372,19 +576,38 @@ fn evidence_reuse_live_stdout_resets_soft_pressure_without_source_credit() {
             output_ranges: None,
             process_output: None,
             error: None,
-            validation: None, event_call_id: "poll".into(), chunk_id: "chunk".into(),
-            wall_time: std::time::Duration::ZERO, raw_output: text.as_bytes().to_vec(),
-            truncation_policy: TruncationPolicy::Tokens(100), max_output_tokens: Some(100),
-            process_id: Some(42), session_capabilities: None, exit_code: None,
-            process_exited: false, search_no_match: false, original_token_count: None,
-            hook_command: None, raw_output_artifact: None, repair_notice: None,
+            validation: None,
+            event_call_id: "poll".into(),
+            chunk_id: "chunk".into(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: text.as_bytes().to_vec(),
+            truncation_policy: TruncationPolicy::Tokens(100),
+            max_output_tokens: Some(100),
+            process_id: Some(42),
+            session_capabilities: None,
+            exit_code: None,
+            process_exited: false,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command: None,
+            raw_output_artifact: None,
+            repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
-        let payload = ToolPayload::Function { arguments: json!({"session_id":42}).to_string() };
+        let payload = ToolPayload::Function {
+            arguments: json!({"session_id":42}).to_string(),
+        };
         let collector = control.collector(&baseline);
         record(&collector, "write_stdin", &payload, &output, "poll");
-        assert!(control.observe_progress(&baseline, &collector, &settled()).is_empty());
-        assert_eq!(control.continuations_without_progress, u32::from(text.is_empty()));
+        assert!(
+            control
+                .observe_progress(&baseline, &collector, &settled())
+                .is_empty()
+        );
+        assert_eq!(
+            control.continuations_without_progress,
+            u32::from(text.is_empty())
+        );
     }
 }
 
@@ -394,83 +617,138 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     let source = root.path().join("source.txt");
     std::fs::write(&source, "source").unwrap();
     let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let observations = cache.begin_source_path_change_observations(
-        root.path(), &[(source.clone(), false)],
-    ).await.unwrap();
+    let observations = cache
+        .begin_source_path_change_observations(root.path(), &[(source.clone(), false)])
+        .await
+        .unwrap();
     let session_replays = Arc::new(SessionPathReplays::default());
     let mut control =
         TurnExecutionControl::new().with_session_path_replays(Arc::clone(&session_replays));
     let baseline = control.baselines(0);
-    let payload = ToolPayload::Function { arguments: json!({"path":source}).to_string() };
+    let payload = ToolPayload::Function {
+        arguments: json!({"path":source}).to_string(),
+    };
     let collector = control.collector(&baseline);
     let registration = collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &payload, "initial",
+        &ToolName::plain("read_file"),
+        &payload,
+        "initial",
     );
     collector.record_replay_dependencies(registration.ordinal, 0, observations.clone(), None);
     collector.record_replay_authorization(registration.ordinal, Some("a".repeat(64)));
     collector.record_response_result(
-        registration.ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success), None,
+        registration.ordinal,
+        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+        None,
         &ResponseInputItem::FunctionCallOutput {
             call_id: "initial".into(),
             output: codex_protocol::models::FunctionCallOutputPayload::from_text("source".into()),
-        }, false,
+        },
+        false,
     );
     control.settle(&baseline, &collector, &settled());
-    cache.note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()])
+        .await;
     let collector = control.collector(&control.baselines(1));
-    let guard = collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &payload, "reused",
-    ).replayed_success.expect("unrelated edits preserve the replay candidate");
+    let guard = collector
+        .register_deterministic_tool_call(&ToolName::plain("read_file"), &payload, "reused")
+        .replayed_success
+        .expect("unrelated edits preserve the replay candidate");
     assert!(guard.is_fresh(1, &cache, None));
-    assert!(guard.matches_source_dependencies(&BTreeSet::from([SourceDependencyV1::new(&source, false)])));
-    assert!(!guard.matches_source_dependencies(&BTreeSet::from([SourceDependencyV1::new(&root.path().join("other.txt"), false)])));
+    assert!(
+        guard.matches_source_dependencies(&BTreeSet::from([SourceDependencyV1::new(
+            &source, false
+        )]))
+    );
+    assert!(
+        !guard.matches_source_dependencies(&BTreeSet::from([SourceDependencyV1::new(
+            &root.path().join("other.txt"),
+            false
+        )]))
+    );
     assert!(!guard.matches_source_dependencies(&BTreeSet::new()));
     let fresh_payload = ToolPayload::Function {
         arguments: json!({"path":source,"force_fresh":true}).to_string(),
     };
-    assert!(collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &fresh_payload, "fresh",
-    ).replayed_success.is_none());
+    assert!(
+        collector
+            .register_deterministic_tool_call(
+                &ToolName::plain("read_file"),
+                &fresh_payload,
+                "fresh",
+            )
+            .replayed_success
+            .is_none()
+    );
     // Revisions are turn-local; the dispatcher re-proves path freshness, so
     // new input and later turns keep the path-scoped candidate.
     control.accepted_user_input();
-    assert!(control.collector(&control.baselines(1)).register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &payload, "new-input",
-    ).replayed_success.is_some());
+    assert!(
+        control
+            .collector(&control.baselines(1))
+            .register_deterministic_tool_call(&ToolName::plain("read_file"), &payload, "new-input",)
+            .replayed_success
+            .is_some()
+    );
     let next_turn = TurnExecutionControl::new().with_session_path_replays(session_replays);
-    assert!(next_turn.collector(&next_turn.baselines(0)).register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &payload, "next-turn",
-    ).replayed_success.is_some());
+    assert!(
+        next_turn
+            .collector(&next_turn.baselines(0))
+            .register_deterministic_tool_call(&ToolName::plain("read_file"), &payload, "next-turn",)
+            .replayed_success
+            .is_some()
+    );
     // Equivalent legacy/default syntax must not turn a review-to-implementation
     // transition into another filesystem read. Never conflate environments,
     // selections, invalid calls, or an explicit freshness request.
     let collector = next_turn.collector(&next_turn.baselines(0));
     for (arguments, reusable) in [
         (json!({"file_path":source}), true),
-        (json!({"path":source,"selectors":null,"environment_id":null,"force_fresh":false}), true),
+        (
+            json!({"path":source,"selectors":null,"environment_id":null,"force_fresh":false}),
+            true,
+        ),
         (json!({"path":source,"environment_id":"other"}), false),
         (json!({"path":source,"offset":1,"limit":1}), false),
         (json!({"path":source,"force_fresh":true}), false),
         (json!({"path":source,"file_path":source}), false),
         (json!({"path":source,"unknown":true}), false),
     ] {
-        let payload = ToolPayload::Function { arguments: arguments.to_string() };
-        assert_eq!(collector.register_deterministic_tool_call(
-            &ToolName::plain("read_file"), &payload, "alias-follow-up",
-        ).replayed_success.is_some(), reusable, "{arguments}");
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        assert_eq!(
+            collector
+                .register_deterministic_tool_call(
+                    &ToolName::plain("read_file"),
+                    &payload,
+                    "alias-follow-up",
+                )
+                .replayed_success
+                .is_some(),
+            reusable,
+            "{arguments}"
+        );
     }
     // Exact canonical outputs and their persisted provenance can seed a new
     // turn owner; compaction prose must never become a replayable file result.
     use codex_protocol::models::ResponseItem;
-    let ToolPayload::Function { arguments } = &payload else { unreachable!() };
+    let ToolPayload::Function { arguments } = &payload else {
+        unreachable!()
+    };
     let mut items = vec![
         ResponseItem::FunctionCall {
-            id: None, name: "read_file".into(), namespace: None,
-            arguments: arguments.clone(), call_id: "initial".into(),
+            id: None,
+            name: "read_file".into(),
+            namespace: None,
+            arguments: arguments.clone(),
+            call_id: "initial".into(),
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
-            id: None, call_id: "initial".into(),
+            id: None,
+            call_id: "initial".into(),
             output: codex_protocol::models::FunctionCallOutputPayload::from_text("source".into()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -499,16 +777,22 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     });
     history.register_workspace_evidence(
         crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
-            None, &items[1], BTreeSet::from([SourceDependencyV1::new(&source, false)]),
-        ).unwrap().with_source_path_observations(observations),
+            None,
+            &items[1],
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .unwrap()
+        .with_source_path_observations(observations),
     );
     let restored = serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
     let replays = Arc::new(SessionPathReplays::default());
     replays.rehydrate(&items, &restored);
     let rehydrated = TurnExecutionControl::new().with_session_path_replays(replays);
-    let restored_guard = rehydrated.collector(&rehydrated.baselines(0))
+    let restored_guard = rehydrated
+        .collector(&rehydrated.baselines(0))
         .register_deterministic_tool_call(&ToolName::plain("read_file"), &payload, "rehydrated")
-        .replayed_success.unwrap();
+        .replayed_success
+        .unwrap();
     assert!(restored_guard.is_fresh(1, &cache, None));
     if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[1] {
         *output = codex_protocol::models::FunctionCallOutputPayload::from_text("receipt".into());
@@ -516,8 +800,13 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     let tampered = SessionPathReplays::default();
     tampered.rehydrate(&items, &restored);
     assert!(tampered.snapshot().is_empty());
-    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
-    assert!(!guard.is_fresh(2, &cache, None), "a relevant edit invalidates the original proof");
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
+        .await;
+    assert!(
+        !guard.is_fresh(2, &cache, None),
+        "a relevant edit invalidates the original proof"
+    );
     assert!(!restored_guard.is_fresh(2, &cache, None));
 }
 
@@ -526,7 +815,10 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
 #[test_case::test_case(false, 16 * 1024; "large_explicit_ranges")]
 #[test_case::test_case(true, 16 * 1024; "large_complete_default_read")]
 #[tokio::test]
-async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards(default_read: bool, padding: usize) {
+async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards(
+    default_read: bool,
+    padding: usize,
+) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.txt");
     std::fs::write(&path, format!("first{}\nsecond\n", "x".repeat(padding))).unwrap();
@@ -534,28 +826,44 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
         {"kind":"lines","start":1,"end":1},
         {"kind":"lines","start":2,"end":2},
     ]);
-    let arguments = if default_read { json!({"path":path}) } else { json!({"path":path,"selectors":selectors}) };
+    let arguments = if default_read {
+        json!({"path":path})
+    } else {
+        json!({"path":path,"selectors":selectors})
+    };
     let invocation = invocation("read_file", arguments).await;
     let result = ReadFileHandler.handle(invocation.clone()).await.unwrap();
     let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let observations = cache.begin_source_path_change_observations(root.path(), &[(path.clone(), false)])
-        .await.unwrap();
+    let observations = cache
+        .begin_source_path_change_observations(root.path(), &[(path.clone(), false)])
+        .await
+        .unwrap();
     let shared = Arc::new(SessionPathReplays::default());
     let mut control = TurnExecutionControl::new().with_session_path_replays(Arc::clone(&shared));
     let baseline = control.baselines(0);
     let collector = control.collector(&baseline);
     let registration = collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &invocation.payload, "original",
+        &ToolName::plain("read_file"),
+        &invocation.payload,
+        "original",
     );
     collector.record_replay_dependencies(registration.ordinal, 0, observations, None);
     let authority = crate::tools::registry::authorized_tool_invocation_sha256(
-        &invocation.step_context.turn, &invocation.payload, None,
+        &invocation.step_context.turn,
+        &invocation.payload,
+        None,
     );
     collector.record_replay_authorization(registration.ordinal, authority.clone());
-    collector.record_read_replay_output(registration.ordinal, result.code_mode_result(&invocation.payload));
+    collector.record_read_replay_output(
+        registration.ordinal,
+        result.code_mode_result(&invocation.payload),
+    );
     collector.record_response_result(
-        registration.ordinal, result.outcome_context(), result.sampling_request_signal(),
-        &result.to_response_item("original", &invocation.payload), false,
+        registration.ordinal,
+        result.outcome_context(),
+        result.sampling_request_signal(),
+        &result.to_response_item("original", &invocation.payload),
+        false,
     );
     control.settle(&baseline, &collector, &settled());
     let next = TurnExecutionControl::new().with_session_path_replays(shared);
@@ -563,20 +871,50 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     let requested = ToolPayload::Function {
         arguments: json!({"path":path,"offset":2,"limit":1}).to_string(),
     };
-    let ToolPayload::Function { arguments: original_args } = &invocation.payload else { unreachable!() };
-    let ToolPayload::Function { arguments: requested_args } = &requested else { unreachable!() };
+    let ToolPayload::Function {
+        arguments: original_args,
+    } = &invocation.payload
+    else {
+        unreachable!()
+    };
+    let ToolPayload::Function {
+        arguments: requested_args,
+    } = &requested
+    else {
+        unreachable!()
+    };
     let raw = result.code_mode_result(&invocation.payload);
-    assert!(crate::tools::handlers::reselect_read_file_output(original_args, requested_args, &raw).is_some(), "raw selector projection: {raw}");
-    assert!(collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &invocation.payload, "original-again",
-    ).replayed_success.is_some(), "original read must remain a candidate");
-    let guard = collector.register_deterministic_tool_call(
-        &ToolName::plain("read_file"), &requested, "subset",
-    ).replayed_success.expect("a delivered selector survives a stage boundary");
+    assert!(
+        crate::tools::handlers::reselect_read_file_output(original_args, requested_args, &raw)
+            .is_some(),
+        "raw selector projection: {raw}"
+    );
+    assert!(
+        collector
+            .register_deterministic_tool_call(
+                &ToolName::plain("read_file"),
+                &invocation.payload,
+                "original-again",
+            )
+            .replayed_success
+            .is_some(),
+        "original read must remain a candidate"
+    );
+    let guard = collector
+        .register_deterministic_tool_call(&ToolName::plain("read_file"), &requested, "subset")
+        .replayed_success
+        .expect("a delivered selector survives a stage boundary");
     assert!(guard.is_fresh(0, &cache, None));
-    assert!(guard.matches_authorization(crate::tools::registry::authorized_tool_invocation_sha256(
-        &invocation.step_context.turn, guard.authorization_payload(&requested), None,
-    ).as_deref()));
+    assert!(
+        guard.matches_authorization(
+            crate::tools::registry::authorized_tool_invocation_sha256(
+                &invocation.step_context.turn,
+                guard.authorization_payload(&requested),
+                None,
+            )
+            .as_deref()
+        )
+    );
     assert!(!guard.matches_authorization(Some("changed-permissions")));
     assert!(!guard.matches_authorization(None));
     let replay = guard.response_for_call("subset").unwrap();
@@ -590,22 +928,32 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     // the shared ledger through selection or response serialization. Discarded
     // registrations leave the candidate usable for the next caller.
     std::thread::scope(|scope| {
-        let workers = (0..8).map(|index| {
-            let collector = &collector;
-            let requested = &requested;
-            scope.spawn(move || {
-                let call_id = format!("parallel-replay-{index}");
-                let registration = collector.register_deterministic_tool_call(
-                    &ToolName::plain("read_file"), requested, &call_id,
-                );
-                let guard = registration.replayed_success.unwrap();
-                if index % 2 == 0 { drop(guard); return; }
-                let response = guard.response_for_call(&call_id).unwrap();
-                let output: Value = serde_json::from_str(&response_output_text(&response).unwrap()).unwrap();
-                assert_eq!(output["results"][0]["text"], "second\n");
+        let workers = (0..8)
+            .map(|index| {
+                let collector = &collector;
+                let requested = &requested;
+                scope.spawn(move || {
+                    let call_id = format!("parallel-replay-{index}");
+                    let registration = collector.register_deterministic_tool_call(
+                        &ToolName::plain("read_file"),
+                        requested,
+                        &call_id,
+                    );
+                    let guard = registration.replayed_success.unwrap();
+                    if index % 2 == 0 {
+                        drop(guard);
+                        return;
+                    }
+                    let response = guard.response_for_call(&call_id).unwrap();
+                    let output: Value =
+                        serde_json::from_str(&response_output_text(&response).unwrap()).unwrap();
+                    assert_eq!(output["results"][0]["text"], "second\n");
+                })
             })
-        }).collect::<Vec<_>>();
-        for worker in workers { worker.join().unwrap(); }
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     });
     for args in [
         json!({"path":path,"offset":1,"limit":3}), // extends past the delivered text
@@ -614,21 +962,43 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
         json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
         json!({"path":path,"selectors":[{"kind":"search","query":"second"}]}),
     ] {
-        if raw["file_complete"] == true && (args.get("offset") == Some(&json!(1)) || args.get("selectors").is_some()) {
+        if raw["file_complete"] == true
+            && (args.get("offset") == Some(&json!(1)) || args.get("selectors").is_some())
+        {
             // A full source can prove EOF-clamped lines and complete searches.
-            assert!(collector.register_deterministic_tool_call(
-                &ToolName::plain("read_file"),
-                &ToolPayload::Function { arguments: args.to_string() }, "full-source",
-            ).replayed_success.is_some(), "{args}");
+            assert!(
+                collector
+                    .register_deterministic_tool_call(
+                        &ToolName::plain("read_file"),
+                        &ToolPayload::Function {
+                            arguments: args.to_string()
+                        },
+                        "full-source",
+                    )
+                    .replayed_success
+                    .is_some(),
+                "{args}"
+            );
             continue;
         }
-        assert!(collector.register_deterministic_tool_call(
-            &ToolName::plain("read_file"),
-            &ToolPayload::Function { arguments: args.to_string() }, "miss",
-        ).replayed_success.is_none(), "{args}");
+        assert!(
+            collector
+                .register_deterministic_tool_call(
+                    &ToolName::plain("read_file"),
+                    &ToolPayload::Function {
+                        arguments: args.to_string()
+                    },
+                    "miss",
+                )
+                .replayed_success
+                .is_none(),
+            "{args}"
+        );
     }
     std::fs::write(&path, "first\nCHANGED\n").unwrap();
-    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
+        .await;
     assert!(!guard.is_fresh(1, &cache, None));
 }
 
@@ -638,8 +1008,17 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
     let path = root.path().join("source.txt");
     std::fs::write(&path, "λ\r\n日本語 second\r\nSECOND\nlast").unwrap();
     let original = invocation("read_file", json!({"path":path})).await;
-    let raw = ReadFileHandler.handle(original.clone()).await.unwrap().code_mode_result(&original.payload);
-    let ToolPayload::Function { arguments: previous } = &original.payload else { unreachable!() };
+    let raw = ReadFileHandler
+        .handle(original.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&original.payload);
+    let ToolPayload::Function {
+        arguments: previous,
+    } = &original.payload
+    else {
+        unreachable!()
+    };
     let mut cases = Vec::new();
     for selectors in [
         json!([{"kind":"lines","start":2,"end":3}]),
@@ -649,15 +1028,27 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
         json!([{"kind":"lines","start":1,"end":2},{"kind":"search","query":"second","context_lines":2}]),
     ] {
         let current = invocation("read_file", json!({"path":path,"selectors":selectors})).await;
-        let fresh = ReadFileHandler.handle(current.clone()).await.unwrap().code_mode_result(&current.payload);
+        let fresh = ReadFileHandler
+            .handle(current.clone())
+            .await
+            .unwrap()
+            .code_mode_result(&current.payload);
         let mut script_call = current.clone();
         script_call.source = ToolCallSource::CodeMode {
-            cell_id: "reselect-script".into(), parent_call_id: None,
+            cell_id: "reselect-script".into(),
+            parent_call_id: None,
             runtime_tool_call_id: "reselect-script-read".into(),
-            nested_deadline: None, cancellation_cause: None,
+            nested_deadline: None,
+            cancellation_cause: None,
         };
-        let script = ReadFileHandler.handle(script_call.clone()).await.unwrap().code_mode_result(&script_call.payload);
-        let ToolPayload::Function { arguments } = current.payload else { unreachable!() };
+        let script = ReadFileHandler
+            .handle(script_call.clone())
+            .await
+            .unwrap()
+            .code_mode_result(&script_call.payload);
+        let ToolPayload::Function { arguments } = current.payload else {
+            unreachable!()
+        };
         cases.push((arguments, fresh, script));
     }
     // Pure projection must not reread, even if the source is unavailable now.
@@ -665,15 +1056,27 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
     std::fs::remove_file(&path).unwrap();
     for (arguments, fresh, script) in cases {
         let replay = crate::tools::handlers::reselect_read_file_output(previous, &arguments, &raw);
-        assert_eq!(fresh["results"], script["results"], "small selections fit both consumer budgets");
+        assert_eq!(
+            fresh["results"], script["results"],
+            "small selections fit both consumer budgets"
+        );
         let replay = replay.unwrap();
-        for key in ["results", "complete", "file_complete", "source_sha256", "canonical_bytes"] {
+        for key in [
+            "results",
+            "complete",
+            "file_complete",
+            "source_sha256",
+            "canonical_bytes",
+        ] {
             assert_eq!(replay[key], fresh[key], "{key}: {arguments}");
         }
         for key in ["file_complete", "canonical_sha256"] {
             let mut invalid = raw.clone();
             invalid[key] = json!(false);
-            assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments, &invalid).is_none());
+            assert!(
+                crate::tools::handlers::reselect_read_file_output(previous, &arguments, &invalid)
+                    .is_none()
+            );
         }
     }
 }
@@ -682,18 +1085,25 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
 fn native_selector_reuse_rejects_incomplete_and_shared_only_results() {
     let previous = json!({"path":"file","selectors":[
         {"kind":"lines","start":1,"end":1}, {"kind":"lines","start":2,"end":2}
-    ]}).to_string();
+    ]})
+    .to_string();
     let requested = json!({"path":"file","offset":2,"limit":1}).to_string();
     // Only the result varies; the envelope itself is reusable.
-    let reselect = |result: Value| crate::tools::handlers::reselect_read_file_output(
-        &previous, &requested, &json!({
-            "artifact_id":null,"canonical_sha256":"source","canonical_bytes":13,
-            "retained_bytes":0,"complete":true,"results":[result]
-        }),
-    );
-    let reused = reselect(json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":true,
-        "text":"second\n","canonical_range":{"start":6,"end":13}}))
-        .expect("a complete delivered selection is reusable");
+    let reselect = |result: Value| {
+        crate::tools::handlers::reselect_read_file_output(
+            &previous,
+            &requested,
+            &json!({
+                "artifact_id":null,"canonical_sha256":"source","canonical_bytes":13,
+                "retained_bytes":0,"complete":true,"results":[result]
+            }),
+        )
+    };
+    let reused = reselect(
+        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":true,
+        "text":"second\n","canonical_range":{"start":6,"end":13}}),
+    )
+    .expect("a complete delivered selection is reusable");
     assert_eq!(reused["results"][0]["text"], "second\n");
     for result in [
         json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":false,
@@ -717,13 +1127,19 @@ fn native_selector_reuse_slices_utf8_crlf_without_inventing_bytes() {
         }]
     });
     let original = json!({"path":"file"}).to_string();
-    let requested = json!({"path":"file","selectors":[{"kind":"bytes","start":4,"end":13}]}).to_string();
-    let result = crate::tools::handlers::reselect_read_file_output(&original, &requested, &output).unwrap();
+    let requested =
+        json!({"path":"file","selectors":[{"kind":"bytes","start":4,"end":13}]}).to_string();
+    let result =
+        crate::tools::handlers::reselect_read_file_output(&original, &requested, &output).unwrap();
     assert_eq!(result["results"][0]["text"], "日本語");
     assert_eq!(result["results"][0]["exact_bytes"], 9);
     assert_eq!(result["file_complete"], false);
-    let split_codepoint = json!({"path":"file","selectors":[{"kind":"bytes","start":1,"end":2}]}).to_string();
-    assert!(crate::tools::handlers::reselect_read_file_output(&original, &split_codepoint, &output).is_none());
+    let split_codepoint =
+        json!({"path":"file","selectors":[{"kind":"bytes","start":1,"end":2}]}).to_string();
+    assert!(
+        crate::tools::handlers::reselect_read_file_output(&original, &split_codepoint, &output)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -732,42 +1148,65 @@ async fn selector_replay_keeps_borrowed_evidence_intact_across_misses_and_hits()
     let path = root.path().join("source.txt");
     std::fs::write(&path, "first\r\n日本語\r\nlast\n").unwrap();
     let original = invocation("read_file", json!({"path":path})).await;
-    let raw = ReadFileHandler.handle(original.clone()).await.unwrap().code_mode_result(&original.payload);
+    let raw = ReadFileHandler
+        .handle(original.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&original.payload);
     let before = raw.to_string();
-    let ToolPayload::Function { arguments: previous } = &original.payload else { unreachable!() };
+    let ToolPayload::Function {
+        arguments: previous,
+    } = &original.payload
+    else {
+        unreachable!()
+    };
     for arguments in [
         json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
         json!({"path":path,"environment_id":"other","offset":2,"limit":1}),
         json!({"path":path,"selectors":[]}),
     ] {
-        assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments.to_string(), &raw).is_none());
+        assert!(
+            crate::tools::handlers::reselect_read_file_output(
+                previous,
+                &arguments.to_string(),
+                &raw
+            )
+            .is_none()
+        );
         assert_eq!(raw.to_string(), before);
     }
     let requested = json!({"path":path,"offset":2,"limit":1}).to_string();
-    let mut first = crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
+    let mut first =
+        crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
     assert_eq!(first["results"][0]["text"], "日本語\r\n");
     first["results"][0]["text"] = json!("caller mutation");
-    let second = crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
+    let second =
+        crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
     assert_eq!(second["results"][0]["text"], "日本語\r\n");
     assert_eq!(raw.to_string(), before);
 }
 
 #[test]
 fn restored_failure_memory_requires_current_syntax_failure_and_runtime_opt_in() {
-    use codex_protocol::models::ResponseItem;
     use crate::tools::registry::TerminalFailureReuse;
+    use codex_protocol::models::ResponseItem;
     let mut output = codex_protocol::models::FunctionCallOutputPayload::from_text(
         "failed to parse function arguments".into(),
     );
     output.success = Some(false);
     let items = vec![
         ResponseItem::FunctionCall {
-            id: None, name: "update_plan".into(), namespace: None,
-            arguments: "{".into(), call_id: "bad".into(),
+            id: None,
+            name: "update_plan".into(),
+            namespace: None,
+            arguments: "{".into(),
+            call_id: "bad".into(),
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
-            id: None, call_id: "bad".into(), output,
+            id: None,
+            call_id: "bad".into(),
+            output,
             internal_chat_message_metadata_passthrough: None,
         },
     ];
@@ -776,14 +1215,24 @@ fn restored_failure_memory_requires_current_syntax_failure_and_runtime_opt_in() 
     control.accepted_user_input();
     let collector = control.collector(&control.baselines(9));
     for (arguments, capability, suppressed) in [
-        ("{", TerminalFailureReuse::RequestRevisionAndJsonSyntax, true),
-        ("{}", TerminalFailureReuse::RequestRevisionAndJsonSyntax, false),
+        (
+            "{",
+            TerminalFailureReuse::RequestRevisionAndJsonSyntax,
+            true,
+        ),
+        (
+            "{}",
+            TerminalFailureReuse::RequestRevisionAndJsonSyntax,
+            false,
+        ),
         ("{", TerminalFailureReuse::RequestRevision, false),
         ("{", TerminalFailureReuse::Never, false),
     ] {
         let registration = collector.register_deterministic_tool_call_with_reuse(
             &ToolName::plain("update_plan"),
-            &ToolPayload::Function { arguments: arguments.into() },
+            &ToolPayload::Function {
+                arguments: arguments.into(),
+            },
             "repeat",
             capability,
         );
@@ -1226,4 +1675,130 @@ async fn mixed_direct_and_nested_work_is_counted_once_per_owned_call() {
     }
     assert_eq!(cycles[0], cycles[1]);
     assert_ne!(cycles[1], cycles[2]);
+}
+
+
+/// A nested code-mode `read_file` must become a replay candidate, so a later
+/// identical read is served from retained bytes instead of re-delivering an
+/// unchanged file. Measured saved sessions showed this as the dominant source of
+/// duplicated model-visible context: one cell re-read five files another cell had
+/// already delivered, repeating 86% of a 59,838-byte result at the same
+/// `source_sha256`.
+///
+/// Reuse must stay evidence-gated, so this also pins the invalidations: a
+/// mutated path, a scope the observations do not cover, and a changed
+/// authorization each deny the candidate.
+#[tokio::test]
+async fn nested_code_mode_read_registers_replay_evidence_and_honors_invalidation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+
+    // The nested lane records against the call id it already registered.
+    let mut nested = invocation("read_file", json!({"path":path})).await;
+    nested.source = ToolCallSource::CodeMode {
+        cell_id: "cell".into(),
+        parent_call_id: Some("outer".into()),
+        runtime_tool_call_id: "nested-read".into(),
+        nested_deadline: None,
+        cancellation_cause: None,
+    };
+    let result = ReadFileHandler.handle(nested.clone()).await.unwrap();
+    let read_output = result.code_mode_result(&nested.payload);
+    assert!(
+        read_output["source_sha256"].is_string(),
+        "a compact source read is the replayable shape: {read_output}"
+    );
+
+    let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let observations = cache
+        .begin_source_path_change_observations(root.path(), &[(path.clone(), false)])
+        .await
+        .unwrap();
+    // Path-scoped candidates cross a turn boundary through the session replay
+    // store, exactly as the direct lane's candidates do.
+    let shared = Arc::new(SessionPathReplays::default());
+    let mut control = TurnExecutionControl::new().with_session_path_replays(Arc::clone(&shared));
+    let baseline = control.baselines(0);
+    let collector = control.collector(&baseline);
+    let registration = collector.register_deterministic_tool_call(
+        &ToolName::plain("read_file"),
+        &nested.payload,
+        "nested-read",
+    );
+    // `ordinal_for_call` is how the nested owner attaches evidence to the call it
+    // recorded, rather than minting a second identity for the same read.
+    assert_eq!(
+        collector.ordinal_for_call("nested-read"),
+        Some(registration.ordinal),
+        "a registered nested call must be addressable by its call id"
+    );
+    collector.record_replay_dependencies(registration.ordinal, 0, observations, None);
+    let authority = crate::tools::registry::authorized_tool_invocation_sha256(
+        &nested.step_context.turn,
+        &nested.payload,
+        None,
+    );
+    collector.record_replay_authorization(registration.ordinal, authority);
+    collector.record_read_replay_output(registration.ordinal, read_output);
+    collector.record_response_result(
+        registration.ordinal,
+        result.outcome_context(),
+        result.sampling_request_signal(),
+        &result.to_response_item("nested-read", &nested.payload),
+        false,
+    );
+    control.settle(&baseline, &collector, &settled());
+
+    // A second cell reading the same unchanged path now replays exact bytes.
+    let next = TurnExecutionControl::new().with_session_path_replays(shared);
+    let collector = next.collector(&next.baselines(0));
+    let guard = collector
+        .register_deterministic_tool_call(
+            &ToolName::plain("read_file"),
+            &nested.payload,
+            "second-cell",
+        )
+        .replayed_success
+        .expect("an unchanged nested read must be replayable by a later cell");
+    assert!(guard.is_fresh(0, &cache, None));
+    let replay = guard.response_for_call("second-cell").unwrap();
+    let value: Value = serde_json::from_str(&response_output_text(&replay).unwrap()).unwrap();
+    assert_eq!(value["results"][0]["text"], "first\nsecond\n");
+
+    // Reuse is gated, not assumed: these must each deny the candidate.
+    assert!(
+        !guard.matches_authorization(Some("changed-permissions")),
+        "a changed authorization must not reuse retained bytes"
+    );
+    let subset = ToolPayload::Function {
+        arguments: json!({"path":path,"offset":2,"limit":1}).to_string(),
+    };
+    let subset_guard = collector
+        .register_deterministic_tool_call(&ToolName::plain("read_file"), &subset, "subset")
+        .replayed_success
+        .expect("a narrower selection projects from the delivered full source");
+    let replay = subset_guard.response_for_call("subset").unwrap();
+    let value: Value = serde_json::from_str(&response_output_text(&replay).unwrap()).unwrap();
+    assert_eq!(value["results"][0]["text"], "second\n");
+    let other = ToolPayload::Function {
+        arguments: json!({"path":path.with_file_name("other.txt")}).to_string(),
+    };
+    assert!(
+        collector
+            .register_deterministic_tool_call(&ToolName::plain("read_file"), &other, "other")
+            .replayed_success
+            .is_none(),
+        "an unobserved path has no retained evidence to reuse"
+    );
+
+    // A mutation to the observed path retires the candidate outright.
+    std::fs::write(&path, "first\nCHANGED\n").unwrap();
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
+        .await;
+    assert!(
+        !guard.is_fresh(0, &cache, None),
+        "a mutated source must never be replayed from retained bytes"
+    );
 }

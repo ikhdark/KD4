@@ -2775,14 +2775,15 @@ async fn unusable_legacy_windows_sandbox_is_reported_at_startup() -> std::io::Re
             let error = config.expect_err("an unusable sandbox must fail closed at startup");
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
             assert!(
-                error.to_string().contains(
-                    codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
-                ),
+                error
+                    .to_string()
+                    .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
                 "{error}"
             );
         } else {
             assert!(config?.startup_warnings.iter().all(|warning| {
-                !warning.contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR)
+                !warning
+                    .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR)
             }));
         }
     }
@@ -3282,7 +3283,8 @@ async fn permissions_profiles_allow_unknown_special_paths_with_nested_entries()
 }
 
 #[tokio::test]
-async fn permissions_profiles_allow_missing_or_empty_filesystem_with_warning() -> std::io::Result<()> {
+async fn permissions_profiles_allow_missing_or_empty_filesystem_with_warning() -> std::io::Result<()>
+{
     for filesystem in [
         None,
         Some(FilesystemPermissionsToml {
@@ -4972,8 +4974,7 @@ fn non_utf8_sqlite_home_env_value_keeps_precedence() {
 }
 
 #[tokio::test]
-async fn workspace_write_falls_back_to_read_only_without_windows_sandbox()
--> std::io::Result<()> {
+async fn workspace_write_falls_back_to_read_only_without_windows_sandbox() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let writable_root = codex_home.path().join("writable").abs();
     let config = Config::load_from_base_config_with_overrides(
@@ -9787,7 +9788,10 @@ fn multi_agent_v2_default_usage_hints_require_report_reconciliation() {
             "finish verified in-scope follow-through before finalizing",
             "do not call a partial integration complete",
         ] {
-            assert!(rendered.contains(required), "missing report policy: {required}");
+            assert!(
+                rendered.contains(required),
+                "missing report policy: {required}"
+            );
         }
     }
 }

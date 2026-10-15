@@ -66,14 +66,19 @@ mod tests {
             let config = Arc::make_mut(&mut turn.config);
             config.model_auto_compact_token_limit_scope =
                 codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
-            config.features.enable(codex_features::Feature::TokenBudget).unwrap();
+            config
+                .features
+                .enable(codex_features::Feature::TokenBudget)
+                .unwrap();
             turn.model_info.context_window = context_window;
             turn.model_info.max_context_window = None;
             turn.model_info.auto_compact_token_limit = soft_limit;
             turn.model_info.effective_context_window_percent = effective_percent;
             assert!(session.clone_history().await.raw_items().is_empty());
-            session.lock_history_state_for_test().await.set_token_info(Some(
-                codex_protocol::protocol::TokenUsageInfo {
+            session
+                .lock_history_state_for_test()
+                .await
+                .set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
                     total_token_usage: Default::default(),
                     last_token_usage: codex_protocol::protocol::TokenUsage {
                         input_tokens: used,
@@ -81,15 +86,16 @@ mod tests {
                         ..Default::default()
                     },
                     model_context_window: context_window,
-                },
-            ));
+                }));
             let payload = ToolPayload::Function {
                 arguments: "{}".into(),
             };
             let output = GetContextRemainingHandler
                 .handle(ToolInvocation {
                     session: Arc::new(session),
-                    step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
+                    step_context: crate::session::step_context::StepContext::for_test(Arc::new(
+                        turn,
+                    )),
                     cancellation_token: Default::default(),
                     tracker: Arc::new(tokio::sync::Mutex::new(
                         crate::turn_diff_tracker::TurnDiffTracker::new(),
@@ -115,7 +121,8 @@ mod tests {
             let ToolSpec::Function(spec) = GetContextRemainingHandler.spec() else {
                 panic!("expected function spec");
             };
-            let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+            let validator =
+                jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
             assert!(validator.is_valid(&direct), "{direct}");
         }
     }

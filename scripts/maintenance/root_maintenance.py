@@ -422,9 +422,34 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/benchmark_scripts/kd4_model_attempt_analysis.py": (
         "scripts.benchmark_scripts.test_kd4_perf_snapshot",
         "scripts.benchmark_scripts.test_kd4_model_inference",
+        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_model_usage_requires_integer_counts_and_exact_reconciliation",
+    ),
+    "scripts/benchmark_scripts/kd4_first_useful_action_analysis.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_invalid_wall_clock_keeps_canonical_lifecycle_and_schema_31",
+    ),
+    "scripts/benchmark_scripts/kd4_timing_analysis.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports",
+    ),
+    "scripts/benchmark_scripts/kd4_session_diagnostics.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_quality_counts_improve_upward_while_costs_improve_downward",
+        "scripts.benchmark_scripts.test_subscription_turns",
+    ),
+    "scripts/benchmark_scripts/restore_rollout_artifact.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_restore_storage_failure_never_publishes_a_partial_destination",
+    ),
+    "scripts/benchmark_scripts/tool_result_audit.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports",
+    ),
+    "scripts/benchmark_scripts/rollout_snapshot.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports",
+    ),
+    "scripts/build/validation_metrics.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_missing_proof_status_preserves_work_without_claiming_current_proof",
     ),
     "scripts/benchmark_scripts/kd4_perf_snapshot.py": ("scripts.benchmark_scripts.test_kd4_model_inference",),
     "scripts/benchmark_scripts/kd4_turn_latency_audit.py": (
+        "scripts.benchmark_scripts.test_rolloutdetect_ports",
+        "scripts.benchmark_scripts.test_subscription_turns",
         f"{REPORT_REGRESSIONS}.test_terminal_conflicts_are_order_independent_and_malformed_is_local",
         "scripts.benchmark_scripts.test_kd4_timing_analysis.SharedTimingAnalysisTest.test_rollout_status_prefers_structured_execution_results",
     ),
@@ -1468,14 +1493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.json:
                 return _emit_python_test_report([], ["No focused test route for " + ", ".join(uncovered)])
             return 2
-        if not targets:
-            if args.json:
-                return run_python_tests([], json_output=True)
-            print("No matching changed Python test modules to run.")
-            return 0
-        if args.json:
-            return run_python_tests(targets, json_output=True)
-        return run_python_tests(targets)
+        return run_python_tests(targets, json_output=args.json)
 
     if args.command == "audit-scripts":
         return run_script_audit(

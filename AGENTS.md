@@ -1,6 +1,6 @@
 # Repository instructions
 
-KD4-specific facts, commands, and tool contracts, shared by Codex and Claude. Agent workflow lives with each agent: Codex's in its harness prompt, `codex-rs/protocol/src/prompts/base_instructions/default.md`; Claude's in the local `CLAUDE.md`. Keep workflow rules out of this file and KD4-only content out of the harness prompt.
+This file supplements the active agent instructions with KD4-specific facts, commands, and tool contracts shared by Codex and Claude; it does not replace their workflow or authorize broader task scope. General workflow lives with each agent: Codex's harness prompt source is `codex-rs/protocol/src/prompts/base_instructions/default.md`; Claude's is the local `CLAUDE.md`. Keep workflow rules out of this file and KD4-only content out of the harness prompt.
 
 ## Repository identity and runtime boundary
 
@@ -19,8 +19,8 @@ KD4-specific facts, commands, and tool contracts, shared by Codex and Claude. Ag
 
 ## Rust validation and generated schemas
 
-* Prompt/documentation-only edits are covered by source/consumer review and focused policy checks; they need no Rust rebuild.
-* `just config-schema-check` and `just app-server-schema-check` check generated contracts without replacing fixtures; use them when those contracts change. Regeneration is explicit. Stable app-server schema checks require a chosen compatibility baseline, not an invented revision.
+* Prompt/documentation-only edits are covered by source/consumer review and focused policy checks; they do not require a Rust rebuild solely because text changed.
+* `just config-schema-check` and `just app-server-schema-check --compatibility-baseline <rev>` check generated contracts without replacing fixtures; use them when those contracts change. The stable app-server baseline may instead be supplied through `CODEX_SCHEMA_COMPATIBILITY_BASELINE`; choose the intended contract revision rather than inventing one. Regeneration is explicit.
 * Run these commands from the active repository root. `scripts/build/rust_test_runner.py` is the public runner; `codex-rs/.config/kd4-rust-tests.toml` owns target and gate names, selections, and helper binaries.
 * Named gates and filtered targets:
   * `just core-test-gates-for <Rust-source-path> [...]` maps source paths to declared gates and target ownership.
@@ -29,7 +29,7 @@ KD4-specific facts, commands, and tool contracts, shared by Codex and Claude. Ag
   * `just core-test-fast <target> -E 'test(<test-name>)'` runs a focused target without retries.
   * `just core-test-list` lists target and gate names.
 * Direct runner form: `python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib -E 'test(<test-name>)'`. Replace angle-bracket placeholders. Put global options such as `--manifest`, `--cargo-profile`, and `--admission-timeout-seconds` before the subcommand; put execution options such as `--profile` before the target name, then filtering arguments after it. `--target-dir` accepts a caller-relative path.
-* Prefer the `just` recipes for execution: they reserve the shared warm `core-tests` Cargo lane. Do not create cold lanes merely to parallelize validation. Unfiltered `core_lib` requires explicit `--all`; zero-test selections fail rather than count as validation.
+* Prefer the `just` recipes for execution: they reserve the shared `core-tests` Cargo lane family and can reuse an idle warm sibling with matching build settings. Do not create cold lanes merely to parallelize validation. Unfiltered `core_lib` requires explicit `--all`; zero-test selections fail rather than count as validation.
 * A full Rust suite (`cargo test` or `cargo nextest run` without a test filter, or a target with `--all`) is admitted only as one standalone command with `--no-fail-fast` (nextest also `--retries 0`). A loop, pipeline or compound script is rejected; set the directory with the tool's `workdir` argument.
 * Admission `busy` (exit 75, `codex_rust_admission_v1`) means required validation is **pending**, not failed or passed. It queues no background work, and the default wait is **0 seconds**, including `just` wrappers.
 * The short creation/prune coordination lock is separate from a busy build: ordinary lane/runner admission allows a bounded **1-second** grace; a child inheriting an already-held lane retains its **30-second** handoff bound. Python `run-lane --lock-timeout-seconds` controls its coordination grace, not the busy-build wait.
@@ -38,6 +38,7 @@ KD4-specific facts, commands, and tool contracts, shared by Codex and Claude. Ag
 ## Codex performance and session analysis
 
 * Compare matched Codex tasks by correct outcomes, total wall-clock time, input/output tokens, requests, tool calls, validation, retries, output recovery, and compactions. Separate model workflow choices from runtime changes; moving a wait into request normalization is not itself evidence of a slowdown. Microbenchmarks alone do not establish end-to-end gains.
-* Rollout JSONL lives in `LOCAL-KD\sessions`; `rollout_payload_artifact` stub records resolve to `LOCAL-KD\rollout-payloads\<sha256>.json`. Its bulk records are tool manifests, inventories, and per-call timing arrays. Complete scripted coverage satisfies a request to read these logs fully.
-* Put all audit documentation in "C:\Users\kuh\Desktop\kd4\.codex\audits"
-* Put all benchmark/audit scripts in "C:\Users\kuh\Desktop\kd4\scripts\benchmark_scripts"
+* Rollout JSONL lives under the fork home's `sessions` directory (archived threads use `archived_sessions`); `rollout_payload_artifact` stub records resolve to the same home's `rollout-payloads/<sha256>.json`. Large records can live in these artifacts instead of inline JSONL; a stub is a reference, not the complete record.
+* Put all audit documentation in `.codex/audits` under the active repository root.
+* Put all benchmark/audit scripts in `scripts/benchmark_scripts` under the active repository root.
+* "C:\Users\kuh\Documents\ChatGPT\rolloutdetect" provides extra tools for auditing and benchmarking.

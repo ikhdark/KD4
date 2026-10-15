@@ -254,6 +254,11 @@ fn thread_items_list_round_trips() {
     let response = ThreadItemsListResponse {
         data: vec![ThreadItem::ContextCompaction {
             id: "item_1".to_string(),
+            tokens_before: None,
+            tokens_after: None,
+            omitted_image_count: None,
+            retained_image_count: None,
+            omitted_text: None,
         }],
         next_cursor: None,
         backwards_cursor: Some("cursor_0".to_string()),

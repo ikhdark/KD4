@@ -1,6 +1,6 @@
 use codex_tools::JsonSchema;
-use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::LoadableToolSpec;
+use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
@@ -56,15 +56,36 @@ pub(crate) fn render_tool_search_sources(
         owners.entry(scope).or_default().insert(name);
     }
     let scope_label = |name: &str| {
-        let Some(tokens) = scopes.get(name) else { return String::new(); };
+        let Some(tokens) = scopes.get(name) else {
+            return String::new();
+        };
         let mut bytes = 0;
-        let labels = tokens.iter().take(8).filter_map(|scope| {
-            let label = format!("source:{scope}{}", if owners[scope].len() > 1 { " (shared)" } else { "" });
-            bytes += label.len();
-            (bytes <= 512).then_some(label)
-        }).collect::<Vec<_>>();
+        let labels = tokens
+            .iter()
+            .take(8)
+            .filter_map(|scope| {
+                let label = format!(
+                    "source:{scope}{}",
+                    if owners[scope].len() > 1 {
+                        " (shared)"
+                    } else {
+                        ""
+                    }
+                );
+                bytes += label.len();
+                (bytes <= 512).then_some(label)
+            })
+            .collect::<Vec<_>>();
         let omitted = tokens.len() - labels.len();
-        format!(" [{}{}]", labels.join(", "), if omitted == 0 { String::new() } else { format!("; {omitted} more scopes") })
+        format!(
+            " [{}{}]",
+            labels.join(", "),
+            if omitted == 0 {
+                String::new()
+            } else {
+                format!("; {omitted} more scopes")
+            }
+        )
     };
     let mut source_descriptions = BTreeMap::new();
     for source in searchable_sources {
@@ -80,7 +101,10 @@ pub(crate) fn render_tool_search_sources(
 
     if source_descriptions.is_empty() {
         if has_unnamed_tools {
-            format!("- Deferred built-in or extension tools{} (named source metadata is unavailable; these deferred tools remain searchable).", scope_label(""))
+            format!(
+                "- Deferred built-in or extension tools{} (named source metadata is unavailable; these deferred tools remain searchable).",
+                scope_label("")
+            )
         } else {
             "None currently enabled.".to_string()
         }
@@ -88,12 +112,19 @@ pub(crate) fn render_tool_search_sources(
         let mut source_descriptions = source_descriptions
             .into_iter()
             .map(|(name, description)| match description {
-                Some(description) => format!("- {name}{}: {}", scope_label(&name), catalog_summary(&description)),
+                Some(description) => format!(
+                    "- {name}{}: {}",
+                    scope_label(&name),
+                    catalog_summary(&description)
+                ),
                 None => format!("- {name}{}", scope_label(&name)),
             })
             .collect::<Vec<_>>();
         if has_unnamed_tools {
-            source_descriptions.push(format!("- Deferred built-in or extension tools{}", scope_label("")));
+            source_descriptions.push(format!(
+                "- Deferred built-in or extension tools{}",
+                scope_label("")
+            ));
         }
         // Charge separators as well as prose so a large connector catalog
         // cannot grow this model-visible contribution beyond the shared cap.
@@ -110,7 +141,11 @@ pub(crate) fn render_tool_search_sources(
 fn catalog_summary(description: &str) -> std::borrow::Cow<'_, str> {
     const MAX_BYTES: usize = 256;
     let description = description.trim();
-    let first = description.split("\n\n").next().unwrap_or_default().trim_end();
+    let first = description
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .trim_end();
     let first = &first[..first.floor_char_boundary(MAX_BYTES.min(first.len()))];
     if first.len() == description.len() {
         return description.into();
@@ -132,20 +167,44 @@ mod tests {
 
     #[test]
     fn source_catalog_advertises_bounded_canonical_and_shared_scopes() {
-        let infos = (0..12).map(|index| {
-            let spec = ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-                name: if index < 2 { "shared".into() } else { format!("canonical_{index}") },
-                description: String::new(),
-                tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(codex_tools::ResponsesApiTool {
-                    name: format!("tool_{index}"), description: String::new(), strict: false, defer_loading: None,
-                    parameters: JsonSchema::object(BTreeMap::new(), None, None), output_schema: None,
-                })],
-            });
-            ToolSearchInfo::from_tool_spec(&spec, Some(ToolSearchSourceInfo {
-                name: if index == 0 { "First app".into() } else { "Other app".into() }, description: None,
-            })).unwrap()
-        }).collect::<Vec<_>>();
-        let sources = infos.iter().filter_map(|info| info.source_info.clone()).collect::<Vec<_>>();
+        let infos = (0..12)
+            .map(|index| {
+                let spec = ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+                    name: if index < 2 {
+                        "shared".into()
+                    } else {
+                        format!("canonical_{index}")
+                    },
+                    description: String::new(),
+                    tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(
+                        codex_tools::ResponsesApiTool {
+                            name: format!("tool_{index}"),
+                            description: String::new(),
+                            strict: false,
+                            defer_loading: None,
+                            parameters: JsonSchema::object(BTreeMap::new(), None, None),
+                            output_schema: None,
+                        },
+                    )],
+                });
+                ToolSearchInfo::from_tool_spec(
+                    &spec,
+                    Some(ToolSearchSourceInfo {
+                        name: if index == 0 {
+                            "First app".into()
+                        } else {
+                            "Other app".into()
+                        },
+                        description: None,
+                    }),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sources = infos
+            .iter()
+            .filter_map(|info| info.source_info.clone())
+            .collect::<Vec<_>>();
         let catalog = render_tool_search_sources(&sources, false, &infos);
         assert!(catalog.contains("First app [source:shared (shared)]"));
         assert!(catalog.contains("source:canonical_"));
@@ -197,16 +256,23 @@ mod tests {
         let catalog = render_tool_search_sources(&sources, false, &[]);
         assert!(catalog.len() < 1_024, "{}", catalog.len());
         assert!(catalog.contains("- small: Find small records."));
-        assert!(catalog.contains("界 [abridged; the source's full description loads with its tools]"));
+        assert!(
+            catalog.contains("界 [abridged; the source's full description loads with its tools]")
+        );
         assert!(!catalog.contains("context truncated"));
 
         // Only the first paragraph of long server guidance is advertised.
         let sources = [ToolSearchSourceInfo {
             name: "guided".to_string(),
-            description: Some(format!("Search the service.\n\n{}", "You MUST follow these rules. ".repeat(250))),
+            description: Some(format!(
+                "Search the service.\n\n{}",
+                "You MUST follow these rules. ".repeat(250)
+            )),
         }];
-        assert_eq!(render_tool_search_sources(&sources, false, &[]),
-            "- guided: Search the service. [abridged; the source's full description loads with its tools]");
+        assert_eq!(
+            render_tool_search_sources(&sources, false, &[]),
+            "- guided: Search the service. [abridged; the source's full description loads with its tools]"
+        );
     }
 
     #[test]

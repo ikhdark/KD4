@@ -349,6 +349,28 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     Ok(())
 }
 
+/// A child inherits the parent's service tier as the parent's next request
+/// would use it. A settings update during the turn changes the session, not
+/// the configuration captured when the turn started.
+pub(crate) async fn inherit_live_service_tier(
+    session: &Session,
+    config: &mut Config,
+) -> Option<String> {
+    let live = session.configured_service_tier().await;
+    config.service_tier = live.clone();
+    live
+}
+
+/// An explicit `default` is a valid choice for every model: it selects the
+/// default tier rather than inheriting one.
+fn spawn_service_tier_is_supported(
+    model_info: &codex_protocol::openai_models::ModelInfo,
+    service_tier: &str,
+) -> bool {
+    service_tier == codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        || model_info.supports_service_tier(service_tier)
+}
+
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     turn: &TurnContext,
@@ -377,7 +399,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
         .await;
 
     if let Some(requested_service_tier) = requested_service_tier
-        && !model_info.supports_service_tier(requested_service_tier)
+        && !spawn_service_tier_is_supported(&model_info, requested_service_tier)
     {
         let supported_service_tiers = if model_info.service_tiers.is_empty() {
             "none".to_string()
@@ -399,7 +421,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
             .into_iter()
             .flatten()
             .find(|candidate_service_tier| {
-                model_info.supports_service_tier(candidate_service_tier.as_str())
+                spawn_service_tier_is_supported(&model_info, candidate_service_tier.as_str())
             });
     Ok(())
 }

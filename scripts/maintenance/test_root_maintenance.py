@@ -142,6 +142,7 @@ class RootMaintenanceTest(unittest.TestCase):
             [
                 "scripts.benchmark_scripts.test_kd4_model_inference",
                 "scripts.benchmark_scripts.test_kd4_perf_snapshot",
+                "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_model_usage_requires_integer_counts_and_exact_reconciliation",
                 "scripts.maintenance.test_dev_environment",
                 "scripts.maintenance.test_report_script_regressions.Report26ValidationRegressions.test_lock_waiter_never_writes_to_an_empty_owned_file",
                 "scripts.maintenance.test_report_script_regressions.Report26ValidationRegressions.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
@@ -776,6 +777,31 @@ class StructuredMaintenanceTest(unittest.TestCase):
         with mock.patch.object(self.owner, "_run_json_worker", return_value=(0, {})):
             self.assertEqual(self.owner.main(["test-python", "--json", "--module", "missing"]), 2)
         self.assertFalse(json.loads(self.output.getvalue())["complete"])
+
+    def test_docs_only_changed_selection_fails_closed_in_both_presentations(self):
+        for json_output in (False, True):
+            with self.subTest(json_output=json_output):
+                self.output.seek(0)
+                self.output.truncate()
+                self.errors.seek(0)
+                self.errors.truncate()
+                with mock.patch.object(self.owner, "_run_json_worker") as worker:
+                    code = self.owner.main([
+                        "test-python", "--changed", "README.md",
+                        *(["--json"] if json_output else []),
+                    ])
+                worker.assert_not_called()
+                self.assertEqual(code, 2, "zero selected tests cannot certify validation")
+                if json_output:
+                    report = json.loads(self.output.getvalue())
+                    self.assertEqual(report["tests_run"], 0)
+                    self.assertEqual(report["environments"], [])
+                    self.assertFalse(report["complete"])
+                    self.assertFalse(report["successful"])
+                    self.assertIn("zero tests", report["errors"][0])
+                else:
+                    self.assertEqual(self.output.getvalue(), "")
+                    self.assertIn("zero tests", self.errors.getvalue())
 
     def test_text_mode_rejects_a_real_empty_module_and_preserves_real_failures(self):
         # Only replace interpreter/environment resolution, not test execution.

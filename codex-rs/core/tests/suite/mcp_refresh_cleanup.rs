@@ -79,7 +79,10 @@ async fn unchanged_generation_reuses_one_mcp_process_for_100_calls() -> anyhow::
             .await?;
         assert_ne!(result.is_error, Some(true), "echo call {call} failed");
         assert_eq!(
-            result.structured_content.as_ref().and_then(|value| value.get("echo")),
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("echo")),
             Some(&serde_json::json!(format!("ECHOING: call-{call}"))),
             "each call must reach the retained server with its own arguments"
         );

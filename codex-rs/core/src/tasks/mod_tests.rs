@@ -325,9 +325,15 @@ impl SessionTask for FailureOnReleaseTask {
                     Err(codex_protocol::error::CodexErr::InvalidRequest(message))
                 }
                 FailureMode::EmittedError => {
-                    session.send_event(&ctx, EventMsg::Error(
-                        codex_protocol::error::CodexErr::Fatal(message).to_error_event(None),
-                    )).await;
+                    session
+                        .send_event(
+                            &ctx,
+                            EventMsg::Error(
+                                codex_protocol::error::CodexErr::Fatal(message)
+                                    .to_error_event(None),
+                            ),
+                        )
+                        .await;
                     // The mid-turn compaction failure path returns Ok and defers input.
                     Ok(super::TurnTaskResult {
                         defer_pending_input: true,
@@ -390,8 +396,6 @@ impl SessionTask for CountingBlockingTask {
         })
     }
 }
-
-
 
 fn test_session_telemetry() -> SessionTelemetry {
     let exporter = InMemoryMetricExporter::default();
@@ -728,8 +732,15 @@ async fn failed_terminal_rollout_flush_releases_fence_without_persistence_attest
     while let Ok(event) = events.try_recv() {
         match event.msg {
             EventMsg::Warning(warning) if warning.message.contains("not durably saved") => {
-                assert!(!terminal_seen, "unsaved-record warning must precede the terminal event");
-                assert!(warning.message.contains("conversation history"), "{}", warning.message);
+                assert!(
+                    !terminal_seen,
+                    "unsaved-record warning must precede the terminal event"
+                );
+                assert!(
+                    warning.message.contains("conversation history"),
+                    "{}",
+                    warning.message
+                );
                 unsaved_warnings += 1;
             }
             EventMsg::TurnComplete(completed) if completed.turn_id == turn_context.sub_id => {
@@ -868,6 +879,112 @@ async fn emitted_error_preserves_pending_input_without_automatic_restart() {
     assert_failed_turn_preserves_pending_input(FailureMode::EmittedError).await;
 }
 
+struct CommentaryThenErrorTask;
+
+impl SessionTask for CommentaryThenErrorTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.commentary_then_error"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        session: Arc<crate::session::session::Session>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            session
+                .record_conversation_items(
+                    &ctx,
+                    &[ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![ContentItem::OutputText {
+                            text: "Findings so far: the cache breaks at the first notice."
+                                .to_string(),
+                        }],
+                        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                        internal_chat_message_metadata_passthrough: None,
+                    }],
+                )
+                .await
+                .expect("record commentary");
+            Err(codex_protocol::error::CodexErr::InvalidRequest(
+                "the final request failed".to_string(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_reports_its_last_commentary_and_the_error() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            CommentaryThenErrorTask,
+        )
+        .await;
+    let done = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let EventMsg::TurnComplete(done) = events.recv().await.expect("event").msg {
+                break done;
+            }
+        }
+    })
+    .await
+    .expect("the failed turn completes");
+    let error =
+        codex_protocol::error::CodexErr::InvalidRequest("the final request failed".to_string())
+            .to_error_event(None)
+            .message;
+    assert_eq!(done.error.map(|error| error.message), Some(error.clone()));
+    assert_eq!(
+        done.last_agent_message,
+        Some(format!(
+            "Findings so far: the cache breaks at the first notice.\n\n(This turn ended on an error before its final answer: {}. Send a message to resume.)",
+            error.trim_end_matches('.')
+        ))
+    );
+}
+
+#[test]
+fn turn_error_fallback_uses_only_this_turns_messages() {
+    let message = |text: &str, turn_id: &str| {
+        let mut item = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        item.set_turn_id_if_missing(turn_id);
+        item
+    };
+    let history = [message("earlier answer", "earlier-turn")];
+    assert_eq!(
+        super::last_message_before_turn_error(&history, "failed-turn", false, "boom"),
+        None,
+        "another turn's answer is not this turn's result"
+    );
+    let history = [
+        message("earlier answer", "earlier-turn"),
+        message("partial result", "failed-turn"),
+    ];
+    assert_eq!(
+        super::last_message_before_turn_error(&history, "failed-turn", false, "boom."),
+        Some("partial result\n\n(This turn ended on an error before its final answer: boom. Send a message to resume.)".to_string())
+    );
+}
+
 async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
     for fail_safe in [false, true] {
         let (session, turn_context, events) = make_session_and_context_with_rx().await;
@@ -882,7 +999,10 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
         let (turn_state, terminal) = {
             let active = session.active_turn.lock().await;
             let active = active.as_ref().expect("fatal task is waiting");
-            (Arc::clone(&active.turn_state), active.terminal.clone().unwrap())
+            (
+                Arc::clone(&active.turn_state),
+                active.terminal.clone().unwrap(),
+            )
         };
         let pending = vec![
             TurnInput::InterAgentCommunication(
@@ -902,17 +1022,23 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
                 client_id: None,
             },
         ];
-        session.input_queue
+        session
+            .input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), &pending)
-            .await.unwrap();
+            .await
+            .unwrap();
         if fail_safe {
             terminal.request_panic_after_terminal_publication();
         }
         release.cancel();
         tokio::time::timeout(Duration::from_secs(5), terminal.wait_cleanup_completed())
-            .await.expect("fatal cleanup must settle without retrying input");
+            .await
+            .expect("fatal cleanup must settle without retrying input");
 
-        assert!(session.active_turn.lock().await.is_none(), "fatal input was retried");
+        assert!(
+            session.active_turn.lock().await.is_none(),
+            "fatal input was retried"
+        );
         assert!(!session.terminal_interaction_pending.load(Ordering::Acquire));
         assert!(session.input_queue.has_pending_turn_start_work().await);
         let mut completed = 0;
@@ -921,7 +1047,12 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
                 EventMsg::TurnStarted(_) => panic!("unexpected automatic successor"),
                 EventMsg::TurnComplete(done) => {
                     assert_eq!(done.turn_id, turn_context.sub_id);
-                    assert!(done.error.unwrap().message.contains("explicit new admission"));
+                    assert!(
+                        done.error
+                            .unwrap()
+                            .message
+                            .contains("explicit new admission")
+                    );
                     completed += 1;
                 }
                 _ => {}
@@ -931,10 +1062,26 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
 
         // This is not a session-wide latch: explicit admission still receives
         // both recovered items in order, once, without discarding steering.
-        let next = session.new_default_turn_with_sub_id("explicit-follow-up".into()).await;
-        session.start_task(next, Vec::new(), FenceBlockingTask).await;
-        assert_eq!(session.input_queue.get_pending_input(&session.active_turn).await, pending);
-        assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+        let next = session
+            .new_default_turn_with_sub_id("explicit-follow-up".into())
+            .await;
+        session
+            .start_task(next, Vec::new(), FenceBlockingTask)
+            .await;
+        assert_eq!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await,
+            pending
+        );
+        assert!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await
+                .is_empty()
+        );
         session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 }
@@ -967,7 +1114,9 @@ fn terminal_failures_suppress_pending_input_restart() {
         assert!(!outcome.allows_pending_input_restart(Some(&failed)));
     }
     for outcome in [
-        TurnTerminalOutcome::Completed { result: Default::default() },
+        TurnTerminalOutcome::Completed {
+            result: Default::default(),
+        },
         TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
         TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted),
     ] {
@@ -1039,31 +1188,61 @@ async fn concurrent_start_task_calls_install_exactly_one_worker() {
 async fn shutdown_abort_retains_checkpoint_and_plan_without_claiming_user_interrupt() {
     for shutdown in [false, true] {
         let (session, mut turn, _events) = make_session_and_context_with_rx().await;
-        Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unshared turn fixture").config)
-            .agent_interrupt_message_enabled = true;
+        Arc::make_mut(
+            &mut Arc::get_mut(&mut turn)
+                .expect("unshared turn fixture")
+                .config,
+        )
+        .agent_interrupt_message_enabled = true;
         let checkpoint = ResponseItem::Message {
-            id: None, role: "developer".into(),
-            content: vec![ContentItem::InputText { text: "<completed_phase_checkpoint>keep this evidence</completed_phase_checkpoint>".into() }],
-            phase: None, internal_chat_message_metadata_passthrough: None,
-        };
-        session.record_conversation_items(&turn, &[checkpoint]).await.unwrap();
-        session.services.plan_store.update(codex_protocol::plan_tool::UpdatePlanArgs {
-            explanation: None,
-            plan: vec![codex_protocol::plan_tool::PlanItemArg {
-                step: "remaining validation".into(), status: codex_protocol::plan_tool::StepStatus::InProgress,
+            id: None,
+            role: "developer".into(),
+            content: vec![ContentItem::InputText {
+                text: "<completed_phase_checkpoint>keep this evidence</completed_phase_checkpoint>"
+                    .into(),
             }],
-        }).await;
-        session.start_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask).await;
-        if shutdown { session.begin_shutdown().await; }
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        session
+            .record_conversation_items(&turn, &[checkpoint])
+            .await
+            .unwrap();
+        session
+            .services
+            .plan_store
+            .update(codex_protocol::plan_tool::UpdatePlanArgs {
+                explanation: None,
+                plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                    step: "remaining validation".into(),
+                    status: codex_protocol::plan_tool::StepStatus::InProgress,
+                }],
+            })
+            .await;
+        session
+            .start_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask)
+            .await;
+        if shutdown {
+            session.begin_shutdown().await;
+        }
         session.abort_all_tasks(TurnAbortReason::Interrupted).await;
         let history = session.clone_history().await;
-        let marker = history.raw_items().iter().rev().find_map(|item| match item {
-            ResponseItem::Message { content, .. } => content.iter().find_map(|part| match part {
-                ContentItem::InputText { text } if text.contains("<turn_aborted>") => Some(text),
+        let marker = history
+            .raw_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ResponseItem::Message { content, .. } => {
+                    content.iter().find_map(|part| match part {
+                        ContentItem::InputText { text } if text.contains("<turn_aborted>") => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                }
                 _ => None,
-            }),
-            _ => None,
-        }).expect("abort marker");
+            })
+            .expect("abort marker");
         if shutdown {
             assert!(marker.contains("session was shutting down"));
             assert!(!marker.contains("interrupted the previous turn on purpose"));
@@ -1577,8 +1756,6 @@ async fn terminal_wakeups_are_generation_aware_and_waiter_counts_are_cancellatio
     assert_eq!(coordinator.waiter_snapshot().interrupt_resolution, 0);
 }
 
-
-
 #[test]
 fn terminal_analytics_claim_converges_across_in_process_recovery() {
     let before_claim = TurnTerminalCoordinator::new("turn-before-claim".to_string());
@@ -1619,10 +1796,9 @@ fn emit_turn_network_proxy_metric_records_active_and_inactive_turns() {
 
 #[test]
 fn emit_compact_metric_records_manual_and_automatic_compaction() {
-    for (compact_type, manual, expected_manual) in [
-        ("remote_v2", true, "true"),
-        ("local", false, "false"),
-    ] {
+    for (compact_type, manual, expected_manual) in
+        [("remote_v2", true, "true"), ("local", false, "false")]
+    {
         let session_telemetry = test_session_telemetry();
         emit_compact_metric(&session_telemetry, compact_type, manual);
         let snapshot = session_telemetry

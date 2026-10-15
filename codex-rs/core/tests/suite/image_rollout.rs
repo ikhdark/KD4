@@ -245,7 +245,10 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     let actual = find_user_message_with_image(&rollout_path)
         .await?
         .expect("expected user message with input image in rollout");
-    assert_eq!(extract_image_url(&actual).as_deref(), Some(image_url.as_str()));
+    assert_eq!(
+        extract_image_url(&actual).as_deref(),
+        Some(image_url.as_str())
+    );
     let expected = ResponseItem::Message {
         id: None,
         role: "user".to_string(),

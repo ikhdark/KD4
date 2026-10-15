@@ -641,7 +641,11 @@ async fn collect_remote_user_shell_output(
 
     loop {
         let response = process
-            .read(after_seq, Some(64 * 1024), Some(if closed { 0 } else { 1_000 }))
+            .read(
+                after_seq,
+                Some(64 * 1024),
+                Some(if closed { 0 } else { 1_000 }),
+            )
             .await
             .map_err(|err| UserShellExecError::Failed(format!("{err:?}")))?;
         if let Some(failure) = response.failure {
@@ -685,11 +689,13 @@ async fn collect_remote_user_shell_output(
             } else {
                 &[]
             };
-            let retained_stream = |buffer: &crate::unified_exec::head_tail_buffer::HeadTailBuffer| StreamOutput {
-                text: String::from_utf8_lossy(&buffer.to_bytes_with_loss_notice(loss_notice)).into_owned(),
-                truncated_after_lines: None,
-                truncated: output_gap || buffer.omitted_bytes() > 0,
-            };
+            let retained_stream =
+                |buffer: &crate::unified_exec::head_tail_buffer::HeadTailBuffer| StreamOutput {
+                    text: String::from_utf8_lossy(&buffer.to_bytes_with_loss_notice(loss_notice))
+                        .into_owned(),
+                    truncated_after_lines: None,
+                    truncated: output_gap || buffer.omitted_bytes() > 0,
+                };
             return Ok(ExecToolCallOutput {
                 exit_code: exit_code.unwrap_or(-1),
                 stdout: retained_stream(&stdout),

@@ -212,9 +212,10 @@ impl ToolRouter {
         };
         // Keep installed-but-rejected capabilities visible through the existing
         // source notice even when no callable survived registration.
-        for warning in planning_warnings.iter().filter(|warning| {
-            warning.starts_with(super::spec_plan::REJECTED_TOOL_WARNING_PREFIX)
-        }) {
+        for warning in planning_warnings
+            .iter()
+            .filter(|warning| warning.starts_with(super::spec_plan::REJECTED_TOOL_WARNING_PREFIX))
+        {
             if !tool_search_sources.is_empty() {
                 tool_search_sources.push('\n');
             }
@@ -247,13 +248,20 @@ impl ToolRouter {
         self.registry.tool_exposure(name).is_some()
     }
 
-    pub(crate) fn tool_search_sources_for_instructions(&self, instructions: Option<&str>) -> std::borrow::Cow<'_, str> {
+    pub(crate) fn tool_search_sources_for_instructions(
+        &self,
+        instructions: Option<&str>,
+    ) -> std::borrow::Cow<'_, str> {
         let Some(instructions) = instructions.filter(|text| text.contains("<app-context>")) else {
             return std::borrow::Cow::Borrowed(&self.tool_search_sources);
         };
         let entries = self.registry.manifest_entries();
-        let available = entries.iter().map(|tool| tool.tool_name().name.as_str()).collect();
-        let missing = crate::context::desktop_instructions::unavailable_tools(instructions, &available);
+        let available = entries
+            .iter()
+            .map(|tool| tool.tool_name().name.as_str())
+            .collect();
+        let missing =
+            crate::context::desktop_instructions::unavailable_tools(instructions, &available);
         if missing.is_empty() {
             std::borrow::Cow::Borrowed(&self.tool_search_sources)
         } else {
@@ -583,7 +591,10 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
-    pub(crate) fn tool_cancellation_cleanup_deadline(&self, call: &ToolCall) -> std::time::Duration {
+    pub(crate) fn tool_cancellation_cleanup_deadline(
+        &self,
+        call: &ToolCall,
+    ) -> std::time::Duration {
         self.registry.cancellation_cleanup_deadline(&call.tool_name)
     }
 
@@ -601,12 +612,16 @@ impl ToolRouter {
     }
 
     pub(crate) fn semantic_capabilities(
-        &self, name: &ToolName,
+        &self,
+        name: &ToolName,
     ) -> crate::tools::registry::ToolSemanticCapabilities {
         self.registry.semantic_capabilities(name)
     }
 
-    pub(crate) fn terminal_failure_reuse(&self, name: &ToolName) -> crate::tools::registry::TerminalFailureReuse {
+    pub(crate) fn terminal_failure_reuse(
+        &self,
+        name: &ToolName,
+    ) -> crate::tools::registry::TerminalFailureReuse {
         self.registry.terminal_failure_reuse(name)
     }
 
@@ -620,15 +635,18 @@ impl ToolRouter {
     }
 
     pub(crate) fn prepares_during_workspace_baseline(&self, call: &ToolCall) -> bool {
-        self.registry.prepares_during_workspace_baseline(&call.tool_name)
+        self.registry
+            .prepares_during_workspace_baseline(&call.tool_name)
     }
 
     pub(crate) fn delegates_workspace_admission(&self, call: &ToolCall) -> bool {
-        self.registry.delegates_workspace_admission(&call.tool_name, &call.payload)
+        self.registry
+            .delegates_workspace_admission(&call.tool_name, &call.payload)
     }
 
     pub(crate) fn native_addition_paths(&self, call: &ToolCall) -> Option<Vec<std::path::PathBuf>> {
-        self.registry.native_addition_paths(&call.tool_name, &call.payload)
+        self.registry
+            .native_addition_paths(&call.tool_name, &call.payload)
     }
 
     #[instrument(level = "trace", skip_all, err)]

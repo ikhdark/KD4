@@ -907,7 +907,9 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
     match kind {
         StableContextKind::BaseModel => PromptContextCategory::BaseSystem,
         StableContextKind::ToolSchemas => PromptContextCategory::ToolSchemas,
-        StableContextKind::Repository | StableContextKind::RepositoryObservation => PromptContextCategory::Repository,
+        StableContextKind::Repository | StableContextKind::RepositoryObservation => {
+            PromptContextCategory::Repository
+        }
         StableContextKind::Collaboration => PromptContextCategory::Collaboration,
         StableContextKind::SkillUsage | StableContextKind::SelectedSkill => {
             PromptContextCategory::Skills
@@ -1432,8 +1434,14 @@ mod tests {
             &StableContextManifest::default(),
         );
         for breakdown in measure_both(&items, &sidecar) {
-            assert_eq!(breakdown.bytes(PromptContextCategory::TaskInput), item_bytes(&items[2]));
-            assert_eq!(breakdown.bytes(PromptContextCategory::History), item_bytes(&items[0]) + item_bytes(&items[1]));
+            assert_eq!(
+                breakdown.bytes(PromptContextCategory::TaskInput),
+                item_bytes(&items[2])
+            );
+            assert_eq!(
+                breakdown.bytes(PromptContextCategory::History),
+                item_bytes(&items[0]) + item_bytes(&items[1])
+            );
         }
     }
 
@@ -1453,8 +1461,15 @@ mod tests {
         let measurements = breakdown.measurements();
         assert_eq!(measurements, breakdown.measurements());
         let empty = PromptContextBreakdown::default().measurements();
-        let hashes = empty.iter().map(|entry| &entry.sha256).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(hashes.len(), PromptContextCategory::ALL.len(), "empty category domains must differ");
+        let hashes = empty
+            .iter()
+            .map(|entry| &entry.sha256)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            hashes.len(),
+            PromptContextCategory::ALL.len(),
+            "empty category domains must differ"
+        );
         for entry in measurements {
             assert_eq!(entry.sha256, hex_hash(&entry.hash));
             assert_eq!(entry.sha256.len(), 64);
@@ -1481,8 +1496,14 @@ mod tests {
             ],
         );
         for breakdown in measure_both(&items, &sidecar) {
-            assert_eq!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions), item_bytes(&items[0]));
-            assert_eq!(breakdown.bytes(PromptContextCategory::AgentRole), item_bytes(&items[1]));
+            assert_eq!(
+                breakdown.bytes(PromptContextCategory::EnvironmentPermissions),
+                item_bytes(&items[0])
+            );
+            assert_eq!(
+                breakdown.bytes(PromptContextCategory::AgentRole),
+                item_bytes(&items[1])
+            );
             assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
         }
     }

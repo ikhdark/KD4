@@ -45,16 +45,25 @@ fn mixed_injections_still_filter_only_trusted_duplicates() {
 fn ambiguous_stable_injections_remain_whole() {
     let trusted = message("<collaboration_mode>unchanged</collaboration_mode>", true);
     for ambiguous in [
-        ContentItem::OutputText { text: "mixed representation".to_string() },
-        ContentItem::InputText { text: "<permissions instructions>unterminated".to_string() },
+        ContentItem::OutputText {
+            text: "mixed representation".to_string(),
+        },
+        ContentItem::InputText {
+            text: "<permissions instructions>unterminated".to_string(),
+        },
     ] {
         let mut candidate = trusted.clone();
-        let ResponseItem::Message { content, .. } = &mut candidate else { unreachable!() };
+        let ResponseItem::Message { content, .. } = &mut candidate else {
+            unreachable!()
+        };
         content.push(ambiguous);
         // The filtering contract preserves an ambiguous message as a unit,
         // even when one recognized section duplicates trusted history.
         assert_eq!(
-            filter_unchanged_stable_context_items(std::slice::from_ref(&trusted), vec![candidate.clone()]),
+            filter_unchanged_stable_context_items(
+                std::slice::from_ref(&trusted),
+                vec![candidate.clone()]
+            ),
             vec![candidate],
         );
     }
@@ -112,5 +121,3 @@ fn dynamic_history_preserves_canonical_order_without_rehashing() {
     assert_eq!(dynamic, expected);
     assert_eq!(dynamic.fingerprint, manifest.fingerprint);
 }
-
-

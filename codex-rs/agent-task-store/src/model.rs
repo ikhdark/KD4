@@ -193,6 +193,9 @@ pub struct AdmissionOverlapSummary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionRejectionReason {
     DuplicateExplorerInvestigation,
+    /// Retained for compatibility; admission no longer emits this reason.
+    /// Seal-time fingerprints cannot certify the inputs a producer observed.
+    ReusableSealedInvestigation,
     IsolatedIntegratorUnavailable,
 }
 
@@ -200,6 +203,7 @@ impl std::fmt::Display for AdmissionRejectionReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
+            Self::ReusableSealedInvestigation => "reusable_sealed_investigation",
             Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
         };
         formatter.write_str(value)
@@ -332,6 +336,8 @@ impl AssignmentDraft {
             relation: self.relation,
             architecture_contract_ref: self.architecture_contract_ref,
             integration_plan: IntegrationPlan::SingleWriter,
+            // Set by selective admission, which is the only place overlap is computed.
+            benign_read_overlap_count: 0,
             task_capsule: None,
             created_at: Utc::now(),
         })
@@ -374,6 +380,11 @@ pub struct Assignment {
     /// Durable integration ownership selected by admission and enforced by the spawn bootstrap.
     #[serde(default)]
     pub integration_plan: IntegrationPlan,
+    /// Count of concurrently active assignments whose read scope overlapped this one at
+    /// admission. Benign for correctness, but it is the direct signal of duplicated
+    /// repository discovery across agents, so it is retained for terminal usage metrics.
+    #[serde(default)]
+    pub benign_read_overlap_count: u32,
     /// Immutable canonical `TaskCapsuleV1` JSON attached before the child is launched.
     #[serde(default)]
     pub task_capsule: Option<String>,
@@ -917,6 +928,11 @@ pub struct AgentReceipt {
     pub architecture_contract: Option<SealedArchitectureContractV1>,
     #[serde(default)]
     pub evidence_epoch: u64,
+    /// Legacy seal-time fingerprint, retained for persisted receipt compatibility.
+    /// It does not bind producer-observed inputs and is never trusted for reuse.
+    /// New receipts leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_scope_fingerprint: Option<String>,
     pub sealed_at: DateTime<Utc>,
 }
 

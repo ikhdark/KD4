@@ -86,7 +86,9 @@ async fn make_session_and_context() -> (crate::session::Session, TurnContext) {
     session.services.models_manager = turn.provider.models_manager(
         &turn.config.model_provider_id,
         turn.config.codex_home.to_path_buf(),
-        Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
+        Some(
+            codex_models_manager::test_support::test_models_response().expect("test model catalog"),
+        ),
     );
     (session, turn)
 }
@@ -103,7 +105,9 @@ async fn make_session_and_context_with_rx() -> (
         .models_manager = turn.provider.models_manager(
         &turn.config.model_provider_id,
         turn.config.codex_home.to_path_buf(),
-        Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
+        Some(
+            codex_models_manager::test_support::test_models_response().expect("test model catalog"),
+        ),
     );
     (session, turn, events)
 }
@@ -182,6 +186,18 @@ fn thread_manager() -> ThreadManager {
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     )
+}
+
+/// Production derives a turn's service tier from the session configuration
+/// when the turn starts; spawns read the session's live value.
+async fn set_session_service_tier(session: &crate::session::session::Session, tier: &str) {
+    session
+        .update_settings(crate::session::SessionSettingsUpdate {
+            service_tier: Some(Some(tier.to_string())),
+            ..Default::default()
+        })
+        .await
+        .expect("service tier update");
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
@@ -2050,6 +2066,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
+        set_session_service_tier(&session, ServiceTier::Fast.request_value()).await;
         let manager = thread_manager();
         let root = manager
             .start_thread((*turn.config).clone())
@@ -2091,6 +2108,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
+        set_session_service_tier(&session, ServiceTier::Fast.request_value()).await;
         let manager = thread_manager();
         let root = manager
             .start_thread((*turn.config).clone())
@@ -2227,6 +2245,7 @@ service_tier = "turbo"
         },
     );
     turn.config = Arc::new(config);
+    set_session_service_tier(&session, ServiceTier::Fast.request_value()).await;
     let manager = thread_manager();
     let root = manager
         .start_thread((*turn.config).clone())
@@ -2261,6 +2280,72 @@ service_tier = "turbo"
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+}
+
+#[tokio::test]
+async fn spawn_agent_uses_the_service_tier_selected_after_the_turn_started() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    // Turning fast mode off stores the explicit `default` choice; an explicit
+    // request for it is valid for every model.
+    for (requested, turned_off_mid_turn) in [(None, true), (Some("default"), false)] {
+        let (mut session, turn) = make_session_and_context().await;
+        let mut turn = turn
+            .with_model("gpt-5.5".to_string(), &session.services.models_manager)
+            .await;
+        let mut config = (*turn.config).clone();
+        config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+        turn.config = Arc::new(config);
+        set_session_service_tier(&session, ServiceTier::Fast.request_value()).await;
+        if turned_off_mid_turn {
+            session
+                .update_settings(crate::session::SessionSettingsUpdate {
+                    service_tier: Some(None),
+                    ..Default::default()
+                })
+                .await
+                .expect("service tier update");
+        }
+        let manager = thread_manager();
+        let root = manager
+            .start_thread((*turn.config).clone())
+            .await
+            .expect("root thread should start");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+
+        let mut args = json!({"message": "inspect this repo"});
+        if let Some(requested) = requested {
+            args["service_tier"] = json!(requested);
+        }
+        let output = SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "spawn_agent",
+                function_payload(args),
+            ))
+            .await
+            .expect("spawn_agent should accept the default service tier");
+        let (content, _) = expect_text_output(output);
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let snapshot = manager
+            .get_thread(parse_agent_id(&result.agent_id))
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+
+        assert_eq!(
+            snapshot.service_tier.as_deref(),
+            Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+            "requested={requested:?}, turned_off_mid_turn={turned_off_mid_turn}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2671,7 +2756,9 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
         {
             Ok(result) => result.into_response(),
             Err(FunctionCallError::RespondToModel(message)) => {
-                crate::tools::parallel::ToolCallRuntime::failure_response_for_message(&call, message)
+                crate::tools::parallel::ToolCallRuntime::failure_response_for_message(
+                    &call, message,
+                )
             }
             Err(error) => panic!("registered message failed: {error}"),
         };
@@ -3660,6 +3747,125 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_send_message_queues_task_name_alias_to_spawned_agent() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "task_name": "worker",
+                "message": "boot worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let (content, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
+    let spawned: serde_json::Value = serde_json::from_str(&content).expect("spawn JSON");
+    assert_eq!(spawned["task_name"], "/root/worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+
+    let output = SendMessageHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "send_message",
+            function_payload(json!({
+                "task_name": spawned["task_name"],
+                "message": "encrypted-alias-message"
+            })),
+        ))
+        .await
+        .expect("send_message should accept spawn_agent's task_name without target");
+    let (_, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
+
+    let ops = manager.captured_ops();
+    let messages: Vec<_> = ops
+        .iter()
+        .filter_map(|(id, op)| match op {
+            Op::InterAgentCommunication { communication }
+                if communication.encrypted_content.as_deref()
+                    == Some("encrypted-alias-message") =>
+            {
+                Some((id, communication))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 1, "queue the message exactly once");
+    let (recipient_id, communication) = messages[0];
+    assert_eq!(*recipient_id, agent_id);
+    assert_eq!(communication.author, AgentPath::root());
+    assert_eq!(communication.recipient.as_str(), "/root/worker");
+    assert!(communication.other_recipients.is_empty());
+    assert!(communication.content.is_empty());
+    assert!(
+        !communication.trigger_turn,
+        "send_message must remain queue-only"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_send_message_rejects_disagreeing_target_and_task_name() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let Err(err) = SendMessageHandlerV2
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_message",
+            function_payload(json!({
+                "target": "a",
+                "task_name": "b",
+                "message": "do not deliver"
+            })),
+        ))
+        .await
+    else {
+        panic!("disagreeing recipient names must be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("recipient disagreement should surface as a model-facing error");
+    };
+    assert_eq!(
+        message,
+        "`target` (a) and `task_name` (b) name different recipients; supply one."
+    );
+    assert!(
+        !manager
+            .captured_ops()
+            .iter()
+            .any(|(_, op)| matches!(op, Op::InterAgentCommunication { .. } | Op::Interrupt))
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -3768,7 +3974,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         panic!("expected model-facing parse error");
     };
     assert!(message.starts_with(
-        "failed to parse function arguments: unknown field `interrupt`, expected one of `target`, `targets`, `message`"
+        "failed to parse function arguments: unknown field `interrupt`, expected one of `target`, `task_name`, `targets`, `message`"
     ));
 
     let ops = manager.captured_ops();
@@ -3919,8 +4125,6 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
 
     assert_eq!(notifications, Vec::<String>::new());
 }
-
-
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
@@ -4984,9 +5188,15 @@ async fn wait_agent_uses_owned_wait_below_floor() {
             "a below-floor timeout must retain the wait rather than reject, spin, or clamp"
         );
         tokio::time::resume();
-        thread.thread.submit(Op::Shutdown {}).await.expect("shutdown target");
+        thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown target");
         let output = timeout(Duration::from_secs(1), waiting)
-            .await.expect("target completion wakes wait").expect("wait succeeds");
+            .await
+            .expect("target completion wakes wait")
+            .expect("wait succeeds");
         let (content, _) = expect_text_output(output);
         let result: wait::WaitAgentResult = serde_json::from_str(&content).expect("wait result");
         assert!(!result.timed_out);
@@ -5136,11 +5346,11 @@ async fn multi_agent_v2_wait_agent_uses_owned_wait_below_configured_min() {
 
     let handler = WaitAgentHandlerV2::default();
     let waiting = handler.handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "wait_agent",
-            function_payload(json!({"timeout_ms": 1})),
-        ));
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({"timeout_ms": 1})),
+    ));
     assert!(
         timeout(Duration::from_millis(120), waiting).await.is_err(),
         "below-minimum timeout must remain owned across maintenance intervals"
@@ -5321,7 +5531,7 @@ async fn multi_agent_v2_wait_agent_clamps_timeout_above_configured_max() {
     )
     .await
     .expect("the configured maximum bounds the wait")
-        .expect("oversized timeout is clamped");
+    .expect("oversized timeout is clamped");
     let (content, _) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait result");
@@ -5859,8 +6069,6 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     }
     assert_eq!(success, None);
 }
-
-
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {

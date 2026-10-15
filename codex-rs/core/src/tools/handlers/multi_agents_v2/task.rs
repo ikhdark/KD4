@@ -42,7 +42,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
 const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
@@ -199,13 +198,11 @@ async fn handle_submit_agent_receipt(
     let arguments = function_arguments(payload)?;
     let args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let binding = coordinator
-        .binding_for_turn(&turn)
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "{SUBMIT_AGENT_RECEIPT_TOOL}: the caller is not a typed agent with a bound task"
-            ))
-        })?;
+    let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{SUBMIT_AGENT_RECEIPT_TOOL}: the caller is not a typed agent with a bound task"
+        ))
+    })?;
     // The binding proves both assignment and attempt ownership. Never retarget a stale worker
     // binding to a newer correction attempt: the root must first refresh the binding explicitly.
     let task = coordinator
@@ -225,12 +222,7 @@ async fn handle_submit_agent_receipt(
     })?;
     let draft = args.into_receipt_draft(&task)?;
     let review_reason = if draft.status == AgentStatusClaim::Completed {
-        derive_review_reason(
-            turn.config.cwd.as_path(),
-            &task,
-            &draft,
-        )
-        .await?
+        derive_review_reason(turn.config.cwd.as_path(), &task, &draft).await?
     } else {
         None
     };
@@ -279,7 +271,11 @@ async fn derive_review_reason(
             .validation_call_ids
             .iter()
             .all(|call_id| successful_validation_ids.contains(call_id.as_str()));
-    let changed_paths = draft.declared_changes.iter().map(|change| change.path.clone()).collect::<Vec<_>>();
+    let changed_paths = draft
+        .declared_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
     let has_declared_changes = !changed_paths.is_empty();
     let touched_contracts = if !has_declared_changes {
         Vec::new()
@@ -512,13 +508,11 @@ async fn handle_set_agent_gate(
     let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
     let actor = if turn.session_source.is_non_root_agent() {
-        let binding = coordinator
-            .binding_for_turn(&turn)
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
-                ))
-            })?;
+        let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
+            ))
+        })?;
         TaskActor::Attempt(binding.attempt_id)
     } else {
         TaskActor::Root
@@ -829,10 +823,14 @@ impl ReceiptEvidenceRefArgs {
                     self.call_id
                 )))?,
         };
-        let kind = self.kind
-            .or_else(|| task.validation_calls.iter()
-                .find(|call| call.call_id == self.call_id)
-                .and_then(ValidationCall::verified_evidence_kind))
+        let kind = self
+            .kind
+            .or_else(|| {
+                task.validation_calls
+                    .iter()
+                    .find(|call| call.call_id == self.call_id)
+                    .and_then(ValidationCall::verified_evidence_kind)
+            })
             .unwrap_or(codex_agent_task_store::CriterionEvidenceKind::ValidationExecution);
         Ok(codex_agent_task_store::CriterionEvidenceRef {
             call_id: self.call_id,
@@ -1808,7 +1806,9 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             ),
             (
                 "required_evidence",
-                string_array_schema("Canonical worker evidence requirements. inspect:<normalized repository-relative file> requests a complete native read_file source_inspection receipt, not a test or semantic correctness claim."),
+                string_array_schema(
+                    "Canonical worker evidence requirements. inspect:<normalized repository-relative file> requests a complete native read_file source_inspection receipt, not a test or semantic correctness claim.",
+                ),
             ),
             (
                 "prohibited_changes",
@@ -2134,9 +2134,9 @@ mod projection_tests {
     use codex_agent_task_store::MutationEventId;
     use codex_agent_task_store::ObservationKind;
     use codex_agent_task_store::RuntimeObservation;
+    use codex_agent_task_store::TaskCapsuleV1;
     use codex_agent_task_store::ValidationEvidence;
     use codex_agent_task_store::WakeEventId;
-    use codex_agent_task_store::TaskCapsuleV1;
     use codex_agent_task_store::WorkspaceStrategy;
     use codex_agent_task_store::WorkspaceTaskStatus;
 
@@ -2189,6 +2189,7 @@ mod projection_tests {
             next_action: Some("durable next action ".repeat(1_000)),
             architecture_contract: None,
             evidence_epoch: 7,
+            read_scope_fingerprint: None,
             sealed_at: Utc::now(),
         };
         let result = SubmitAgentReceiptResult {
@@ -2357,6 +2358,7 @@ mod projection_tests {
             next_action: Some("finish the open criterion".to_string()),
             architecture_contract: None,
             evidence_epoch: 13,
+            read_scope_fingerprint: None,
             sealed_at: now,
         };
         let result = GetAgentTaskResult {
@@ -2387,6 +2389,7 @@ mod projection_tests {
                     relation: None,
                     architecture_contract_ref: None,
                     integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
+                    benign_read_overlap_count: 0,
                     task_capsule: Some(
                         serde_json::to_string(&capsule).expect("task capsule serializes"),
                     ),
@@ -2473,7 +2476,12 @@ mod projection_tests {
                 <= TASK_OUTPUT_INLINE_LIMIT_BYTES
         );
         assert_eq!(projection["workspace"]["freshness"], "not_tracked");
-        for field in ["epoch", "current_epoch", "snapshot_epoch", "snapshot_manifest_hash"] {
+        for field in [
+            "epoch",
+            "current_epoch",
+            "snapshot_epoch",
+            "snapshot_manifest_hash",
+        ] {
             assert!(projection["workspace"].get(field).is_none());
         }
         assert_eq!(projection["receipt"]["evidence_epoch"], 13);
@@ -2547,8 +2555,8 @@ mod review_policy_tests {
     use super::*;
     use codex_agent_task_store::AssignmentAdmissionOrigin;
     use codex_agent_task_store::AssignmentDraft;
-    use codex_agent_task_store::LocalAgentTaskStore;
     use codex_agent_task_store::CapabilityProfile;
+    use codex_agent_task_store::LocalAgentTaskStore;
     use codex_agent_task_store::WorkspaceStrategy;
 
     #[tokio::test]

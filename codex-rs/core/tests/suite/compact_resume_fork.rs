@@ -163,7 +163,10 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
         "compact+resume test expects resumed path {resumed_path:?} to exist",
     );
 
-    resumed.flush_rollout().await.expect("flush source before fork");
+    resumed
+        .flush_rollout()
+        .await
+        .expect("flush source before fork");
     let forked = fork_thread(&manager, &config, resumed_path, /*nth_user_message*/ 2).await;
     user_turn(&forked, "AFTER_FORK").await;
 
@@ -180,7 +183,11 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let summary_after_fork = extract_summary_user_text(&requests[4], SUMMARY_TEXT);
     assert_eq!(
         json_conversation_user_texts(&requests[2]),
-        vec![summary_after_compact, "hello world".to_string(), "AFTER_COMPACT".to_string()]
+        vec![
+            summary_after_compact,
+            "hello world".to_string(),
+            "AFTER_COMPACT".to_string()
+        ]
     );
     assert_eq!(
         json_conversation_user_texts(&requests[3]),
@@ -258,7 +265,11 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         .collect::<Vec<_>>();
     requests.iter_mut().for_each(normalize_line_endings);
     normalize_compact_prompts(&mut requests);
-    assert_eq!(requests.len(), 8, "all compact/resume/fork phases must execute");
+    assert_eq!(
+        requests.len(),
+        8,
+        "all compact/resume/fork phases must execute"
+    );
     assert_eq!(
         json_conversation_user_texts(&requests[0]),
         vec!["hello world".to_string()]
@@ -618,7 +629,12 @@ async fn mount_second_compact_sequence(server: &MockServer) -> ResponseMock {
 async fn start_test_conversation(
     server: &MockServer,
     model: Option<&str>,
-) -> ((Arc<TempDir>, Arc<TempDir>), Config, Arc<ThreadManager>, Arc<CodexThread>) {
+) -> (
+    (Arc<TempDir>, Arc<TempDir>),
+    Config,
+    Arc<ThreadManager>,
+    Arc<CodexThread>,
+) {
     let base_url = format!("{}/v1", server.uri());
     let model = model.map(str::to_string);
     let mut builder = test_codex().with_config(move |config| {

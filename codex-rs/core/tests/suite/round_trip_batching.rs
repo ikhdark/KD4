@@ -589,6 +589,7 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
         "Resume a live operation rather than restarting it.",
         "Do not read or run again what is already in context",
         "Choose the smallest checks that cover the requested behavior and the credible regressions introduced by the change",
+        "do not re-read merely to confirm a result you already have",
         "A display limit is not a retention guarantee",
         "Recover missing output from its retained artifact (`read_tool_output`) before rerunning the producer",
     ] {

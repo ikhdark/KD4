@@ -147,7 +147,12 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
         "committed\n"
     );
-    assert!(!home.path().join("agent-task-coordination/snapshots").exists());
+    assert!(
+        !home
+            .path()
+            .join("agent-task-coordination/snapshots")
+            .exists()
+    );
     // Each call owns its runtime, and the runtime holds the patch gate until dropped.
     drop(runtime);
 
@@ -166,7 +171,12 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
         "updated\n"
     );
-    assert!(!home.path().join("agent-task-coordination/snapshots").exists());
+    assert!(
+        !home
+            .path()
+            .join("agent-task-coordination/snapshots")
+            .exists()
+    );
 }
 
 #[test]
@@ -432,7 +442,11 @@ async fn sandbox_cwd_uses_patch_action_cwd() {
         permissions_preapproved: false,
     };
 
-    req.action.cwd = req.turn_environment.cwd().join("patch-subdirectory").unwrap();
+    req.action.cwd = req
+        .turn_environment
+        .cwd()
+        .join("patch-subdirectory")
+        .unwrap();
     assert_ne!(&req.action.cwd, req.turn_environment.cwd());
     assert_eq!(runtime.sandbox_cwd(&req), Some(&req.action.cwd));
 }

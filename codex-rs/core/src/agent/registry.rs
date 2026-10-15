@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -23,13 +24,22 @@ pub(crate) struct AgentRegistry {
     active_agents: Mutex<ActiveAgents>,
     total_count: AtomicUsize,
     capacity_updates: tokio::sync::watch::Sender<u64>,
+    /// Latches on the first registered sub-agent and never clears.
+    ///
+    /// `has_live_agents` reflects the current graph, which empties when children
+    /// finish. The agent tool surface is derived from this flag instead so those
+    /// tool schemas — part of the cached prompt prefix — cannot be retracted and
+    /// re-added as children come and go.
+    ever_had_live_agents: AtomicBool,
 }
 
 impl Default for AgentRegistry {
     fn default() -> Self {
         Self {
-            active_agents: Mutex::default(), total_count: AtomicUsize::new(0),
+            active_agents: Mutex::default(),
+            total_count: AtomicUsize::new(0),
             capacity_updates: tokio::sync::watch::channel(0).0,
+            ever_had_live_agents: AtomicBool::new(false),
         }
     }
 }
@@ -142,7 +152,8 @@ impl AgentRegistry {
         };
         if removed_counted_agent {
             self.total_count.fetch_sub(1, Ordering::AcqRel);
-            self.capacity_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
+            self.capacity_updates
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 
@@ -222,6 +233,24 @@ impl AgentRegistry {
             })
     }
 
+    /// Whether a sub-agent has ever been live in this session tree.
+    ///
+    /// Monotonic: once true it stays true for the life of the registry, so the
+    /// agent tool surface derived from it stays byte-stable in the cached prefix.
+    pub(crate) fn ever_had_live_agents(&self) -> bool {
+        if self.ever_had_live_agents.load(Ordering::Acquire) {
+            return true;
+        }
+        // Latch lazily too, so a tree whose children were registered by a path
+        // other than `register_spawned_thread` (a resumed session, for example)
+        // still reports the surface.
+        if self.has_live_agents() {
+            self.ever_had_live_agents.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String) {
         let mut active_agents = self
             .active_agents
@@ -280,6 +309,16 @@ impl AgentRegistry {
             .unwrap_or_else(|| format!("thread:{thread_id}"));
         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
             active_agents.used_agent_nicknames.insert(agent_nickname);
+        }
+        // Latch here, matching the non-root filter `has_live_agents` applies, so
+        // the agent tool surface survives a child that finishes before the next
+        // turn assembles its prompt.
+        if !agent_metadata
+            .agent_path
+            .as_ref()
+            .is_some_and(AgentPath::is_root)
+        {
+            self.ever_had_live_agents.store(true, Ordering::Release);
         }
         active_agents.agent_tree.insert(key, agent_metadata);
         Ok(())
@@ -554,7 +593,9 @@ impl Drop for SpawnReservation {
                 self.state.release_reserved_agent_path(&agent_path);
             }
             self.state.total_count.fetch_sub(1, Ordering::AcqRel);
-            self.state.capacity_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
+            self.state
+                .capacity_updates
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 }

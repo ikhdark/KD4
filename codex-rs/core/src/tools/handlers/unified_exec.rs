@@ -28,13 +28,21 @@ async fn preserve_durability_failure_output(
     codex_home: &std::path::Path,
     thread_id: &str,
 ) -> String {
-    let Some(mut output) = output else { return message; };
+    let Some(mut output) = output else {
+        return message;
+    };
     // A zero display budget must not discard the only observed result when
     // durable history failed. Keep this fatal diagnostic bounded and recoverable.
     output.max_output_tokens = Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS);
-    output.prepare_recovery_artifact(codex_home, thread_id).await;
-    let observed = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
-    format!("{message}\nCommand result observed before durability failure (not successful persistence; do not rerun):\n{observed}")
+    output
+        .prepare_recovery_artifact(codex_home, thread_id)
+        .await;
+    let observed = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".into(),
+    });
+    format!(
+        "{message}\nCommand result observed before durability failure (not successful persistence; do not rerun):\n{observed}"
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,7 +118,9 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
-        let mut argument_notices = raw.extra.keys()
+        let mut argument_notices = raw
+            .extra
+            .keys()
             .map(|field| format!("Ignored unsupported exec_command field `{field}`."))
             .collect::<Vec<_>>();
         if raw.timeout_ms.is_some() {
@@ -145,7 +155,10 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             i128::from(crate::unified_exec::MIN_YIELD_TIME_MS),
             i128::from(crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS),
         ) as u64;
-        if raw.yield_time_ms.is_some_and(|requested| requested != i128::from(yield_time_ms)) {
+        if raw
+            .yield_time_ms
+            .is_some_and(|requested| requested != i128::from(yield_time_ms))
+        {
             argument_notices.push(format!("Adjusted `yield_time_ms` to {yield_time_ms}."));
         }
         Ok(Self {
@@ -157,7 +170,9 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             yield_time_requested: raw.yield_time_ms.is_some(),
             stall_timeout_ms: raw
                 .stall_timeout_ms
-                .or_else(|| (!long_running).then_some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
+                .or_else(|| {
+                    (!long_running).then_some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS)
+                })
                 .filter(|timeout| *timeout != 0),
             stall_timeout_requested: raw.stall_timeout_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,

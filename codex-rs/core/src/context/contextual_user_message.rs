@@ -121,8 +121,9 @@ static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstruction
     FragmentRegistrationProxy::new();
 static ENVIRONMENT_CONTEXT_REGISTRATION: FragmentRegistrationProxy<EnvironmentsState> =
     FragmentRegistrationProxy::new();
-static SUBAGENTS_CONTEXT_REGISTRATION: FragmentRegistrationProxy<super::world_state::SubagentsState> =
-    FragmentRegistrationProxy::new();
+static SUBAGENTS_CONTEXT_REGISTRATION: FragmentRegistrationProxy<
+    super::world_state::SubagentsState,
+> = FragmentRegistrationProxy::new();
 static ADDITIONAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<AdditionalContextUserFragment> =
     FragmentRegistrationProxy::new();
 static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInjection> =

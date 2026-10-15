@@ -59,6 +59,16 @@ pub enum ApplyPatchError {
     /// Error that occurs while computing replacements when applying patch chunks
     #[error("{0}")]
     ComputeReplacements(String),
+    /// Preflight found several independent conflicts against one source
+    /// snapshot. `report` is the same aggregated text a `ComputeReplacements`
+    /// failure carried before, so model-facing output is unchanged; the typed
+    /// mismatches are retained alongside it so a retry receipt can still name
+    /// the observed source instead of forcing a separate re-read.
+    #[error("{report}")]
+    MultiplePatchConflicts {
+        report: String,
+        mismatches: Vec<PatchContextMismatch>,
+    },
     /// A patch chunk did not match, with bounded context from the exact source
     /// snapshot observed by the confined patch runtime when safely available.
     #[error(transparent)]
@@ -974,15 +984,32 @@ pub(crate) async fn preflight_hunks(
     match failures.len() {
         0 => Ok(prepared),
         1 => Err(failures.remove(0)),
-        _ => Err(ApplyPatchError::ComputeReplacements(format!(
-            "Patch preflight found {} conflicts; no files were changed.\n{}",
-            failures.len(),
-            failures
+        _ => {
+            let report = format!(
+                "Patch preflight found {} conflicts; no files were changed.\n{}",
+                failures.len(),
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            );
+            // Keep the typed mismatches in declaration order. Without them the
+            // retry receipt reports no observed source, which costs a re-read
+            // round trip that the single-conflict path does not need.
+            let mismatches = failures
                 .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        ))),
+                .filter_map(|failure| match failure {
+                    ApplyPatchError::PatchContextMismatch(mismatch) => Some(mismatch.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if mismatches.is_empty() {
+                Err(ApplyPatchError::ComputeReplacements(report))
+            } else {
+                Err(ApplyPatchError::MultiplePatchConflicts { report, mismatches })
+            }
+        }
     }
 }
 
@@ -1826,6 +1853,27 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("b.rs")).unwrap(),
             "actual b\n"
+        );
+        // The aggregated report keeps the typed mismatches, so a retry receipt
+        // can still name the observed source without a separate re-read.
+        let (aggregated, _) = failure.into_parts();
+        let ApplyPatchError::MultiplePatchConflicts { mismatches, report } = aggregated else {
+            panic!("expected retained typed mismatches, got {aggregated:?}");
+        };
+        assert_eq!(report, error);
+        let paths = mismatches
+            .iter()
+            .map(|mismatch| mismatch.canonical_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.iter().any(|path| path.ends_with("a.rs"))
+                && paths.iter().any(|path| path.ends_with("b.rs")),
+            "{paths:?}"
+        );
+        assert!(
+            mismatches
+                .iter()
+                .all(|mismatch| !mismatch.current_content_sha256.is_empty())
         );
     }
 

@@ -86,9 +86,10 @@ impl FileSystemContext {
             |path: &Path| is_session_visualization_directory(codex_home, path);
         self.workspace_roots
             .retain(|root| !is_session_directory(Path::new(root)));
-        if let FileSystemPermissionProfileContext::Managed(
-            ManagedFileSystemContext::Restricted { entries, .. },
-        ) = &mut self.permission_profile
+        if let FileSystemPermissionProfileContext::Managed(ManagedFileSystemContext::Restricted {
+            entries,
+            ..
+        }) = &mut self.permission_profile
         {
             entries.retain(|entry| {
                 entry.access == FileSystemAccessMode::Deny
@@ -292,7 +293,11 @@ impl NetworkContext {
             "<managed_network_proxy configured_enabled=\"{}\">",
             self.enabled
         );
-        Self::push_rendered_domain_element(&mut rendered, "required_allowed", &self.allowed_domains);
+        Self::push_rendered_domain_element(
+            &mut rendered,
+            "required_allowed",
+            &self.allowed_domains,
+        );
         Self::push_rendered_domain_element(&mut rendered, "required_denied", &self.denied_domains);
         rendered.push_str("</managed_network_proxy>");
         rendered

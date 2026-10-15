@@ -171,10 +171,7 @@ impl AsyncWrite for Counted {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -196,9 +193,10 @@ async fn serve_websocket(socket: TcpStream, server: Server, deflate: bool) {
         inner: socket,
         read: Arc::clone(&read),
     };
-    let mut ws = tokio_tungstenite::accept_async_with_config(socket, Some(server_ws_config(deflate)))
-        .await
-        .unwrap();
+    let mut ws =
+        tokio_tungstenite::accept_async_with_config(socket, Some(server_ws_config(deflate)))
+            .await
+            .unwrap();
     let mut consumed = 0;
     while let Some(Ok(message)) = ws.next().await {
         let Message::Text(_) = message else {
@@ -743,8 +741,7 @@ where
     for bytes in [256 * KIB, MIB, 4 * MIB] {
         let (mut after_last_byte, mut total) = (Vec::new(), Vec::new());
         for _ in 0..5 {
-            let (marks, delivery) =
-                scripted(server, Script::LargeItem { bytes }, &mut start).await;
+            let (marks, delivery) = scripted(server, Script::LargeItem { bytes }, &mut start).await;
             let delivered = delivery.item.expect("large item delivered");
             after_last_byte.push(delivered.saturating_duration_since(marks[1]));
             total.push(delivered - marks[0]);

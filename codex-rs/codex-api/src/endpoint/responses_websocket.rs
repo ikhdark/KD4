@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::debug;
@@ -418,12 +419,6 @@ impl ResponsesWebsocketConnection {
         .await
     }
 
-    #[instrument(
-        name = "responses_websocket.stream_request",
-        level = "info",
-        skip_all,
-        fields(transport = "responses_websocket", api.path = "responses")
-    )]
     pub async fn stream_request_with_dispatch_ready(
         &self,
         request: &ResponsesWsRequest,
@@ -433,11 +428,44 @@ impl ResponsesWebsocketConnection {
         dispatch_ready: impl FnOnce(Bytes) + Send + 'static,
         stream_established: impl FnOnce() + Send + 'static,
     ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_with_response_idle_timeout(
+            request,
+            connection_reused,
+            turn_state,
+            /*response_idle_timeout*/ None,
+            queue_started,
+            dispatch_ready,
+            stream_established,
+        )
+        .await
+    }
+
+    /// Like [`Self::stream_request_with_dispatch_ready`], but bounds silence
+    /// while waiting for response progress by `response_idle_timeout` when set.
+    /// Queueing and sending keep the connection's idle timeout.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "responses_websocket.stream_request",
+        level = "info",
+        skip_all,
+        fields(transport = "responses_websocket", api.path = "responses")
+    )]
+    pub async fn stream_request_with_response_idle_timeout(
+        &self,
+        request: &ResponsesWsRequest,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        response_idle_timeout: Option<Duration>,
+        queue_started: impl FnOnce(),
+        dispatch_ready: impl FnOnce(Bytes) + Send + 'static,
+        stream_established: impl FnOnce() + Send + 'static,
+    ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let stream = Arc::clone(&self.stream);
         let retired = Arc::clone(&self.retired);
         let idle_timeout = self.idle_timeout;
+        let response_idle_timeout = response_idle_timeout.unwrap_or(idle_timeout);
         let metadata = self.metadata.clone();
         let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
         let telemetry = self.telemetry.clone();
@@ -521,7 +549,7 @@ impl ResponsesWebsocketConnection {
                         run_websocket_response_stream(
                             ws_stream,
                             tx_event.clone(),
-                            idle_timeout,
+                            response_idle_timeout,
                             telemetry,
                             metadata,
                             turn_state,
@@ -995,19 +1023,39 @@ async fn run_websocket_response_stream(
             Message::Close(frame) => {
                 let mut message =
                     "websocket closed by server before response.completed".to_string();
+                let mut reconnectable = false;
                 if let Some(frame) = frame {
                     message.push_str(&format!(
                         " (code {}, reason: {:?})",
                         frame.code,
                         frame.reason.as_str()
                     ));
+                    reconnectable = close_code_invites_reconnect(frame.code);
                 }
-                return Err(ApiError::Stream(message));
+                return Err(if reconnectable {
+                    ApiError::reconnectable_close(message)
+                } else {
+                    ApiError::Stream(message)
+                });
             }
             Message::Frame(_) => {}
             Message::Ping(_) | Message::Pong(_) => {}
         }
     }
+}
+
+/// Whether a mid-response close code means "connect again", not "do not".
+///
+/// The server closes with these codes when it sheds load or restarts a node,
+/// which is unrelated to this request: the same request on a new socket
+/// normally completes. Every other code — a policy rejection, a protocol or
+/// payload error, an authentication failure — describes the request or the
+/// client, so reconnecting would only repeat the rejection.
+fn close_code_invites_reconnect(code: CloseCode) -> bool {
+    matches!(
+        code,
+        CloseCode::Normal | CloseCode::Away | CloseCode::Restart | CloseCode::Again
+    )
 }
 
 fn websocket_read_error(err: WsError) -> ApiError {
@@ -1211,6 +1259,83 @@ mod tests {
                 );
             }
             producer.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_idle_timeout_override_outlasts_connection_idle_timeout() {
+        for (response_idle_timeout, provider_completes) in [
+            (None, true),
+            (Some(Duration::from_millis(500)), true),
+            // The longer wait must still end when the provider never answers.
+            (Some(Duration::from_millis(500)), false),
+        ] {
+            let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(4, 4096);
+            let pump_task = tokio::spawn(async move {
+                if let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
+                    let _ = tx_result.send(Ok(()));
+                }
+                std::future::pending::<()>().await;
+            });
+            let connection = ResponsesWebsocketConnection::new(
+                WsStream {
+                    tx_command,
+                    rx_message,
+                    rx_failure: None,
+                    pending_failure: None,
+                    pump_task,
+                },
+                Duration::from_millis(100),
+                ResponsesStreamMetadata::default(),
+                None,
+            );
+            let mut response = connection
+                .stream_request_with_response_idle_timeout(
+                    &test_response_request("test"),
+                    false,
+                    None,
+                    response_idle_timeout,
+                    || {},
+                    |_| {},
+                    || {},
+                )
+                .await
+                .unwrap();
+            // The provider stays silent longer than the connection idle timeout.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if provider_completes {
+                let _ = tx_message.try_send(Message::Text(
+                    json!({"type":"response.completed","response":{"id":"done"}})
+                        .to_string()
+                        .into(),
+                ));
+            }
+            let mut completed = false;
+            let mut error = None;
+            while let Some(event) = response.next().await {
+                match event {
+                    Ok(ResponseEvent::Completed { .. }) => completed = true,
+                    Ok(_) => {}
+                    Err(err) => error = Some(err),
+                }
+            }
+            let expected_timeout = match (response_idle_timeout, provider_completes) {
+                (Some(_), true) => None,
+                (None, _) => Some("idle timeout waiting for websocket after 100ms"),
+                (Some(_), false) => Some("idle timeout waiting for websocket after 500ms"),
+            };
+            match expected_timeout {
+                None => assert!(completed && error.is_none(), "{error:?}"),
+                Some(expected) => {
+                    assert!(!completed);
+                    assert!(
+                        matches!(&error, Some(ApiError::Stream(message)) if message == expected),
+                        "{error:?}"
+                    );
+                }
+            }
+            drop(tx_message);
         }
     }
 
@@ -2216,7 +2341,10 @@ mod tests {
 
     #[tokio::test]
     async fn response_stream_preserves_server_close_details() {
-        for (frame, expected) in [
+        // A close code that invites another connection is additionally marked
+        // reconnectable, so the retry layer rebuilds the socket instead of
+        // abandoning WebSockets for the session.
+        for (frame, expected, reconnectable) in [
             (
                 Some(CloseFrame {
                     code:
@@ -2224,8 +2352,41 @@ mod tests {
                     reason: "policy rejection".into(),
                 }),
                 "websocket closed by server before response.completed (code 1008, reason: \"policy rejection\")",
+                false,
             ),
-            (None, "websocket closed by server before response.completed"),
+            (
+                Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "timeout waiting for websocket (reconnectable close)".into(),
+                }),
+                "websocket closed by server before response.completed (code 1008, reason: \"timeout waiting for websocket (reconnectable close)\")",
+                false,
+            ),
+            (
+                Some(CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "".into(),
+                }),
+                "websocket closed by server before response.completed (code 1012, reason: \"\")",
+                true,
+            ),
+            (
+                Some(CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    reason: "".into(),
+                }),
+                "websocket closed by server before response.completed (code 1000, reason: \"\")",
+                true,
+            ),
+            // A close with no frame carries no code, so it cannot be trusted to
+            // invite a reconnect.
+            (
+                None,
+                "websocket closed by server before response.completed",
+                false,
+            ),
         ] {
             let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
             let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
@@ -2262,10 +2423,27 @@ mod tests {
                 if snapshot.limit_id.as_deref() == Some("codex"))
             );
             let error = response.next().await.unwrap().unwrap_err();
-            assert!(
-                matches!(&error, ApiError::Stream(message) if message == expected),
-                "{error:?}"
+            let ApiError::Stream(message) = &error else {
+                panic!("expected a stream error, got {error:?}");
+            };
+            assert_eq!(
+                crate::error::is_reconnectable_close_message(message),
+                reconnectable,
+                "{message}"
             );
+            assert_eq!(
+                crate::error::strip_reconnectable_close_marker(message.clone()),
+                expected,
+                "the routing marker must not reach a user-visible message"
+            );
+            let codex_protocol::error::CodexErr::ResponseStreamFailed(mapped) =
+                crate::api_bridge::map_api_error(error)
+            else {
+                panic!("close must remain a stream failure");
+            };
+            assert!(!mapped.idle_timeout, "a close frame is not silence");
+            assert_eq!(mapped.reconnectable_close, reconnectable);
+            assert_eq!(mapped.message, expected, "preserve the exact close reason");
             assert!(
                 response.next().await.is_none(),
                 "close must prevent completion"

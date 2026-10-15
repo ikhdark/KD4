@@ -75,7 +75,7 @@ async fn diagnostic_deadlines_preserve_status_and_protocol_errors() {
 /// Local fault-injection benchmark, deliberately excluded from ordinary tests.
 /// Run with nextest's `--success-output immediate` to display the measurements.
 #[tokio::test]
-#[ignore]
+#[ignore = "manual local fault-injection benchmark; timing is descriptive"]
 async fn stalled_diagnostics_benchmark() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

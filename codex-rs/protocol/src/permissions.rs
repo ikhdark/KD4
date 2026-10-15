@@ -43,7 +43,8 @@ pub fn is_protected_metadata_directory_name(name: &OsStr) -> bool {
 
 pub(crate) fn path_component_matches(left: &OsStr, right: &OsStr) -> bool {
     if cfg!(windows) {
-        left.as_encoded_bytes().eq_ignore_ascii_case(right.as_encoded_bytes())
+        left.as_encoded_bytes()
+            .eq_ignore_ascii_case(right.as_encoded_bytes())
     } else {
         left == right
     }
@@ -357,9 +358,9 @@ impl ReadDenyMatcher {
         let path_candidates = normalized_and_canonical_candidates(path);
         if self.denied_candidates.iter().any(|denied_candidates| {
             path_candidates.iter().any(|candidate| {
-                denied_candidates.iter().any(|denied_candidate| {
-                    path_is_within_denied_root(candidate, denied_candidate)
-                })
+                denied_candidates
+                    .iter()
+                    .any(|denied_candidate| path_is_within_denied_root(candidate, denied_candidate))
             })
         }) {
             return true;
@@ -2113,7 +2114,10 @@ mod tests {
         for name in PROTECTED_METADATA_PATH_NAMES {
             std::fs::create_dir(cwd.path().join(name)).expect("create protected directory");
             let alias = cwd.path().join(name.to_ascii_uppercase());
-            assert!(alias.is_dir(), "the alias addresses the protected directory");
+            assert!(
+                alias.is_dir(),
+                "the alias addresses the protected directory"
+            );
             let target = alias.join("new-file");
             assert!(!target.exists());
             assert_eq!(
@@ -2122,11 +2126,20 @@ mod tests {
             );
             assert!(!policy.can_write_path_with_cwd(&target, cwd.path()));
             assert!(is_protected_metadata_name(alias.file_name().unwrap()));
-            assert!(policy.get_writable_roots_with_cwd(cwd.path()).iter()
-                .all(|root| !root.is_path_writable(&target)));
-            assert!(policy.can_write_path_with_cwd(
-                &cwd.path().join(format!("{name}-unrelated")).join("new-file"), cwd.path(),
-            ));
+            assert!(
+                policy
+                    .get_writable_roots_with_cwd(cwd.path())
+                    .iter()
+                    .all(|root| !root.is_path_writable(&target))
+            );
+            assert!(
+                policy.can_write_path_with_cwd(
+                    &cwd.path()
+                        .join(format!("{name}-unrelated"))
+                        .join("new-file"),
+                    cwd.path(),
+                )
+            );
         }
     }
 
@@ -2339,7 +2352,8 @@ mod tests {
             access: FileSystemAccessMode::Read,
         });
         assert!(
-            carved.needs_direct_runtime_enforcement(NetworkSandboxPolicy::Restricted, &canonical_cwd),
+            carved
+                .needs_direct_runtime_enforcement(NetworkSandboxPolicy::Restricted, &canonical_cwd),
             "the nested read-only carveout is the only difference from the legacy projection"
         );
     }

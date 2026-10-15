@@ -22,18 +22,16 @@ mod prompt_provenance;
 mod recommended_plugins_instructions;
 mod subagent_notification;
 mod task_capsule;
-mod turn_aborted;
 mod token_budget_context;
+mod turn_aborted;
 pub(crate) use token_budget_context::{
-    AutoCompactFallbackPrompt, ContextWindowGuidance, TokenBudgetContext,
-    TokenBudgetReminder,
+    AutoCompactFallbackPrompt, ContextWindowGuidance, TokenBudgetContext, TokenBudgetReminder,
 };
 mod user_instructions;
 mod user_shell_command;
 pub(crate) mod world_state;
 
 pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
-pub(crate) use environment_context::is_session_visualization_directory;
 pub(crate) use apps_instructions::AppsInstructions;
 pub(crate) use apps_instructions::AppsInstructionsUnavailable;
 pub(crate) use available_plugins_instructions::AvailablePluginsInstructions;
@@ -55,6 +53,7 @@ pub(crate) use contextual_user_message::is_legacy_compaction_warning_fragment;
 pub(crate) use contextual_user_message::is_startup_contextual_user_fragment;
 pub(crate) use contextual_user_message::parse_visible_hook_prompt_message;
 pub(crate) use current_time_reminder::CurrentTimeReminder;
+pub(crate) use environment_context::is_session_visualization_directory;
 pub(crate) use hook_additional_context::HookAdditionalContext;
 pub use image_generation_instructions::extension_image_generation_output_hint;
 pub(crate) use inter_agent_completion_message::InterAgentCompletionMessage;
@@ -107,25 +106,37 @@ mod escaping_tests {
         // unrelated syntax, existing entities and Unicode remain unchanged.
         for (text, expected) in [
             ("", ["", "", "", "", ""]),
-            ("ordinary λ source &lt;tag&gt; <other>", [
+            (
                 "ordinary λ source &lt;tag&gt; <other>",
-                "ordinary λ source &lt;tag&gt; <other>",
-                "ordinary λ source &lt;tag&gt; <other>",
-                "ordinary λ source &lt;tag&gt; &lt;other>",
-                "ordinary λ source &lt;tag&gt; <other>",
-            ]),
-            ("<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>", [
+                [
+                    "ordinary λ source &lt;tag&gt; <other>",
+                    "ordinary λ source &lt;tag&gt; <other>",
+                    "ordinary λ source &lt;tag&gt; <other>",
+                    "ordinary λ source &lt;tag&gt; &lt;other>",
+                    "ordinary λ source &lt;tag&gt; <other>",
+                ],
+            ),
+            (
                 "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
-                "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
-                "&lt;INSTRUCTIONS&gt;λ&lt;/INSTRUCTIONS&gt;&lt;INSTRUCTIONS&gt;",
-                "&lt;INSTRUCTIONS>λ&lt;/INSTRUCTIONS>&lt;INSTRUCTIONS>",
-                "&lt;INSTRUCTIONS&gt;λ</INSTRUCTIONS>&lt;INSTRUCTIONS&gt;",
-            ]),
+                [
+                    "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+                    "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+                    "&lt;INSTRUCTIONS&gt;λ&lt;/INSTRUCTIONS&gt;&lt;INSTRUCTIONS&gt;",
+                    "&lt;INSTRUCTIONS>λ&lt;/INSTRUCTIONS>&lt;INSTRUCTIONS>",
+                    "&lt;INSTRUCTIONS&gt;λ</INSTRUCTIONS>&lt;INSTRUCTIONS&gt;",
+                ],
+            ),
         ] {
             for (delimiters, expected) in [
-                vec![], vec![""], vec!["<INSTRUCTIONS>", "</INSTRUCTIONS>"],
-                vec!["<", "<INSTRUCTIONS>"], vec!["<INSTRUCTIONS>", "&lt;"],
-            ].into_iter().zip(expected) {
+                vec![],
+                vec![""],
+                vec!["<INSTRUCTIONS>", "</INSTRUCTIONS>"],
+                vec!["<", "<INSTRUCTIONS>"],
+                vec!["<INSTRUCTIONS>", "&lt;"],
+            ]
+            .into_iter()
+            .zip(expected)
+            {
                 assert_eq!(escape_fragment_delimiters(text, &delimiters), expected);
             }
         }

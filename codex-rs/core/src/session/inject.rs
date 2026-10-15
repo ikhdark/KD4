@@ -509,9 +509,15 @@ mod tests {
                     /*has_internal_completion*/ false,
                 )
                 .await;
-            assert_eq!(pending_activity, (!internal).then_some(InputQueueActivity::Steer));
             assert_eq!(
-                session.input_queue.has_pending_input(&session.active_turn).await,
+                pending_activity,
+                (!internal).then_some(InputQueueActivity::Steer)
+            );
+            assert_eq!(
+                session
+                    .input_queue
+                    .has_pending_input(&session.active_turn)
+                    .await,
                 !internal
             );
             assert_eq!(

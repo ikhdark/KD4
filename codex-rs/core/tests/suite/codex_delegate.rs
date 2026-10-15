@@ -54,9 +54,11 @@ async fn assert_review_completes_without_approval(
             EventMsg::TurnComplete(completed) => {
                 match expected {
                     Ok(_) => assert_eq!(completed.error, None),
-                    Err(message) => assert!(completed.error.is_some_and(|error| {
-                        error.message.contains(message)
-                    })),
+                    Err(message) => assert!(
+                        completed
+                            .error
+                            .is_some_and(|error| { error.message.contains(message) })
+                    ),
                 }
                 break;
             }

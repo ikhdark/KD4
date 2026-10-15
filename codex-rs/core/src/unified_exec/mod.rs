@@ -178,10 +178,7 @@ impl PendingSpawnRegistration {
         }
     }
 
-    pub(crate) fn with_workspace_operation<T: Send + Sync + 'static>(
-        &self,
-        permit: T,
-    ) -> Self {
+    pub(crate) fn with_workspace_operation<T: Send + Sync + 'static>(&self, permit: T) -> Self {
         Self {
             processes: Arc::clone(&self.processes),
             termination_owner: self.termination_owner.clone(),
@@ -310,7 +307,11 @@ impl ProcessIdReservation {
 }
 
 impl ProcessStore {
-    fn remember_finished(&mut self, id: u32, response: &crate::tools::context::ExecCommandToolOutput) {
+    fn remember_finished(
+        &mut self,
+        id: u32,
+        response: &crate::tools::context::ExecCommandToolOutput,
+    ) {
         const MAX_FINISHED: usize = 32;
         self.used_process_ids.entry(id).or_insert(None);
         if self.finished.len() == MAX_FINISHED {
@@ -322,20 +323,37 @@ impl ProcessStore {
         self.finished.push_back((id, response));
         // Bound retained output as well as record count; never retain process
         // handles/tasks just to support an idempotent terminal poll.
-        while self.finished.len() > 1 && self.finished.iter().map(|(_, output)| {
-            output.raw_output.len() + output.process_output.as_ref().map_or(0, |snapshot| {
-                snapshot.aggregated_output.len() + snapshot.stdout.len() + snapshot.stderr.len()
-            })
-        }).sum::<usize>() > 8 * 1024 * 1024 {
+        while self.finished.len() > 1
+            && self
+                .finished
+                .iter()
+                .map(|(_, output)| {
+                    output.raw_output.len()
+                        + output.process_output.as_ref().map_or(0, |snapshot| {
+                            snapshot.aggregated_output.len()
+                                + snapshot.stdout.len()
+                                + snapshot.stderr.len()
+                        })
+                })
+                .sum::<usize>()
+                > 8 * 1024 * 1024
+        {
             self.finished.pop_front();
         }
     }
 
-    fn finished_response(&self, request: &WriteStdinRequest<'_>) -> Option<Result<crate::tools::context::ExecCommandToolOutput, UnifiedExecError>> {
-        let (_, response) = self.finished.iter().find(|(id, _)| *id == request.process_id)?;
+    fn finished_response(
+        &self,
+        request: &WriteStdinRequest<'_>,
+    ) -> Option<Result<crate::tools::context::ExecCommandToolOutput, UnifiedExecError>> {
+        let (_, response) = self
+            .finished
+            .iter()
+            .find(|(id, _)| *id == request.process_id)?;
         if !request.input.is_empty() {
             return Some(Err(UnifiedExecError::process_failed(format!(
-                "process {} has exited; input was not delivered", request.process_id,
+                "process {} has exited; input was not delivered",
+                request.process_id,
             ))));
         }
         let mut response = response.clone();
@@ -352,7 +370,10 @@ impl ProcessStore {
         self.reserved_process_ids.remove(&process_id);
         self.reserved_process_slots.remove(&process_id);
         let entry = self.processes.remove(&process_id)?;
-        self.used_process_ids.insert(process_id, Some(entry.process.session_capabilities(entry.tty).incarnation));
+        self.used_process_ids.insert(
+            process_id,
+            Some(entry.process.session_capabilities(entry.tty).incarnation),
+        );
         Some(entry)
     }
 }

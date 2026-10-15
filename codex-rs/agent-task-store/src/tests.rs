@@ -580,6 +580,7 @@ async fn audit_task_view_validation_history_and_receipt_references_are_complete(
         next_action: Some("inspect complete task view".to_string()),
         architecture_contract: None,
         evidence_epoch: 0,
+        read_scope_fingerprint: None,
         sealed_at: recorded_at,
     };
     sqlx::query(
@@ -2280,10 +2281,239 @@ async fn explorer_identity_rejects_only_the_same_primary_question() {
             true,
         )
         .await
-        .expect("a sealed investigation cannot prove freshness for new work");
+        .expect("a sealed investigation over changed bytes cannot prove freshness");
     assert_ne!(
         completed_duplicate.assignment.assignment_id,
         first.assignment.assignment_id
+    );
+}
+
+#[tokio::test]
+async fn sealed_explorer_result_does_not_reuse_inputs_changed_before_seal() {
+    let fixture = Fixture::new().await;
+    let source = fixture.repo.path().join("src/shared.rs");
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
+    std::fs::write(&source, "original parser").expect("seed source");
+    let draft = || {
+        explorer_draft(
+            "explorer-stale-root",
+            "src/shared.rs",
+            "trace the parser ownership",
+        )
+    };
+    let first = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), draft(), true)
+        .await
+        .expect("first investigation is admitted");
+
+    // The producer observes A, but another writer changes the input to B before
+    // the A-based answer seals. Seal-time bytes cannot certify that answer.
+    let observed = std::fs::read_to_string(&source).expect("producer reads source");
+    assert_eq!(observed, "original parser");
+    std::fs::write(&source, "modified parser").expect("concurrent writer changes source");
+    let mut result = completed_receipt(Vec::new());
+    result.summary = observed;
+    let receipt = fixture
+        .store
+        .submit_agent_receipt(first.attempt.attempt_id, result)
+        .await
+        .expect("the investigation result seals");
+    assert_eq!(receipt.read_scope_fingerprint, None);
+    assert_eq!(
+        fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), draft())
+            .await
+            .expect("reuse probe succeeds"),
+        None,
+        "an A-based result cannot be offered as an investigation of B"
+    );
+    let fresh = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), draft(), true)
+        .await
+        .expect("changed-before-seal inputs require a fresh investigation");
+    assert_ne!(
+        fresh.assignment.assignment_id,
+        first.assignment.assignment_id
+    );
+}
+
+#[tokio::test]
+async fn sealed_explorer_result_does_not_trust_legacy_fingerprints() {
+    // Unchanged seal-time bytes still do not establish what the producer read.
+    // Exercise both newly sealed receipts and the persisted format from before
+    // fail-closed admission, including a matching legacy fingerprint.
+    for legacy_fingerprint in [
+        None,
+        Some("b5290b1806bc098bb731063b479c205165e66cbba5d9f4875f8788d2d9b5f137"),
+    ] {
+        let fixture = Fixture::new().await;
+        std::fs::create_dir_all(fixture.repo.path().join("src")).expect("source directory");
+        std::fs::write(fixture.repo.path().join("src/shared.rs"), "original parser")
+            .expect("seed source");
+        let draft = || {
+            explorer_draft(
+                "explorer-legacy-root",
+                "src/shared.rs",
+                "trace the parser ownership",
+            )
+        };
+        let first = fixture
+            .store
+            .create_admitted_assignment(fixture.repo.path(), draft(), true)
+            .await
+            .expect("first investigation is admitted");
+        if let Some(fingerprint) = legacy_fingerprint {
+            // Import a historical receipt once, rather than updating a sealed
+            // receipt. Production's immutable-receipt triggers remain enabled.
+            // Legacy v1: SHA256(prefix || NUL || path || NUL || "file:" ||
+            // SHA256("original parser")), independently computed for this fixture.
+            let draft = completed_receipt(Vec::new());
+            let receipt = AgentReceipt {
+                assignment_id: first.assignment.assignment_id,
+                attempt_id: first.attempt.attempt_id,
+                status: draft.status,
+                summary: draft.summary,
+                criterion_results: draft.criterion_results,
+                declared_changes: draft.declared_changes,
+                validation_call_ids: draft.validation_call_ids,
+                blockers: draft.blockers,
+                risks: draft.risks,
+                next_action: draft.next_action,
+                architecture_contract: None,
+                evidence_epoch: 0,
+                read_scope_fingerprint: Some(fingerprint.to_string()),
+                sealed_at: Utc::now(),
+            };
+            let pool = coordination_pool(&fixture).await;
+            let mut transaction = pool.begin().await.expect("legacy import begins");
+            sqlx::query(
+                "INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(receipt.attempt_id.to_string())
+            .bind(receipt.assignment_id.to_string())
+            .bind(serde_json::to_string(&receipt.status).expect("serialize receipt status"))
+            .bind(serde_json::to_string(&receipt).expect("serialize legacy receipt"))
+            .bind(serde_json::to_string(&receipt.sealed_at).expect("serialize receipt time"))
+            .execute(&mut *transaction)
+            .await
+            .expect("import legacy receipt");
+            sqlx::query("UPDATE attempts SET state = ?, sealed_at = ? WHERE attempt_id = ?")
+                .bind(serde_json::to_string(&AttemptState::Completed).expect("serialize state"))
+                .bind(serde_json::to_string(&receipt.sealed_at).expect("serialize receipt time"))
+                .bind(receipt.attempt_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .expect("import sealed attempt state");
+            transaction.commit().await.expect("legacy import commits");
+            pool.close().await;
+        } else {
+            let receipt = fixture
+                .store
+                .submit_agent_receipt(first.attempt.attempt_id, completed_receipt(Vec::new()))
+                .await
+                .expect("the investigation result seals");
+            assert_eq!(receipt.read_scope_fingerprint, None);
+        }
+
+        let persisted = fixture
+            .store
+            .get_agent_task(first.assignment.assignment_id, Some(0))
+            .await
+            .expect("sealed fixture reads");
+        assert_eq!(persisted.current_attempt.state, AttemptState::Completed);
+        assert_eq!(
+            persisted.receipt.expect("sealed receipt").read_scope_fingerprint,
+            legacy_fingerprint.map(str::to_string)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .reusable_explorer_assignment(fixture.repo.path(), draft())
+                .await
+                .expect("reuse probe succeeds"),
+            None,
+            "neither absent nor legacy fingerprints prove observed inputs"
+        );
+        let fresh = fixture
+            .store
+            .create_admitted_assignment(fixture.repo.path(), draft(), true)
+            .await
+            .expect("unverified sealed inputs require a fresh investigation");
+        assert_ne!(
+            fresh.assignment.assignment_id,
+            first.assignment.assignment_id
+        );
+    }
+}
+
+/// A different question over the same surface is independent work, and an
+/// unsuccessful result is never offered for reuse.
+#[tokio::test]
+async fn sealed_reuse_requires_the_same_question_and_a_successful_result() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "explorer-reuse-bounds";
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("source directory");
+    std::fs::write(fixture.repo.path().join("src/shared.rs"), "parser").expect("seed source");
+
+    let blocked = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            explorer_draft(root_session_id, "src/shared.rs", "trace the blocked path"),
+            true,
+        )
+        .await
+        .expect("investigation is admitted");
+    let mut unsuccessful = completed_receipt(Vec::new());
+    unsuccessful.status = AgentStatusClaim::Blocked;
+    unsuccessful.criterion_results[0].status = CriterionStatus::NotRun;
+    unsuccessful.criterion_results[0].evidence = None;
+    unsuccessful.blockers = vec!["the dependency is unavailable".to_string()];
+    fixture
+        .store
+        .submit_agent_receipt(blocked.attempt.attempt_id, unsuccessful)
+        .await
+        .expect("a blocked receipt seals");
+    let repeated = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            explorer_draft(root_session_id, "src/shared.rs", "trace the blocked path"),
+            true,
+        )
+        .await
+        .expect("an unsuccessful sealed result is never reusable");
+    assert_ne!(
+        repeated.assignment.assignment_id,
+        blocked.assignment.assignment_id
+    );
+
+    fixture
+        .store
+        .submit_agent_receipt(repeated.attempt.attempt_id, completed_receipt(Vec::new()))
+        .await
+        .expect("the retry seals successfully");
+    // A distinct question over the identical surface remains independent work.
+    let distinct = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            explorer_draft(
+                root_session_id,
+                "src/shared.rs",
+                "trace the serializer ownership",
+            ),
+            true,
+        )
+        .await
+        .expect("a distinct question is not a duplicate");
+    assert_ne!(
+        distinct.assignment.assignment_id,
+        repeated.assignment.assignment_id
     );
 }
 

@@ -55,20 +55,37 @@ fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
 async fn desktop_missing_tool_notice_uses_current_instructions_on_a_reused_router() {
     let (_, turn) = make_session_and_context().await;
     let step = StepContext::for_test(Arc::new(turn));
-    let router = ToolRouter::from_context(&step, ToolRouterParams {
-        tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
-        extension_tool_executors: Vec::new(), dynamic_tools: &[], exposure_identity: Default::default(),
-    }, &Default::default());
+    let router = ToolRouter::from_context(
+        &step,
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
     let instructions = "<app-context>\n# Codex desktop context\n### Thread Coordination\nUse `list_threads` and `send_message_to_thread`.\n</app-context>";
     let notice = router.tool_search_sources_for_instructions(Some(instructions));
     assert!(notice.contains("Thread Coordination: list_threads, send_message_to_thread"));
     assert!(notice.contains("absent from the current inventory"));
-    assert_eq!(router.tool_search_sources_for_instructions(None), router.tool_search_sources);
-    assert_eq!(router.tool_search_sources_for_instructions(Some("unknown envelope")), router.tool_search_sources);
+    assert_eq!(
+        router.tool_search_sources_for_instructions(None),
+        router.tool_search_sources
+    );
+    assert_eq!(
+        router.tool_search_sources_for_instructions(Some("unknown envelope")),
+        router.tool_search_sources
+    );
 }
 
 #[tokio::test]
-#[expect(clippy::print_stderr, reason = "the schema-size regression test reports measurements for each tool mode")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the schema-size regression test reports measurements for each tool mode"
+)]
 async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Result<()> {
     use codex_features::Feature;
     use codex_protocol::openai_models::ToolMode;
@@ -231,7 +248,9 @@ async fn retired_transactions_are_unregistered_and_do_not_intercept_edits() -> a
         tool_name: ToolName::plain("apply_patch"),
         call_id: "direct-workspace-edit".to_string(),
         payload: ToolPayload::Custom {
-            input: "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch".to_string(),
+            input:
+                "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch"
+                    .to_string(),
         },
     };
     router
@@ -329,38 +348,66 @@ async fn deferred_capability_revision_depends_only_on_provenance_and_schema() {
 #[tokio::test]
 async fn deferred_revision_invalidates_identical_schema_from_another_authority() {
     let handler = crate::tools::handlers::DynamicToolHandler::new(&DynamicToolFunctionSpec {
-        name: "authority_bound".into(), description: "test".into(),
-        input_schema: json!({"type":"object"}), defer_loading: true,
-    }).unwrap();
+        name: "authority_bound".into(),
+        description: "test".into(),
+        input_schema: json!({"type":"object"}),
+        defer_loading: true,
+    })
+    .unwrap();
     let runtime: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(handler);
     let revisions = |authority: &str| {
         let registered = crate::tools::registry::RegisteredTool::with_exposure(
-            Arc::clone(&runtime), codex_tools::ToolExposure::Deferred, TypedToolClass::DynamicExternal,
-        ).with_provider_authority(authority.into());
-        ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools(vec![registered]), vec![])
-            .deferred_tool_capability_revisions()
+            Arc::clone(&runtime),
+            codex_tools::ToolExposure::Deferred,
+            TypedToolClass::DynamicExternal,
+        )
+        .with_provider_authority(authority.into());
+        ToolRouter::from_parts(
+            ToolRegistry::from_unique_registered_tools(vec![registered]),
+            vec![],
+        )
+        .deferred_tool_capability_revisions()
     };
-    assert_eq!(revisions("account-a:endpoint-a"), revisions("account-a:endpoint-a"));
-    assert_ne!(revisions("account-a:endpoint-a"), revisions("account-b:endpoint-a"));
-    assert_ne!(revisions("account-a:endpoint-a"), revisions("account-a:endpoint-b"));
+    assert_eq!(
+        revisions("account-a:endpoint-a"),
+        revisions("account-a:endpoint-a")
+    );
+    assert_ne!(
+        revisions("account-a:endpoint-a"),
+        revisions("account-b:endpoint-a")
+    );
+    assert_ne!(
+        revisions("account-a:endpoint-a"),
+        revisions("account-a:endpoint-b")
+    );
 }
 
 #[test]
 fn deferred_revision_includes_output_contract_but_wire_schema_does_not() {
     let handler = crate::tools::handlers::DynamicToolHandler::new(&DynamicToolFunctionSpec {
-        name: "output_bound".into(), description: "test".into(),
-        input_schema: json!({"type":"object"}), defer_loading: true,
-    }).unwrap();
+        name: "output_bound".into(),
+        description: "test".into(),
+        input_schema: json!({"type":"object"}),
+        defer_loading: true,
+    })
+    .unwrap();
     let runtime: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(handler);
     let revision = |output: serde_json::Value| {
         let mut registered = crate::tools::registry::RegisteredTool::with_exposure(
-            Arc::clone(&runtime), codex_tools::ToolExposure::Deferred, TypedToolClass::DynamicExternal,
+            Arc::clone(&runtime),
+            codex_tools::ToolExposure::Deferred,
+            TypedToolClass::DynamicExternal,
         );
-        let ToolSpec::Function(tool) = registered.spec_mut() else { panic!("function") };
+        let ToolSpec::Function(tool) = registered.spec_mut() else {
+            panic!("function")
+        };
         tool.output_schema = Some(output.into());
         let wire = serde_json::to_vec(registered.spec()).unwrap();
-        let revision = ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools(vec![registered]), vec![])
-            .deferred_tool_capability_revisions();
+        let revision = ToolRouter::from_parts(
+            ToolRegistry::from_unique_registered_tools(vec![registered]),
+            vec![],
+        )
+        .deferred_tool_capability_revisions();
         (wire, revision)
     };
     let a = revision(json!({"type":"string"}));
@@ -1580,8 +1627,10 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
             gate.try_lock().is_ok(),
             "settled mutation releases the exact workspace gate"
         );
-        assert_eq!(std::fs::read_to_string(repo.join("first.txt"))?,
-            if cancel { "before\n" } else { "after\n" });
+        assert_eq!(
+            std::fs::read_to_string(repo.join("first.txt"))?,
+            if cancel { "before\n" } else { "after\n" }
+        );
         let expected_writes = if cancel {
             vec![first.clone(), first.clone()]
         } else {
@@ -1599,23 +1648,24 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
                 "must-not-be-written\n"
             );
         }
-        let diff = tracker
-            .lock()
-            .await
-            .get_unified_diff();
+        let diff = tracker.lock().await.get_unified_diff();
         if cancel {
-            assert!(diff.as_deref().is_none_or(str::is_empty),
-                "successfully rolled back prefix must not remain in the turn diff: {diff:?}");
+            assert!(
+                diff.as_deref().is_none_or(str::is_empty),
+                "successfully rolled back prefix must not remain in the turn diff: {diff:?}"
+            );
         } else {
             let diff = diff.expect("committed patch must be visible in the turn diff");
-            assert!(diff.contains("first.txt") && diff.contains("-before") && diff.contains("+after"), "{diff}");
+            assert!(
+                diff.contains("first.txt") && diff.contains("-before") && diff.contains("+after"),
+                "{diff}"
+            );
             assert!(diff.contains("tail.txt"), "{diff}");
         }
         store.close().await;
     }
     Ok(())
 }
-
 
 #[tokio::test]
 async fn router_apply_patch_preserves_turn_diff_without_task_snapshots() -> anyhow::Result<()> {
@@ -1731,7 +1781,11 @@ async fn router_apply_patch_preserves_turn_diff_without_task_snapshots() -> anyh
     assert!(diff.contains("deleted file mode 100755"), "{diff}");
     assert!(diff.contains("executable.sh"), "{diff}");
 
-    assert!(!repo.join(".typed-task-home/agent-task-coordination/snapshots").exists());
+    assert!(
+        !repo
+            .join(".typed-task-home/agent-task-coordination/snapshots")
+            .exists()
+    );
     store.close().await;
     Ok(())
 }
@@ -2624,11 +2678,13 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
         .expect("activated additions are an array");
     assert_eq!(
         additions,
-        &vec![serde_json::to_value(
-            router.registry.registered_tool(&name).unwrap().spec()
-        ).unwrap()]
+        &vec![
+            serde_json::to_value(router.registry.registered_tool(&name).unwrap().spec()).unwrap()
+        ]
     );
-    let visible = manifest["model_visible"].as_array().expect("model-visible schemas");
+    let visible = manifest["model_visible"]
+        .as_array()
+        .expect("model-visible schemas");
     assert!(
         additions.iter().all(|spec| !visible.contains(spec)),
         "activated additions must not repeat model-visible schemas"
@@ -2649,37 +2705,62 @@ async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()>
     turn.permission_profile = PermissionProfile::Disabled;
     turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
     let coordinator = session.services.agent_control.task_coordinator();
-    coordinator.initialize(
-        codex_state::StateRuntime::init(temp.path().join("task-home"), "test-provider".into()).await?,
-        "frozen-turn-root".into(),
-    ).await?;
-    let (assignment, original) = coordinator.create_assignment(&repo, AssignmentDraft {
-        root_session_id: "frozen-turn-root".into(),
-        admission_origin: AssignmentAdmissionOrigin::Typed,
-        role: AgentRole::Worker,
-        capability_profile: CapabilityProfile::ScopedSourceWrite,
-        objective: "inspect the authored source".into(),
-        acceptance_criteria: vec![AcceptanceCriterion {
-            id: "inspect".into(), text: "inspect tracked.txt in this attempt".into(),
-        }],
-        read_scope: vec![RepoScope { path: "tracked.txt".into(), recursive: false }],
-        write_scope: vec![RepoScope { path: "tracked.txt".into(), recursive: false }],
-        stop_condition: "inspection recorded".into(),
-        dependencies: Vec::new(), risk_hints: Vec::new(),
-        required_evidence: vec!["inspect:tracked.txt".into()],
-        prohibited_changes: Vec::new(), contract_claims: Vec::new(),
-        workspace_strategy: WorkspaceStrategy::Shared,
-        relation: None, architecture_contract_ref: None,
-    }).await?;
+    coordinator
+        .initialize(
+            codex_state::StateRuntime::init(temp.path().join("task-home"), "test-provider".into())
+                .await?,
+            "frozen-turn-root".into(),
+        )
+        .await?;
+    let (assignment, original) = coordinator
+        .create_assignment(
+            &repo,
+            AssignmentDraft {
+                root_session_id: "frozen-turn-root".into(),
+                admission_origin: AssignmentAdmissionOrigin::Typed,
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "inspect the authored source".into(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    id: "inspect".into(),
+                    text: "inspect tracked.txt in this attempt".into(),
+                }],
+                read_scope: vec![RepoScope {
+                    path: "tracked.txt".into(),
+                    recursive: false,
+                }],
+                write_scope: vec![RepoScope {
+                    path: "tracked.txt".into(),
+                    recursive: false,
+                }],
+                stop_condition: "inspection recorded".into(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: vec!["inspect:tracked.txt".into()],
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Shared,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await?;
     let path = AgentPath::try_from("/root/frozen_worker").map_err(anyhow::Error::msg)?;
-    let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
-        assignment_id: assignment.assignment_id, attempt_id: original.attempt_id,
-        agent_path: path.to_string(), task_name: "frozen_worker".into(),
-        thread_id: Some(session.thread_id.to_string()),
-    }).await?;
+    let binding = coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: original.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "frozen_worker".into(),
+            thread_id: Some(session.thread_id.to_string()),
+        })
+        .await?;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id: ThreadId::new(), depth: 1, agent_path: Some(path),
-        agent_nickname: None, agent_role: Some("worker".into()),
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(path),
+        agent_nickname: None,
+        agent_role: Some("worker".into()),
     });
     turn.agent_task_binding.set(Some(binding)).unwrap();
     let receipt_args = json!({
@@ -2689,74 +2770,156 @@ async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()>
         "blockers":["parent correction required"], "risks":[], "next_action":null
     });
     let store = coordinator.store().expect("initialized store");
-    store.submit_agent_receipt(original.attempt_id, serde_json::from_value(receipt_args.clone())?).await?;
-    store.set_agent_gate(TaskActor::Root, assignment.assignment_id, GateKind::Review,
-        GateStatus::ChangesRequested, "correct the attempt".into()).await?;
-    let corrected = store.amend_agent_task(TaskActor::Root, assignment.assignment_id, AttemptAmendment {
-        reason: "explicit correction".into(), objective: None,
-        acceptance_criteria: None, stop_condition: None,
-    }).await?;
-    coordinator.refresh_binding(assignment.assignment_id).await?;
-    let current = coordinator.binding_for_source(&turn.session_source).unwrap();
+    store
+        .submit_agent_receipt(
+            original.attempt_id,
+            serde_json::from_value(receipt_args.clone())?,
+        )
+        .await?;
+    store
+        .set_agent_gate(
+            TaskActor::Root,
+            assignment.assignment_id,
+            GateKind::Review,
+            GateStatus::ChangesRequested,
+            "correct the attempt".into(),
+        )
+        .await?;
+    let corrected = store
+        .amend_agent_task(
+            TaskActor::Root,
+            assignment.assignment_id,
+            AttemptAmendment {
+                reason: "explicit correction".into(),
+                objective: None,
+                acceptance_criteria: None,
+                stop_condition: None,
+            },
+        )
+        .await?;
+    coordinator
+        .refresh_binding(assignment.assignment_id)
+        .await?;
+    let current = coordinator
+        .binding_for_source(&turn.session_source)
+        .unwrap();
     assert_eq!(current.attempt_id, corrected.attempt_id);
-    assert!(coordinator.heartbeat_typed_actor_binding(&current, false).await?);
+    assert!(
+        coordinator
+            .heartbeat_typed_actor_binding(&current, false)
+            .await?
+    );
 
     let turn = Arc::new(turn);
     let old_step = StepContext::for_test(Arc::clone(&turn));
     let make_router = |step: &StepContext| {
-        let router = ToolRouter::from_context(step, ToolRouterParams {
-            tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
-            extension_tool_executors: Vec::new(), dynamic_tools: &[],
-            exposure_identity: ToolExposureIdentity {
-                agent_surface_stage: crate::tools::exposure::AgentSurfaceStage::TypedAdministration,
-                ..Default::default()
+        let router = ToolRouter::from_context(
+            step,
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: ToolExposureIdentity {
+                    agent_surface_stage:
+                        crate::tools::exposure::AgentSurfaceStage::TypedAdministration,
+                    ..Default::default()
+                },
             },
-        }, &Default::default());
-        step.turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+            &Default::default(),
+        );
+        step.turn
+            .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
         router
     };
     let router = make_router(&old_step);
     let make_call = |name: &str, call_id: &str, args: serde_json::Value| ToolCall {
-        tool_name: router.registered_tool_names_for_test().into_iter()
-            .find(|tool| tool.name == name).expect("real registered tool"),
-        call_id: call_id.into(), payload: ToolPayload::Function { arguments: args.to_string() },
+        tool_name: router
+            .registered_tool_names_for_test()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .expect("real registered tool"),
+        call_id: call_id.into(),
+        payload: ToolPayload::Function {
+            arguments: args.to_string(),
+        },
     };
     for call in [
         make_call("read_file", "stale-read", json!({"path":"tracked.txt"})),
-        make_call("submit_agent_receipt", "stale-receipt", receipt_args.clone()),
+        make_call(
+            "submit_agent_receipt",
+            "stale-receipt",
+            receipt_args.clone(),
+        ),
     ] {
         let state = admitted_tool_dispatch_state();
-        let result = router.dispatch_tool_call_with_terminal_outcome(
-            Arc::clone(&session), Arc::clone(&old_step), CancellationToken::new(),
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())), call,
-            ToolCallSource::Direct, Arc::clone(&state),
-        ).await;
-        assert!(matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
-            if message.contains("no longer active")));
+        let result = router
+            .dispatch_tool_call_with_terminal_outcome(
+                Arc::clone(&session),
+                Arc::clone(&old_step),
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+                Arc::clone(&state),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
+            if message.contains("no longer active"))
+        );
         assert!(state.is_terminal());
         assert!(!state.handler_started());
     }
-    let task = store.get_agent_task(assignment.assignment_id, Some(0)).await?;
+    let task = store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await?;
     assert_eq!(task.current_attempt.attempt_id, corrected.attempt_id);
     assert_eq!(task.current_attempt.state, AttemptState::Active);
     assert!(task.receipt.is_none());
-    assert!(store.get_validation_call("stale-read".into()).await?.is_none());
-    assert_eq!(coordinator.binding_for_turn(&turn).unwrap().attempt_id, original.attempt_id);
+    // Durable inspection evidence is namespaced by the attempt that owns it.
+    for attempt in [original.attempt_id, corrected.attempt_id] {
+        assert!(
+            store
+                .get_validation_call(format!("inspection:{attempt}:stale-read"))
+                .await?
+                .is_none()
+        );
+    }
+    assert_eq!(
+        coordinator.binding_for_turn(&turn).unwrap().attempt_id,
+        original.attempt_id
+    );
 
     let (_, mut unbound_turn) = make_session_and_context().await;
     unbound_turn.session_source = turn.session_source.clone();
     unbound_turn.agent_task_binding.set(None).unwrap();
     let unbound_step = StepContext::for_test(Arc::new(unbound_turn));
-    let result = router.dispatch_tool_call_with_terminal_outcome(
-        Arc::clone(&session), Arc::clone(&unbound_step), CancellationToken::new(),
-        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-        make_call("read_file", "unbound-read", json!({"path":"tracked.txt"})),
-        ToolCallSource::Direct, admitted_tool_dispatch_state(),
-    ).await;
-    assert!(matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
-        if message.contains("no bound typed assignment")));
+    let result = router
+        .dispatch_tool_call_with_terminal_outcome(
+            Arc::clone(&session),
+            Arc::clone(&unbound_step),
+            CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            make_call("read_file", "unbound-read", json!({"path":"tracked.txt"})),
+            ToolCallSource::Direct,
+            admitted_tool_dispatch_state(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
+        if message.contains("no bound typed assignment"))
+    );
     assert!(coordinator.binding_for_turn(&unbound_step.turn).is_none());
-    assert!(store.get_validation_call("unbound-read".into()).await?.is_none());
+    for attempt in [original.attempt_id, corrected.attempt_id] {
+        assert!(
+            store
+                .get_validation_call(format!("inspection:{attempt}:unbound-read"))
+                .await?
+                .is_none()
+        );
+    }
 
     // A new turn on the same session must acquire B and use the same registered
     // handlers successfully; blocking all typed work is not a valid fix.
@@ -2772,17 +2935,40 @@ async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()>
         make_call("read_file", "fresh-read", json!({"path":"tracked.txt"})),
         make_call("submit_agent_receipt", "fresh-receipt", receipt_args),
     ] {
-        fresh_router.dispatch_tool_call_with_terminal_outcome(
-            Arc::clone(&session), Arc::clone(&fresh_step), CancellationToken::new(),
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())), call,
-            ToolCallSource::Direct, admitted_tool_dispatch_state(),
-        ).await?;
+        fresh_router
+            .dispatch_tool_call_with_terminal_outcome(
+                Arc::clone(&session),
+                Arc::clone(&fresh_step),
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+                admitted_tool_dispatch_state(),
+            )
+            .await?;
     }
-    let inspection = store.get_validation_call("fresh-read".into()).await?.expect("fresh inspection");
+    assert!(
+        store
+            .get_validation_call(format!("inspection:{}:fresh-read", original.attempt_id))
+            .await?
+            .is_none()
+    );
+    let inspection = store
+        .get_validation_call(format!("inspection:{}:fresh-read", corrected.attempt_id))
+        .await?
+        .expect("fresh inspection");
     assert_eq!(inspection.attempt_id, corrected.attempt_id);
-    assert_eq!(inspection.verified_evidence_kind(), Some(CriterionEvidenceKind::SourceInspection));
-    let task = store.get_agent_task(assignment.assignment_id, Some(0)).await?;
-    assert_eq!(task.receipt.expect("fresh receipt").attempt_id, corrected.attempt_id);
+    assert_eq!(
+        inspection.verified_evidence_kind(),
+        Some(CriterionEvidenceKind::SourceInspection)
+    );
+    let task = store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await?;
+    assert_eq!(
+        task.receipt.expect("fresh receipt").attempt_id,
+        corrected.attempt_id
+    );
     store.close().await;
     Ok(())
 }
@@ -2796,14 +2982,26 @@ async fn code_mode_same_turn_refreshes_eager_schemas_when_environment_becomes_re
     let ready_step = StepContext::for_test(Arc::clone(&turn));
     let mut unavailable_step = (*ready_step).clone();
     unavailable_step.environments.turn_environments.clear();
-    let make_router = |step: &StepContext| ToolRouter::from_context(step, ToolRouterParams {
-        tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
-        extension_tool_executors: Vec::new(), dynamic_tools: &[], exposure_identity: Default::default(),
-    }, &Default::default());
+    let make_router = |step: &StepContext| {
+        ToolRouter::from_context(
+            step,
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        )
+    };
     let unavailable = make_router(&unavailable_step);
     assert!(!unavailable.has_registered_tool(&ToolName::plain("apply_patch")));
     let before = unavailable.model_visible_schemas_for_turn(&turn);
-    assert!(String::from_utf8_lossy(before.serialized()).contains("Nested apply_patch is unavailable"));
+    assert!(
+        String::from_utf8_lossy(before.serialized()).contains("Nested apply_patch is unavailable")
+    );
 
     let ready = make_router(&ready_step);
     assert!(ready.has_registered_tool(&ToolName::plain("apply_patch")));
@@ -2812,13 +3010,29 @@ async fn code_mode_same_turn_refreshes_eager_schemas_when_environment_becomes_re
     let description = String::from_utf8_lossy(after.serialized());
     assert!(description.contains("Nested apply_patch is available"));
     assert!(!description.contains("Nested apply_patch is unavailable"));
-    assert_eq!(after.serialized(), ready.model_visible_schemas().serialized());
-    assert!(Arc::ptr_eq(&after, &ready.model_visible_schemas_for_turn(&turn)));
+    assert_eq!(
+        after.serialized(),
+        ready.model_visible_schemas().serialized()
+    );
+    assert!(Arc::ptr_eq(
+        &after,
+        &ready.model_visible_schemas_for_turn(&turn)
+    ));
     // Rebuilding an unchanged eager surface must retain the original Arc too.
     let equivalent = make_router(&ready_step);
-    assert!(Arc::ptr_eq(&after, &equivalent.model_visible_schemas_for_turn(&turn)));
-    assert_eq!(ready.tool_manifest(&turn).manifest.unwrap()["model_visible"],
-        serde_json::to_value(after.specs()).unwrap());
+    assert!(Arc::ptr_eq(
+        &after,
+        &equivalent.model_visible_schemas_for_turn(&turn)
+    ));
+    assert_eq!(
+        ready.tool_manifest(&turn).manifest.unwrap()["model_visible"],
+        serde_json::to_value(after.specs()).unwrap()
+    );
     // Capability loss must replace the cache in the reverse direction as well.
-    assert_eq!(unavailable.model_visible_schemas_for_turn(&turn).serialized(), before.serialized());
+    assert_eq!(
+        unavailable
+            .model_visible_schemas_for_turn(&turn)
+            .serialized(),
+        before.serialized()
+    );
 }

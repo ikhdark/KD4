@@ -124,21 +124,31 @@ impl PlannedTools {
     fn reject_tool(&mut self, name: &ToolName, error: &dyn std::fmt::Display) {
         warn!(%name, %error, "tool registration rejected");
         // Diagnostic metadata only: never register a permissive replacement.
-        let count = self.warnings.iter()
-            .filter(|warning| warning.starts_with(REJECTED_TOOL_WARNING_PREFIX)).count();
+        let count = self
+            .warnings
+            .iter()
+            .filter(|warning| warning.starts_with(REJECTED_TOOL_WARNING_PREFIX))
+            .count();
         if count > 16 {
             return;
         }
         let warning = if count == 16 {
-            format!("{REJECTED_TOOL_WARNING_PREFIX}additional rejected tools omitted; see host logs.")
+            format!(
+                "{REJECTED_TOOL_WARNING_PREFIX}additional rejected tools omitted; see host logs."
+            )
         } else {
             let bounded = |text: String, limit| {
-                if text.len() <= limit { text } else {
+                if text.len() <= limit {
+                    text
+                } else {
                     format!("{}…", &text[..text.floor_char_boundary(limit)])
                 }
             };
-            format!("{REJECTED_TOOL_WARNING_PREFIX}{}: {}. Repair the installed contract; repeated discovery will not make it callable.",
-                bounded(name.to_string(), 256), bounded(error.to_string(), 384))
+            format!(
+                "{REJECTED_TOOL_WARNING_PREFIX}{}: {}. Repair the installed contract; repeated discovery will not make it callable.",
+                bounded(name.to_string(), 256),
+                bounded(error.to_string(), 384)
+            )
         };
         self.warnings.push(warning);
     }
@@ -749,9 +759,16 @@ fn build_code_mode_executors(
             // keep their schemas lazy to avoid rebuilding the prompt around
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
-                && matches!(executor.tool_name().name.as_str(),
-                    "exec_command" | "shell_command" | "write_stdin" | "apply_patch" | "read_file"
-                        | "read_tool_output" | "tool_search" | "update_plan"
+                && matches!(
+                    executor.tool_name().name.as_str(),
+                    "exec_command"
+                        | "shell_command"
+                        | "write_stdin"
+                        | "apply_patch"
+                        | "read_file"
+                        | "read_tool_output"
+                        | "tool_search"
+                        | "update_plan"
                 )
                 && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
             {
@@ -772,9 +789,11 @@ fn build_code_mode_executors(
                 // the full contract, and the handlers still decode these fields.
                 let withdrawn: &[&str] = match &*definition.name {
                     "read_file" => &["file_path", "offset", "limit"],
-                    "update_plan" => {
-                        &["resolve", "scope_change_instructions", "superseded", "workflow"]
-                    }
+                    "update_plan" => &[
+                        "scope_change_instructions",
+                        "superseded",
+                        "workflow",
+                    ],
                     _ => &[],
                 };
                 let mut trimmed_plan_contract = false;
@@ -799,7 +818,7 @@ fn build_code_mode_executors(
                     trimmed_plan_contract = &*definition.name == "update_plan";
                 }
                 if trimmed_plan_contract {
-                    definition.description = format!("{}\nRarely needed lineage fields (superseded, resolve, scope_change_instructions, workflow) are omitted here; a rejected revision names the field to add, and resolve_tool(\"update_plan\") has their contract.", definition.description).into();
+                    definition.description = format!("{}\nRarely needed fields (superseded, scope_change_instructions, workflow) are omitted here; use resolve_tool(\"update_plan\") before retiring scope or linking task-coordinator assignments.", definition.description).into();
                 }
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
@@ -926,24 +945,36 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
 
 fn quarantine_conflicting_namespaces(planned: &mut PlannedTools) {
     let conflicts = conflicting_namespace_metadata(
-        planned.runtimes.iter().map(RegisteredTool::spec).chain(planned.hosted_specs.iter()),
+        planned
+            .runtimes
+            .iter()
+            .map(RegisteredTool::spec)
+            .chain(planned.hosted_specs.iter()),
     );
     for name in &conflicts {
-        planned.warnings.push(format!("Namespace `{name}` was not loaded: conflicting descriptions."));
+        planned.warnings.push(format!(
+            "Namespace `{name}` was not loaded: conflicting descriptions."
+        ));
     }
-    let allowed = |spec: &ToolSpec| !matches!(spec, ToolSpec::Namespace(ns) if conflicts.contains(&ns.name));
+    let allowed =
+        |spec: &ToolSpec| !matches!(spec, ToolSpec::Namespace(ns) if conflicts.contains(&ns.name));
     planned.runtimes.retain(|runtime| allowed(runtime.spec()));
     planned.hosted_specs.retain(allowed);
 }
 
-fn conflicting_namespace_metadata<'a>(specs: impl IntoIterator<Item = &'a ToolSpec>) -> std::collections::BTreeSet<String> {
+fn conflicting_namespace_metadata<'a>(
+    specs: impl IntoIterator<Item = &'a ToolSpec>,
+) -> std::collections::BTreeSet<String> {
     let mut descriptions = BTreeMap::<&str, &str>::new();
     let mut conflicts = std::collections::BTreeSet::new();
     for spec in specs {
         if let ToolSpec::Namespace(namespace) = spec {
             let description = namespace.description.as_str();
-            if description.trim().is_empty() { continue; }
-            if descriptions.insert(&namespace.name, description)
+            if description.trim().is_empty() {
+                continue;
+            }
+            if descriptions
+                .insert(&namespace.name, description)
                 .is_some_and(|previous| previous != description)
             {
                 conflicts.insert(namespace.name.clone());
@@ -1129,7 +1160,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
-    planned_tools.add_with_authorization_class(crate::tools::handlers::ReadStatusHandler, TypedToolClass::ReadSearch);
+    planned_tools.add_with_authorization_class(
+        crate::tools::handlers::ReadStatusHandler,
+        TypedToolClass::ReadSearch,
+    );
     if !context
         .step_context
         .environments
@@ -1137,6 +1171,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         .is_empty()
     {
         planned_tools.add_with_authorization_class(ListFilesHandler, TypedToolClass::ReadSearch);
+        planned_tools.add_with_authorization_class(
+            crate::tools::handlers::SaveTurnDiffHandler,
+            TypedToolClass::StructuredEdit,
+        );
     }
 
     // Mode restrictions belong in dispatch, not in the cached tool schema.
@@ -1284,10 +1322,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     let turn_context = context.step_context.turn.as_ref();
     let can_spawn = !primary_environment_uses_foreign_cwd(context.step_context);
     if agent_jobs_tools_enabled(context) {
-        planned_tools.add_with_authorization_class(
-            SpawnAgentsOnCsvHandler,
-            TypedToolClass::RootTaskControl,
-        );
+        planned_tools
+            .add_with_authorization_class(SpawnAgentsOnCsvHandler, TypedToolClass::RootTaskControl);
         if agent_jobs_worker_tools_enabled(context) {
             planned_tools
                 .add_with_authorization_class(ReportAgentJobResultHandler, TypedToolClass::OwnTask);
@@ -1335,7 +1371,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 ToolMode::CodeMode | ToolMode::CodeModeOnly
             ) && exposure != ToolExposure::DirectModelOnly
                 && tool_namespace.is_none_or(|namespace| {
-                    !turn_context.config.code_mode.excluded_tool_namespaces.iter()
+                    !turn_context
+                        .config
+                        .code_mode
+                        .excluded_tool_namespaces
+                        .iter()
                         .chain(&turn_context.config.code_mode.direct_only_tool_namespaces)
                         .any(|excluded| excluded == namespace)
                 });
@@ -1464,7 +1504,11 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     let authority = |tool: &codex_mcp::ToolInfo| {
         // Share the exact provider inputs used by remembered approvals. Do not
         // expose their raw transport/auth values in the model-visible revision.
-        let inputs = context.step_context.mcp.manager().approval_authority(&tool.server_name);
+        let inputs = context
+            .step_context
+            .mcp
+            .manager()
+            .approval_authority(&tool.server_name);
         let canonical = codex_config::schema::canonicalize(&serde_json::json!({
             "provider": inputs,
             "server": tool.server_name,
@@ -1473,12 +1517,17 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
             "annotations": tool.tool.annotations,
         }));
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(canonical.to_string().as_bytes()))
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(canonical.to_string().as_bytes())
+        )
     };
     if let Some(mcp_tools) = context.mcp_tools {
         for tool in mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Direct, authority(tool)),
+                Ok(handler) => {
+                    planned_tools.add_mcp_runtime(handler, ToolExposure::Direct, authority(tool))
+                }
                 Err(err) => planned_tools.reject_tool(&tool.canonical_tool_name(), &err),
             }
         }
@@ -1487,7 +1536,9 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
         for tool in deferred_mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred, authority(tool)),
+                Ok(handler) => {
+                    planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred, authority(tool))
+                }
                 Err(err) => planned_tools.reject_tool(&tool.canonical_tool_name(), &err),
             }
         }
@@ -1519,7 +1570,10 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                     let handler = match DynamicToolHandler::new_in_namespace(namespace, tool) {
                         Ok(handler) => handler,
                         Err(err) => {
-                            planned_tools.reject_tool(&ToolName::namespaced(&namespace.name, &tool.name), &err);
+                            planned_tools.reject_tool(
+                                &ToolName::namespaced(&namespace.name, &tool.name),
+                                &err,
+                            );
                             continue;
                         }
                     };

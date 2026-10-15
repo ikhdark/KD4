@@ -129,6 +129,20 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn comma_lists_and_conditionals_are_safe_only_when_every_command_is() {
+        for (script, expected) in [
+            ("Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length", true),
+            ("Get-Location; Get-ChildItem -Force -Name; if (Test-Path AGENTS.md) { Get-Content AGENTS.md }", true),
+            ("if (Test-Path a) { Get-Content a } else { Remove-Item a }", false),
+            ("Remove-Item a,b", false),
+            ("Get-Content a,$(Remove-Item b)", false),
+        ] {
+            assert_eq!(is_safe_command_windows(&vec_str(&["powershell.exe", "-NoProfile", "-Command", script])), expected, "{script}");
+        }
+    }
+
     fn windows_powershell_path() -> Option<String> {
         Some(
             std::path::PathBuf::from(std::env::var_os("SystemRoot")?)

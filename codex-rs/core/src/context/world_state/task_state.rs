@@ -20,9 +20,14 @@ pub(crate) struct TaskStateSnapshot {
 impl TaskState {
     #[cfg(test)]
     pub(crate) fn new(plan: Option<(UpdatePlanArgs, PlanLineage)>) -> Self {
-        let revision = plan.as_ref().map(|(plan, lineage)|
-            crate::plan_store::plan_revision_with_lineage(Some(plan), lineage));
-        Self::from_plan(plan.as_ref().zip(revision.as_deref()).map(|((plan, lineage), revision)| (plan, lineage, revision)))
+        let revision = plan.as_ref().map(|(plan, lineage)| {
+            crate::plan_store::plan_revision_with_lineage(Some(plan), lineage)
+        });
+        Self::from_plan(
+            plan.as_ref()
+                .zip(revision.as_deref())
+                .map(|((plan, lineage), revision)| (plan, lineage, revision)),
+        )
     }
 
     pub(crate) fn from_plan(plan: Option<(&UpdatePlanArgs, &PlanLineage, &str)>) -> Self {
@@ -54,7 +59,9 @@ impl WorldStateSection for TaskState {
     type Snapshot = TaskStateSnapshot;
 
     fn snapshot(&self) -> TaskStateSnapshot {
-        TaskStateSnapshot { state: (*self.0).clone() }
+        TaskStateSnapshot {
+            state: (*self.0).clone(),
+        }
     }
 
     fn required() -> bool {
@@ -124,14 +131,19 @@ mod tests {
     #[tokio::test]
     async fn continuity_cached_task_views_match_owner_and_detach_on_change() {
         let store = crate::plan_store::PlanStore::default();
-        let plan = UpdatePlanArgs { explanation: None, plan: vec![PlanItemArg {
-            step: "retain obligations".into(), status: StepStatus::Pending,
-        }] };
+        let plan = UpdatePlanArgs {
+            explanation: None,
+            plan: vec![PlanItemArg {
+                step: "retain obligations".into(),
+                status: StepStatus::Pending,
+            }],
+        };
         store.restore(Some(plan.clone())).await;
         let first = store.task_state(false).await;
         let again = store.task_state(false).await;
         assert!(std::sync::Arc::ptr_eq(&first.0, &again.0));
-        let expected = TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(false);
+        let expected =
+            TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(false);
         assert_eq!(first.0, expected.0);
         let suspended = store.task_state(true).await;
         assert_eq!(suspended.0["execution_suspended"], true);
@@ -154,47 +166,105 @@ mod tests {
     #[tokio::test]
     async fn suspended_execution_context_retains_unresolved_work_not_retired_details() {
         let store = crate::plan_store::PlanStore::default();
-        let plan = UpdatePlanArgs { explanation: None, plan: vec![PlanItemArg {
-            step: "implementation".into(), status: StepStatus::Pending,
-        }] };
+        let plan = UpdatePlanArgs {
+            explanation: None,
+            plan: vec![PlanItemArg {
+                step: "implementation".into(),
+                status: StepStatus::Pending,
+            }],
+        };
         let mut lineage = PlanLineage::default();
-        lineage.requirements.insert("retired".into(), crate::plan_store::PlanRequirement {
-            text: "historical completed detail".into(), status: StepStatus::Completed, superseded_reason: None,
-        });
-        lineage.requirements.insert("orphan".into(), crate::plan_store::PlanRequirement {
-            text: "still required".into(), status: StepStatus::Pending, superseded_reason: None,
-        });
+        lineage.requirements.insert(
+            "retired".into(),
+            crate::plan_store::PlanRequirement {
+                text: "historical completed detail".into(),
+                status: StepStatus::Completed,
+                superseded_reason: None,
+            },
+        );
+        lineage.requirements.insert(
+            "orphan".into(),
+            crate::plan_store::PlanRequirement {
+                text: "still required".into(),
+                status: StepStatus::Pending,
+                superseded_reason: None,
+            },
+        );
         store.restore_with_lineage(Some(plan), Some(lineage)).await;
-        let state = TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(true);
+        let state =
+            TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(true);
         assert_eq!(state.0["execution_suspended"], true);
         assert!(state.0["lineage"]["requirements"].get("retired").is_none());
-        assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 2);
-        assert!(state.body().contains("not debt of the current planning deliverable"));
-        assert!(store.snapshot_with_lineage().await.unwrap().1.requirements.contains_key("retired"));
+        assert_eq!(
+            state.0["obligations"]["unresolved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            state
+                .body()
+                .contains("not debt of the current planning deliverable")
+        );
+        assert!(
+            store
+                .snapshot_with_lineage()
+                .await
+                .unwrap()
+                .1
+                .requirements
+                .contains_key("retired")
+        );
     }
 
     #[test]
     fn task_state_is_context_not_a_new_request_and_survives_delivery_metadata() {
-        let state = TaskState::new(Some((UpdatePlanArgs {
-            explanation: None,
-            plan: vec![PlanItemArg {
-                step: "Preserve </codex_task_state> obligations".into(),
-                status: StepStatus::Pending,
-            }],
-        }, PlanLineage::default())));
-        let fragment = state.render_diff(PreviousSectionState::Absent).unwrap().render();
+        let state = TaskState::new(Some((
+            UpdatePlanArgs {
+                explanation: None,
+                plan: vec![PlanItemArg {
+                    step: "Preserve </codex_task_state> obligations".into(),
+                    status: StepStatus::Pending,
+                }],
+            },
+            PlanLineage::default(),
+        )));
+        let fragment = state
+            .render_diff(PreviousSectionState::Absent)
+            .unwrap()
+            .render();
         assert_eq!(state.0["obligations"]["completed"], 0);
-        assert!(state.0["lineage"]["requirements"].as_object().unwrap().is_empty());
-        assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 1);
+        assert!(
+            state.0["lineage"]["requirements"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state.0["obligations"]["unresolved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(fragment.contains("&lt;/codex_task_state&gt;"));
-        assert!(crate::context::is_contextual_user_fragment(&ContentItem::InputText {
-            text: fragment,
-        }));
+        assert!(crate::context::is_contextual_user_fragment(
+            &ContentItem::InputText { text: fragment }
+        ));
         let mut snapshot = serde_json::to_value(WorldStateSection::snapshot(&state)).unwrap();
         snapshot["_retained_delivery"] = "host-delivery-digest".into();
         let previous: TaskStateSnapshot = serde_json::from_value(snapshot).unwrap();
-        assert!(state.render_diff(PreviousSectionState::Known(&previous)).is_none());
+        assert!(
+            state
+                .render_diff(PreviousSectionState::Known(&previous))
+                .is_none()
+        );
         assert!(state.render_diff(PreviousSectionState::Unknown).is_some());
-        assert!(TaskState::new(None).render_diff(PreviousSectionState::Absent).is_none());
+        assert!(
+            TaskState::new(None)
+                .render_diff(PreviousSectionState::Absent)
+                .is_none()
+        );
     }
 }

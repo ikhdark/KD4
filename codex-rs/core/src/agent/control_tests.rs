@@ -310,7 +310,12 @@ impl AgentGraphStore for FailingAgentGraphStore {
         _root_thread_id: ThreadId,
         _status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
-        Box::pin(std::future::ready(Ok(Vec::new())))
+        let result = if self.fail_list {
+            Err(Self::injected_error("list descendants"))
+        } else {
+            Ok(Vec::new())
+        };
+        Box::pin(std::future::ready(result))
     }
 }
 
@@ -1009,9 +1014,15 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
     })
     .await
     .expect("inter-agent communication should stay pending");
-    assert!(!thread.codex.session.input_queue
-        .has_pending_input(&thread.codex.session.active_turn).await,
-        "non-triggering mail must not request a new turn");
+    assert!(
+        !thread
+            .codex
+            .session
+            .input_queue
+            .has_pending_input(&thread.codex.session.active_turn)
+            .await,
+        "non-triggering mail must not request a new turn"
+    );
 
     let history_items = thread
         .codex
@@ -2040,14 +2051,28 @@ fn registered_independent_spawns_overlap_before_initial_submission() {
             use core_test_support::responses;
 
             let server = responses::start_mock_server().await;
-            let models = responses::mount_sse_sequence(&server, (0..2).map(|i| responses::sse(vec![
-                responses::ev_response_created(&format!("parallel-child-{i}")),
-                responses::ev_assistant_message(&format!("parallel-answer-{i}"), "done"),
-                responses::ev_completed(&format!("parallel-child-{i}")),
-            ])).collect()).await;
+            let models = responses::mount_sse_sequence(
+                &server,
+                (0..2)
+                    .map(|i| {
+                        responses::sse(vec![
+                            responses::ev_response_created(&format!("parallel-child-{i}")),
+                            responses::ev_assistant_message(
+                                &format!("parallel-answer-{i}"),
+                                "done",
+                            ),
+                            responses::ev_completed(&format!("parallel-child-{i}")),
+                        ])
+                    })
+                    .collect(),
+            )
+            .await;
             let (home, mut config) = test_config().await;
             for feature in [Feature::MultiAgentV2, Feature::Collab] {
-                config.features.enable(feature).expect("enable V2 registration");
+                config
+                    .features
+                    .enable(feature)
+                    .expect("enable V2 registration");
             }
             config.multi_agent_v2.max_concurrent_threads_per_session = 3;
             config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
@@ -2068,30 +2093,43 @@ fn registered_independent_spawns_overlap_before_initial_submission() {
                 },
                 &Default::default(),
             ));
-            step.turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+            step.turn
+                .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
             assert!(step.set_tool_router(router).is_ok());
             let runtime = ToolCallRuntime::new(
-                Arc::clone(&parent.codex.session), step,
-                Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::default())),
+                Arc::clone(&parent.codex.session),
+                step,
+                Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::default(),
+                )),
             );
             let barrier = Arc::new(AgentControlTestBarrier::default());
             control.set_before_initial_submission_barrier(Some(barrier.clone()));
             let call = |name: &str| ToolCall {
                 tool_name: codex_tools::ToolName::namespaced("agents", "spawn_agent"),
                 call_id: format!("parallel-{name}"),
-                payload: ToolPayload::Function { arguments: serde_json::json!({
-                    "task_name": name, "message": "Return done."
-                }).to_string() },
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "task_name": name, "message": "Return done."
+                    })
+                    .to_string(),
+                },
             };
             let first_runtime = runtime.clone();
             let first_call = call("first");
             let first = tokio::spawn(async move {
-                first_runtime.handle_tool_call(first_call, tokio_util::sync::CancellationToken::new()).await
+                first_runtime
+                    .handle_tool_call(first_call, tokio_util::sync::CancellationToken::new())
+                    .await
             });
-            timeout(Duration::from_secs(15), barrier.wait_until_reached()).await.expect("first child reaches setup barrier");
+            timeout(Duration::from_secs(15), barrier.wait_until_reached())
+                .await
+                .expect("first child reaches setup barrier");
             let second_call = call("second");
             let second = tokio::spawn(async move {
-                runtime.handle_tool_call(second_call, tokio_util::sync::CancellationToken::new()).await
+                runtime
+                    .handle_tool_call(second_call, tokio_util::sync::CancellationToken::new())
+                    .await
             });
             // The first child's setup remains blocked. No timing improvement alone
             // can satisfy this: the second real dispatch must reach the same point.
@@ -2100,7 +2138,11 @@ fn registered_independent_spawns_overlap_before_initial_submission() {
             barrier.release_one();
             barrier.release_one();
             for (name, task) in [("first", first), ("second", second)] {
-                let result = timeout(Duration::from_secs(15), task).await.unwrap().unwrap().unwrap();
+                let result = timeout(Duration::from_secs(15), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
                 let output = serde_json::to_string(&result).unwrap();
                 assert!(output.contains(&format!("/root/{name}")), "{output}");
             }
@@ -2108,12 +2150,22 @@ fn registered_independent_spawns_overlap_before_initial_submission() {
                 while models.requests().len() < 2 {
                     sleep(Duration::from_millis(10)).await;
                 }
-            }).await;
-            let shutdown = harness.manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
-            assert!(shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(), "{shutdown:?}");
+            })
+            .await;
+            let shutdown = harness
+                .manager
+                .shutdown_all_threads_bounded(Duration::from_secs(5))
+                .await;
+            assert!(
+                shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(),
+                "{shutdown:?}"
+            );
             assert_eq!(shutdown.completed.len(), 3);
             sampled.expect("both children sample before shutdown");
-            assert!(overlap.is_ok(), "independent spawn was serialized behind blocked setup");
+            assert!(
+                overlap.is_ok(),
+                "independent spawn was serialized behind blocked setup"
+            );
         },
     );
 }
@@ -2273,7 +2325,11 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
             );
             let child_source = child.config_snapshot().await.session_source;
             assert!(
-                coordinator.record_task_usage_for_source(&child_source, 0, 0),
+                coordinator.record_task_usage_for_source(
+                    &child_source,
+                    crate::agent::task_metrics::TokenClassTotals::default(),
+                    0
+                ),
                 "live child accounting remains open"
             );
             release_model
@@ -2341,7 +2397,14 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
             timeout(Duration::from_secs(5), child.wait_until_terminated())
                 .await
                 .expect("child loop terminated");
-            assert!(!coordinator.record_task_usage_for_source(&child_source, 1, 1));
+            assert!(!coordinator.record_task_usage_for_source(
+                &child_source,
+                crate::agent::task_metrics::TokenClassTotals {
+                    total: 1,
+                    ..Default::default()
+                },
+                1
+            ));
             let task = coordinator
                 .get_agent_task(binding.assignment_id, Some(0))
                 .await
@@ -3769,19 +3832,13 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 
     // Ops are only captured for live threads, so check every thread: a
     // completion redirected to the root would show up here.
-    assert!(
-        !harness
-            .manager
-            .captured_ops()
-            .into_iter()
-            .any(|(_, op)| {
-                matches!(
-                    op,
-                    Op::InterAgentCommunication { communication }
-                        if communication.author == tester_path
-                )
-            })
-    );
+    assert!(!harness.manager.captured_ops().into_iter().any(|(_, op)| {
+        matches!(
+            op,
+            Op::InterAgentCommunication { communication }
+                if communication.author == tester_path
+        )
+    }));
 
     let root_history_items = root_thread
         .codex
@@ -3828,38 +3885,77 @@ async fn repeated_terminal_errors_and_watcher_deliver_one_parent_message() {
     for index in 0..3 {
         let mut turn = child.codex.session.new_default_turn().await;
         Arc::get_mut(&mut turn).unwrap().session_source = source.clone();
-        child.codex.session.send_event(&turn, EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: turn.sub_id.clone(),
-            last_agent_message: None,
-            surfaced_result: None,
-            error: Some(CodexErr::Fatal("no active bound attempt".into()).to_error_event(None)),
-            completed_at: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-            timing: None,
-        })).await;
+        child
+            .codex
+            .session
+            .send_event(
+                &turn,
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn.sub_id.clone(),
+                    last_agent_message: None,
+                    surfaced_result: None,
+                    error: Some(
+                        CodexErr::Fatal("no active bound attempt".into()).to_error_event(None),
+                    ),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+            )
+            .await;
         if index == 0 {
-            let watcher = harness.control.maybe_start_completion_watcher(
-                child_id, Some(source.clone()), child_path.to_string(), Some(child_path.clone()),
-            ).unwrap();
-            timeout(Duration::from_secs(5), watcher).await.unwrap().unwrap();
-            let pending = parent.codex.session.input_queue
-                .get_pending_input(&parent.codex.session.active_turn).await;
-            let [crate::session::TurnInput::InterAgentCommunication(message)] = pending.as_slice() else {
+            let watcher = harness
+                .control
+                .maybe_start_completion_watcher(
+                    child_id,
+                    Some(source.clone()),
+                    child_path.to_string(),
+                    Some(child_path.clone()),
+                )
+                .unwrap();
+            timeout(Duration::from_secs(5), watcher)
+                .await
+                .unwrap()
+                .unwrap();
+            let pending = parent
+                .codex
+                .session
+                .input_queue
+                .get_pending_input(&parent.codex.session.active_turn)
+                .await;
+            let [crate::session::TurnInput::InterAgentCommunication(message)] = pending.as_slice()
+            else {
                 panic!("terminal publication and watcher must deliver one error: {pending:?}");
             };
             let parent_turn = parent.codex.session.new_default_turn().await;
-            parent.codex.session.record_inter_agent_communication(&parent_turn, message.clone())
-                .await.unwrap();
+            parent
+                .codex
+                .session
+                .record_inter_agent_communication(&parent_turn, message.clone())
+                .await
+                .unwrap();
         } else {
-            assert!(parent.codex.session.input_queue
-                .get_pending_input(&parent.codex.session.active_turn).await.is_empty());
+            assert!(
+                parent
+                    .codex
+                    .session
+                    .input_queue
+                    .get_pending_input(&parent.codex.session.active_turn)
+                    .await
+                    .is_empty()
+            );
         }
     }
     let history = parent.codex.session.clone_history().await;
-    assert_eq!(history.raw_items().iter().filter(|item| matches!(
-        item, ResponseItem::AgentMessage { .. }
-    )).count(), 1);
+    assert_eq!(
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::AgentMessage { .. }))
+            .count(),
+        1
+    );
     assert!(parent.codex.session.active_turn.lock().await.is_none());
 }
 
@@ -4808,6 +4904,342 @@ fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants() {
                 no_path_child_subtree_thread_ids,
                 expected_no_path_child_subtree_thread_ids
             );
+        },
+    );
+}
+
+#[test]
+fn aggregate_live_subtree_usage_separates_root_from_descendants() {
+    run_current_thread_test_with_stack(
+        "aggregate_live_subtree_usage_separates_root_from_descendants",
+        || async {
+            let harness = AgentControlHarness::new().await;
+            let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+            let worker_path = AgentPath::root().join("worker").expect("worker path");
+
+            let worker_thread_id = Box::pin(harness.control.spawn_agent(
+                harness.config.clone(),
+                text_input("hello worker"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: Some(worker_path.clone()),
+                    agent_nickname: None,
+                    agent_role: Some("worker".to_string()),
+                })),
+            ))
+            .await
+            .expect("worker spawn should succeed");
+            let _worker_child_thread_id = Box::pin(harness.control.spawn_agent(
+                harness.config.clone(),
+                text_input("hello worker child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: worker_thread_id,
+                    depth: 2,
+                    agent_path: Some(worker_path.join("child").expect("worker child path")),
+                    agent_nickname: None,
+                    agent_role: Some("worker".to_string()),
+                })),
+            ))
+            .await
+            .expect("worker child spawn should succeed");
+
+            // Parent membership includes the worker and its child.
+            let leaf = harness
+                .control
+                .aggregate_live_subtree_usage(parent_thread_id)
+                .await
+                .expect("parent subtree usage should load");
+            assert_eq!(leaf.descendant_threads, 2, "worker and its child");
+
+            let worker = harness
+                .control
+                .aggregate_live_subtree_usage(worker_thread_id)
+                .await
+                .expect("worker subtree usage should load");
+            assert_eq!(worker.descendant_threads, 1, "the worker's own child");
+
+            // This harness has no real provider accounting, so every member reports no
+            // usage. The totals must still be the arithmetic sum of their scopes, and
+            // the combined figure must be flagged as a lower bound.
+            assert_eq!(
+                worker.combined(),
+                crate::agent::control::ThreadUsageTotals::default()
+            );
+            assert!(
+                !worker.is_complete(),
+                "threads without provider accounting are reported as unmeasured"
+            );
+            assert_eq!(worker.threads_missing_usage, 2);
+        },
+    );
+}
+
+#[test]
+fn aggregate_live_subtree_usage_retains_unloaded_and_closed_descendants() {
+    run_current_thread_test_with_stack(
+        "aggregate_live_subtree_usage_retains_unloaded_and_closed_descendants",
+        || async {
+            let harness = AgentControlHarness::new().await;
+            let (parent_id, parent) = harness.start_thread().await;
+            let mut ephemeral_config = harness.config.clone();
+            ephemeral_config.ephemeral = true;
+            let ephemeral_id = Box::pin(harness.control.spawn_agent(
+                ephemeral_config,
+                text_input("ephemeral child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            ))
+            .await
+            .expect("spawn ephemeral child");
+            let ephemeral = harness
+                .manager
+                .get_thread(ephemeral_id)
+                .await
+                .expect("ephemeral child loaded");
+            for (thread, tokens) in [(&parent, 10), (&ephemeral, 20)] {
+                let turn = thread.codex.session.new_default_turn().await;
+                thread
+                    .codex
+                    .session
+                    .record_token_usage_info(
+                        &turn,
+                        Some(&codex_protocol::protocol::TokenUsage {
+                            input_tokens: tokens,
+                            total_tokens: tokens,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("record known usage");
+            }
+            let ephemeral_loaded = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect("ephemeral subtree usage");
+            assert_eq!(ephemeral_loaded.combined().total_tokens, 30);
+            harness
+                .manager
+                .remove_thread(&ephemeral_id)
+                .await
+                .expect("unload ephemeral child");
+            let ephemeral_unloaded = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect("usage after ephemeral unload");
+            assert_eq!(ephemeral_unloaded.combined().total_tokens, 10);
+            assert_eq!(ephemeral_unloaded.threads_missing_usage, 0);
+            assert!(
+                !ephemeral_unloaded.is_complete(),
+                "absent ephemeral edges cannot certify a complete total"
+            );
+            ephemeral
+                .submit(Op::Shutdown)
+                .await
+                .expect("stop ephemeral child");
+            timeout(Duration::from_secs(5), ephemeral.wait_until_terminated())
+                .await
+                .expect("ephemeral child terminates");
+            let child_id = Box::pin(harness.control.spawn_agent(
+                harness.config.clone(),
+                text_input("child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            ))
+            .await
+            .expect("spawn child");
+            let grandchild_id = Box::pin(harness.control.spawn_agent(
+                harness.config.clone(),
+                text_input("grandchild"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: child_id,
+                    depth: 2,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            ))
+            .await
+            .expect("spawn grandchild");
+            let child = harness
+                .manager
+                .get_thread(child_id)
+                .await
+                .expect("child loaded");
+            let grandchild = harness
+                .manager
+                .get_thread(grandchild_id)
+                .await
+                .expect("grandchild loaded");
+            // Supply known provider usage through the session accounting owner,
+            // then measure through the real subtree aggregation path.
+            for (thread, tokens) in [(&child, 20), (&grandchild, 30)] {
+                let turn = thread.codex.session.new_default_turn().await;
+                thread
+                    .codex
+                    .session
+                    .record_token_usage_info(
+                        &turn,
+                        Some(&codex_protocol::protocol::TokenUsage {
+                            input_tokens: tokens,
+                            total_tokens: tokens,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("record known usage");
+            }
+            let complete = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect("loaded subtree usage");
+            assert_eq!(complete.combined().total_tokens, 60);
+            assert_eq!(complete.descendant_threads, 2);
+            assert_eq!(complete.threads_missing_usage, 0);
+            assert!(
+                !complete.is_complete(),
+                "durable edges cannot certify all spawn modes"
+            );
+
+            // Removing an intermediate node must not hide either that member or
+            // its still-loaded child from the aggregate.
+            harness
+                .manager
+                .remove_thread(&child_id)
+                .await
+                .expect("unload child");
+            let unloaded = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect("unloaded subtree usage");
+            assert_eq!(unloaded.descendant_threads, 2);
+            assert_eq!(unloaded.threads_missing_usage, 1);
+            assert_eq!(unloaded.combined().total_tokens, 40);
+            assert!(!unloaded.is_complete());
+
+            harness
+                .control
+                .close_agent(grandchild_id)
+                .await
+                .expect("close grandchild");
+            let closed = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect("closed subtree usage");
+            assert_eq!(closed.descendant_threads, 2);
+            assert_eq!(closed.threads_missing_usage, 2);
+            assert_eq!(closed.combined().total_tokens, 10);
+            assert!(!closed.is_complete());
+            child
+                .submit(Op::Shutdown)
+                .await
+                .expect("stop unloaded child");
+            timeout(Duration::from_secs(5), child.wait_until_terminated())
+                .await
+                .expect("unloaded child terminates");
+            harness
+                .control
+                .shutdown_live_agent(parent_id)
+                .await
+                .expect("stop parent");
+        },
+    );
+}
+
+#[test]
+fn aggregate_live_subtree_usage_without_retained_membership_is_incomplete() {
+    run_current_thread_test_with_stack(
+        "aggregate_live_subtree_usage_without_retained_membership_is_incomplete",
+        || async {
+            let (_home, config) = test_config().await;
+            let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+                CodexAuth::from_api_key("dummy"),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+                /*state_db*/ None,
+                Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+            )
+            .with_agent_graph_store_for_tests(None);
+            let parent = manager.start_thread(config).await.expect("start parent");
+            let turn = parent.thread.codex.session.new_default_turn().await;
+            parent
+                .thread
+                .codex
+                .session
+                .record_token_usage_info(
+                    &turn,
+                    Some(&codex_protocol::protocol::TokenUsage {
+                        input_tokens: 10,
+                        total_tokens: 10,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("record known usage");
+            let control = manager.agent_control();
+            let usage = control
+                .aggregate_live_subtree_usage(parent.thread_id)
+                .await
+                .expect("live usage without retained graph");
+            assert_eq!(usage.combined().total_tokens, 10);
+            assert_eq!(usage.threads_missing_usage, 0);
+            assert!(!usage.membership_complete);
+            assert!(
+                !usage.is_complete(),
+                "loaded usage does not prove complete membership"
+            );
+            control
+                .shutdown_live_agent(parent.thread_id)
+                .await
+                .expect("stop parent");
+        },
+    );
+}
+
+#[test]
+fn aggregate_live_subtree_usage_propagates_membership_read_failure() {
+    run_current_thread_test_with_stack(
+        "aggregate_live_subtree_usage_propagates_membership_read_failure",
+        || async {
+            let (home, config) = test_config().await;
+            let harness = AgentControlHarness::new_with_config_and_agent_graph_store(
+                home,
+                config,
+                Some(Arc::new(FailingAgentGraphStore::failing_list())),
+            )
+            .await;
+            let (parent_id, _) = harness.start_thread().await;
+            let error = harness
+                .control
+                .aggregate_live_subtree_usage(parent_id)
+                .await
+                .expect_err("unreadable membership cannot produce a complete metric");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected list descendants failure")
+            );
+            harness
+                .control
+                .shutdown_live_agent(parent_id)
+                .await
+                .expect("stop parent");
         },
     );
 }
@@ -6761,51 +7193,376 @@ fn spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints() {
             for identifiable_boundary in [true, false] {
                 let harness = AgentControlHarness::new().await;
                 let (parent_thread_id, parent_thread) = harness.start_thread().await;
-                parent_thread.inject_user_message_without_turn("excluded old parent task".into()).await;
-                parent_thread.inject_user_message_without_turn("current parent task".into()).await;
-                let mut replacement_history = parent_thread.codex.session.clone_history().await.into_raw_items();
+                parent_thread
+                    .inject_user_message_without_turn("excluded old parent task".into())
+                    .await;
+                parent_thread
+                    .inject_user_message_without_turn("current parent task".into())
+                    .await;
+                let mut replacement_history = parent_thread
+                    .codex
+                    .session
+                    .clone_history()
+                    .await
+                    .into_raw_items();
                 if !identifiable_boundary {
-                    replacement_history.retain(|item| !history_contains_text(std::slice::from_ref(item), "current parent task"));
+                    replacement_history.retain(|item| {
+                        !history_contains_text(std::slice::from_ref(item), "current parent task")
+                    });
                 }
                 replacement_history.push(assistant_message("checkpoint-only current answer", None));
-                parent_thread.codex.session.persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
-                    message: String::new(), replacement_history: Some(replacement_history),
-                    window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
-                })]).await;
+                parent_thread
+                    .codex
+                    .session
+                    .persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(replacement_history),
+                        window_number: None,
+                        first_window_id: None,
+                        previous_window_id: None,
+                        window_id: None,
+                    })])
+                    .await;
                 let spawn_turn = parent_thread.codex.session.new_default_turn().await;
-                parent_thread.codex.session.record_conversation_items(
-                    &spawn_turn, &[spawn_agent_call("spawn-call-checkpoint")],
-                ).await.unwrap();
+                parent_thread
+                    .codex
+                    .session
+                    .record_conversation_items(
+                        &spawn_turn,
+                        &[spawn_agent_call("spawn-call-checkpoint")],
+                    )
+                    .await
+                    .unwrap();
                 parent_thread.ensure_rollout_materialized().await;
-                parent_thread.flush_rollout().await.expect("flush parent checkpoint");
+                parent_thread
+                    .flush_rollout()
+                    .await
+                    .expect("flush parent checkpoint");
                 let started = std::time::Instant::now();
-                let result = harness.control.spawn_agent_with_metadata(
-                    harness.config.clone(), text_input("child task"),
-                    Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                        parent_thread_id, depth: 1, agent_path: None, agent_nickname: None, agent_role: None,
-                    })),
-                    SpawnAgentOptions {
-                        fork_parent_spawn_call_id: Some("spawn-call-checkpoint".into()),
-                        fork_mode: Some(SpawnAgentForkMode::LastNTurns(1)), ..Default::default()
-                    },
-                ).await;
+                let result = harness
+                    .control
+                    .spawn_agent_with_metadata(
+                        harness.config.clone(),
+                        text_input("child task"),
+                        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                            parent_thread_id,
+                            depth: 1,
+                            agent_path: None,
+                            agent_nickname: None,
+                            agent_role: None,
+                        })),
+                        SpawnAgentOptions {
+                            fork_parent_spawn_call_id: Some("spawn-call-checkpoint".into()),
+                            fork_mode: Some(SpawnAgentForkMode::LastNTurns(1)),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                 eprintln!("last_n_checkpoint_spawn_elapsed={:?}", started.elapsed());
                 if identifiable_boundary {
                     let child_thread_id = result.expect("bounded checkpoint fork").thread_id;
-                    let child = harness.manager.get_thread(child_thread_id).await.expect("child thread");
+                    let child = harness
+                        .manager
+                        .get_thread(child_thread_id)
+                        .await
+                        .expect("child thread");
                     let history = child.codex.session.clone_history().await;
-                    assert!(!history_contains_text(history.raw_items(), "excluded old parent task"));
-                    assert!(history_contains_text(history.raw_items(), "current parent task"));
-                    assert!(history_contains_text(history.raw_items(), "checkpoint-only current answer"));
+                    assert!(!history_contains_text(
+                        history.raw_items(),
+                        "excluded old parent task"
+                    ));
+                    assert!(history_contains_text(
+                        history.raw_items(),
+                        "current parent task"
+                    ));
+                    assert!(history_contains_text(
+                        history.raw_items(),
+                        "checkpoint-only current answer"
+                    ));
                     assert!(child.codex.session.reference_context_item().await.is_none());
-                    harness.control.shutdown_live_agent(child_thread_id).await.expect("shutdown child");
+                    harness
+                        .control
+                        .shutdown_live_agent(child_thread_id)
+                        .await
+                        .expect("shutdown child");
                 } else {
-                    assert!(matches!(result, Err(CodexErr::InvalidRequest(message))
+                    assert!(
+                        matches!(result, Err(CodexErr::InvalidRequest(message))
                         if message.contains("compaction checkpoint does not uniquely identify")),
-                        "an unidentifiable checkpoint must fail, not leak old turns or lose current checkpoint content");
+                        "an unidentifiable checkpoint must fail, not leak old turns or lose current checkpoint content"
+                    );
                 }
-                parent_thread.submit(Op::Shutdown {}).await.expect("shutdown parent");
+                parent_thread
+                    .submit(Op::Shutdown {})
+                    .await
+                    .expect("shutdown parent");
             }
         },
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FailingTurnTask {
+    ReturnedError,
+    Panicked,
+}
+
+fn finished_child_result() -> InterAgentCommunication {
+    InterAgentCommunication::new(
+        AgentPath::root().join("finished").expect("finished path"),
+        AgentPath::root(),
+        Vec::new(),
+        "finished result".to_string(),
+        false,
+    )
+}
+
+impl crate::tasks::SessionTask for FailingTurnTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.failing_turn"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        session: Arc<crate::session::session::Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        _cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+        Box::pin(async move {
+            match *self {
+                Self::ReturnedError => {
+                    Err(CodexErr::InvalidRequest("the root turn failed".to_string()))
+                }
+                Self::Panicked => {
+                    // Startup transfers earlier mail into this turn's pending input,
+                    // which abort cleanup clears. Model a result arriving after that
+                    // transfer: it must remain queued for the user's next message.
+                    session
+                        .input_queue
+                        .enqueue_mailbox_communication(finished_child_result())
+                        .await
+                        .expect("queue result after parent startup");
+                    panic!("injected parent worker panic");
+                }
+            }
+        })
+    }
+}
+
+struct WaitingChildTurnTask {
+    started: tokio_util::sync::CancellationToken,
+    stopped: tokio_util::sync::CancellationToken,
+}
+
+impl crate::tasks::SessionTask for WaitingChildTurnTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.waiting_child"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+        Box::pin(async move {
+            self.started.cancel();
+            cancellation_token.cancelled().await;
+            self.stopped.cancel();
+            Err(CodexErr::TurnAborted)
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_interrupts_running_children_and_names_queued_results() {
+    assert_failed_turn_interrupts_running_children(FailingTurnTask::ReturnedError).await;
+}
+
+#[tokio::test]
+async fn panicked_turn_interrupts_running_children_and_names_queued_results() {
+    assert_failed_turn_interrupts_running_children(FailingTurnTask::Panicked).await;
+}
+
+async fn assert_failed_turn_interrupts_running_children(failure: FailingTurnTask) {
+    let harness = AgentControlHarness::new().await;
+    let (root_id, root) = harness.start_thread().await;
+    let (manager, config) = (&harness.manager, &harness.config);
+    let start_child = |name: &'static str| {
+        let options = StartThreadOptions {
+            config: config.clone(),
+            allow_provider_model_fallback: false,
+            initial_history: InitialHistory::New,
+            history_mode: None,
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_id,
+                depth: 1,
+                agent_path: Some(AgentPath::root().join(name).expect("child path")),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            thread_source: None,
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Vec::new(),
+            thread_extension_init: ExtensionDataInit::default(),
+            supports_openai_form_elicitation: false,
+        };
+        async move {
+            let thread = manager
+                .start_thread_with_options(options)
+                .await
+                .expect("start child thread");
+            (thread.thread_id, thread.thread)
+        }
+    };
+    let (running_id, running) = start_child("running").await;
+    let (finished_id, finished) = start_child("finished").await;
+    let child_started = tokio_util::sync::CancellationToken::new();
+    let child_stopped = tokio_util::sync::CancellationToken::new();
+    let turn = running.codex.session.new_default_turn().await;
+    running
+        .codex
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn.sub_id.clone(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            }),
+        )
+        .await;
+    running
+        .codex
+        .session
+        .start_task(
+            turn,
+            Vec::new(),
+            WaitingChildTurnTask {
+                started: child_started.clone(),
+                stopped: child_stopped.clone(),
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(5), child_started.cancelled())
+        .await
+        .expect("child worker is running before the parent fails");
+    let turn = finished.codex.session.new_default_turn().await;
+    finished
+        .codex
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("finished result".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        harness.control.get_status(running_id).await,
+        AgentStatus::Running
+    );
+    // Returned errors recover pre-start pending input. Panic cleanup clears that
+    // input, so the panicking task instead queues the result after startup.
+    let finished_path = AgentPath::root().join("finished").expect("finished path");
+    if matches!(failure, FailingTurnTask::ReturnedError) {
+        root.codex
+            .session
+            .input_queue
+            .enqueue_mailbox_communication(finished_child_result())
+            .await
+            .expect("queue the finished result");
+    }
+
+    let root_turn = root.codex.session.new_default_turn().await;
+    root.codex
+        .session
+        .start_task(Arc::clone(&root_turn), Vec::new(), failure)
+        .await;
+    let mut warning = None;
+    let mut worker_errors = 0;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match root.next_event().await.expect("root event").msg {
+                EventMsg::Error(error) if error.message.contains("turn worker panicked") => {
+                    assert_eq!(
+                        error.codex_error_info,
+                        Some(codex_protocol::protocol::CodexErrorInfo::InternalServerError)
+                    );
+                    worker_errors += 1;
+                }
+                EventMsg::Warning(event) if event.message.contains("ended on an error") => {
+                    warning = Some(event.message);
+                }
+                EventMsg::TurnComplete(done) => {
+                    assert!(matches!(failure, FailingTurnTask::ReturnedError));
+                    assert_eq!(done.turn_id, root_turn.sub_id);
+                    assert!(done.error.is_some());
+                    break;
+                }
+                EventMsg::TurnAborted(aborted) => {
+                    assert!(matches!(failure, FailingTurnTask::Panicked));
+                    assert_eq!(aborted.turn_id.as_deref(), Some(root_turn.sub_id.as_str()));
+                    assert_eq!(aborted.reason, TurnAbortReason::InternalError);
+                    assert_eq!(worker_errors, 1, "worker error must precede terminal abort");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the failed root turn completes");
+
+    timeout(Duration::from_secs(5), child_stopped.cancelled())
+        .await
+        .expect("the failed parent must cancel the live child worker");
+    let ops = harness.manager.captured_ops();
+    assert_eq!(
+        ops.iter()
+            .filter(|(id, op)| *id == running_id && matches!(op, Op::Interrupt))
+            .count(),
+        1,
+        "the running child must be interrupted exactly once"
+    );
+    assert!(
+        !ops.iter()
+            .any(|(id, op)| *id == finished_id && matches!(op, Op::Interrupt))
+    );
+    let warning = warning.expect("the failure names the stopped and queued agents");
+    assert!(
+        warning.contains("Interrupted the agents it started"),
+        "{warning}"
+    );
+    assert!(warning.contains(finished_path.as_str()), "{warning}");
+    assert!(
+        root.codex
+            .session
+            .input_queue
+            .pending_mailbox_authors()
+            .await
+            .contains(&finished_path),
+        "the warning must describe a result still queued for the next message"
     );
 }

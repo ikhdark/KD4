@@ -50,27 +50,44 @@ async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
         assert_eq!(result["results"][0]["text"], "retained evidence\n");
         assert_eq!(result["delivered_selection_complete"], true);
         assert_eq!(result["retained_bytes"], result["canonical_bytes"]);
-        let ResponseInputItem::FunctionCallOutput { output: visible, .. } =
-            output.to_response_item("recovered", &payload) else { panic!("function output") };
+        let ResponseInputItem::FunctionCallOutput {
+            output: visible, ..
+        } = output.to_response_item("recovered", &payload)
+        else {
+            panic!("function output")
+        };
         let visible: Value = serde_json::from_str(&visible.body.to_text().unwrap()).unwrap();
-        assert_eq!(visible["delivered_selection_complete"], result["delivered_selection_complete"]);
+        assert_eq!(
+            visible["delivered_selection_complete"],
+            result["delivered_selection_complete"]
+        );
         assert_eq!(visible["retained_bytes"], result["retained_bytes"]);
         let schema = crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema(
             crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema(),
         );
-        jsonschema::validator_for(&schema).unwrap().validate(&visible).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&visible)
+            .unwrap();
         assert!(visible["results"][0].get("exact_bytes").is_none());
-        for field in ["artifact_id", "canonical_sha256", "canonical_bytes", "complete", "retained_artifact_complete"] {
+        for field in [
+            "artifact_id",
+            "canonical_sha256",
+            "canonical_bytes",
+            "complete",
+            "retained_artifact_complete",
+        ] {
             assert_eq!(visible[field], result[field], "{field}");
         }
         assert_eq!(visible["results"][0]["text"], result["results"][0]["text"]);
-        assert_eq!(output.canonical_result(&payload).unwrap().value, Some(result));
+        assert_eq!(
+            output.canonical_result(&payload).unwrap().value,
+            Some(result)
+        );
 
         let mut pending = Some(crate::turn_timing::ContinuationCause::ToolResult);
-        turn.turn_timing_state.begin_model_generation(
-            &mut pending,
-            &codex_protocol::protocol::SessionSource::Cli,
-        );
+        turn.turn_timing_state
+            .begin_model_generation(&mut pending, &codex_protocol::protocol::SessionSource::Cli);
     }
     let counters = turn
         .turn_timing_state
@@ -233,10 +250,14 @@ fn partial_recovery_preserves_delivered_ranges_and_selection_failure() {
     for start in [0, 10, 20] {
         let evidence = serde_json::json!({"source":"artifact", "scope":"snapshot",
             "identity":{"sha256":"source-hash", "ranges":[[start, start + 10]], "values":[]}});
-        let output = recovery_tool_output(serde_json::json!({
-            "artifact_id":"snapshot", "canonical_sha256":"source-hash", "complete":false,
-            "results":[{"status":"ok", "text":"new bytes"}, {"status":"not_found"}]
-        }), false, Some(evidence.clone()));
+        let output = recovery_tool_output(
+            serde_json::json!({
+                "artifact_id":"snapshot", "canonical_sha256":"source-hash", "complete":false,
+                "results":[{"status":"ok", "text":"new bytes"}, {"status":"not_found"}]
+            }),
+            false,
+            Some(evidence.clone()),
+        );
         let signal = output.sampling_request_signal().unwrap();
         assert_eq!(signal["semantic_evidence"], evidence);
         assert_eq!(signal["outcome"], "failure");
@@ -253,26 +274,57 @@ async fn byte_budget_delivers_an_exact_prefix_and_resumable_remainder() {
     let temp = tempfile::tempdir().unwrap();
     let text = "λ source evidence\n".repeat(2000);
     let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-        temp.path(), "thread", &CanonicalToolResult::text(text.clone()),
-    ).await;
-    let snapshot = load_tool_output_snapshot(temp.path(), "thread", &artifact.artifact_id().unwrap().to_string())
-        .await.unwrap();
+        temp.path(),
+        "thread",
+        &CanonicalToolResult::text(text.clone()),
+    )
+    .await;
+    let snapshot = load_tool_output_snapshot(
+        temp.path(),
+        "thread",
+        &artifact.artifact_id().unwrap().to_string(),
+    )
+    .await
+    .unwrap();
     let result = drain_recovery_snapshot_with_byte_limit(
         &snapshot,
-        vec![ToolOutputSelector::Bytes { start: 0, end: text.len() as u64 }],
-        RECOVERY_AGGREGATE_TOKEN_CEILING, 4096, &CancellationToken::new(),
-    ).await.unwrap();
-    let delivered: u64 = result.output.delivered_ranges().iter().map(|(start, end)| end - start).sum();
+        vec![ToolOutputSelector::Bytes {
+            start: 0,
+            end: text.len() as u64,
+        }],
+        RECOVERY_AGGREGATE_TOKEN_CEILING,
+        4096,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let delivered: u64 = result
+        .output
+        .delivered_ranges()
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum();
     assert!(delivered > 0 && delivered <= 4096, "{delivered}");
     assert!(!result.output.complete);
-    assert!(result.continuation_stop.as_ref().is_some_and(|stop| stop.resumable));
-    assert!(recovery_call_succeeded(&result.output, result.continuation_stop.as_ref()));
+    assert!(
+        result
+            .continuation_stop
+            .as_ref()
+            .is_some_and(|stop| stop.resumable)
+    );
+    assert!(recovery_call_succeeded(
+        &result.output,
+        result.continuation_stop.as_ref()
+    ));
     let mut cancelled = result.continuation_stop.clone().unwrap();
     cancelled.reason = ContinuationStopReason::Cancelled;
     assert!(!recovery_call_succeeded(&result.output, Some(&cancelled)));
     let mut invalid = result.output.clone();
     invalid.results[0].status = ToolOutputSelectorStatus::Invalid;
-    assert!(!recovery_call_succeeded(&invalid, result.continuation_stop.as_ref()));
+    assert!(!recovery_call_succeeded(
+        &invalid,
+        result.continuation_stop.as_ref()
+    ));
     for page in &result.output.results {
         if let (Some(range), Some(value)) = (page.canonical_range, page.text.as_ref()) {
             assert_eq!(value, &text[range.start as usize..range.end as usize]);
@@ -287,39 +339,78 @@ async fn recovery_data_is_independent_of_display_budget_and_keeps_byte_bounds() 
     let turn = std::sync::Arc::new(turn);
     let text = "exact source line with unique context\n".repeat(2_000);
     let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-        &turn.config.codex_home, &session.thread_id.to_string(),
-        &CanonicalToolResult::text(text.clone())).await;
-    session.register_tool_artifact_origin(
-        artifact.artifact_id().unwrap(), "producer".into(), text.len() as u64,
-        crate::tool_history::sha256(text.as_bytes())).await;
+        &turn.config.codex_home,
+        &session.thread_id.to_string(),
+        &CanonicalToolResult::text(text.clone()),
+    )
+    .await;
+    session
+        .register_tool_artifact_origin(
+            artifact.artifact_id().unwrap(),
+            "producer".into(),
+            text.len() as u64,
+            crate::tool_history::sha256(text.as_bytes()),
+        )
+        .await;
     let cell = codex_code_mode::CellId::new("bounded-recovery".into());
-    session.services.code_mode_service.record_cell_parent_call_id(&cell, "outer");
+    session
+        .services
+        .code_mode_service
+        .record_cell_parent_call_id(&cell, "outer");
     let mut previous = None;
     for budget in [0, 512, 4_000, 10_000] {
-        session.services.code_mode_service.record_output_budget(&cell, Some(budget));
-        let payload = ToolPayload::Function { arguments: serde_json::json!({
-            "artifact_id": artifact.artifact_id().unwrap(),
-            "selectors": [{"kind":"bytes", "start":0, "end":text.len()}]
-        }).to_string() };
-        let result = ReadToolOutputHandler.handle(ToolInvocation {
-            session: std::sync::Arc::clone(&session),
-            step_context: crate::session::step_context::StepContext::for_test(std::sync::Arc::clone(&turn)),
-            cancellation_token: Default::default(),
-            tracker: std::sync::Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
-            call_id: "recover".into(), tool_name: ToolName::plain("read_tool_output"),
-            source: ToolCallSource::CodeMode { cell_id: cell.to_string(), parent_call_id: Some("outer".into()),
-                runtime_tool_call_id: "nested".into(), nested_deadline: None, cancellation_cause: None },
-            payload: payload.clone(),
-        }).await;
+        session
+            .services
+            .code_mode_service
+            .record_output_budget(&cell, Some(budget));
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "artifact_id": artifact.artifact_id().unwrap(),
+                "selectors": [{"kind":"bytes", "start":0, "end":text.len()}]
+            })
+            .to_string(),
+        };
+        let result = ReadToolOutputHandler
+            .handle(ToolInvocation {
+                session: std::sync::Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(
+                    std::sync::Arc::clone(&turn),
+                ),
+                cancellation_token: Default::default(),
+                tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "recover".into(),
+                tool_name: ToolName::plain("read_tool_output"),
+                source: ToolCallSource::CodeMode {
+                    cell_id: cell.to_string(),
+                    parent_call_id: Some("outer".into()),
+                    runtime_tool_call_id: "nested".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                },
+                payload: payload.clone(),
+            })
+            .await;
         let output = result.unwrap().code_mode_result(&payload);
-        assert!(codex_utils_string::approx_token_count(&output.to_string()) <= CODE_MODE_RECOVERY_TOKEN_CEILING + 128);
+        assert!(
+            codex_utils_string::approx_token_count(&output.to_string())
+                <= CODE_MODE_RECOVERY_TOKEN_CEILING + 128
+        );
         if let Some(previous) = &previous {
-            assert_eq!(&output, previous, "display budget {budget} changed exact recovery");
+            assert_eq!(
+                &output, previous,
+                "display budget {budget} changed exact recovery"
+            );
         }
         previous = Some(output.clone());
         assert_eq!(output["complete"], false);
-        let pages = output["results"].as_array().unwrap().iter()
-            .filter(|page| page["text"].is_string()).collect::<Vec<_>>();
+        let pages = output["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|page| page["text"].is_string())
+            .collect::<Vec<_>>();
         assert!(!pages.is_empty());
         for page in pages {
             let start = page["canonical_range"]["start"].as_u64().unwrap() as usize;
@@ -327,12 +418,30 @@ async fn recovery_data_is_independent_of_display_budget_and_keeps_byte_bounds() 
             assert_eq!(page["text"].as_str().unwrap(), &text[start..end]);
         }
         assert!(output.get("continuation_stop").is_some());
-        assert!(!output["continuation_stop"]["page_selectors"].as_array().unwrap().is_empty());
-        let history = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
-        assert_eq!(history["recovered_call_ids"], serde_json::json!(["producer", "recover"]));
+        assert!(
+            !output["continuation_stop"]["page_selectors"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let history =
+            serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+        assert_eq!(
+            history["recovered_call_ids"],
+            serde_json::json!(["producer", "recover"])
+        );
     }
-    session.services.code_mode_service.finish_cell_dispatch(&cell);
-    assert_eq!(session.services.code_mode_service.output_budget(cell.as_str()), None);
+    session
+        .services
+        .code_mode_service
+        .finish_cell_dispatch(&cell);
+    assert_eq!(
+        session
+            .services
+            .code_mode_service
+            .output_budget(cell.as_str()),
+        None
+    );
 }
 
 #[tokio::test]
@@ -354,9 +463,14 @@ async fn recovery_handler_output_schema_covers_exact_search_and_rejected_selecto
     let ToolSpec::Function(spec) = spec else {
         panic!("recovery uses a function spec");
     };
-    let validator =
-        jsonschema::validator_for(&spec.output_schema.as_ref().expect("output schema").to_value())
-            .expect("valid output schema");
+    let validator = jsonschema::validator_for(
+        &spec
+            .output_schema
+            .as_ref()
+            .expect("output schema")
+            .to_value(),
+    )
+    .expect("valid output schema");
     for (selector, expected_status, expected_reason) in [
         (
             serde_json::json!({"kind": "json_pointer", "pointer": "invalid"}),
@@ -616,10 +730,8 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
                 });
                 let expected = reference.reconstructed_output();
                 let fits = recovery_result_fits_token_ceiling(&expected, ceiling);
-                let accepted = state.accept_page(
-                    result_index,
-                    &selector,
-                    recovery_output(vec![page]),);
+                let accepted =
+                    state.accept_page(result_index, &selector, recovery_output(vec![page]));
                 assert_eq!(
                     accepted,
                     if fits {
@@ -630,8 +742,7 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
                 );
                 if !fits {
                     reference.output = before;
-                    reference
-                        .record_stop(ContinuationStopReason::Budget, Some(selector.clone()));
+                    reference.record_stop(ContinuationStopReason::Budget, Some(selector.clone()));
                     state.record_stop(ContinuationStopReason::Budget, Some(selector));
                     break;
                 }
@@ -724,13 +835,17 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
 
 #[test]
 fn search_page_limit_does_not_automatically_fetch_later_matches() {
-    let selector = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
+    let selector = ToolOutputSelector::Search {
+        enclosing: false,
+        case_insensitive: false,
         query: "needle".into(),
         start_byte: 0,
         max_results: 1,
         context_lines: 0,
     };
-    let next = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
+    let next = ToolOutputSelector::Search {
+        enclosing: false,
+        case_insensitive: false,
         query: "needle".into(),
         start_byte: 100,
         max_results: 1,
@@ -742,7 +857,8 @@ fn search_page_limit_does_not_automatically_fetch_later_matches() {
             Some(next.clone()),
             "one match",
         )]),
-        usize::MAX,);
+        usize::MAX,
+    );
     assert_eq!(state.next_step(), ContinuationStep::Complete);
     let output = state.finish();
     assert_eq!(output.drained_continuation_pages, 0);
@@ -762,27 +878,20 @@ fn overlapping_json_selection_does_not_block_byte_reconstruction() {
     };
     json.canonical_range = owner.canonical_range;
     json.value = Some(serde_json::json!(true));
-    let mut first =
-        continuation_result(ToolOutputSelector::Bytes { start: 0, end: 2 }, None, "tr");
+    let mut first = continuation_result(ToolOutputSelector::Bytes { start: 0, end: 2 }, None, "tr");
     first.canonical_range = Some(CanonicalByteRange::new(0, 2));
-    let mut last =
-        continuation_result(ToolOutputSelector::Bytes { start: 2, end: 4 }, None, "ue");
+    let mut last = continuation_result(ToolOutputSelector::Bytes { start: 2, end: 4 }, None, "ue");
     last.canonical_range = Some(CanonicalByteRange::new(2, 4));
     owner.continuation = Some(first.selector.clone());
     let mut state = RecoveryContinuationState::new(
         recovery_output(vec![owner.clone(), json.clone()]),
-        usize::MAX,);
+        usize::MAX,
+    );
     state
-        .accept_page(
-            0,
-            &first.selector.clone(),
-            recovery_output(vec![first]),)
+        .accept_page(0, &first.selector.clone(), recovery_output(vec![first]))
         .unwrap();
     state
-        .accept_page(
-            0,
-            &last.selector.clone(),
-            recovery_output(vec![last]),)
+        .accept_page(0, &last.selector.clone(), recovery_output(vec![last]))
         .unwrap();
     assert_eq!(state.next_step(), ContinuationStep::Complete);
     let transaction = state.finish();
@@ -863,18 +972,28 @@ fn terminal_recovery_results_complete_after_the_validation_pass() {
     oversized.status = ToolOutputSelectorStatus::SelectorTooLarge;
     let mut omitted = continuation_result(page_selector(20), None, "omitted");
     omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
-    let state = RecoveryContinuationState::new(
-        recovery_output(vec![ok, oversized, omitted]),
-        usize::MAX,);
+    let state =
+        RecoveryContinuationState::new(recovery_output(vec![ok, oversized, omitted]), usize::MAX);
 
     assert_eq!(state.next_step(), ContinuationStep::Complete);
     let result = state.finish();
-    assert!(!result.output.complete, "stopping traversal does not complete unavailable selections");
-    assert_eq!(result.output.results.iter().map(|row| row.status).collect::<Vec<_>>(), vec![
-        ToolOutputSelectorStatus::Ok,
-        ToolOutputSelectorStatus::SelectorTooLarge,
-        ToolOutputSelectorStatus::AggregateOmitted,
-    ]);
+    assert!(
+        !result.output.complete,
+        "stopping traversal does not complete unavailable selections"
+    );
+    assert_eq!(
+        result
+            .output
+            .results
+            .iter()
+            .map(|row| row.status)
+            .collect::<Vec<_>>(),
+        vec![
+            ToolOutputSelectorStatus::Ok,
+            ToolOutputSelectorStatus::SelectorTooLarge,
+            ToolOutputSelectorStatus::AggregateOmitted,
+        ]
+    );
 }
 
 #[test]
@@ -935,8 +1054,7 @@ fn final_page_is_budgeted_as_reconstructed_selection() {
         &recovery_output(vec![owner.clone(), page.clone()]),
         ceiling,
     ));
-    let mut state =
-        RecoveryContinuationState::new(recovery_output(vec![owner]), ceiling);
+    let mut state = RecoveryContinuationState::new(recovery_output(vec![owner]), ceiling);
     assert_eq!(
         state.accept_page(0, &selector, recovery_output(vec![page])),
         Ok(())
@@ -1044,26 +1162,42 @@ fn exact_continuation_pages_are_drained_in_selector_order() {
 
 #[test]
 fn selector_errors_do_not_strand_later_pages() {
-    for status in [ToolOutputSelectorStatus::Invalid, ToolOutputSelectorStatus::NotFound] {
+    for status in [
+        ToolOutputSelectorStatus::Invalid,
+        ToolOutputSelectorStatus::NotFound,
+    ] {
         let initial = recovery_output(vec![
             selector_result(status),
             continuation_result(page_selector(0), Some(page_selector(10)), "first"),
         ]);
         let mut state = RecoveryContinuationState::new(initial, usize::MAX);
         for (index, next) in [(1, Some(page_selector(20))), (2, None)] {
-            let ContinuationStep::Follow { result_index, selector } = state.next_step() else {
+            let ContinuationStep::Follow {
+                result_index,
+                selector,
+            } = state.next_step()
+            else {
                 panic!("independent pages must still drain");
             };
             assert_eq!(result_index, index);
-            state.accept_page(result_index, &selector,
-                recovery_output(vec![continuation_result(selector.clone(), next, "page")])).unwrap();
+            state
+                .accept_page(
+                    result_index,
+                    &selector,
+                    recovery_output(vec![continuation_result(selector.clone(), next, "page")]),
+                )
+                .unwrap();
         }
         assert_eq!(state.next_step(), ContinuationStep::Complete);
         let result = state.finish();
         assert_eq!(result.drained_continuation_pages, 2);
         assert_eq!(result.output.results[0].status, status);
         assert!(!result.output.complete);
-        assert!(result.output.results[1..].iter().all(|result| result.complete));
+        assert!(
+            result.output.results[1..]
+                .iter()
+                .all(|result| result.complete)
+        );
     }
 }
 
@@ -1081,9 +1215,8 @@ fn final_page_is_admitted_using_exact_reconstruction_and_shared_coverage() {
     let expected = recovery_output(vec![exact.clone(), exact]);
     let ceiling =
         codex_utils_string::approx_token_count(&serde_json::to_string(&expected).unwrap()) + 10;
-    let mut state = RecoveryContinuationState::new(
-        recovery_output(vec![owner.clone(), owner]),
-        ceiling,);
+    let mut state =
+        RecoveryContinuationState::new(recovery_output(vec![owner.clone(), owner]), ceiling);
     assert_eq!(
         state.accept_page(0, &child, recovery_output(vec![page])),
         Ok(())
@@ -1193,8 +1326,11 @@ fn continuation_identity_drift_stops_without_mutating_the_aggregate() {
             _ => selector = page_selector(20),
         }
         let mut state = RecoveryContinuationState::new(initial.clone(), usize::MAX);
-        assert_eq!(state.accept_page(0, &selector, drifted_page),
-            Err(ContinuationStopReason::IdentityDrift), "{changed}");
+        assert_eq!(
+            state.accept_page(0, &selector, drifted_page),
+            Err(ContinuationStopReason::IdentityDrift),
+            "{changed}"
+        );
         assert_eq!(state.finish().output, initial, "{changed}");
     }
 }
@@ -1291,10 +1427,7 @@ fn selector_overflow_drains_the_owner_subdivision_plan_and_preserves_its_contrac
             selector: child_selector.clone(),
         }
     );
-    assert_eq!(
-        state.accept_page(0, &child_selector, first_page),
-        Ok(())
-    );
+    assert_eq!(state.accept_page(0, &child_selector, first_page), Ok(()));
     assert_eq!(
         state.next_step(),
         ContinuationStep::Follow {
@@ -1361,9 +1494,8 @@ fn exact_code_mode_recovery_is_carried_by_owner_receipt() {
         results: vec![selector_result(ToolOutputSelectorStatus::Ok)],
     };
 
-    let receipt =
-        exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string(), 2)
-            .expect("exact nested recovery receipt");
+    let receipt = exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string(), 2)
+        .expect("exact nested recovery receipt");
 
     assert_eq!(receipt.state_revision, "canonical-revision");
     assert_eq!(receipt.action_bounds_hash, "selector-bounds");
@@ -1433,13 +1565,10 @@ fn recovered_text_identity_deduplicates_delivered_coverage() {
     };
 
     let evidence = output.delivered_evidence().expect("delivered text");
-    assert_eq!(evidence["ranges"], serde_json::json!([[0,35]]));
+    assert_eq!(evidence["ranges"], serde_json::json!([[0, 35]]));
     let mut repeated = output;
     repeated.results.push(repeated.results[0].clone());
-    assert_eq!(
-        repeated.delivered_evidence(),
-        Some(evidence)
-    );
+    assert_eq!(repeated.delivered_evidence(), Some(evidence));
 }
 
 #[test]
@@ -1485,7 +1614,8 @@ fn disjoint_recovered_fragments_do_not_create_synthetic_semantic_facts() {
         let mut result = selector_result(ToolOutputSelectorStatus::Ok);
         result.text = Some(fragment.to_string());
         result.canonical_range = Some(CanonicalByteRange::new(
-            index as u64 * 40, index as u64 * 40 + fragment.len() as u64,
+            index as u64 * 40,
+            index as u64 * 40 + fragment.len() as u64,
         ));
         results.push(result);
     }
@@ -1500,9 +1630,10 @@ fn disjoint_recovered_fragments_do_not_create_synthetic_semantic_facts() {
         results,
     };
     let evidence = output.delivered_evidence().unwrap();
-    assert_eq!(evidence["ranges"], serde_json::json!([
-        [0,fragments[0].len()], [40,40 + fragments[1].len()]
-    ]));
+    assert_eq!(
+        evidence["ranges"],
+        serde_json::json!([[0, fragments[0].len()], [40, 40 + fragments[1].len()]])
+    );
 }
 
 #[test]
@@ -1558,7 +1689,11 @@ fn verified_evidence_negative_search_identity_includes_matching_mode_not_display
         result.text = None;
         result.canonical_range = None;
         result.selector = ToolOutputSelector::Search {
-            query: "missing".into(), case_insensitive, start_byte: 0, max_results, context_lines,
+            query: "missing".into(),
+            case_insensitive,
+            start_byte: 0,
+            max_results,
+            context_lines,
             enclosing: false,
         };
         result.value = Some(serde_json::json!({"query":"missing", "start_byte":0,
@@ -1587,9 +1722,8 @@ fn resumable_byte_stop_preserves_the_remaining_owner_suffix() {
         ContinuationStopReason::Budget,
         ContinuationStopReason::Cancelled,
     ] {
-        let mut state = RecoveryContinuationState::new(
-            recovery_output(vec![owner.clone()]),
-            usize::MAX,);
+        let mut state =
+            RecoveryContinuationState::new(recovery_output(vec![owner.clone()]), usize::MAX);
         state.record_stop(reason, Some(child.clone()));
         let stop = state.finish().continuation_stop.unwrap();
         assert!(stop.resumable);
@@ -1598,8 +1732,7 @@ fn resumable_byte_stop_preserves_the_remaining_owner_suffix() {
             Some(ToolOutputSelector::Bytes { start: 7, end: 31 })
         );
     }
-    let mut state =
-        RecoveryContinuationState::new(recovery_output(vec![owner]), usize::MAX);
+    let mut state = RecoveryContinuationState::new(recovery_output(vec![owner]), usize::MAX);
     state.record_page_read_error(&ReadToolOutputError::StillWriting, child);
     assert_eq!(
         state.finish().continuation_stop.unwrap().selector,
@@ -1628,7 +1761,8 @@ fn continuation_page_error_preserves_retryability_and_cause() {
         let expected_message = error.for_model();
         let mut state = RecoveryContinuationState::new(
             recovery_output(vec![selector_result(ToolOutputSelectorStatus::Ok)]),
-            usize::MAX,);
+            usize::MAX,
+        );
         state.record_page_read_error(&error, selector.clone());
         let stop = state
             .finish()
@@ -1669,11 +1803,18 @@ fn legacy_single_range_uses_the_canonical_line_invariants() {
     );
     args.start_line = Some(17);
     args.end_line = None;
-    assert_eq!(resolved_selectors(&args).unwrap(),
-        vec![ToolOutputSelector::Lines { start: 17, end: 216 }]);
+    assert_eq!(
+        resolved_selectors(&args).unwrap(),
+        vec![ToolOutputSelector::Lines {
+            start: 17,
+            end: 216
+        }]
+    );
     args.start_line = None;
-    assert_eq!(resolved_selectors(&args).unwrap(),
-        vec![ToolOutputSelector::Lines { start: 1, end: 200 }]);
+    assert_eq!(
+        resolved_selectors(&args).unwrap(),
+        vec![ToolOutputSelector::Lines { start: 1, end: 200 }]
+    );
     args.start_line = Some(usize::MAX);
     assert!(resolved_selectors(&args).is_err());
 }
@@ -1693,8 +1834,8 @@ fn max_bytes_is_legacy_validated_but_not_a_clipping_contract() {
 fn read_tool_output_schema_matches_runtime_bounds() {
     let tool = serde_json::to_value(create_read_tool_output_tool())
         .expect("serialize read_tool_output tool");
-    let validator = jsonschema::validator_for(&tool["parameters"])
-        .expect("compile read_tool_output schema");
+    let validator =
+        jsonschema::validator_for(&tool["parameters"]).expect("compile read_tool_output schema");
     let line_selector = serde_json::json!({
         "kind": "lines",
         "start": 1,
@@ -1728,7 +1869,11 @@ fn read_tool_output_schema_matches_runtime_bounds() {
         (selector_args(1), true, true),
         (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS), true, true),
         (selector_args(0), false, false),
-        (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1), false, false),
+        (
+            selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1),
+            false,
+            false,
+        ),
         (range_args(1), false, true),
         (range_args(64), false, true),
         (range_args(0), false, false),

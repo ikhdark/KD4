@@ -8,18 +8,42 @@ async fn automatic_excerpts_reuse_producer_bytes_without_artifact_reread() {
     let temp = tempfile::tempdir().unwrap();
     let canonical = CanonicalToolResult::text("first exact line\nsecond exact line\n");
     let id = "01900000-0000-7000-8000-000000000000";
-    let ranges = vec![ToolOutputProjectionRange { id: "source".into(), start_line: 2, end_line: 2 }];
+    let ranges = vec![ToolOutputProjectionRange {
+        id: "source".into(),
+        start_line: 2,
+        end_line: 2,
+    }];
     // No artifact exists: a disk read would fail. Production calls this only
     // after persisting and protecting this canonical identity.
     let (content, receipt) = drain_predetermined_artifact_selectors(
-        temp.path(), "thread", id, &canonical.sha256, ranges.clone(), Vec::new(),
-        &[], &BTreeMap::new(), 4_000, Some(&canonical)).await;
+        temp.path(),
+        "thread",
+        id,
+        &canonical.sha256,
+        ranges.clone(),
+        Vec::new(),
+        &[],
+        &BTreeMap::new(),
+        4_000,
+        Some(&canonical),
+    )
+    .await;
     assert!(receipt.is_some());
     assert_eq!(content[0]["results"][0]["text"], "second exact line\n");
     assert_eq!(content[0]["canonical_sha256"], canonical.sha256);
     let (stale, receipt) = drain_predetermined_artifact_selectors(
-        temp.path(), "thread", id, "wrong-sha", ranges, Vec::new(),
-        &[], &BTreeMap::new(), 4_000, Some(&canonical)).await;
+        temp.path(),
+        "thread",
+        id,
+        "wrong-sha",
+        ranges,
+        Vec::new(),
+        &[],
+        &BTreeMap::new(),
+        4_000,
+        Some(&canonical),
+    )
+    .await;
     assert!(stale.is_empty());
     assert!(receipt.is_none());
     assert!(!temp.path().join("tool-output").exists());
@@ -347,8 +371,13 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
         if exit_code == 1 && line_count == 300 {
             let metadata = output.projection_metadata().unwrap();
             assert!(metadata.predetermined_ranges.is_empty());
-            assert!(metadata.fragments.iter().any(|fragment| fragment.shell_output.is_some()),
-                "the owning projection defers diagnostic selection until it knows the budget");
+            assert!(
+                metadata
+                    .fragments
+                    .iter()
+                    .any(|fragment| fragment.shell_output.is_some()),
+                "the owning projection defers diagnostic selection until it knows the budget"
+            );
         }
         let mut result = AnyToolResult {
             call_id: invocation.call_id.clone(),
@@ -371,7 +400,12 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
                 .expect("oversized result projection");
             assert!(projection.projection_truncated);
             assert!(result.deterministic_continuation_receipts().is_empty());
-            assert!(projection.bounded.rendered().contains("error: exact evidence"));
+            assert!(
+                projection
+                    .bounded
+                    .rendered()
+                    .contains("error: exact evidence")
+            );
             let candidate = projection
                 .candidate
                 .as_ref()
@@ -552,27 +586,90 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
     let preflight = CodeModeArgumentPreflight::default();
 
     assert_eq!(
-        preflight.validate(&name, &spec, &valid_payload, valid_arguments.as_ref(), false),
+        preflight.validate(
+            &name,
+            &spec,
+            &valid_payload,
+            valid_arguments.as_ref(),
+            false
+        ),
         Ok(())
     );
     // This represents the final payload after a PreToolUse hook rewrites the
     // initially valid invocation.
     for (arguments, expected) in [
         (serde_json::json!({ "path": 7 }), "/path"),
-        (serde_json::json!({ "path": "src/lib.rs", "extra": true }), "Additional properties"),
+        (
+            serde_json::json!({ "path": "src/lib.rs", "extra": true }),
+            "Additional properties",
+        ),
     ] {
         let invalid_payload = ToolPayload::Function {
             arguments: arguments.to_string(),
         };
         let invalid_arguments = ParsedFunctionArguments::from_payload(&invalid_payload);
         let error = preflight
-            .validate(&name, &spec, &invalid_payload, invalid_arguments.as_ref(), false)
+            .validate(
+                &name,
+                &spec,
+                &invalid_payload,
+                invalid_arguments.as_ref(),
+                false,
+            )
             .expect_err("invalid typed arguments must be rejected before dispatch");
         assert!(error.contains("argument preflight failed"), "{error}");
         assert!(error.contains(expected), "{error}");
     }
     assert_eq!(preflight.compile_count.load(Ordering::Relaxed), 1);
     assert_eq!(preflight.validation_count.load(Ordering::Relaxed), 3);
+}
+
+/// A rejection must name the shape the tool accepts, not only the key that was
+/// wrong.
+///
+/// Recorded sessions show the same rejected call reissued in the same shape
+/// after messages such as "Additional properties are not allowed ('kind',
+/// 'environment_id' were unexpected)" and "is not valid under any of the
+/// schemas listed in the 'oneOf' keyword". Both name the fault and omit the
+/// remedy, so a retry had nothing new to work from. The schema is already in
+/// hand during preflight; these assertions keep it in the message.
+#[test]
+fn preflight_rejection_names_the_accepted_shape() {
+    let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
+        name: "typed_helper".to_string(),
+        description: "test helper".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: codex_tools::JsonSchema::object(
+            BTreeMap::from([
+                ("path".to_string(), codex_tools::JsonSchema::string(None)),
+                ("query".to_string(), codex_tools::JsonSchema::string(None)),
+            ]),
+            Some(vec!["path".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    });
+    let name = ToolName::plain("typed_helper");
+    let payload = ToolPayload::Function {
+        // The shape recorded in the corpus: a key the schema forbids.
+        arguments: serde_json::json!({ "path": "src/lib.rs", "environment_id": "local" })
+            .to_string(),
+    };
+    let arguments = ParsedFunctionArguments::from_payload(&payload);
+    let error = CodeModeArgumentPreflight::default()
+        .validate(&name, &spec, &payload, arguments.as_ref(), false)
+        .expect_err("a forbidden property must be rejected before dispatch");
+
+    assert!(error.contains("argument preflight failed"), "{error}");
+    // The original diagnosis is preserved.
+    assert!(error.contains("Additional properties"), "{error}");
+    // The remedy is now present: every accepted key, and which are required.
+    assert!(
+        error.contains("accepted properties: path, query"),
+        "{error}"
+    );
+    assert!(error.contains("required: path"), "{error}");
 }
 
 #[test]
@@ -604,7 +701,8 @@ fn exec_command_code_mode_preflight_preserves_prescriptive_boundary_errors() {
     let compatible = ToolPayload::Function {
         arguments: serde_json::json!({
             "cmd": "echo ok", "timeout_ms": 50, "old_option": true, "yield_time_ms": 1,
-        }).to_string(),
+        })
+        .to_string(),
     };
     let parsed = ParsedFunctionArguments::from_payload(&compatible);
     CodeModeArgumentPreflight::default()
@@ -623,12 +721,17 @@ fn verified10_external_names_do_not_inherit_native_argument_exemptions() {
                 "type":"object", "required":["external_id"], "properties":{"external_id":{"type":"string"}},
             })).unwrap(),
         });
-        let payload = ToolPayload::Function { arguments: if name.name == "read_file" {
-            r#"{"path":"native.txt"}"#.into()
-        } else { r#"{"cmd":"echo native"}"#.into() } };
+        let payload = ToolPayload::Function {
+            arguments: if name.name == "read_file" {
+                r#"{"path":"native.txt"}"#.into()
+            } else {
+                r#"{"cmd":"echo native"}"#.into()
+            },
+        };
         let parsed = ParsedFunctionArguments::from_payload(&payload);
         let error = CodeModeArgumentPreflight::default()
-            .validate(&name, &spec, &payload, parsed.as_ref(), false).unwrap_err();
+            .validate(&name, &spec, &payload, parsed.as_ref(), false)
+            .unwrap_err();
         assert!(error.contains("external_id"), "{error}");
     }
 }
@@ -818,7 +921,10 @@ async fn semantic_controls_projection_round_trip() -> std::time::Duration {
     let started = std::time::Instant::now();
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let invocation = test_invocation(
-        Arc::new(session), Arc::new(turn), "semantic-controls", ToolName::plain("semantic_fixture"),
+        Arc::new(session),
+        Arc::new(turn),
+        "semantic-controls",
+        ToolName::plain("semantic_fixture"),
     );
     let value = serde_json::json!({
         "a_payload": (0..1000).map(|i| (format!("field_{i:04}"), Value::from("payload".repeat(20))))
@@ -834,26 +940,52 @@ async fn semantic_controls_projection_round_trip() -> std::time::Duration {
         code_mode_feedback: Vec::new(),
     };
     let mut input = prepare_model_projection(
-        &invocation, &mut result, None, Some(&Default::default()), false, false,
-    ).await.expect("oversized payload requires canonical projection");
+        &invocation,
+        &mut result,
+        None,
+        Some(&Default::default()),
+        false,
+        false,
+    )
+    .await
+    .expect("oversized payload requires canonical projection");
     input.applied_token_limit = 256;
     let codex_home = input.codex_home.clone();
     let thread_id = input.thread_id.clone();
-    let projection = project_model_output(input).await.expect("bounded projection");
+    let projection = project_model_output(input)
+        .await
+        .expect("bounded projection");
     let (header, _) = model_projection_parts(projection.bounded.rendered());
-    assert_eq!(header["complete"], false, "artifact retention is not provider completeness");
+    assert_eq!(
+        header["complete"], false,
+        "artifact retention is not provider completeness"
+    );
     assert_eq!(header["truncated"], true);
     assert_eq!(header["status"], "partial");
     assert_eq!(header["nextCursor"], "remaining-page");
-    let candidate = projection.candidate.as_ref().expect("raw evidence remains recoverable");
+    let candidate = projection
+        .candidate
+        .as_ref()
+        .expect("raw evidence remains recoverable");
     let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
-        &codex_home, &thread_id, &candidate.artifact_id,
-        vec![crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer {
-            pointer: "/a_payload/field_0000".into(),
-        }], true, &tokio_util::sync::CancellationToken::new(),
-    ).await.unwrap();
+        &codex_home,
+        &thread_id,
+        &candidate.artifact_id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer {
+                pointer: "/a_payload/field_0000".into(),
+            },
+        ],
+        true,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(recovered.output.canonical_sha256, candidate.artifact_sha256);
-    assert_eq!(recovered.output.results[0].value.as_ref(), Some(&value["a_payload"]["field_0000"]));
+    assert_eq!(
+        recovered.output.results[0].value.as_ref(),
+        Some(&value["a_payload"]["field_0000"])
+    );
     assert!(recovered.output.complete);
     started.elapsed()
 }
@@ -865,7 +997,10 @@ async fn semantic_controls_survive_registry_projection_and_recovery() {
 
 #[tokio::test]
 #[ignore = "opt-in actual projection/persistence/recovery wall-clock benchmark"]
-#[expect(clippy::print_stdout, reason = "report observed runtime timings without speedup assertions")]
+#[expect(
+    clippy::print_stdout,
+    reason = "report observed runtime timings without speedup assertions"
+)]
 async fn semantic_controls_projection_wall_clock() {
     let mut micros = Vec::new();
     for _ in 0..7 {
@@ -873,7 +1008,10 @@ async fn semantic_controls_projection_wall_clock() {
     }
     let total = micros.iter().sum::<u128>();
     micros.sort_unstable();
-    println!("semantic_projection iterations=7 median_us={} total_us={total} model_requests=0 projection_calls=7 recovery_calls=7", micros[3]);
+    println!(
+        "semantic_projection iterations=7 median_us={} total_us={total} model_requests=0 projection_calls=7 recovery_calls=7",
+        micros[3]
+    );
 }
 
 #[test]
@@ -1486,7 +1624,9 @@ fn projection_owner_recovery_validates_json_pointers_and_combined_identity() {
         validated_predetermined_json_pointers(&too_many[..64], &many_canonical.json_pointers).len(),
         64
     );
-    assert!(validated_predetermined_json_pointers(&too_many, &many_canonical.json_pointers).is_empty());
+    assert!(
+        validated_predetermined_json_pointers(&too_many, &many_canonical.json_pointers).is_empty()
+    );
 
     let (duplicate_ranges, duplicate_pointers) = validated_omitted_predetermined_selectors(
         &[ToolOutputProjectionRange {
@@ -1779,7 +1919,10 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         (150, 151, "line-150\nline-151\n"),
         (299, 300, "line-299\nline-300"),
     ]) {
-        assert_eq!(result["selector"], serde_json::json!({"kind": "lines", "start": start, "end": end}));
+        assert_eq!(
+            result["selector"],
+            serde_json::json!({"kind": "lines", "start": start, "end": end})
+        );
         assert_eq!(result["status"], "ok");
         assert_eq!(result["complete"], true);
         assert_eq!(result["text"], expected);
@@ -1799,8 +1942,6 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         "owner drain must not create a child artifact"
     );
 }
-
-
 
 #[test]
 fn wire_only_receipt_cannot_satisfy_bounds_sensitive_owner_drain() {
@@ -2259,7 +2400,10 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
                 .is_some_and(|extension| extension == "log")
         })
         .count();
-    assert_eq!(log_count, 1, "the carrier must not recursively spill recovered evidence");
+    assert_eq!(
+        log_count, 1,
+        "the carrier must not recursively spill recovered evidence"
+    );
 }
 
 #[test]
@@ -2737,7 +2881,10 @@ async fn incompatible_tool_payload_is_recoverable_without_execution() {
             custom_payload,
             "expected raw text",
         ),
-    ].into_iter().enumerate() {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let registry = ToolRegistry::from_tools([Arc::new(RecoveryFormatHandler {
             spec,
@@ -2970,25 +3117,36 @@ impl CoreToolRuntime for IndependentNameHandler {}
 fn verified10_output_only_changes_invalidate_capability_fingerprint() {
     for namespaced in [false, true] {
         let function = codex_tools::ResponsesApiTool {
-            name: "contract".into(), description: "Contract".into(), strict: false,
-            defer_loading: Some(true), parameters: codex_tools::JsonSchema::default(),
+            name: "contract".into(),
+            description: "Contract".into(),
+            strict: false,
+            defer_loading: Some(true),
+            parameters: codex_tools::JsonSchema::default(),
             output_schema: Some(serde_json::json!({"type":"string"}).into()),
         };
         let spec = if namespaced {
             ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-                name: "provider".into(), description: "Provider".into(),
+                name: "provider".into(),
+                description: "Provider".into(),
                 tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(function)],
             })
-        } else { ToolSpec::Function(function) };
-        let mut registered = RegisteredTool::new(Arc::new(RecoveryFormatHandler {
-            spec, calls: Arc::new(AtomicUsize::new(0)),
-        }), TypedToolClass::DynamicExternal);
+        } else {
+            ToolSpec::Function(function)
+        };
+        let mut registered = RegisteredTool::new(
+            Arc::new(RecoveryFormatHandler {
+                spec,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            TypedToolClass::DynamicExternal,
+        );
         let wire = serde_json::to_value(registered.spec()).unwrap();
         let before = registered.canonical_spec_sha256().to_string();
         let function = match registered.spec_mut() {
             ToolSpec::Function(tool) => tool,
             ToolSpec::Namespace(namespace) => {
-                let codex_tools::ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
+                let codex_tools::ResponsesApiNamespaceTool::Function(tool) =
+                    &mut namespace.tools[0];
                 tool
             }
             _ => unreachable!(),
@@ -3014,48 +3172,89 @@ async fn verified10_external_dispatch_rejects_invalid_and_hook_rewritten_argumen
                     }]
                 }]}})).unwrap();
                 let stack = codex_config::ConfigLayerStack::new(
-                    vec![codex_config::ConfigLayerEntry::new(codex_config::ConfigLayerSource::User {
-                        file: turn.config.codex_home.join("config.toml"), profile: None,
-                    }, layer)], Default::default(), Default::default(),
-                ).unwrap();
-                session.services.hooks.store(Arc::new(codex_hooks::Hooks::new(codex_hooks::HooksConfig {
-                    feature_enabled: true, bypass_hook_trust: true,
-                    config_layer_stack: Some(stack), ..Default::default()
-                })));
+                    vec![codex_config::ConfigLayerEntry::new(
+                        codex_config::ConfigLayerSource::User {
+                            file: turn.config.codex_home.join("config.toml"),
+                            profile: None,
+                        },
+                        layer,
+                    )],
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap();
+                session
+                    .services
+                    .hooks
+                    .store(Arc::new(codex_hooks::Hooks::new(
+                        codex_hooks::HooksConfig {
+                            feature_enabled: true,
+                            bypass_hook_trust: true,
+                            config_layer_stack: Some(stack),
+                            ..Default::default()
+                        },
+                    )));
             }
             let calls = Arc::new(AtomicUsize::new(0));
             let name = ToolName::plain("typed_helper");
             let registry = ToolRegistry::from_tools([Arc::new(RecoveryFormatHandler {
                 spec: ToolSpec::Function(codex_tools::ResponsesApiTool {
-                    name: name.name.clone(), description: "Typed helper".into(), strict: false,
-                    defer_loading: None, output_schema: None,
+                    name: name.name.clone(),
+                    description: "Typed helper".into(),
+                    strict: false,
+                    defer_loading: None,
+                    output_schema: None,
                     parameters: codex_tools::parse_tool_input_schema(&serde_json::json!({
                         "type":"object", "properties":{"path":{"type":"string"}},
                         "required":["path"], "additionalProperties":false,
-                    })).unwrap(),
-                }), calls: Arc::clone(&calls),
+                    }))
+                    .unwrap(),
+                }),
+                calls: Arc::clone(&calls),
             }) as Arc<dyn CoreToolRuntime>]);
-            let mut invocation = test_invocation(Arc::new(session), Arc::new(turn), "invalid-external", name.clone());
+            let mut invocation = test_invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "invalid-external",
+                name.clone(),
+            );
             invocation.payload = ToolPayload::Function {
-                arguments: if rewrite { r#"{"path":"valid"}"# } else { r#"{"path":7}"# }.into(),
+                arguments: if rewrite {
+                    r#"{"path":"valid"}"#
+                } else {
+                    r#"{"path":7}"#
+                }
+                .into(),
             };
             if nested {
                 invocation.source = ToolCallSource::CodeMode {
-                    cell_id: "cell".into(), parent_call_id: None, runtime_tool_call_id: "nested".into(),
-                    nested_deadline: None, cancellation_cause: None,
+                    cell_id: "cell".into(),
+                    parent_call_id: None,
+                    runtime_tool_call_id: "nested".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 };
             }
-            let error = match registry.dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state()).await {
+            let error = match registry
+                .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+                .await
+            {
                 Err(FunctionCallError::RespondToModel(error)) => error,
                 _ => panic!("invalid external arguments must be rejected"),
             };
             assert!(error.contains("argument preflight failed"), "{error}");
             assert_eq!(calls.load(Ordering::Relaxed), 0);
-            assert_eq!(registry.code_mode_argument_preflight_counts(&name), Some((1, if rewrite { 2 } else { 1 })));
+            assert_eq!(
+                registry.code_mode_argument_preflight_counts(&name),
+                Some((1, if rewrite { 2 } else { 1 }))
+            );
             errors.push(error);
         }
     }
-    assert!(errors.windows(2).all(|pair| pair[0] == pair[1]), "{errors:?}");
+    assert!(
+        errors.windows(2).all(|pair| pair[0] == pair[1]),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -3090,42 +3289,68 @@ fn registry_caches_each_runtime_spec_once() {
     assert_eq!(spec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
-
 #[tokio::test]
 async fn callable_alias_executes_same_identity_after_catalog_growth() {
     struct IdentityDelegate;
     impl codex_code_mode::CodeModeSessionDelegate for IdentityDelegate {
-        fn invoke_tool<'a>(&'a self, call: codex_code_mode::CodeModeNestedToolCall,
-            _: codex_code_mode::NestedCancellation) -> codex_code_mode::ToolInvocationFuture<'a> {
+        fn invoke_tool<'a>(
+            &'a self,
+            call: codex_code_mode::CodeModeNestedToolCall,
+            _: codex_code_mode::NestedCancellation,
+        ) -> codex_code_mode::ToolInvocationFuture<'a> {
             Box::pin(async move { Ok(serde_json::json!({"target":call.tool_name.to_string()})) })
         }
-        fn notify<'a>(&'a self, _: String, _: codex_code_mode::CellId, _: String,
-            _: tokio_util::sync::CancellationToken) -> codex_code_mode::NotificationFuture<'a> {
+        fn notify<'a>(
+            &'a self,
+            _: String,
+            _: codex_code_mode::CellId,
+            _: String,
+            _: tokio_util::sync::CancellationToken,
+        ) -> codex_code_mode::NotificationFuture<'a> {
             Box::pin(async { Ok(()) })
         }
         fn cell_closed(&self, _: &codex_code_mode::CellId) {}
     }
-    let service = codex_code_mode::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
-    let specs = [test_spec(&ToolName::plain("read_file")), test_spec(&ToolName::plain("read-file"))];
+    let service =
+        codex_code_mode::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
+    let specs = [
+        test_spec(&ToolName::plain("read_file")),
+        test_spec(&ToolName::plain("read-file")),
+    ];
     for count in [1, 2] {
-        let response = service.execute(codex_code_mode::ExecuteRequest {
-            state_path: None,
-            tool_call_id: format!("alias-{count}"),
-            enabled_tools: codex_tools::collect_code_mode_tool_definitions(&specs[..count]).into(),
-            source: "text(await tools.read_file({}));".into(),
-            yield_time_ms: Some(60_000), max_output_tokens: None, default_tool_timeout_ms: None,
-        }).await.unwrap().initial_response().await.unwrap();
-        let codex_code_mode::RuntimeResponse::Result { error_text: None, content_items, .. } = response else {
+        let response = service
+            .execute(codex_code_mode::ExecuteRequest {
+                state_path: None,
+                tool_call_id: format!("alias-{count}"),
+                enabled_tools: codex_tools::collect_code_mode_tool_definitions(&specs[..count])
+                    .into(),
+                source: "text(await tools.read_file({}));".into(),
+                yield_time_ms: Some(60_000),
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            })
+            .await
+            .unwrap()
+            .initial_response()
+            .await
+            .unwrap();
+        let codex_code_mode::RuntimeResponse::Result {
+            error_text: None,
+            content_items,
+            ..
+        } = response
+        else {
             panic!("alias execution failed: {response:?}");
         };
-        assert!(content_items.iter().any(|item| matches!(item,
+        assert!(
+            content_items.iter().any(|item| matches!(item,
             codex_code_mode::FunctionCallOutputContentItem::InputText { text }
-                if text == "{\"target\":\"read_file\"}")), "{content_items:?}");
+                if text == "{\"target\":\"read_file\"}")),
+            "{content_items:?}"
+        );
     }
     service.shutdown().await.unwrap();
 }
-
-
 
 #[test]
 fn registry_dispatch_identity_is_derived_from_the_cached_spec() {
@@ -3526,8 +3751,6 @@ async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::R
     Ok(())
 }
 
-
-
 #[tokio::test]
 async fn spawn_agent_function_tools_use_agent_matcher_alias() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -3887,7 +4110,12 @@ async fn cancellation_during_projection_does_not_publish_completed_lifecycle() -
     assert_eq!(recovery["kind"], "handler_result");
     assert_eq!(recovery["call_id"], "projection-call");
     assert_eq!(recovery["result"], "ordinary result");
-    assert!(recovery["message"].as_str().unwrap().contains("tool cancelled after runtime cleanup"));
+    assert!(
+        recovery["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool cancelled after runtime cleanup")
+    );
     assert_eq!(
         projection_calls.load(std::sync::atomic::Ordering::Acquire),
         1,
@@ -4041,9 +4269,12 @@ fn invocation_identity_is_order_independent_but_action_sensitive() {
 fn custom_invocation_identity_preserves_raw_text_semantics() {
     let identity = |input: &str| {
         canonical_tool_invocation_sha256(
-            &ToolPayload::Custom { input: input.to_string() },
+            &ToolPayload::Custom {
+                input: input.to_string(),
+            },
             None,
-        ).expect("custom invocation identity")
+        )
+        .expect("custom invocation identity")
     };
     // A custom grammar receives these exact strings, not parsed JSON. A
     // success for one cannot resolve a failure for a different raw request.
@@ -4086,10 +4317,13 @@ fn admission_normalizes_multi_text_output_without_dropping_non_text_content() {
     );
     assert_eq!(
         preserved_non_text_content(&normalized),
-        vec![serde_json::to_value(FunctionCallOutputContentItem::InputImage {
-            image_url: "data:image/png;base64,eA==".to_string(),
-            detail: None,
-        }).expect("image serialization")]
+        vec![
+            serde_json::to_value(FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,eA==".to_string(),
+                detail: None,
+            })
+            .expect("image serialization")
+        ]
     );
 }
 
@@ -4162,8 +4396,16 @@ fn admission_fallback_does_not_retype_structured_tool_search_output() {
 async fn admission_only_projection_preserves_original_response_and_registers_candidate() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
     let mut history = crate::tool_history::ToolHistoryState::default();
-    for (ordinal, outcome) in [ToolOutputOutcome::Failure, ToolOutputOutcome::Skipped,
-        ToolOutputOutcome::Yielded, ToolOutputOutcome::TimedOut, ToolOutputOutcome::Success].into_iter().enumerate() {
+    for (ordinal, outcome) in [
+        ToolOutputOutcome::Failure,
+        ToolOutputOutcome::Skipped,
+        ToolOutputOutcome::Yielded,
+        ToolOutputOutcome::TimedOut,
+        ToolOutputOutcome::Success,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let call_id = format!("outcome-{ordinal}");
         let output = "ordinary inline result\n".repeat(1_000);
         let canonical = CanonicalToolResult::text(output.clone());
@@ -4220,14 +4462,21 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
         assert!(
             candidate
                 .supersession_identity
-                .as_ref().is_some_and(|identity| identity.contains(&invocation_sha256))
+                .as_ref()
+                .is_some_and(|identity| identity.contains(&invocation_sha256))
         );
         candidate.consumed_by_generation = Some(crate::tool_history::ModelGenerationId {
-            turn_id: "turn".into(), ordinal: ordinal as u32,
+            turn_id: "turn".into(),
+            ordinal: ordinal as u32,
         });
         history.register(candidate);
-        assert_eq!(history.phase_checkpoint_receipts(&["outcome-0".into()]).is_ok(),
-            outcome == ToolOutputOutcome::Success, "skipped/yielded must not resolve a failure");
+        assert_eq!(
+            history
+                .phase_checkpoint_receipts(&["outcome-0".into()])
+                .is_ok(),
+            outcome == ToolOutputOutcome::Success,
+            "skipped/yielded must not resolve a failure"
+        );
     }
 }
 
@@ -4245,7 +4494,9 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let visible = "line 0\n[omitted lines 2-399 of 400; artifact_id={cell_output_artifact_id}]\nline 399".to_string();
+    let visible =
+        "line 0\n[omitted lines 2-399 of 400; artifact_id={cell_output_artifact_id}]\nline 399"
+            .to_string();
     let canonical = CanonicalToolResult::text(canonical_text.clone());
     let original_response = ResponseInputItem::CustomToolCallOutput {
         call_id: "exec-call".to_string(),
@@ -4254,7 +4505,8 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     };
     let mut essential_inline = serde_json::json!({"success": true});
     essential_inline[crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY] = Value::Bool(true);
-    essential_inline["cell_output_recovery_selector"] = serde_json::json!({"kind":"lines","start":2,"end":399});
+    essential_inline["cell_output_recovery_selector"] =
+        serde_json::json!({"kind":"lines","start":2,"end":399});
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
         spillable_text: canonical_text.clone(),
@@ -4302,14 +4554,23 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     let (shown, notice) = rendered.rsplit_once('\n').expect("recovery notice line");
     let notice: Value = serde_json::from_str(notice).expect("notice is JSON");
     let candidate = projection.candidate.expect("admission candidate");
-    assert_eq!(shown, visible.replace("{cell_output_artifact_id}", &candidate.artifact_id));
+    assert_eq!(
+        shown,
+        visible.replace("{cell_output_artifact_id}", &candidate.artifact_id)
+    );
     assert_eq!(notice["output_truncated"], true);
     assert_eq!(notice["recovery_tool"], "read_tool_output");
     assert_eq!(notice["artifact_id"], candidate.artifact_id.as_str());
     assert_eq!(notice["recovery"]["tool"], "read_tool_output");
-    assert_eq!(notice["recovery"]["arguments"]["artifact_id"], candidate.artifact_id);
+    assert_eq!(
+        notice["recovery"]["arguments"]["artifact_id"],
+        candidate.artifact_id
+    );
     assert_eq!(notice["recovery_scope"], "omitted_output");
-    assert_eq!(notice["recovery"]["arguments"]["selectors"][0], serde_json::json!({"kind":"lines","start":2,"end":399}));
+    assert_eq!(
+        notice["recovery"]["arguments"]["selectors"][0],
+        serde_json::json!({"kind":"lines","start":2,"end":399})
+    );
     assert_eq!(
         candidate.bounded_model_output, rendered,
         "history must track exactly the text the model received"
@@ -4320,19 +4581,23 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
         "exec-thread",
         &candidate.artifact_id,
         vec![
-            crate::tools::command_output_artifact::ToolOutputSelector::Lines {
-                start: 2,
-                end: 399,
-            },
+            crate::tools::command_output_artifact::ToolOutputSelector::Lines { start: 2, end: 399 },
         ],
         /*code_mode_recovery*/ true,
     )
     .await
     .expect("named artifact is recoverable");
-    let expected = canonical_text.split_inclusive('\n').skip(1).take(398).collect::<String>();
+    let expected = canonical_text
+        .split_inclusive('\n')
+        .skip(1)
+        .take(398)
+        .collect::<String>();
     assert!(recovered.complete);
-    assert_eq!(recovered.results[0].text.as_deref(), Some(expected.as_str()),
-        "the recipe must cover all omitted lines, not just a 200-line prefix");
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some(expected.as_str()),
+        "the recipe must cover all omitted lines, not just a 200-line prefix"
+    );
 }
 
 #[tokio::test]
@@ -4448,15 +4713,25 @@ fn verified_evidence_minimal_projection_keeps_outcome_and_completeness() {
     for outcome in ["failure", "timed_out", "skipped", "success"] {
         for budget in [0, 1, 10] {
             let envelope = ToolProjectionV1 {
-                version:1, tool:"fixture".into(), outcome:outcome.into(),
-                canonical_sha256:"hash".into(), canonical_bytes:10_000,
-                canonical_approximate_tokens:2500, canonical_complete:false,
-                model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
-                sections:vec![], omitted_sections:vec![],
-                result:serde_json::json!({"essential":{"output_complete":false,"process_exited":true}}),
+                version: 1,
+                tool: "fixture".into(),
+                outcome: outcome.into(),
+                canonical_sha256: "hash".into(),
+                canonical_bytes: 10_000,
+                canonical_approximate_tokens: 2500,
+                canonical_complete: false,
+                model_bytes: 0,
+                model_approximate_tokens: 0,
+                artifact_id: Some("retained".into()),
+                sections: vec![],
+                omitted_sections: vec![],
+                result: serde_json::json!({"essential":{"output_complete":false,"process_exited":true}}),
             };
-            let projection = serialize_projection_with_limit(envelope, &"diagnostic ".repeat(1000), budget).unwrap();
-            let header: serde_json::Value = serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
+            let projection =
+                serialize_projection_with_limit(envelope, &"diagnostic ".repeat(1000), budget)
+                    .unwrap();
+            let header: serde_json::Value =
+                serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
             assert_eq!(header["outcome"], outcome);
             assert_eq!(header["output_complete"], false);
             assert_eq!(header["canonical_complete"], false);
@@ -4468,21 +4743,46 @@ fn verified_evidence_minimal_projection_keeps_outcome_and_completeness() {
 #[test]
 fn fitted_fragment_metadata_describes_only_delivered_fragments() {
     let fragments = vec![
-        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "FIRST complete").with_id("first"),
-        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "SECOND diagnostic ".repeat(1000)).with_id("second"),
-        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "THIRD omitted").with_id("third"),
+        ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+            "FIRST complete",
+        )
+        .with_id("first"),
+        ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+            "SECOND diagnostic ".repeat(1000),
+        )
+        .with_id("second"),
+        ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+            "THIRD omitted",
+        )
+        .with_id("third"),
     ];
     let (output, _) = select_typed_projection_fragments(&fragments, 20_000);
     for budget in [128, 256, 512] {
         let envelope = ToolProjectionV1 {
-            version:1, tool:"fixture".into(), outcome:"success".into(),
-            canonical_sha256:"hash".into(), canonical_bytes:output.len() as u64,
-            canonical_approximate_tokens:approx_token_count(&output) as u64, canonical_complete:true,
-            model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
-            sections:fragments.iter().map(|fragment| omitted_projection_section(
-                fragment.id.clone().unwrap(), CanonicalByteRange::new(0, 1))).collect(),
-            omitted_sections:vec![],
-            result:serde_json::json!({"selection":{"origin_call_id":"original", "selected_ids":["stale"]}}),
+            version: 1,
+            tool: "fixture".into(),
+            outcome: "success".into(),
+            canonical_sha256: "hash".into(),
+            canonical_bytes: output.len() as u64,
+            canonical_approximate_tokens: approx_token_count(&output) as u64,
+            canonical_complete: true,
+            model_bytes: 0,
+            model_approximate_tokens: 0,
+            artifact_id: Some("retained".into()),
+            sections: fragments
+                .iter()
+                .map(|fragment| {
+                    omitted_projection_section(
+                        fragment.id.clone().unwrap(),
+                        CanonicalByteRange::new(0, 1),
+                    )
+                })
+                .collect(),
+            omitted_sections: vec![],
+            result: serde_json::json!({"selection":{"origin_call_id":"original", "selected_ids":["stale"]}}),
         };
         let fitted = serialize_projection_fragments(envelope, &output, &fragments, budget).unwrap();
         let envelope = fitted.envelope().unwrap();
@@ -4490,7 +4790,10 @@ fn fitted_fragment_metadata_describes_only_delivered_fragments() {
         assert!(text.contains("FIRST complete") && text.contains("SECOND"));
         assert!(!text.contains("THIRD"));
         let facts = &envelope.result["selection"];
-        assert_eq!(facts["selected_ids"], serde_json::json!(["first","second"]));
+        assert_eq!(
+            facts["selected_ids"],
+            serde_json::json!(["first", "second"])
+        );
         assert_eq!(facts["partial_ids"], serde_json::json!(["second"]));
         assert_eq!(facts["omitted_inline_ids"], serde_json::json!(["third"]));
         assert_eq!(facts["selected_fragments"], 2);
@@ -4505,11 +4808,18 @@ fn compact_projection_distinguishes_display_reduction_from_unavailable_bytes() {
     for retention_limit in [false, true] {
         for budget in [0, 1, 128] {
             let envelope = ToolProjectionV1 {
-                version: 1, tool: "fixture".into(), outcome: "success".into(),
-                canonical_sha256: "hash".into(), canonical_bytes: 10_000,
-                canonical_approximate_tokens: 2500, canonical_complete: true,
-                model_bytes: 0, model_approximate_tokens: 0, artifact_id: Some("retained".into()),
-                sections: vec![], omitted_sections: vec![],
+                version: 1,
+                tool: "fixture".into(),
+                outcome: "success".into(),
+                canonical_sha256: "hash".into(),
+                canonical_bytes: 10_000,
+                canonical_approximate_tokens: 2500,
+                canonical_complete: true,
+                model_bytes: 0,
+                model_approximate_tokens: 0,
+                artifact_id: Some("retained".into()),
+                sections: vec![],
+                omitted_sections: vec![],
                 result: serde_json::json!({"essential": {
                     "output_complete": !retention_limit,
                     "streams_complete": !retention_limit,
@@ -4518,14 +4828,22 @@ fn compact_projection_distinguishes_display_reduction_from_unavailable_bytes() {
                     "raw_output_artifact_retention_limit_reason": if retention_limit { Some("byte_limit") } else { None },
                 }}),
             };
-            let projection = serialize_projection_with_limit(envelope, &"data ".repeat(2000), budget).unwrap();
-            let header: Value = serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
+            let projection =
+                serialize_projection_with_limit(envelope, &"data ".repeat(2000), budget).unwrap();
+            let header: Value =
+                serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
             assert_eq!(header["output_reduced"], true);
             assert_eq!(header["output_complete"], !retention_limit);
             assert_eq!(header["streams_complete"], !retention_limit);
-            assert_eq!(header["raw_output_artifact_retention_limit_hit"], retention_limit);
+            assert_eq!(
+                header["raw_output_artifact_retention_limit_hit"],
+                retention_limit
+            );
             if retention_limit {
-                assert_eq!(header["raw_output_artifact_retention_limit_reason"], "byte_limit");
+                assert_eq!(
+                    header["raw_output_artifact_retention_limit_reason"],
+                    "byte_limit"
+                );
             }
         }
     }
@@ -4584,19 +4902,34 @@ async fn disabled_history_projection_skips_artifacts_for_complete_inline_results
 }
 #[test]
 fn projection_reserves_header_and_advertises_sections_without_recurring_cuts() {
-    let text = (1..=3000).map(|line| format!("unique source line {line}\r\n")).collect::<String>();
+    let text = (1..=3000)
+        .map(|line| format!("unique source line {line}\r\n"))
+        .collect::<String>();
     let envelope = ToolProjectionV1 {
-        version: 1, tool: "exec_command".into(), outcome: "success".into(),
-        canonical_sha256: "hash".into(), canonical_bytes: text.len() as u64,
+        version: 1,
+        tool: "exec_command".into(),
+        outcome: "success".into(),
+        canonical_sha256: "hash".into(),
+        canonical_bytes: text.len() as u64,
         canonical_approximate_tokens: approx_token_count(&text) as u64,
-        canonical_complete: true, model_bytes: 0, model_approximate_tokens: 0,
+        canonical_complete: true,
+        model_bytes: 0,
+        model_approximate_tokens: 0,
         artifact_id: Some("retained-source".into()),
-        sections: vec![omitted_projection_section("output".into(), CanonicalByteRange::new(0, text.len() as u64))],
+        sections: vec![omitted_projection_section(
+            "output".into(),
+            CanonicalByteRange::new(0, text.len() as u64),
+        )],
         omitted_sections: vec!["output".into()],
         result: serde_json::json!({"essential": {"exit_code": 0}}),
     };
-    let fragments = vec![ToolOutputProjectionFragment::new(
-        ToolOutputProjectionFragmentKind::ContextualSpillableText, text.clone()).with_id("output")];
+    let fragments = vec![
+        ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ContextualSpillableText,
+            text.clone(),
+        )
+        .with_id("output"),
+    ];
     let projected = serialize_projection_fragments(envelope, &text, &fragments, 1000).unwrap();
     assert!(approx_token_count(projected.rendered()) <= 1000);
     assert_eq!(projected.rendered().matches("[omitted lines ").count(), 2);
@@ -4608,21 +4941,39 @@ fn projection_reserves_header_and_advertises_sections_without_recurring_cuts() {
 #[tokio::test]
 async fn direct_read_file_page_keeps_original_snapshot_and_complete_json() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "page-budget", ToolName::plain("read_file"));
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "page-budget",
+        ToolName::plain("read_file"),
+    );
     let canonical = CanonicalToolResult::text("unique file line\n".repeat(20_000));
-    for selectors in [None, Some(vec![ToolOutputSelector::Lines { start: 1, end: 20_000 }])] {
-        let (page, continuation) = crate::tools::command_output_artifact::select_file_snapshot(&canonical, selectors).unwrap();
+    for selectors in [
+        None,
+        Some(vec![ToolOutputSelector::Lines {
+            start: 1,
+            end: 20_000,
+        }]),
+    ] {
+        let (page, continuation) =
+            crate::tools::command_output_artifact::select_file_snapshot(&canonical, selectors)
+                .unwrap();
         let mut value = serde_json::to_value(page).unwrap();
         value["path"] = serde_json::json!("source.txt");
         value["continuation"] = serde_json::json!(continuation);
         let output = codex_tools::JsonToolOutput::new(value.clone());
         let mut result = AnyToolResult {
-            call_id: invocation.call_id.clone(), payload: invocation.payload.clone(),
-            result: Box::new(output), model_projection: None, source_dependencies: None,
+            call_id: invocation.call_id.clone(),
+            payload: invocation.payload.clone(),
+            result: Box::new(output),
+            model_projection: None,
+            source_dependencies: None,
             code_mode_feedback: Vec::new(),
         };
         let original = result.response();
-        if let Some(input) = prepare_model_projection(&invocation, &mut result, None, None, false, true).await {
+        if let Some(input) =
+            prepare_model_projection(&invocation, &mut result, None, None, false, true).await
+        {
             assert_eq!(input.applied_token_limit, 10_000);
             result.install_model_projection(project_model_output(input).await, None);
         }
@@ -4644,56 +4995,128 @@ fn verified10_final_registry_budget_preserves_compiler_json_and_central_fix() {
         }
     }).to_string()).collect::<Vec<_>>().join("\r\n");
     let command = ExecCommandToolOutput {
-        output_ranges:None, process_output:None, error:None, validation:None,
-        event_call_id:String::new(), chunk_id:String::new(), wall_time:std::time::Duration::ZERO,
-        raw_output:raw.as_bytes().to_vec(), truncation_policy:TruncationPolicy::Tokens(2000),
-        max_output_tokens:Some(2000), process_id:None, session_capabilities:None,
-        exit_code:Some(1), process_exited:true, search_no_match:false, original_token_count:None,
-        hook_command:Some("cargo check --message-format=json".into()), raw_output_artifact:None,
-        repair_notice:None, pending_deferred_completions:Vec::new(),
+        output_ranges: None,
+        process_output: None,
+        error: None,
+        validation: None,
+        event_call_id: String::new(),
+        chunk_id: String::new(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: raw.as_bytes().to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(2000),
+        max_output_tokens: Some(2000),
+        process_id: None,
+        session_capabilities: None,
+        exit_code: Some(1),
+        process_exited: true,
+        search_no_match: false,
+        original_token_count: None,
+        hook_command: Some("cargo check --message-format=json".into()),
+        raw_output_artifact: None,
+        repair_notice: None,
+        pending_deferred_completions: Vec::new(),
     };
-    let (_, metadata) = command.to_response_item_with_projection_metadata("compiler", &ToolPayload::Function {arguments:"{}".into()});
+    let (_, metadata) = command.to_response_item_with_projection_metadata(
+        "compiler",
+        &ToolPayload::Function {
+            arguments: "{}".into(),
+        },
+    );
     let fragments = metadata.unwrap().fragments;
-    assert!(fragments.iter().any(|fragment| fragment.shell_output.is_some() && fragment.text == raw));
+    assert!(
+        fragments
+            .iter()
+            .any(|fragment| fragment.shell_output.is_some() && fragment.text == raw)
+    );
     let (text, _) = select_typed_projection_fragments(&fragments, usize::MAX);
     for budget in [1400, 1800, 2000] {
         let envelope = ToolProjectionV1 {
-            version:1, tool:"exec_command".into(), outcome:"failure".into(),
-            canonical_sha256:"revision".into(), canonical_bytes:raw.len() as u64,
-            canonical_approximate_tokens:approx_token_count(&raw) as u64, canonical_complete:true,
-            model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
-            sections:vec![omitted_projection_section("output".into(), CanonicalByteRange::new(0, raw.len() as u64))],
-            omitted_sections:vec![], result:serde_json::json!({"essential":{"exit_code":1}, "selection":{}}),
+            version: 1,
+            tool: "exec_command".into(),
+            outcome: "failure".into(),
+            canonical_sha256: "revision".into(),
+            canonical_bytes: raw.len() as u64,
+            canonical_approximate_tokens: approx_token_count(&raw) as u64,
+            canonical_complete: true,
+            model_bytes: 0,
+            model_approximate_tokens: 0,
+            artifact_id: Some("retained".into()),
+            sections: vec![omitted_projection_section(
+                "output".into(),
+                CanonicalByteRange::new(0, raw.len() as u64),
+            )],
+            omitted_sections: vec![],
+            result: serde_json::json!({"essential":{"exit_code":1}, "selection":{}}),
         };
-        let projected = serialize_projection_fragments(envelope, &text, &fragments, budget).unwrap();
+        let projected =
+            serialize_projection_fragments(envelope, &text, &fragments, budget).unwrap();
         assert!(approx_token_count(projected.rendered()) <= budget);
-        let selected = projected.envelope().unwrap().result["selected_text"].as_str().unwrap();
-        let summary: Value = selected.lines().find_map(|line| serde_json::from_str::<Value>(line).ok()
-            .filter(|value| value["format"] == "compiler_diagnostics")).expect("complete compiler JSON");
-        let error = summary["diagnostics"].as_array().unwrap().iter().find(|item|
-            item["diagnostic"]["level"] == "error").expect("central error");
+        let selected = projected.envelope().unwrap().result["selected_text"]
+            .as_str()
+            .unwrap();
+        let summary: Value = selected
+            .lines()
+            .find_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .filter(|value| value["format"] == "compiler_diagnostics")
+            })
+            .expect("complete compiler JSON");
+        let error = summary["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["diagnostic"]["level"] == "error")
+            .expect("central error");
         assert_eq!(error["diagnostic"]["message"], "UNIQUE_ACTIONABLE_MIDDLE");
-        assert_eq!(error["diagnostic"]["spans"][0]["suggested_replacement"], "required.into()");
+        assert_eq!(
+            error["diagnostic"]["spans"][0]["suggested_replacement"],
+            "required.into()"
+        );
     }
 }
 
 #[tokio::test]
 async fn verified10_undrained_exited_command_is_not_admitted_for_retirement() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "undrained", ToolName::plain("exec"));
-    for (exited, complete, owns_work) in [(false, false, true), (true, false, true), (true, true, false)] {
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "undrained",
+        ToolName::plain("exec"),
+    );
+    for (exited, complete, owns_work) in [
+        (false, false, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
         let state = serde_json::json!({"session_id":42, "process_exited":exited, "output_complete":complete,
             "session_capabilities":{"polling":true,"incarnation":"owned"}});
-        assert_eq!(crate::tools::code_mode::command_owns_work(&state), owns_work);
-        let mut output = crate::tools::context::FunctionToolOutput::from_text("pending pipe evidence".repeat(100), Some(true));
-        output.essential_inline.insert("nested_commands".into(), serde_json::json!([state]));
+        assert_eq!(
+            crate::tools::code_mode::command_owns_work(&state),
+            owns_work
+        );
+        let mut output = crate::tools::context::FunctionToolOutput::from_text(
+            "pending pipe evidence".repeat(100),
+            Some(true),
+        );
+        output
+            .essential_inline
+            .insert("nested_commands".into(), serde_json::json!([state]));
         let mut result = AnyToolResult {
-            call_id:invocation.call_id.clone(), payload:invocation.payload.clone(), result:Box::new(output),
-            model_projection:None, source_dependencies:None, code_mode_feedback:Vec::new(),
+            call_id: invocation.call_id.clone(),
+            payload: invocation.payload.clone(),
+            result: Box::new(output),
+            model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: Vec::new(),
         };
-        let input = prepare_model_projection(&invocation, &mut result, None, None, false, true).await;
+        let input =
+            prepare_model_projection(&invocation, &mut result, None, None, false, true).await;
         assert_eq!(input.is_none(), owns_work);
-        let response = result.result.to_response_item(&invocation.call_id, &invocation.payload);
+        let response = result
+            .result
+            .to_response_item(&invocation.call_id, &invocation.payload);
         assert!(consolidated_history_output_text(&response).contains("pending pipe evidence"));
     }
 }
@@ -4717,4 +5140,3 @@ fn continuity_delivery_status_survives_output_wrappers_and_serialization() {
     assert!(is_model_delivery_unavailable_receipt(&restored, "call"));
     assert!(!is_model_delivery_unavailable_receipt(&restored, "other"));
 }
-

@@ -313,25 +313,50 @@ mod tests {
         impl crate::auth::AuthProvider for NoAuth {
             fn add_auth_headers(&self, _: &mut HeaderMap) {}
         }
-        let session = EndpointSession::new(PendingHeaders, Provider {
-            name: "local probe".into(), base_url: "http://127.0.0.1".into(),
-            query_params: None, headers: HeaderMap::new(),
-            retry: crate::provider::RetryConfig {
-                max_retries: 0, base_delay: std::time::Duration::ZERO,
-                retry_429: false, retry_5xx: false, retry_transport: false,
+        let session = EndpointSession::new(
+            PendingHeaders,
+            Provider {
+                name: "local probe".into(),
+                base_url: "http://127.0.0.1".into(),
+                query_params: None,
+                headers: HeaderMap::new(),
+                retry: crate::provider::RetryConfig {
+                    max_retries: 0,
+                    base_delay: std::time::Duration::ZERO,
+                    retry_429: false,
+                    retry_5xx: false,
+                    retry_transport: false,
+                },
+                stream_idle_timeout: std::time::Duration::from_millis(50),
             },
-            stream_idle_timeout: std::time::Duration::from_millis(50),
-        }, Arc::new(NoAuth));
-        let result = tokio::time::timeout(std::time::Duration::from_millis(75),
-            session.stream_encoded_json_with(Method::POST, "responses", HeaderMap::new(), None, |_| {})).await;
+            Arc::new(NoAuth),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(75),
+            session.stream_encoded_json_with(
+                Method::POST,
+                "responses",
+                HeaderMap::new(),
+                None,
+                |_| {},
+            ),
+        )
+        .await;
         let bounded = matches!(result, Ok(Err(ApiError::ProviderFailure { code, .. }))
             if code.as_deref() == Some("response_header_timeout"));
-        let result = format!("latency_edge headers: configured_budget_ms=50 externally_stopped_ms=75 deadline_applied={bounded}\n");
+        let result = format!(
+            "latency_edge headers: configured_budget_ms=50 externally_stopped_ms=75 deadline_applied={bounded}\n"
+        );
         eprint!("{result}");
         if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
             use std::io::Write;
-            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
-                .write_all(result.as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(result.as_bytes())
+                .unwrap();
         }
     }
 
@@ -348,7 +373,9 @@ mod tests {
                 Box::pin(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                        return Err(crate::auth::AuthError::Transient("credentials unavailable".into()));
+                        return Err(crate::auth::AuthError::Transient(
+                            "credentials unavailable".into(),
+                        ));
                     }
                     Ok(request)
                 })
@@ -371,19 +398,31 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let auth = Arc::new(DelayedAuth(AtomicUsize::new(0)));
-        let session = EndpointSession::new(ImmediateHeaders(calls.clone()), Provider {
-            name: "auth retry probe".into(), base_url: "http://127.0.0.1".into(),
-            query_params: None, headers: HeaderMap::new(),
-            retry: crate::provider::RetryConfig {
-                max_retries: 1, base_delay: Duration::from_millis(100),
-                retry_429: false, retry_5xx: false, retry_transport: true,
+        let session = EndpointSession::new(
+            ImmediateHeaders(calls.clone()),
+            Provider {
+                name: "auth retry probe".into(),
+                base_url: "http://127.0.0.1".into(),
+                query_params: None,
+                headers: HeaderMap::new(),
+                retry: crate::provider::RetryConfig {
+                    max_retries: 1,
+                    base_delay: Duration::from_millis(100),
+                    retry_429: false,
+                    retry_5xx: false,
+                    retry_transport: true,
+                },
+                stream_idle_timeout: Duration::from_millis(50),
             },
-            stream_idle_timeout: Duration::from_millis(50),
-        }, auth.clone());
-        let result = session.stream_encoded_json_with(
-            Method::POST, "responses", HeaderMap::new(), None, |_| {},
-        ).await;
-        assert!(result.is_ok(), "authentication/backoff are not response silence");
+            auth.clone(),
+        );
+        let result = session
+            .stream_encoded_json_with(Method::POST, "responses", HeaderMap::new(), None, |_| {})
+            .await;
+        assert!(
+            result.is_ok(),
+            "authentication/backoff are not response silence"
+        );
         assert_eq!(auth.0.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -467,7 +506,10 @@ mod tests {
                 assert_eq!(started.elapsed(), Duration::from_millis(50));
             } else if delay == Some(Duration::ZERO) {
                 let error = result.err().expect("concrete transport timeout");
-                assert!(matches!(&error, ApiError::Transport(TransportError::Timeout)));
+                assert!(matches!(
+                    &error,
+                    ApiError::Transport(TransportError::Timeout)
+                ));
                 assert!(crate::api_bridge::map_api_error(error).is_retryable());
                 assert_eq!(started.elapsed(), Duration::ZERO);
             } else {

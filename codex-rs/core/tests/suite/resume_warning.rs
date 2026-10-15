@@ -214,7 +214,10 @@ async fn resumed_model_difference_uses_model_switch_context_without_legacy_warni
     assert_eq!(request.body_json()["model"].as_str(), Some("gpt-5.4"));
     let developer_texts = request.message_input_texts("developer");
     assert_eq!(
-        developer_texts.iter().filter(|text| text.contains("<model_switch>")).count(),
+        developer_texts
+            .iter()
+            .filter(|text| text.contains("<model_switch>"))
+            .count(),
         1
     );
     assert!(

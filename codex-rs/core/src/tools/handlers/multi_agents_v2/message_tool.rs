@@ -43,8 +43,32 @@ impl MessageDeliveryMode {
 /// Input for the MultiAgentV2 `send_message` tool.
 pub(crate) struct SendMessageArgs {
     pub(crate) target: Option<String>,
+    /// `spawn_agent` names this same value `task_name` in both its arguments
+    /// and its result, so a caller forwarding that field is reading this API as
+    /// written. Rejecting it failed the whole exec cell, including work the cell
+    /// had already completed, over a spelling.
+    pub(crate) task_name: Option<String>,
     pub(crate) targets: Option<Vec<String>>,
     pub(crate) message: String,
+}
+
+impl SendMessageArgs {
+    /// The single recipient, under either accepted name.
+    ///
+    /// Supplying both is only an error when they disagree: the caller then has
+    /// two different recipients in mind and the tool must not guess.
+    fn single_target(&self) -> Result<Option<String>, FunctionCallError> {
+        match (self.target.as_deref(), self.task_name.as_deref()) {
+            (Some(target), Some(task_name)) if target != task_name => {
+                Err(FunctionCallError::RespondToModel(format!(
+                    "`target` ({target}) and `task_name` ({task_name}) name different recipients; supply one."
+                )))
+            }
+            (Some(target), _) => Ok(Some(target.to_string())),
+            (None, Some(task_name)) => Ok(Some(task_name.to_string())),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +102,8 @@ impl SendMessageHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let arguments = function_arguments(invocation.payload.clone())?;
         let args: SendMessageArgs = parse_arguments(&arguments)?;
-        match (args.target, args.targets) {
+        let target = args.single_target()?;
+        match (target, args.targets) {
             (Some(target), None) => handle_message_string_tool(
                 invocation,
                 MessageDeliveryMode::QueueOnly,
@@ -121,7 +146,8 @@ impl SendMessageHandler {
                 )))
             }
             _ => Err(FunctionCallError::RespondToModel(
-                "Provide exactly one of `target` or a non-empty `targets` list.".to_string(),
+                "Provide exactly one of `target` (or its alias `task_name`) or a non-empty `targets` list."
+                    .to_string(),
             )),
         }
     }

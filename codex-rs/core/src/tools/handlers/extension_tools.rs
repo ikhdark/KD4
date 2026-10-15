@@ -277,7 +277,8 @@ mod tests {
                     "unvalidated_replacement"
                 } else {
                     "extension_text"
-                }.to_string(),
+                }
+                .to_string(),
                 description: "Accept a raw greeting.".to_string(),
                 format: codex_tools::FreeformToolFormat {
                     r#type: "grammar".to_string(),
@@ -290,8 +291,10 @@ mod tests {
         fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
             Box::pin(async move {
                 *self.captured.lock().await = Some(call);
-                Ok(Box::new(codex_tools::JsonToolOutput::new(json!({"ok": true})))
-                    as Box<dyn codex_tools::ToolOutput>)
+                Ok(
+                    Box::new(codex_tools::JsonToolOutput::new(json!({"ok": true})))
+                        as Box<dyn codex_tools::ToolOutput>,
+                )
             })
         }
     }
@@ -310,17 +313,23 @@ mod tests {
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
         let turn = Arc::new(turn);
         let step = StepContext::for_test(Arc::clone(&turn));
-        let router = ToolRouter::from_context(step.as_ref(), ToolRouterParams {
-            tool_suggest_candidates: None,
-            mcp_tools: None,
-            deferred_mcp_tools: None,
-            extension_tool_executors: vec![executor],
-            dynamic_tools: &[],
-            exposure_identity: Default::default(),
-        }, &Default::default());
+        let router = ToolRouter::from_context(
+            step.as_ref(),
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                extension_tool_executors: vec![executor],
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &Default::default(),
+        );
         let name = codex_tools::ToolName::plain("extension_text");
         assert!(router.has_registered_tool(&name));
-        assert!(!router.has_registered_tool(&codex_tools::ToolName::plain("unvalidated_replacement")));
+        assert!(
+            !router.has_registered_tool(&codex_tools::ToolName::plain("unvalidated_replacement"))
+        );
         assert!(router.model_visible_specs().iter().any(|spec| {
             matches!(spec, codex_tools::ToolSpec::Freeform(tool) if tool.name == "extension_text")
         }));
@@ -328,32 +337,61 @@ mod tests {
         // JSON calls must not reach a raw-text executor despite being schema-valid JSON.
         let state = Arc::new(ToolDispatchState::new());
         assert!(state.try_admit());
-        let wrong_kind = router.dispatch_tool_call_with_terminal_outcome(
-            Arc::clone(&session), Arc::clone(&step), tokio_util::sync::CancellationToken::new(),
-            Arc::new(Mutex::new(TurnDiffTracker::new())),
-            crate::tools::router::ToolCall {
-                tool_name: name.clone(), call_id: "wrong-kind".into(),
-                payload: ToolPayload::Function { arguments: "{}".into() },
-            }, ToolCallSource::Direct, state,
-        ).await;
-        assert!(matches!(wrong_kind, Err(crate::FunctionCallError::RespondToModel(message))
-            if message.contains("incompatible payload")));
+        let wrong_kind = router
+            .dispatch_tool_call_with_terminal_outcome(
+                Arc::clone(&session),
+                Arc::clone(&step),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(Mutex::new(TurnDiffTracker::new())),
+                crate::tools::router::ToolCall {
+                    tool_name: name.clone(),
+                    call_id: "wrong-kind".into(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".into(),
+                    },
+                },
+                ToolCallSource::Direct,
+                state,
+            )
+            .await;
+        assert!(
+            matches!(wrong_kind, Err(crate::FunctionCallError::RespondToModel(message))
+            if message.contains("incompatible payload"))
+        );
         assert!(captured.lock().await.is_none());
         let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
-            id: None, status: None, call_id: "raw-extension".into(),
-            name: name.name.clone(), namespace: None, input: "hello".into(),
+            id: None,
+            status: None,
+            call_id: "raw-extension".into(),
+            name: name.name.clone(),
+            namespace: None,
+            input: "hello".into(),
             internal_chat_message_metadata_passthrough: None,
-        }).expect("custom response decodes").expect("custom tool call");
+        })
+        .expect("custom response decodes")
+        .expect("custom tool call");
         let state = Arc::new(ToolDispatchState::new());
         assert!(state.try_admit());
-        router.dispatch_tool_call_with_terminal_outcome(
-            session, step, tokio_util::sync::CancellationToken::new(),
-            Arc::new(Mutex::new(TurnDiffTracker::new())), call,
-            ToolCallSource::Direct, state,
-        ).await.expect("advertised freeform contract must reach its executor");
+        router
+            .dispatch_tool_call_with_terminal_outcome(
+                session,
+                step,
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+                state,
+            )
+            .await
+            .expect("advertised freeform contract must reach its executor");
         let captured = captured.lock().await.take().expect("extension was invoked");
         assert_eq!(captured.tool_name, name);
-        assert_eq!(captured.payload, ToolPayload::Custom { input: "hello".into() });
+        assert_eq!(
+            captured.payload,
+            ToolPayload::Custom {
+                input: "hello".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -579,7 +617,8 @@ mod tests {
         )
         .expect("function extension should be discoverable");
 
-        let codex_tools::LoadableToolSpec::Function(discovered) = search_info.entry.output.as_ref() else {
+        let codex_tools::LoadableToolSpec::Function(discovered) = search_info.entry.output.as_ref()
+        else {
             panic!("expected a function search result");
         };
         assert_eq!(discovered.description, "schema snapshot 0");

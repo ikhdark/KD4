@@ -214,6 +214,22 @@ class SessionDiagnosticsTest(unittest.TestCase):
                     "terminalModelMs", "inputEstimateAbsoluteErrorTokens"):
             self.assertIsNone(metrics[key], key)
 
+    def test_null_request_token_categories_leave_calibration_unavailable(self):
+        # Saved 2026-10-09 rollouts record `"requestTokenCategories": null`.
+        timing = {
+            "counters": {"toolCallCount": 2, "toolOutputTruncationCount": 1,
+                         "truncationInducedContinuationCount": 0},
+            "toolClosure": {"complete": True},
+            "toolCalls": [{"callId": "parent", "source": "direct"},
+                          {"callId": "child", "source": "code_mode", "parentCallId": "parent"}],
+            "modelRequests": [{"generationIndex": 0, "generationPurpose": "terminal",
+                               "modelStreamWaitNs": 5_000_000, "requestTokenCategories": None}],
+        }
+        turn = {"requestRetention": {"complete": True}}
+        metrics = diagnostics._turn_metrics({"timing": timing}, turn, {}, {})["metrics"]
+        self.assertIsNone(metrics["inputEstimateAbsoluteErrorTokens"])
+        self.assertEqual(metrics["terminalModelMs"], 5)
+
     def test_nonprogress_fallback_requires_complete_explicit_observations(self):
         timing = _timing()
         timing.pop("observationalNonprogressLatency")

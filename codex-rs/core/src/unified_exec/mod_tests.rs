@@ -228,15 +228,25 @@ async fn exec_argv(
 async fn unified_exec_spawn_reuses_dispatch_workspace_baseline() {
     let (session, turn) = test_session_and_turn().await;
     let workspace = tempfile::tempdir().unwrap();
-    assert!(tokio::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(workspace.path())
-        .status().await.unwrap().success());
+    assert!(
+        tokio::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace.path())
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
     let cwd = dunce::canonicalize(workspace.path()).unwrap();
-    let tracker = Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new()));
+    let tracker = Arc::new(tokio::sync::Mutex::new(
+        crate::turn_diff_tracker::TurnDiffTracker::new(),
+    ));
     let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
     assert!(batch.register_call("call"));
-    tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+    tracker
+        .lock()
+        .await
+        .activate_workspace_evidence_generation_batch(&batch);
     let cache = &session.services.git_workspace;
     let baseline = cache.workspace_evidence_identity(&cwd).await;
     assert!(baseline.is_some());
@@ -254,12 +264,23 @@ async fn unified_exec_spawn_reuses_dispatch_workspace_baseline() {
         Some(tracker),
     ).await.unwrap();
     let captures_after_spawn = cache.workspace_evidence_capture_count();
-    session.services.unified_exec_manager.terminate_all_processes().await;
+    session
+        .services
+        .unified_exec_manager
+        .terminate_all_processes()
+        .await;
 
     assert!(output.process_id.is_some(), "fixture must still be running");
-    assert_eq!(std::fs::read_to_string(cwd.join("sentinel.txt")).unwrap().trim(), "started");
-    assert_eq!(captures_after_spawn, captures_before,
-        "the production spawn path must reuse the dispatch baseline");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("sentinel.txt"))
+            .unwrap()
+            .trim(),
+        "started"
+    );
+    assert_eq!(
+        captures_after_spawn, captures_before,
+        "the production spawn path must reuse the dispatch baseline"
+    );
 }
 
 #[cfg(windows)]
@@ -270,7 +291,11 @@ async fn capacity_rejection_does_not_launch_sentinel_command() {
     let process = super::process_tests::remote_process(WriteStatus::Accepted, None).await;
     for id in 0..MAX_UNIFIED_EXEC_PROCESSES as u32 {
         super::process_tests::store_process_for_test(
-            manager, &session, &turn, id, Arc::clone(&process),
+            manager,
+            &session,
+            &turn,
+            id,
+            Arc::clone(&process),
         )
         .await;
     }
@@ -278,23 +303,49 @@ async fn capacity_rejection_does_not_launch_sentinel_command() {
     let sentinel = workspace.path().join("sentinel.txt");
     let command = "[IO.File]::WriteAllText((Join-Path (Get-Location) 'sentinel.txt'), 'started')";
     let error = exec_command_with_tty(
-        &session, &turn, command, 30_000, Some(workspace.path().to_path_buf()), false,
+        &session,
+        &turn,
+        command,
+        30_000,
+        Some(workspace.path().to_path_buf()),
+        false,
     )
     .await
     .expect_err("full capacity must reject before launch");
-    assert!(error.to_string().contains("command was not started"), "{error}");
-    assert!(!sentinel.exists(), "rejected command must have no external effect");
-    assert!(!process.has_exited(), "admission must not terminate existing work");
+    assert!(
+        error.to_string().contains("command was not started"),
+        "{error}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "rejected command must have no external effect"
+    );
+    assert!(
+        !process.has_exited(),
+        "admission must not terminate existing work"
+    );
 
     manager.release_process_id(0).await;
     let result = exec_command_with_tty(
-        &session, &turn, command, 30_000, Some(workspace.path().to_path_buf()), false,
+        &session,
+        &turn,
+        command,
+        30_000,
+        Some(workspace.path().to_path_buf()),
+        false,
     )
     .await
     .expect("freed slot admits the same command");
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "started");
-    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .reserved_process_slots
+            .is_empty()
+    );
 }
 
 struct BlockingTerminateExecProcess {
@@ -630,10 +681,9 @@ async fn a_poll_queued_past_its_nested_budget_yields_instead_of_failing() -> any
     );
     assert!(!output.process_exited);
     assert!(
-        output
-            .repair_notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("queued") && notice.contains("No input was requested")),
+        output.repair_notice.as_deref().is_some_and(
+            |notice| notice.contains("queued") && notice.contains("No input was requested")
+        ),
         "the model needs to know the poll never reached the process: {:?}",
         output.repair_notice
     );
@@ -672,7 +722,8 @@ async fn an_empty_poll_on_a_validation_launch_waits_the_requested_yield() -> any
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_until_output_poll_on_a_validation_launch_waits_the_requested_yield() -> anyhow::Result<()> {
+async fn an_until_output_poll_on_a_validation_launch_waits_the_requested_yield()
+-> anyhow::Result<()> {
     validation_poll_waits_the_requested_yield(true).await
 }
 
@@ -698,14 +749,18 @@ async fn validation_poll_waits_the_requested_yield(until_output: bool) -> anyhow
     emit_burst_then_go_silent(&process, Duration::from_secs(1));
     let started_at = Instant::now();
     let output = if until_output {
-        session.services.unified_exec_manager.write_stdin_until_output(WriteStdinRequest {
-            process_id,
-            input: "",
-            yield_time_ms: 20_000,
-            max_output_tokens: None,
-            truncation_policy: TruncationPolicy::Tokens(10_000),
-            nested_deadline: None,
-        }).await?
+        session
+            .services
+            .unified_exec_manager
+            .write_stdin_until_output(WriteStdinRequest {
+                process_id,
+                input: "",
+                yield_time_ms: 20_000,
+                max_output_tokens: None,
+                truncation_policy: TruncationPolicy::Tokens(10_000),
+                nested_deadline: None,
+            })
+            .await?
     } else {
         write_stdin(&session, process_id, "", /*yield_time_ms*/ 20_000).await?
     };
@@ -918,7 +973,10 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
         Instant::now().saturating_duration_since(started_at),
         Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
     );
-    assert_eq!(output.wall_time, Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS));
+    assert_eq!(
+        output.wall_time,
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
+    );
     assert!(output.raw_output.is_empty());
     assert_eq!(output.process_id, Some(process_id));
     assert_eq!(output.exit_code, None);
@@ -952,7 +1010,10 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
-    for chunks in [vec![b"b".as_slice(), b"c".as_slice()], vec![b"bc".as_slice()]] {
+    for chunks in [
+        vec![b"b".as_slice(), b"c".as_slice()],
+        vec![b"bc".as_slice()],
+    ] {
         let mut buffer = HeadTailBuffer::default();
         buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
         for chunk in chunks {
@@ -1555,7 +1616,18 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
         .set(codex_protocol::protocol::AskForApproval::Never)?;
     let none = CancellationToken::new();
     // Warm the executor-readiness floor and the process cache.
-    exec_argv(&session, &turn, cmd("echo warm"), "warm", 10_000, None, false, None, &none).await?;
+    exec_argv(
+        &session,
+        &turn,
+        cmd("echo warm"),
+        "warm",
+        10_000,
+        None,
+        false,
+        None,
+        &none,
+    )
+    .await?;
     raw(&cmd("echo warm")).await;
 
     for tty in [false, true] {
@@ -1564,18 +1636,33 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
         for _ in 0..20 {
             raw_samples.push(raw(&command).await);
             let started = Instant::now();
-            let result =
-                exec_argv(&session, &turn, command.clone(), "short", 10_000, None, tty, None, &none)
-                    .await?;
+            let result = exec_argv(
+                &session,
+                &turn,
+                command.clone(),
+                "short",
+                10_000,
+                None,
+                tty,
+                None,
+                &none,
+            )
+            .await?;
             harness.push(started.elapsed());
             reported.push(result.wall_time);
             assert_eq!(result.exit_code, Some(0));
             assert!(result.process_id.is_none());
-            assert!(result.truncated_output(TEST_MAX_OUTPUT_TOKENS).contains("short"));
+            assert!(
+                result
+                    .truncated_output(TEST_MAX_OUTPUT_TOKENS)
+                    .contains("short")
+            );
         }
         eprintln!(
             "BENCH short tty={tty}: harness={:.1}ms raw={:.1}ms reported_wall={:.1}ms",
-            ms(median(harness)), ms(median(raw_samples)), ms(median(reported)),
+            ms(median(harness)),
+            ms(median(raw_samples)),
+            ms(median(reported)),
         );
     }
 
@@ -1585,16 +1672,26 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
     for _ in 0..10 {
         raw_samples.push(raw(&command).await);
         let started = Instant::now();
-        let result =
-            exec_argv(&session, &turn, command.clone(), "stored", 10_000, None, false, None, &none)
-                .await?;
+        let result = exec_argv(
+            &session,
+            &turn,
+            command.clone(),
+            "stored",
+            10_000,
+            None,
+            false,
+            None,
+            &none,
+        )
+        .await?;
         harness.push(started.elapsed());
         assert_eq!(result.exit_code, Some(0));
         assert!(result.process_id.is_none());
     }
     eprintln!(
         "BENCH short-stored: harness={:.1}ms raw={:.1}ms",
-        ms(median(harness)), ms(median(raw_samples)),
+        ms(median(harness)),
+        ms(median(raw_samples)),
     );
 
     let command = cmd("ping -n 3 127.0.0.1 >nul & echo done");
@@ -1602,27 +1699,47 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
     for _ in 0..3 {
         raw_samples.push(raw(&command).await);
         let started = Instant::now();
-        let result =
-            exec_argv(&session, &turn, command.clone(), "long", 10_000, None, false, None, &none)
-                .await?;
+        let result = exec_argv(
+            &session,
+            &turn,
+            command.clone(),
+            "long",
+            10_000,
+            None,
+            false,
+            None,
+            &none,
+        )
+        .await?;
         harness.push(started.elapsed());
         assert_eq!(result.exit_code, Some(0));
         assert!(result.process_id.is_none());
     }
     eprintln!(
         "BENCH long: harness={:.1}ms raw={:.1}ms",
-        ms(median(harness)), ms(median(raw_samples)),
+        ms(median(harness)),
+        ms(median(raw_samples)),
     );
 
-    let command =
-        cmd("echo one & ping -n 2 127.0.0.1 >nul & echo two & ping -n 2 127.0.0.1 >nul & echo three");
+    let command = cmd(
+        "echo one & ping -n 2 127.0.0.1 >nul & echo two & ping -n 2 127.0.0.1 >nul & echo three",
+    );
     let (mut harness, mut raw_samples) = (Vec::new(), Vec::new());
     for _ in 0..3 {
         raw_samples.push(raw(&command).await);
         let started = Instant::now();
-        let mut result =
-            exec_argv(&session, &turn, command.clone(), "stream", 500, None, false, None, &none)
-                .await?;
+        let mut result = exec_argv(
+            &session,
+            &turn,
+            command.clone(),
+            "stream",
+            500,
+            None,
+            false,
+            None,
+            &none,
+        )
+        .await?;
         let mut output = result.truncated_output(TEST_MAX_OUTPUT_TOKENS);
         while let Some(process_id) = result.process_id {
             result = write_stdin(&session, process_id, "", 5_000).await?;
@@ -1637,14 +1754,25 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
     }
     eprintln!(
         "BENCH stream+poll: harness={:.1}ms raw={:.1}ms",
-        ms(median(harness)), ms(median(raw_samples)),
+        ms(median(harness)),
+        ms(median(raw_samples)),
     );
 
     let mut cancel_to_return = Vec::new();
     for _ in 0..3 {
         let cancel = CancellationToken::new();
         let (result, cancelled_at) = tokio::join!(
-            exec_argv(&session, &turn, cmd("ping -n 30 127.0.0.1"), "cancel", 10_000, None, false, None, &cancel),
+            exec_argv(
+                &session,
+                &turn,
+                cmd("ping -n 30 127.0.0.1"),
+                "cancel",
+                10_000,
+                None,
+                false,
+                None,
+                &cancel
+            ),
             async {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 cancel.cancel();
@@ -1655,7 +1783,10 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
         assert!(result.is_err(), "cancelled command must not report success");
     }
     assert!(session.list_background_terminals().await.is_empty());
-    eprintln!("BENCH cancel->return: {:.1}ms", ms(median(cancel_to_return)));
+    eprintln!(
+        "BENCH cancel->return: {:.1}ms",
+        ms(median(cancel_to_return))
+    );
     Ok(())
 }
 
@@ -1841,7 +1972,10 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     // Lift the pause only after the command process has exited. Three seconds
     // outlasts even the cold Windows executor's 2s floor on this 250ms request;
     // a 1s child could finish before an unpaused yield and falsely pass.
-    assert!(clamp_yield_time(250) < 3_000, "fixture must outlast the effective yield");
+    assert!(
+        clamp_yield_time(250) < 3_000,
+        "fixture must outlast the effective yield"
+    );
     let release = tokio::spawn(async move {
         let pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -1876,11 +2010,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
         pid_path.to_string_lossy().replace('\'', "''")
     );
     let response = exec_command(
-        &session,
-        &turn,
-        &command,
-        /*yield_time_ms*/ 250,
-        /*workdir*/ None,
+        &session, &turn, &command, /*yield_time_ms*/ 250, /*workdir*/ None,
     )
     .await?;
     let responded_at = Instant::now();
@@ -2001,9 +2131,12 @@ async fn reusing_completed_process_replays_its_finished_response() -> anyhow::Re
     assert_eq!(replay.process_id, None);
     assert_eq!(replay.exit_code, Some(0));
     assert!(replay.process_exited);
-    assert_eq!(replay.code_mode_result(&crate::tools::context::ToolPayload::Function {
-        arguments: "{}".into(),
-    })["output_complete"], true);
+    assert_eq!(
+        replay.code_mode_result(&crate::tools::context::ToolPayload::Function {
+            arguments: "{}".into(),
+        })["output_complete"],
+        true
+    );
     assert!(String::from_utf8_lossy(&replay.raw_output).contains("final-output-preserved"));
 
     assert!(

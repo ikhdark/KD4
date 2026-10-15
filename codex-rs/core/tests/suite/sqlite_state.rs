@@ -377,8 +377,11 @@ async fn resume_quarantines_invalid_dynamic_tools_from_rollout() -> Result<()> {
         })]
     );
     assert_eq!(
-        requests[1].message_input_texts("user")
-            .iter().filter(|text| text.as_str() == "persist this thread").count(),
+        requests[1]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.as_str() == "persist this thread")
+            .count(),
         1
     );
 
@@ -482,7 +485,10 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
     assert_eq!(metadata.id, thread_id);
     assert_eq!(metadata.rollout_path, rollout_path.to_path_buf());
     assert_eq!(metadata.model_provider, default_provider);
-    assert_eq!(metadata.first_user_message.as_deref(), Some("hello from backfill"));
+    assert_eq!(
+        metadata.first_user_message.as_deref(),
+        Some("hello from backfill")
+    );
 
     Ok(())
 }

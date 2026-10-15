@@ -1,8 +1,8 @@
+use sha2::Digest;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
-use sha2::Digest;
 
 use codex_analytics::TurnProfile;
 use codex_protocol::items::AgentMessageItem;
@@ -68,13 +68,17 @@ async fn timing_storage_deadline_preserves_inline_details_and_creation_owner() {
     let artifact = tokio::spawn(async move {
         held.await.unwrap();
         finished.send(()).unwrap();
-        crate::tools::command_output_artifact::RawOutputArtifact::unavailable("test storage unavailable")
+        crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
+            "test storage unavailable",
+        )
     });
     let started = tokio::time::Instant::now();
     let fallback = super::retain_turn_timing_artifact(timing.clone(), artifact).await;
     assert_eq!(fallback, timing);
     assert_eq!(started.elapsed(), super::TURN_TIMING_STORAGE_TIMEOUT);
-    release.send(()).expect("storage still owns its transaction");
+    release
+        .send(())
+        .expect("storage still owns its transaction");
     done.await.unwrap();
 }
 
@@ -117,21 +121,34 @@ async fn timing_details_are_recoverable_without_repeating_them_in_the_rollout() 
     assert!(compact.tool_call_details_artifact_id.is_some());
     for result in [observed, compact] {
         let Some(id) = result.tool_call_details_artifact_id.as_ref() else {
-            assert_eq!(result, timing, "deadline fallback must preserve all inline data");
+            assert_eq!(
+                result, timing,
+                "deadline fallback must preserve all inline data"
+            );
             continue;
         };
         assert_eq!(result.inclusive_duration_ms, 456);
         assert_eq!(result.tool_calls[0].call_id, call.call_id);
         assert!(result.tool_calls[0].lifecycle_events.is_empty());
         let artifact = read_tool_output_selectors(
-            home.path(), "thread", id,
-            vec![ToolOutputSelector::JsonPointer { pointer: "/0/lifecycleEvents".into() }],
-        ).await.unwrap();
-        assert_eq!(artifact.results[0].value, Some(serde_json::to_value(&call.lifecycle_events).unwrap()));
+            home.path(),
+            "thread",
+            id,
+            vec![ToolOutputSelector::JsonPointer {
+                pointer: "/0/lifecycleEvents".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            artifact.results[0].value,
+            Some(serde_json::to_value(&call.lifecycle_events).unwrap())
+        );
     }
     let not_a_directory = home.path().join("file");
     std::fs::write(&not_a_directory, "occupied").unwrap();
-    let fallback = super::retain_turn_timing_details(timing.clone(), &not_a_directory, "thread").await;
+    let fallback =
+        super::retain_turn_timing_details(timing.clone(), &not_a_directory, "thread").await;
     assert_eq!(fallback, timing);
 }
 
@@ -495,22 +512,36 @@ fn final_publication_is_not_observational_nonprogress() {
         let (_clock, state) = timing();
         state.mark_turn_started();
         state.begin_model_generation_with_metadata(
-            &mut None, &SessionSource::Cli,
+            &mut None,
+            &SessionSource::Cli,
             Some(TurnTimingGenerationPurpose::ArtifactContinuation),
-            TurnTimingGenerationDisposition::DecisionBearing, None,
+            TurnTimingGenerationDisposition::DecisionBearing,
+            None,
         );
         drop(state.begin_model_request_wait());
         let item: ResponseItem = serde_json::from_value(serde_json::json!({
             "type": "message", "role": "assistant", "phase": phase,
             "content": [{"type": "output_text", "text": "The requested result is ready."}]
-        })).unwrap();
+        }))
+        .unwrap();
         state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item));
         state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
         let timing = state.complete_snapshot().protocol_timing();
-        assert_eq!(timing.observational_nonprogress_tokens.logical_generations, expected);
-        assert_eq!(timing.counters.generations_by_purpose.terminal_completion_reasoning,
-                   u32::from(expected == 0));
-        assert_eq!(timing.counters.generations_by_purpose.artifact_continuation, expected);
+        assert_eq!(
+            timing.observational_nonprogress_tokens.logical_generations,
+            expected
+        );
+        assert_eq!(
+            timing
+                .counters
+                .generations_by_purpose
+                .terminal_completion_reasoning,
+            u32::from(expected == 0)
+        );
+        assert_eq!(
+            timing.counters.generations_by_purpose.artifact_continuation,
+            expected
+        );
     }
 }
 
@@ -521,10 +552,19 @@ fn rolling_checkpoint_does_not_complete_the_live_turn() {
     clock.set_ms(10);
     let checkpoint = state.sampling_checkpoint();
     assert!(checkpoint.tail_unknown);
-    assert_eq!(checkpoint.timing.inclusive_duration_ns, 10 * NS_PER_MS as u64);
+    assert_eq!(
+        checkpoint.timing.inclusive_duration_ns,
+        10 * NS_PER_MS as u64
+    );
     assert!(state.state().completed_snapshot.is_none());
     clock.set_ms(30);
-    assert_eq!(state.complete_snapshot().protocol_timing().inclusive_duration_ns, 30 * NS_PER_MS as u64);
+    assert_eq!(
+        state
+            .complete_snapshot()
+            .protocol_timing()
+            .inclusive_duration_ns,
+        30 * NS_PER_MS as u64
+    );
 }
 
 #[test]
@@ -547,12 +587,19 @@ fn sampling_checkpoints_keep_tool_counters_but_leave_call_details_to_final_timin
         assert!(state.state().completed_snapshot.is_none());
         // Unsettled-call identities may occur in the closure checkpoint. They
         // are recovery state, not the per-call timing records excluded above.
-        assert_eq!(serde_json::to_value(&checkpoint.timing.tool_calls).unwrap(), serde_json::json!([]));
+        assert_eq!(
+            serde_json::to_value(&checkpoint.timing.tool_calls).unwrap(),
+            serde_json::json!([])
+        );
     }
     let final_timing = state.complete_snapshot().protocol_timing();
     assert_eq!(final_timing.counters.tool_call_count, 3);
     assert_eq!(
-        final_timing.tool_calls.iter().map(|call| call.call_id.as_str()).collect::<Vec<_>>(),
+        final_timing
+            .tool_calls
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["call-1", "call-2", "call-3"]
     );
 }
@@ -562,9 +609,11 @@ fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
     let (clock, state) = timing();
     state.mark_turn_started();
     state.begin_model_generation_with_metadata(
-        &mut None, &SessionSource::Cli,
+        &mut None,
+        &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::InitialReasoning),
-        TurnTimingGenerationDisposition::DecisionBearing, None,
+        TurnTimingGenerationDisposition::DecisionBearing,
+        None,
     );
     drop(state.begin_model_request_wait());
     state.record_model_attempt_identity("sampling-1", "attempt-1");
@@ -576,7 +625,10 @@ fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
     clock.set_ms(10);
     let unchanged = state.sampling_checkpoint();
     assert!(unchanged.timing.model_requests.is_empty());
-    assert_eq!(unchanged.timing.inclusive_duration_ns, 10 * NS_PER_MS as u64);
+    assert_eq!(
+        unchanged.timing.inclusive_duration_ns,
+        10 * NS_PER_MS as u64
+    );
     // A changed request (a retry attempt) is written again in full.
     state.record_model_attempt_identity("sampling-1", "attempt-2");
     let retried = state.sampling_checkpoint();
@@ -621,29 +673,48 @@ async fn turn_timing_state_uses_one_wall_and_monotonic_start_sample() {
 
 #[test]
 fn lost_turn_recovery_lists_nested_in_flight_calls_from_merged_checkpoints() {
-    use codex_protocol::protocol::{RolloutItem, SamplingBoundaryItem, SamplingTimingCheckpoint, TurnTimingToolCall};
-    let boundary = |calls, incremental| RolloutItem::SamplingBoundary(SamplingBoundaryItem {
-        sampling_request_id: "sampling".into(), physical_attempt_id: "attempt".into(),
-        turn_id: None, unresolved_context: false,
-        timing_checkpoint: Some(SamplingTimingCheckpoint {
-            observed_at_unix_ms: 100, tail_unknown: true, incremental,
-            runtime_identity: Default::default(), harness_build: None,
-            timing: codex_protocol::protocol::TurnTiming { tool_calls: calls, ..Default::default() },
-        }),
-    });
+    use codex_protocol::protocol::{
+        RolloutItem, SamplingBoundaryItem, SamplingTimingCheckpoint, TurnTimingToolCall,
+    };
+    let boundary = |calls, incremental| {
+        RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+            sampling_request_id: "sampling".into(),
+            physical_attempt_id: "attempt".into(),
+            turn_id: None,
+            unresolved_context: false,
+            timing_checkpoint: Some(SamplingTimingCheckpoint {
+                observed_at_unix_ms: 100,
+                tail_unknown: true,
+                incremental,
+                runtime_identity: Default::default(),
+                harness_build: None,
+                timing: codex_protocol::protocol::TurnTiming {
+                    tool_calls: calls,
+                    ..Default::default()
+                },
+            }),
+        })
+    };
     let active = TurnTimingToolCall {
-        call_id: "nested-process".into(), tool_name: "exec_command".into(),
-        parent_call_id: Some("outer".into()), parent_cell_id: Some("cell".into()),
-        handler_entry_at_ms: Some(1), handler_exit_at_ms: Some(2),
-        process_spawned_at_ms: Some(1), ..Default::default()
+        call_id: "nested-process".into(),
+        tool_name: "exec_command".into(),
+        parent_call_id: Some("outer".into()),
+        parent_cell_id: Some("cell".into()),
+        handler_entry_at_ms: Some(1),
+        handler_exit_at_ms: Some(2),
+        process_spawned_at_ms: Some(1),
+        ..Default::default()
     };
     let mut completed = TurnTimingToolCall {
-        call_id: "settled".into(), tool_name: "read_file".into(),
-        handler_entry_at_ms: Some(1), ..Default::default()
+        call_id: "settled".into(),
+        tool_name: "read_file".into(),
+        handler_entry_at_ms: Some(1),
+        ..Default::default()
     };
     let first = boundary(vec![active, completed.clone()], false);
     completed.handler_exit_at_ms = Some(3);
-    let (notice, timing) = crate::context::lost_turn_recovery(&[first, boundary(vec![completed], true)]);
+    let (notice, timing) =
+        crate::context::lost_turn_recovery(&[first, boundary(vec![completed], true)]);
     assert!(notice.contains("nested-process"));
     assert!(notice.contains("exec_command"));
     assert!(notice.contains("outer"));
@@ -1922,8 +1993,16 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     state.record_model_attempt_identity("old", "old-attempt");
     drop(state.begin_model_request_wait());
     state.record_model_attempt_identity("new", "new-attempt");
-    state.record_model_request_payload("new", "new-attempt", br#"{"instructions":"two","input":[]}"#);
-    state.record_model_request_payload("old", "old-attempt", br#"{"instructions":"one","input":[]}"#);
+    state.record_model_request_payload(
+        "new",
+        "new-attempt",
+        br#"{"instructions":"two","input":[]}"#,
+    );
+    state.record_model_request_payload(
+        "old",
+        "old-attempt",
+        br#"{"instructions":"one","input":[]}"#,
+    );
     state.record_model_response_id("old-attempt", "response-one");
     let before_diagnostics = state.complete_snapshot().protocol_timing();
     for request in &before_diagnostics.model_requests {
@@ -1932,8 +2011,16 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     }
     // Late diagnostics must refresh the completed snapshot without rebinding
     // old attempt data to the newer generation.
-    state.record_model_request_sections("new", "new-attempt", br#"{"instructions":"two","input":[]}"#);
-    state.record_model_request_sections("old", "old-attempt", br#"{"instructions":"one","input":[]}"#);
+    state.record_model_request_sections(
+        "new",
+        "new-attempt",
+        br#"{"instructions":"two","input":[]}"#,
+    );
+    state.record_model_request_sections(
+        "old",
+        "old-attempt",
+        br#"{"instructions":"one","input":[]}"#,
+    );
     state.record_model_request_token_categories(
         "old",
         "old-attempt",
@@ -1964,15 +2051,31 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     assert_eq!(old.fixed_prefix_reuse_eligible, Some(true));
     assert_eq!(old.response_id_by_attempt["old-attempt"], "response-one");
     assert!(new.response_id_by_attempt.is_empty());
-    assert_eq!(old.request_sha256_by_attempt["old-attempt"],
-        format!("{:x}", sha2::Sha256::digest(br#"{"instructions":"one","input":[]}"#)));
-    assert_eq!(new.request_sha256_by_attempt["new-attempt"],
-        format!("{:x}", sha2::Sha256::digest(br#"{"instructions":"two","input":[]}"#)));
+    assert_eq!(
+        old.request_sha256_by_attempt["old-attempt"],
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(br#"{"instructions":"one","input":[]}"#)
+        )
+    );
+    assert_eq!(
+        new.request_sha256_by_attempt["new-attempt"],
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(br#"{"instructions":"two","input":[]}"#)
+        )
+    );
     let old_sections = &old.request_section_sha256_by_attempt["old-attempt"];
     let new_sections = &new.request_section_sha256_by_attempt["new-attempt"];
     assert_eq!(old_sections["input"], new_sections["input"]);
-    assert_eq!(old_sections["input"], format!("{:x}", sha2::Sha256::digest(b"[]")));
-    assert_eq!(old_sections["instructions"], format!("{:x}", sha2::Sha256::digest(br#""one""#)));
+    assert_eq!(
+        old_sections["input"],
+        format!("{:x}", sha2::Sha256::digest(b"[]"))
+    );
+    assert_eq!(
+        old_sections["instructions"],
+        format!("{:x}", sha2::Sha256::digest(br#""one""#))
+    );
     assert_ne!(old_sections["instructions"], new_sections["instructions"]);
     assert!(new.request_token_categories.is_none());
     assert!(new.fixed_prefix_reuse_eligible.is_none());
@@ -2748,8 +2851,8 @@ fn completed_response_bookkeeping_is_not_model_time() {
         let stream = state.begin_model_stream_wait();
         clock.set_ms(20);
         drop(stream);
-        let processing =
-            state.begin_model_stream_processing(&ResponseEvent::OutputTextDelta("text".to_string()));
+        let processing = state
+            .begin_model_stream_processing(&ResponseEvent::OutputTextDelta("text".to_string()));
         assert!(processing.is_some());
         clock.set_ms(25);
         drop(processing);
@@ -3318,7 +3421,10 @@ fn request_setup_phases_are_frozen_per_dispatch_and_survive_checkpoints() {
         assert_eq!(phases["history_snapshot"], history_ms * NS_PER_MS as u64);
         assert_eq!(phases["preparation"], history_ms * NS_PER_MS as u64);
         assert_eq!(phases["persistence"], persistence_ms * NS_PER_MS as u64);
-        assert_eq!(phases["transport_readiness"], persistence_ms * NS_PER_MS as u64);
+        assert_eq!(
+            phases["transport_readiness"],
+            persistence_ms * NS_PER_MS as u64
+        );
     }
     let serialized = serde_json::to_value(&checkpoint.timing).unwrap();
     let restored: TurnTiming = serde_json::from_value(serialized).unwrap();
@@ -3347,11 +3453,18 @@ fn request_setup_phases_discard_failed_attempt_and_reset_for_retry() {
     drop(retry);
     let timing = state.complete_snapshot().protocol_timing();
     assert!(timing.model_requests[0].setup_phase_ns.is_empty());
-    assert_eq!(timing.model_requests[1].setup_phase_ns["serialization"], 2 * NS_PER_MS as u64);
-    assert_eq!(timing.model_requests[1].attempt_kind, TurnTimingAttemptKind::Retry);
+    assert_eq!(
+        timing.model_requests[1].setup_phase_ns["serialization"],
+        2 * NS_PER_MS as u64
+    );
+    assert_eq!(
+        timing.model_requests[1].attempt_kind,
+        TurnTimingAttemptKind::Retry
+    );
     let mut legacy = serde_json::to_value(&timing.model_requests[1]).unwrap();
     legacy.as_object_mut().unwrap().remove("setupPhaseNs");
-    let legacy: codex_protocol::protocol::TurnTimingModelRequest = serde_json::from_value(legacy).unwrap();
+    let legacy: codex_protocol::protocol::TurnTimingModelRequest =
+        serde_json::from_value(legacy).unwrap();
     assert!(legacy.setup_phase_ns.is_empty());
 }
 
@@ -3423,10 +3536,7 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
     for attempt_index in 0..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
         let sampling = format!("sampling-{MAX_MODEL_REQUEST_TIMINGS}");
         let attempt = format!("latest-attempt-{attempt_index}");
-        state.record_model_attempt_identity(
-            &sampling,
-            &attempt,
-        );
+        state.record_model_attempt_identity(&sampling, &attempt);
         state.record_model_request_payload(&sampling, &attempt, br#"{"input":[]}"#);
         state.record_model_request_sections(&sampling, &attempt, br#"{"input":[]}"#);
         state.record_model_response_id(&attempt, &format!("response-{attempt_index}"));
@@ -3464,10 +3574,34 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
     let expected_attempts = (1..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS)
         .map(|index| format!("latest-attempt-{index}"))
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(latest.request_sha256_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
-    assert_eq!(latest.request_section_sha256_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
-    assert_eq!(latest.response_id_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
-    assert_eq!(latest.response_id_by_attempt["latest-attempt-1"], "response-1");
+    assert_eq!(
+        latest
+            .request_sha256_by_attempt
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_attempts
+    );
+    assert_eq!(
+        latest
+            .request_section_sha256_by_attempt
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_attempts
+    );
+    assert_eq!(
+        latest
+            .response_id_by_attempt
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_attempts
+    );
+    assert_eq!(
+        latest.response_id_by_attempt["latest-attempt-1"],
+        "response-1"
+    );
     assert_eq!(
         latest.progress_kinds.len(),
         MAX_MODEL_REQUEST_PROGRESS_KINDS

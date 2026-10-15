@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use codex_exec_server::WalkOptions;
 use codex_exec_server::WalkFilters;
+use codex_exec_server::WalkOptions;
 use codex_tools::JsonSchema;
 use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
@@ -90,15 +90,30 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
             let max_depth = args.max_depth.unwrap_or(8).min(MAX_DEPTH);
             let max_entries = args.max_entries.unwrap_or(2000).min(MAX_ENTRIES);
             let max_directories = args.max_directories.unwrap_or(max_entries).min(10_000);
-            let filters = WalkFilters { include: args.include, exclude: args.exclude, exclude_directories: args.exclude_directories };
-            filters.validate().map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            let filters = WalkFilters {
+                include: args.include,
+                exclude: args.exclude,
+                exclude_directories: args.exclude_directories,
+            };
+            filters
+                .validate()
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
             if max_entries == 0 || max_directories == 0 {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "list_files requires max_depth 0-{MAX_DEPTH}, max_entries 1-{MAX_ENTRIES}, and max_directories 1-10000"
                 )));
             }
-            let environment = wait_for_tool_environment(&invocation.step_context.environments, args.environment_id.as_deref(), &invocation.cancellation_token).await?
-                .ok_or_else(|| FunctionCallError::RespondToModel("list_files requires a selected execution environment".into()))?;
+            let environment = wait_for_tool_environment(
+                &invocation.step_context.environments,
+                args.environment_id.as_deref(),
+                &invocation.cancellation_token,
+            )
+            .await?
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "list_files requires a selected execution environment".into(),
+                )
+            })?;
             let path = environment
                 .cwd()
                 .join(&args.path)
@@ -134,7 +149,11 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                     Some(rest) if rest.starts_with(['/', '\\']) => &rest[1..],
                     _ => return native,
                 };
-                if cwd.contains('\\') { relative.replace('\\', "/") } else { relative.to_string() }
+                if cwd.contains('\\') {
+                    relative.replace('\\', "/")
+                } else {
+                    relative.to_string()
+                }
             };
             let value = json!({
                 "path": path.inferred_native_path_string(),
@@ -172,7 +191,9 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                     "walk_options": value["effective_walk_options"]},
                 "identity": crate::tool_history::sha256(value.to_string().as_bytes()),
             }));
-            Ok(boxed_tool_output(JsonToolOutput::new(value).with_sampling_request_signal(evidence)))
+            Ok(boxed_tool_output(
+                JsonToolOutput::new(value).with_sampling_request_signal(evidence),
+            ))
         })
     }
 }

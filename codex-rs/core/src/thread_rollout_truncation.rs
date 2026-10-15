@@ -314,12 +314,17 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         return Ok(Vec::new());
     };
     let mut retained = items[keep_idx..].to_vec();
-    if !retained.iter().any(|item| matches!(item, RolloutItem::Compacted(_))) {
+    if !retained
+        .iter()
+        .any(|item| matches!(item, RolloutItem::Compacted(_)))
+    {
         return Ok(retained);
     }
-    let cannot_bound_checkpoint = || CodexErr::InvalidRequest(
+    let cannot_bound_checkpoint = || {
+        CodexErr::InvalidRequest(
         "Cannot fork last-N turns: a compaction checkpoint does not uniquely identify the retained turn boundary. Use full-history or task-capsule mode instead.".into(),
-    );
+    )
+    };
     let boundary = match &items[keep_idx] {
         RolloutItem::ResponseItem(item) => std::borrow::Cow::Borrowed(item),
         RolloutItem::InterAgentCommunication(communication) => {
@@ -340,24 +345,32 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     };
     // Legacy messages lack stable IDs. Repeated raw messages make even a
     // single checkpoint match ambiguous; never guess using text similarity.
-    let matching_positions = items.iter().enumerate().filter_map(|(index, item)| {
-        let matched = match item {
-            RolloutItem::ResponseItem(item) => matches_boundary(item),
-            RolloutItem::InterAgentCommunication(communication) => {
-                matches_boundary(&communication.to_model_input_item())
-            }
-            _ => false,
-        };
-        matched.then_some(index)
-    }).collect::<Vec<_>>();
+    let matching_positions = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let matched = match item {
+                RolloutItem::ResponseItem(item) => matches_boundary(item),
+                RolloutItem::InterAgentCommunication(communication) => {
+                    matches_boundary(&communication.to_model_input_item())
+                }
+                _ => false,
+            };
+            matched.then_some(index)
+        })
+        .collect::<Vec<_>>();
     for (offset, item) in retained.iter_mut().enumerate() {
         if let RolloutItem::Compacted(compacted) = item {
             if matching_positions.partition_point(|index| *index < keep_idx + offset) != 1 {
                 return Err(cannot_bound_checkpoint());
             }
-            let history = compacted.replacement_history.as_mut()
+            let history = compacted
+                .replacement_history
+                .as_mut()
                 .ok_or_else(&cannot_bound_checkpoint)?;
-            let mut matches = history.iter().enumerate()
+            let mut matches = history
+                .iter()
+                .enumerate()
                 .filter_map(|(index, item)| matches_boundary(item).then_some(index));
             let start = matches.next().ok_or_else(&cannot_bound_checkpoint)?;
             if matches.next().is_some() {

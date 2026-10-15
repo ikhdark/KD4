@@ -411,7 +411,7 @@ def summarize(records):
             reasons[reason] += 1
             classified.append((row, reason))
             prior_by_command[command_key] = row
-            if current and row["outcome"] == "passed" and proof["status"] == "passed" and reason != "redundant":
+            if current and row["outcome"] == "passed" and proof.get("status") == "passed" and reason != "redundant":
                 new_current_proof += 1
                 successful_validation_work.append(row["lifecycle_seconds"])
     work["redundant_lifecycle"] = _sum_known(

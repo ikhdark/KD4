@@ -22,10 +22,7 @@ fn update_plan_rejects_multiple_in_progress_items() {
     }))
     .expect("a single active item should deserialize");
     assert_eq!(
-        args.plan
-            .iter()
-            .map(|item| item.status)
-            .collect::<Vec<_>>(),
+        args.plan.iter().map(|item| item.status).collect::<Vec<_>>(),
         vec![StepStatus::InProgress, StepStatus::Pending]
     );
 }

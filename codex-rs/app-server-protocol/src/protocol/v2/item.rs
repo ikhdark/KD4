@@ -369,6 +369,26 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     ContextCompaction {
         id: String,
+        /// Active context tokens before the replacement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        tokens_before: Option<i64>,
+        /// Active context tokens after the replacement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        tokens_after: Option<i64>,
+        /// Images dropped from the retained task input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        omitted_image_count: Option<usize>,
+        /// Images kept in the retained task input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        retained_image_count: Option<usize>,
+        /// Whether earlier text was dropped rather than summarized in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        omitted_text: Option<bool>,
     },
 }
 
@@ -415,6 +435,34 @@ impl ThreadItem {
             ThreadItem::ImageGeneration(item) => &item.id,
         }
     }
+}
+
+/// Describes what a compaction dropped, for a user-facing notice. Returns None
+/// when no detail was recorded, so callers keep their bare wording.
+pub fn describe_context_compaction(
+    tokens_before: Option<i64>,
+    tokens_after: Option<i64>,
+    omitted_image_count: Option<usize>,
+    omitted_text: Option<bool>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let (Some(before), Some(after)) = (tokens_before, tokens_after)
+        && before > 0
+    {
+        parts.push(format!(
+            "{} tokens of context replaced by a {} token summary",
+            before, after
+        ));
+    }
+    match omitted_image_count {
+        Some(1) => parts.push("1 image dropped".to_string()),
+        Some(count) if count > 1 => parts.push(format!("{count} images dropped")),
+        _ => {}
+    }
+    if omitted_text == Some(true) {
+        parts.push("earlier output dropped rather than summarized in place".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 pub(crate) fn web_search_action_from_core(
@@ -608,9 +656,14 @@ impl From<CoreTurnItem> for ThreadItem {
                     duration_ms,
                 }
             }
-            CoreTurnItem::ContextCompaction(compaction) => {
-                ThreadItem::ContextCompaction { id: compaction.id }
-            }
+            CoreTurnItem::ContextCompaction(compaction) => ThreadItem::ContextCompaction {
+                id: compaction.id,
+                tokens_before: compaction.tokens_before,
+                tokens_after: compaction.tokens_after,
+                omitted_image_count: compaction.omitted_image_count,
+                retained_image_count: compaction.retained_image_count,
+                omitted_text: compaction.omitted_text,
+            },
         }
     }
 }

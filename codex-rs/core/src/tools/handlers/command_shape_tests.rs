@@ -409,7 +409,9 @@ fn powershell_exec_and_safety_projections_encode_the_same_script() {
             let bytes = BASE64_STANDARD.decode(encoded).expect("base64 payload");
             assert_eq!(bytes.len() % 2, 0, "UTF-16LE must not have trailing bytes");
             let utf16 = bytes
-                .as_chunks::<2>().0.iter()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -478,11 +480,12 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
 #[test]
 fn failure_advisory_respects_the_active_powershell_script_mode() {
     let syntax_advisory = powershell_script_failure_advisory(
-            Some(ShellType::PowerShell),
-            Some(1),
-            true,
-            "ParserError: Unexpected token 'foo'",
-        ).expect("invalid source needs a syntax hint even in encoded mode");
+        Some(ShellType::PowerShell),
+        Some(1),
+        true,
+        "ParserError: Unexpected token 'foo'",
+    )
+    .expect("invalid source needs a syntax hint even in encoded mode");
     assert!(syntax_advisory.contains("correct the PowerShell script syntax"));
     assert!(!syntax_advisory.contains("retry with"));
 

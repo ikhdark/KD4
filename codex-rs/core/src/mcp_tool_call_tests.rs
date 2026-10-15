@@ -80,7 +80,8 @@ fn mcp_contract_comparison_ignores_callable_aliases_not_schema_or_annotations() 
     let live: ToolInfo = serde_json::from_value(serde_json::json!({
         "server_name": "docs", "tool_name": "read-file", "tool_namespace": "docs",
         "tool": {"name": "read-file", "inputSchema": {"type": "object"}}
-    })).unwrap();
+    }))
+    .unwrap();
     let mut sampled = live.clone();
     sampled.callable_namespace = "mcp__docs".into();
     sampled.callable_name = "read_file_collision_suffix".into();
@@ -88,7 +89,12 @@ fn mcp_contract_comparison_ignores_callable_aliases_not_schema_or_annotations() 
     sampled.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
     assert!(!mcp_contract_matches(&sampled, &live));
     sampled.tool.annotations = None;
-    sampled.tool.input_schema = Arc::new(serde_json::json!({"type":"object", "required":["path"]}).as_object().unwrap().clone());
+    sampled.tool.input_schema = Arc::new(
+        serde_json::json!({"type":"object", "required":["path"]})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     assert!(!mcp_contract_matches(&sampled, &live));
     for field in ["server", "origin", "connector", "parallel"] {
         let mut sampled = live.clone();
@@ -974,7 +980,10 @@ async fn mcp_tool_call_rejects_changed_contract_before_upload_or_execution() {
     // The sampled contract must admit the file argument so dispatch reaches
     // the live-contract check rather than failing generic schema validation.
     Arc::make_mut(&mut sampled_tool.tool.input_schema)
-        .get_mut("properties").unwrap().as_object_mut().unwrap()
+        .get_mut("properties")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
         .insert("file".into(), serde_json::json!({"type":"string"}));
     step_context.seed_mcp_tools_for_test(live_tools).await;
 
@@ -1012,7 +1021,14 @@ async fn mcp_tool_call_rejects_changed_contract_before_upload_or_execution() {
     let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
     assert_eq!(request_user_input_count, 0);
     assert_eq!(completed.status, McpToolCallStatus::Failed);
-    assert!(completed.error.as_ref().unwrap().message.contains("contract changed"));
+    assert!(
+        completed
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("contract changed")
+    );
     assert_eq!(completed.connector_id.as_deref(), Some("calendar"));
     assert_eq!(completed.app_name.as_deref(), Some("Calendar"));
 
@@ -1119,22 +1135,47 @@ async fn sampled_read_only_mcp_tool_cannot_dispatch_live_mutating_contract() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let (step, startup) = step_context_with_live_apps(&turn, &server.uri()).await;
     let live = step.mcp.manager().list_all_tools().await;
-    let mut sampled = live.iter().find(|tool| tool.tool.name == "calendar_create_event").unwrap().clone();
-    assert_eq!(sampled.tool.annotations.as_ref().unwrap().read_only_hint, Some(false));
+    let mut sampled = live
+        .iter()
+        .find(|tool| tool.tool.name == "calendar_create_event")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        sampled.tool.annotations.as_ref().unwrap().read_only_hint,
+        Some(false)
+    );
     sampled.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
     step.seed_mcp_tools_for_test(live).await;
     let name = sampled.canonical_tool_name();
     let runtime = runtime_for_sampled_mcp_tool(Arc::clone(&session), step, sampled);
     let call_id = "read-only-became-mutating";
-    tokio::time::timeout(Duration::from_secs(2), runtime.handle_tool_call(
-        ToolCall { tool_name: name, call_id: call_id.into(), payload: ToolPayload::Function {
-            arguments: serde_json::json!({"title":"test", "starts_at":"tomorrow"}).to_string(),
-        } }, CancellationToken::new(),
-    )).await.unwrap().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.handle_tool_call(
+            ToolCall {
+                tool_name: name,
+                call_id: call_id.into(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({"title":"test", "starts_at":"tomorrow"})
+                        .to_string(),
+                },
+            },
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let (completed, prompts) = recv_mcp_item_completed(&events, call_id).await;
     assert_eq!(prompts, 0);
     assert_eq!(completed.status, McpToolCallStatus::Failed);
-    assert!(completed.error.unwrap().message.contains("contract changed"));
+    assert!(
+        completed
+            .error
+            .unwrap()
+            .message
+            .contains("contract changed")
+    );
     assert!(recorded_apps_tool_calls(&server).await.is_empty());
     startup.cancel();
 }
@@ -1738,11 +1779,7 @@ fn custom_servers_require_an_identified_authority_for_remembered_approval() {
         Some(expected.clone())
     );
     assert_eq!(
-        persistent_mcp_tool_approval_key(
-            &invocation,
-            Some(&metadata),
-            AppToolApproval::Auto
-        ),
+        persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto),
         Some(expected)
     );
 }
@@ -1837,7 +1874,10 @@ async fn remembered_mcp_consent_is_scoped_to_authority_and_contract() {
         Some(key)
     );
     metadata.persistent_authority = false;
-    assert!(persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).is_none());
+    assert!(
+        persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto)
+            .is_none()
+    );
 }
 
 #[test]
@@ -2598,12 +2638,14 @@ fn approval_answers_require_an_uninterrupted_response() {
             McpToolApprovalDecision::AcceptAndRemember,
         ),
     ] {
-        let response = request_user_input_response_from_elicitation_content(Some(serde_json::json!({
-            "approval": answer,
-        })));
+        let response =
+            request_user_input_response_from_elicitation_content(Some(serde_json::json!({
+                "approval": answer,
+            })));
         assert_eq!(
             response,
-            Some(RequestUserInputResponse { disposition: None,
+            Some(RequestUserInputResponse {
+                disposition: None,
                 answers: HashMap::from([(
                     "approval".to_string(),
                     RequestUserInputAnswer {
@@ -2626,7 +2668,10 @@ fn approval_answers_require_an_uninterrupted_response() {
         ] {
             let mut not_approved = interrupted.clone();
             not_approved.disposition = Some(disposition);
-            assert_eq!(parse_mcp_tool_approval_response(Some(not_approved), "approval"), McpToolApprovalDecision::Cancel);
+            assert_eq!(
+                parse_mcp_tool_approval_response(Some(not_approved), "approval"),
+                McpToolApprovalDecision::Cancel
+            );
         }
         interrupted.interrupted = true;
         assert_eq!(
@@ -3128,10 +3173,18 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config() {
 
     let config = session.get_config().await;
     let manager = session.services.latest_mcp_runtime().manager_arc();
-    assert!(scoped_mcp_approval_is_persisted(&config, manager.as_ref(), &key));
+    assert!(scoped_mcp_approval_is_persisted(
+        &config,
+        manager.as_ref(),
+        &key
+    ));
     let mut other_provider = key.clone();
     other_provider.authority = "different-provider".into();
-    assert!(!scoped_mcp_approval_is_persisted(&config, manager.as_ref(), &other_provider));
+    assert!(!scoped_mcp_approval_is_persisted(
+        &config,
+        manager.as_ref(),
+        &other_provider
+    ));
     let apps_toml = config
         .config_layer_stack
         .effective_config()
@@ -3712,7 +3765,10 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let event = rx_event.recv().await.expect("approval event channel closed");
+            let event = rx_event
+                .recv()
+                .await
+                .expect("approval event channel closed");
             if matches!(
                 event.msg,
                 EventMsg::RequestUserInput(_) | EventMsg::ElicitationRequest(_)

@@ -22,14 +22,15 @@ fn session_visualization_roots_do_not_change_the_prompt_or_runtime_permissions()
         "01a0f3c5-18aa-79e2-86f0-10bf6108b5f7",
         "01a0f3c5-18aa-79e2-86f0-10bf6108b5f8",
     ] {
-        let internal = AbsolutePathBuf::try_from(
-            home.path().join("visualizations/2026/09/30").join(id),
-        )?;
-        let roots = vec![project.clone(), user_visualization.clone(), internal.clone()];
-        let original = FileSystemContext::from_permission_profile(
-            &PermissionProfile::Disabled,
-            &roots,
-        );
+        let internal =
+            AbsolutePathBuf::try_from(home.path().join("visualizations/2026/09/30").join(id))?;
+        let roots = vec![
+            project.clone(),
+            user_visualization.clone(),
+            internal.clone(),
+        ];
+        let original =
+            FileSystemContext::from_permission_profile(&PermissionProfile::Disabled, &roots);
         let visible = original.clone().without_session_visualizations(home.path());
         assert!(original.render().contains(id));
         assert_eq!(roots[2], internal);
@@ -51,43 +52,63 @@ fn visualization_projection_hides_managed_grants_but_preserves_denials() -> Resu
 
     let home = tempfile::tempdir()?;
     let project = AbsolutePathBuf::try_from(home.path().join("project"))?;
-    let allowed = AbsolutePathBuf::try_from(home.path().join(
-        "visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f7",
-    ))?;
-    let denied = AbsolutePathBuf::try_from(home.path().join(
-        "visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f8",
-    ))?;
+    let allowed = AbsolutePathBuf::try_from(
+        home.path()
+            .join("visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f7"),
+    )?;
+    let denied = AbsolutePathBuf::try_from(
+        home.path()
+            .join("visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f8"),
+    )?;
     let profile = PermissionProfile::from_runtime_permissions(
         &FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: allowed.clone() },
+                path: FileSystemPath::Path {
+                    path: allowed.clone(),
+                },
                 access: FileSystemAccessMode::Write,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: denied.clone() },
+                path: FileSystemPath::Path {
+                    path: denied.clone(),
+                },
                 access: FileSystemAccessMode::Deny,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: project.clone() },
+                path: FileSystemPath::Path {
+                    path: project.clone(),
+                },
                 access: FileSystemAccessMode::Write,
             },
         ]),
         NetworkSandboxPolicy::Restricted,
     );
     let original = FileSystemContext::from_permission_profile(
-        &profile, &[project.clone(), allowed.clone(), denied.clone()],
+        &profile,
+        &[project.clone(), allowed.clone(), denied.clone()],
     );
     let before = original.render();
     let allowed = allowed.as_path().display();
     let denied = denied.as_path().display();
     let project = project.as_path().display();
-    assert!(before.contains(&format!("<entry access=\"write\"><path>{allowed}</path></entry>")));
-    let visible = original.clone().without_session_visualizations(home.path()).render();
+    assert!(before.contains(&format!(
+        "<entry access=\"write\"><path>{allowed}</path></entry>"
+    )));
+    let visible = original
+        .clone()
+        .without_session_visualizations(home.path())
+        .render();
     assert_eq!(
         visible,
-        format!("<filesystem><workspace_roots><root>{project}</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"deny\" escalatable=\"false\"><path>{denied}</path></entry><entry access=\"write\"><path>{project}</path></entry></file_system></permission_profile></filesystem>")
+        format!(
+            "<filesystem><workspace_roots><root>{project}</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"deny\" escalatable=\"false\"><path>{denied}</path></entry><entry access=\"write\"><path>{project}</path></entry></file_system></permission_profile></filesystem>"
+        )
     );
-    assert_eq!(original.render(), before, "prompt projection must not mutate runtime context");
+    assert_eq!(
+        original.render(),
+        before,
+        "prompt projection must not mutate runtime context"
+    );
     Ok(())
 }
 
@@ -286,33 +307,34 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
 #[test]
 fn legacy_network_snapshot_is_replaced_with_explicit_proxy_configuration() {
     let current = EnvironmentsState {
-        network: Some(NetworkContext::new(false, vec!["example.com".to_string()], vec![])),
+        network: Some(NetworkContext::new(
+            false,
+            vec!["example.com".to_string()],
+            vec![],
+        )),
         ..Default::default()
     };
     let mut previous = WorldStateSection::snapshot(&current);
-    previous.network = Some(
-        "<network enabled=\"false\"><allowed>example.com</allowed></network>".to_string(),
-    );
-    let previous: EnvironmentsSnapshot = serde_json::from_value(
-        serde_json::to_value(previous).expect("serialize legacy snapshot"),
-    )
-    .expect("legacy snapshot should remain readable");
-    let rendered = WorldStateSection::render_diff(
-        &current,
-        PreviousSectionState::Known(&previous),
-    )
-    .expect("old ambiguous projection must be replaced")
-    .render();
+    previous.network =
+        Some("<network enabled=\"false\"><allowed>example.com</allowed></network>".to_string());
+    let previous: EnvironmentsSnapshot =
+        serde_json::from_value(serde_json::to_value(previous).expect("serialize legacy snapshot"))
+            .expect("legacy snapshot should remain readable");
+    let rendered = WorldStateSection::render_diff(&current, PreviousSectionState::Known(&previous))
+        .expect("old ambiguous projection must be replaced")
+        .render();
     assert!(rendered.contains("replaces all previously provided environment context"));
     assert!(rendered.contains(
         "<managed_network_proxy configured_enabled=\"false\"><required_allowed>example.com</required_allowed></managed_network_proxy>"
     ));
     assert!(!rendered.contains("<network enabled="));
-    assert!(WorldStateSection::render_diff(
-        &current,
-        PreviousSectionState::Known(&WorldStateSection::snapshot(&current)),
-    )
-    .is_none());
+    assert!(
+        WorldStateSection::render_diff(
+            &current,
+            PreviousSectionState::Known(&WorldStateSection::snapshot(&current)),
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -582,7 +604,10 @@ fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
     for (field, expected) in [
         ("current_date", "  <current_date>unknown</current_date>"),
         ("timezone", "  <timezone>unknown</timezone>"),
-        ("network", "  <managed_network_proxy status=\"unspecified\" />"),
+        (
+            "network",
+            "  <managed_network_proxy status=\"unspecified\" />",
+        ),
         ("filesystem", "  <filesystem status=\"unspecified\" />"),
         ("subagents", "  <subagents>\n    none\n  </subagents>"),
     ] {
@@ -609,7 +634,10 @@ fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
         let retained = [
             ("current_date", "  <current_date>2026-09-13</current_date>"),
             ("timezone", "  <timezone>UTC</timezone>"),
-            ("network", "  <managed_network_proxy configured_enabled=\"true\"></managed_network_proxy>"),
+            (
+                "network",
+                "  <managed_network_proxy configured_enabled=\"true\"></managed_network_proxy>",
+            ),
             (
                 "filesystem",
                 "  <filesystem><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>",

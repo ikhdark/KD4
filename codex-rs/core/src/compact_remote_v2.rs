@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::Prompt;
 use crate::ResponseStream;
@@ -26,6 +27,7 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -51,6 +53,17 @@ use attempt::run_remote_compact_v2_attempt;
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
 
+// The provider returns the checkpoint only when generation finishes, so the whole
+// generation is silence to the progress deadline. Long tasks grow the summary; at
+// about 14K tokens it needed ~300 s and the default 300 s deadline failed every attempt.
+const REMOTE_COMPACTION_V2_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+fn remote_compaction_progress_timeout(provider: &ModelProviderInfo) -> Duration {
+    provider
+        .stream_idle_timeout()
+        .max(REMOTE_COMPACTION_V2_PROGRESS_TIMEOUT)
+}
+
 fn preserve_model_fallback_failure(
     previous_error: &CodexErr,
     final_error: CodexErr,
@@ -72,6 +85,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
@@ -87,6 +101,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         Some(client_session),
         initial_context_injection,
         compaction_metadata,
+        emit_error_event,
         cancellation_token,
     )
     .await
@@ -122,11 +137,15 @@ pub(crate) async fn run_remote_compact_task(
         /*client_session*/ None,
         InitialContextInjection::AtStart(world_state),
         compaction_metadata,
+        /*emit_error_event*/ true,
         cancellation_token,
     )
     .await
 }
 
+/// `emit_error_event` is false when the caller recovers from the failure; a
+/// turn error event would mark a turn that continues as failed.
+#[allow(clippy::too_many_arguments)]
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
@@ -134,6 +153,7 @@ async fn run_remote_compact_task_inner(
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
@@ -193,10 +213,12 @@ async fn run_remote_compact_task_inner(
         Err(err @ CodexErr::TurnAborted) => Err(err),
         Err(err) => {
             sess.track_turn_codex_error(turn_context, &err);
-            let event = EventMsg::Error(
-                err.to_error_event(Some("Error running remote compact task".to_string())),
-            );
-            sess.send_event(turn_context, event).await;
+            if emit_error_event {
+                let event = EventMsg::Error(
+                    err.to_error_event(Some("Error running remote compact task".to_string())),
+                );
+                sess.send_event(turn_context, event).await;
+            }
             Err(err)
         }
     }
@@ -308,7 +330,8 @@ async fn run_remote_compact_task_inner_impl(
         sess.update_token_usage_info(compaction_turn_context, Some(token_usage))
             .await?;
     }
-    let (retained_input, retained_images) = prepare_v2_retained_input(sess, &retention_input).await?;
+    let (retained_input, retained_images) =
+        prepare_v2_retained_input(sess, &retention_input).await?;
     analytics_details.retained_image_count = Some(retained_images);
     let (new_history, world_state_baseline, fragment_digests) =
         process_compacted_history_with_retained_input(
@@ -394,8 +417,10 @@ async fn run_remote_compaction_request_v2(
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retry_state = ResponsesStreamRetryState::default();
+    let mut progress_timeouts = 0_u32;
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
+        let attempt_started = tokio::time::Instant::now();
         let trace_attempt = if compaction_trace.is_enabled() {
             let compaction_trace = compaction_trace.clone();
             let model = turn_context.model_info.slug.clone();
@@ -467,6 +492,18 @@ async fn run_remote_compaction_request_v2(
             Ok(compaction_output) => return Ok(compaction_output),
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
+                // An attempt that used the whole progress budget produced nothing.
+                // The identical request usually fails the same way again, and transport
+                // fallback would otherwise allow up to six such attempts; allow one.
+                if prompt
+                    .stream_progress_timeout
+                    .is_some_and(|timeout| attempt_started.elapsed() >= timeout)
+                {
+                    progress_timeouts += 1;
+                    if progress_timeouts > 1 {
+                        return Err(err);
+                    }
+                }
                 handle_retryable_response_stream_error(
                     &mut retry_state,
                     max_retries,
@@ -669,7 +706,8 @@ mod tests {
                     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
                     config.model_provider.supports_websockets = false;
                 },
-            ).await;
+            )
+            .await;
         let turn = Arc::get_mut(&mut turn).expect("test turn is uniquely owned");
         // Deliberately stale: each request must resolve the live setting instead.
         Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
@@ -692,35 +730,232 @@ mod tests {
             (true, true, None, None),
         ] {
             if fast {
-                Arc::make_mut(&mut turn.config).features.enable(codex_features::Feature::FastMode)?;
+                Arc::make_mut(&mut turn.config)
+                    .features
+                    .enable(codex_features::Feature::FastMode)?;
             } else {
-                Arc::make_mut(&mut turn.config).features.disable(codex_features::Feature::FastMode)?;
+                Arc::make_mut(&mut turn.config)
+                    .features
+                    .disable(codex_features::Feature::FastMode)?;
             }
             turn.model_info.service_tiers = if supported {
                 vec![codex_protocol::openai_models::ModelServiceTier {
-                    id: "priority".into(), name: "Priority".into(), description: "Priority".into(),
+                    id: "priority".into(),
+                    name: "Priority".into(),
+                    description: "Priority".into(),
                 }]
             } else {
                 Vec::new()
             };
-            session.update_settings(crate::session::SessionSettingsUpdate {
-                service_tier: Some(configured.map(str::to_string)),
-                ..Default::default()
-            }).await?;
-            let log = responses::mount_sse_once(&server, responses::sse(vec![
-                serde_json::json!({
-                    "type": "response.output_item.done",
-                    "item": {"type": "compaction", "encrypted_content": "summary"},
-                }),
-                responses::ev_completed("compacted"),
-            ])).await;
+            session
+                .update_settings(crate::session::SessionSettingsUpdate {
+                    service_tier: Some(configured.map(str::to_string)),
+                    ..Default::default()
+                })
+                .await?;
+            let log = responses::mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {"type": "compaction", "encrypted_content": "summary"},
+                    }),
+                    responses::ev_completed("compacted"),
+                ]),
+            )
+            .await;
             let mut client = session.services.model_client.new_session();
             run_remote_compaction_request_v2(
-                &session, turn, &mut client, &Prompt::default(), &metadata,
-                &CompactionTraceContext::disabled(), &CancellationToken::new(),
-            ).await?;
-            assert_eq!(log.single_request().body_json().get("service_tier").and_then(serde_json::Value::as_str), expected);
+                &session,
+                turn,
+                &mut client,
+                &Prompt::default(),
+                &metadata,
+                &CompactionTraceContext::disabled(),
+                &CancellationToken::new(),
+            )
+            .await?;
+            assert_eq!(
+                log.single_request()
+                    .body_json()
+                    .get("service_tier")
+                    .and_then(serde_json::Value::as_str),
+                expected
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_compaction_progress_timeout_never_shortens_provider_timeout() {
+        let mut provider = ModelProviderInfo::default();
+        assert_eq!(
+            remote_compaction_progress_timeout(&provider),
+            REMOTE_COMPACTION_V2_PROGRESS_TIMEOUT
+        );
+        provider.stream_idle_timeout_ms = Some(30 * 60 * 1000);
+        assert_eq!(
+            remote_compaction_progress_timeout(&provider),
+            Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_outlasts_provider_idle_timeout() -> anyhow::Result<()> {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        // The checkpoint arrives only after longer silence than the provider allows.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(responses::sse(vec![
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "item": {"type": "compaction", "encrypted_content": "checkpoint"},
+                        }),
+                        responses::ev_completed("compacted"),
+                    ]))
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+        let home = TempDir::new()?;
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test-key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                    config.model_provider.stream_idle_timeout_ms = Some(100);
+                    config.model_provider.stream_max_retries = Some(0);
+                },
+            )
+            .await;
+
+        // Control: a request without the compaction budget keeps the provider timeout.
+        let metadata = turn.turn_metadata_state.to_responses_metadata(
+            session.installation_id.clone(),
+            session.current_window_id().await,
+            CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2,
+                CompactionPhase::StandaloneTurn,
+            )),
+        );
+        let mut client = session.services.model_client.new_session();
+        let control = run_remote_compaction_request_v2(
+            &session,
+            &turn,
+            &mut client,
+            &Prompt::default(),
+            &metadata,
+            &CompactionTraceContext::disabled(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            control.is_err(),
+            "the provider timeout must still bound other requests"
+        );
+
+        session
+            .record_conversation_items(
+                &turn,
+                &[message("user", "compact this history", /*phase*/ None)],
+            )
+            .await?;
+        run_remote_compact_task(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert!(session.clone_history().await.raw_items().iter().any(|item| matches!(
+            item,
+            ResponseItem::Compaction { encrypted_content, .. } if encrypted_content == "checkpoint"
+        )));
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_reattempts_a_progress_timeout_once() -> anyhow::Result<()> {
+        use core_test_support::streaming_sse::StreamingSseChunk;
+        use core_test_support::streaming_sse::start_streaming_sse_server;
+
+        core_test_support::require_network!();
+        // Each response sends headers and then nothing, so every attempt uses its
+        // whole progress budget. Holding the gates keeps the streams open.
+        let mut gates = Vec::new();
+        let mut stalled_responses = Vec::new();
+        for _ in 0..3 {
+            let (gate, gated) = tokio::sync::oneshot::channel::<()>();
+            gates.push(gate);
+            stalled_responses.push(vec![StreamingSseChunk {
+                gate: Some(gated),
+                body: String::new(),
+            }]);
+        }
+        let (server, _completions) = start_streaming_sse_server(stalled_responses).await;
+        let home = TempDir::new()?;
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test-key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                    config.model_provider.stream_max_retries = Some(2);
+                },
+            )
+            .await;
+        let metadata = turn.turn_metadata_state.to_responses_metadata(
+            session.installation_id.clone(),
+            session.current_window_id().await,
+            CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2,
+                CompactionPhase::StandaloneTurn,
+            )),
+        );
+        let prompt = Prompt {
+            stream_progress_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let mut client = session.services.model_client.new_session();
+        let result = run_remote_compaction_request_v2(
+            &session,
+            &turn,
+            &mut client,
+            &prompt,
+            &metadata,
+            &CompactionTraceContext::disabled(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("every attempt stalls");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("idle timeout waiting for SSE after 200ms"),
+            "{error}"
+        );
+        // The stream retry budget alone would allow three requests.
+        assert_eq!(server.requests().await.len(), 2);
+        drop(gates);
+        server.shutdown().await;
         Ok(())
     }
 
@@ -1141,7 +1376,8 @@ mod tests {
             retained,
             &InitialContextInjection::DoNotInject,
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         assert_eq!(
             replacement,
             vec![
@@ -1212,15 +1448,26 @@ mod tests {
             retained,
             &InitialContextInjection::DoNotInject,
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         assert_eq!(&replacement[..3], &[request, correction, handoff]);
         let ResponseItem::Message { content, .. } = &replacement[3] else {
             panic!("expected the current plan in the model checkpoint");
         };
         let text = crate::compact::content_items_to_text(content).unwrap();
-        let (current, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        let (current, lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .unwrap();
         assert_eq!(current, plan);
-        assert!(text.contains(&crate::plan_store::plan_revision_with_lineage(Some(&plan), &lineage)));
+        assert!(
+            text.contains(&crate::plan_store::plan_revision_with_lineage(
+                Some(&plan),
+                &lineage
+            ))
+        );
         assert!(text.contains("not current instructions or proof of completion"));
         assert_eq!(replacement.last(), Some(&opaque));
 
@@ -1242,9 +1489,19 @@ mod tests {
             .filter(|text| text.contains("source=\"compaction_plan\""))
             .collect::<Vec<_>>();
         assert_eq!(plans.len(), 1);
-        let (current, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        let (current, lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .unwrap();
         assert_eq!(current, updated);
-        assert!(plans[0].contains(&crate::plan_store::plan_revision_with_lineage(Some(&updated), &lineage)));
+        assert!(
+            plans[0].contains(&crate::plan_store::plan_revision_with_lineage(
+                Some(&updated),
+                &lineage
+            ))
+        );
         assert!(!plans[0].contains("Finish network modeling"));
     }
 
@@ -1268,8 +1525,6 @@ mod tests {
             original.as_slice()
         );
     }
-
-
 
     #[test]
     fn build_v2_compacted_history_bounds_unresolved_user_text() {
@@ -1378,7 +1633,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (history, retained_image_count) = build_v2_compacted_history(input.clone(), output.clone());
+        let (history, retained_image_count) =
+            build_v2_compacted_history(input.clone(), output.clone());
 
         let mut expected = input;
         expected.push(output);
@@ -1399,13 +1655,15 @@ mod tests {
             if cancel_before_poll {
                 cancellation_token.cancel();
             }
-            let mut pending = Box::pin(collect_compaction_output(stream, None, &cancellation_token));
+            let mut pending =
+                Box::pin(collect_compaction_output(stream, None, &cancellation_token));
             if !cancel_before_poll {
                 assert!(futures::poll!(pending.as_mut()).is_pending());
                 cancellation_token.cancel();
             }
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
-                .await.expect("cancelled compaction collector must stop");
+                .await
+                .expect("cancelled compaction collector must stop");
             assert!(matches!(result, Err(CodexErr::TurnAborted)));
         }
     }
@@ -1526,9 +1784,9 @@ mod tests {
                 token_usage: None,
                 end_turn: Some(true),
             }));
-            let result = collect_compaction_output(
-                response_stream(events), None, &CancellationToken::new(),
-            ).await;
+            let result =
+                collect_compaction_output(response_stream(events), None, &CancellationToken::new())
+                    .await;
             assert!(matches!(result, Err(CodexErr::Fatal(message))
                 if message.contains(&format!("got {count} from {count} output items"))));
         }

@@ -12,11 +12,11 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::WriteStdinRequest;
+use codex_async_utils::OrCancelExt;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use codex_async_utils::OrCancelExt;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -108,12 +108,20 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
-        let live_incarnation = session.services.unified_exec_manager
-            .process_incarnation(args.session_id).await;
-        if live_incarnation.is_none() && args.chars.is_empty() && !args.terminate
+        let live_incarnation = session
+            .services
+            .unified_exec_manager
+            .process_incarnation(args.session_id)
+            .await;
+        if live_incarnation.is_none()
+            && args.chars.is_empty()
+            && !args.terminate
             && let Some(incarnation) = args.incarnation
-            && let Some(result) = session.services.command_execution
-                .completed_process_result(args.session_id, incarnation).await
+            && let Some(result) = session
+                .services
+                .command_execution
+                .completed_process_result(args.session_id, incarnation)
+                .await
         {
             return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
         }
@@ -140,11 +148,15 @@ impl WriteStdinHandler {
         validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         if args.terminate
-            && !session.services.unified_exec_manager
-                .terminate_process_for_poll(args.session_id).await
+            && !session
+                .services
+                .unified_exec_manager
+                .terminate_process_for_poll(args.session_id)
+                .await
         {
             return Err(FunctionCallError::RespondToModel(
-                "termination could not be confirmed; inspect the session before retrying".to_string(),
+                "termination could not be confirmed; inspect the session before retrying"
+                    .to_string(),
             ));
         }
         let yield_time_ms = owner_wait_yield_time_ms(
@@ -165,17 +177,29 @@ impl WriteStdinHandler {
             };
             let manager = &session.services.unified_exec_manager;
             let response = if wait_for_output {
-                manager.write_stdin_until_output(request)
-                    .or_cancel(&cancellation_token).await
-                    .map_err(|_| FunctionCallError::RespondToModel("command wait cancelled; process state remains inspectable".to_string()))?
+                manager
+                    .write_stdin_until_output(request)
+                    .or_cancel(&cancellation_token)
+                    .await
+                    .map_err(|_| {
+                        FunctionCallError::RespondToModel(
+                            "command wait cancelled; process state remains inspectable".to_string(),
+                        )
+                    })?
             } else {
                 manager.write_stdin(request).await
             };
-            if !wait_for_output || response.as_ref().map_or(true, |output| {
-                output.process_exited || !output.raw_output.is_empty()
-                    || !output.pending_deferred_completions.is_empty()
-                    || nested_return_margin_reached(source.nested_deadline(), std::time::Instant::now())
-            }) {
+            if !wait_for_output
+                || response.as_ref().map_or(true, |output| {
+                    output.process_exited
+                        || !output.raw_output.is_empty()
+                        || !output.pending_deferred_completions.is_empty()
+                        || nested_return_margin_reached(
+                            source.nested_deadline(),
+                            std::time::Instant::now(),
+                        )
+                })
+            {
                 break response;
             }
         };
@@ -200,14 +224,20 @@ impl WriteStdinHandler {
             Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
                 if args.chars.is_empty() && !args.terminate =>
             {
-                if let Some(result) = session.services.command_execution
-                    .completed_process_result(process_id, incarnation).await
+                if let Some(result) = session
+                    .services
+                    .command_execution
+                    .completed_process_result(process_id, incarnation)
+                    .await
                 {
                     return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
                 }
                 Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
             }
-            Err(crate::unified_exec::UnifiedExecError::ProcessFailedWithOutput { mut output, .. }) => {
+            Err(crate::unified_exec::UnifiedExecError::ProcessFailedWithOutput {
+                mut output,
+                ..
+            }) => {
                 output.max_output_tokens = args.max_output_tokens;
                 output.truncation_policy = turn.model_info.truncation_policy.into();
                 Ok(*output)
@@ -216,12 +246,26 @@ impl WriteStdinHandler {
         };
         let mut response = match response {
             Ok(response) => response,
-            Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { message, output, .. }) => {
-                return Err(FunctionCallError::Fatal(super::preserve_durability_failure_output(
-                    message, output, &turn.config.codex_home, &session.thread_id.to_string(),
-                ).await));
+            Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {
+                message,
+                output,
+                ..
+            }) => {
+                return Err(FunctionCallError::Fatal(
+                    super::preserve_durability_failure_output(
+                        message,
+                        output,
+                        &turn.config.codex_home,
+                        &session.thread_id.to_string(),
+                    )
+                    .await,
+                ));
             }
-            Err(err) => return Err(FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))),
+            Err(err) => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "write_stdin failed: {err}"
+                )));
+            }
         };
 
         if let Some(running) = session
@@ -232,15 +276,23 @@ impl WriteStdinHandler {
         {
             if let Some(cwd) = running.key.local_cwd() {
                 super::exec_command::attach_hidden_rg_directory_advisory(
-                    &mut response, &cwd, &session.services.git_workspace,
-                ).await;
+                    &mut response,
+                    &cwd,
+                    &turn,
+                    &session.services.git_workspace,
+                )
+                .await;
             }
             let artifact = response
                 .raw_output_artifact
                 .clone()
                 .unwrap_or_else(|| running.artifact.clone());
             response.raw_output_artifact = Some(artifact.clone());
-            session.services.command_execution.update_running_artifact(args.session_id, artifact).await;
+            session
+                .services
+                .command_execution
+                .update_running_artifact(args.session_id, artifact)
+                .await;
             if response.process_id.is_none() {
                 session
                     .services
@@ -271,9 +323,12 @@ impl WriteStdinHandler {
                 .await;
         }
 
-        response.prepare_recovery_artifact(
-            turn.config.codex_home.as_path(), &session.thread_id.to_string(),
-        ).await;
+        response
+            .prepare_recovery_artifact(
+                turn.config.codex_home.as_path(),
+                &session.thread_id.to_string(),
+            )
+            .await;
         Ok(boxed_tool_output(response))
     }
 }
@@ -323,9 +378,8 @@ impl CoreToolRuntime for WriteStdinHandler {
         let ToolPayload::Function { arguments } = payload else {
             return false;
         };
-        serde_json::from_str::<WriteStdinArgs>(arguments).is_ok_and(|args| {
-            args.chars.is_empty() && !args.terminate
-        })
+        serde_json::from_str::<WriteStdinArgs>(arguments)
+            .is_ok_and(|args| args.chars.is_empty() && !args.terminate)
     }
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
@@ -371,16 +425,30 @@ mod tests {
         let handler = WriteStdinHandler::default();
         for (arguments, observation, control) in [
             (r#"{"session_id":7}"#, true, false),
-            (r#"{"session_id":7,"chars":"","terminate":false}"#, true, false),
+            (
+                r#"{"session_id":7,"chars":"","terminate":false}"#,
+                true,
+                false,
+            ),
             (r#"{"session_id":7,"chars":"input"}"#, false, false),
             (r#"{"session_id":7,"terminate":true}"#, false, true),
-            (r#"{"session_id":7,"terminate":true,"chars":"input"}"#, false, false),
+            (
+                r#"{"session_id":7,"terminate":true,"chars":"input"}"#,
+                false,
+                false,
+            ),
             (r#"{"session_id":7,"terminate":"true"}"#, false, false),
             (r#"{"terminate":true}"#, false, false),
             ("not json", false, false),
         ] {
-            let payload = ToolPayload::Function { arguments: arguments.to_string() };
-            assert_eq!(handler.permits_shared_workspace_observation(&payload), observation, "{arguments}");
+            let payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
+            assert_eq!(
+                handler.permits_shared_workspace_observation(&payload),
+                observation,
+                "{arguments}"
+            );
             assert_eq!(handler.controls_process(&payload), control, "{arguments}");
         }
     }
@@ -394,7 +462,8 @@ mod tests {
         assert!(nested_return_margin_reached(Some(now), now));
         assert!(nested_return_margin_reached(Some(now + margin), now));
         assert!(!nested_return_margin_reached(
-            Some(now + margin + std::time::Duration::from_nanos(1)), now,
+            Some(now + margin + std::time::Duration::from_nanos(1)),
+            now,
         ));
     }
 
@@ -407,7 +476,10 @@ mod tests {
             (serde_json::json!({"yield_time_ms":1000}), false),
             (serde_json::json!({"chars":"input"}), false),
             (serde_json::json!({"terminate":true}), false),
-            (serde_json::json!({"yield_time_ms":1000,"wait_for_output":true}), true),
+            (
+                serde_json::json!({"yield_time_ms":1000,"wait_for_output":true}),
+                true,
+            ),
         ] {
             let mut value = fields;
             value["session_id"] = 7.into();
@@ -421,14 +493,22 @@ mod tests {
         for session_id in [0, 2_374_420_115_u64, u64::from(u32::MAX)] {
             let args: WriteStdinArgs = serde_json::from_value(serde_json::json!({
                 "session_id": session_id, "chars": "", "yield_time_ms": 1000,
-            })).expect("session id returned by exec_command should deserialize");
+            }))
+            .expect("session id returned by exec_command should deserialize");
             assert_eq!(u64::from(args.session_id), session_id);
             assert_eq!(args.yield_time_ms, Some(1_000));
         }
-        for session_id in [serde_json::json!(-1), serde_json::json!(u64::from(u32::MAX) + 1), serde_json::json!(1.5)] {
-            assert!(serde_json::from_value::<WriteStdinArgs>(serde_json::json!({
-                "session_id": session_id,
-            })).is_err());
+        for session_id in [
+            serde_json::json!(-1),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                serde_json::from_value::<WriteStdinArgs>(serde_json::json!({
+                    "session_id": session_id,
+                }))
+                .is_err()
+            );
         }
     }
 

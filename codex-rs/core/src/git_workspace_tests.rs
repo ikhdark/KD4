@@ -26,25 +26,58 @@ async fn verified_capture_path_deltas_preserve_unrelated_dirty_files() {
     let (_temp, repo) = create_clean_git_repo().await;
     std::fs::write(repo.join("README.md"), "dirty before\n").unwrap();
     std::fs::write(repo.join("other.txt"), "unchanged dirty\n").unwrap();
-    let before = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    let before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
     std::fs::write(repo.join("README.md"), "changed after\n").unwrap();
-    let after = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
-    assert_eq!(after.changed_paths_since(&before), Some(BTreeSet::from([repo.join("README.md").to_path_buf()])));
+    let after = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_eq!(
+        after.changed_paths_since(&before),
+        Some(BTreeSet::from([repo.join("README.md").to_path_buf()]))
+    );
     run_git(repo.as_path(), &["add", "README.md"]).await;
-    let staged = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
-    assert_eq!(staged.changed_paths_since(&after), Some(BTreeSet::from([repo.join("README.md").to_path_buf()])));
+    let staged = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.changed_paths_since(&after),
+        Some(BTreeSet::from([repo.join("README.md").to_path_buf()]))
+    );
     run_git(repo.as_path(), &["mv", "README.md", "renamed.md"]).await;
-    let renamed = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
-    assert_eq!(renamed.changed_paths_since(&staged), Some(BTreeSet::from([
-        repo.join("README.md").to_path_buf(), repo.join("renamed.md").to_path_buf(),
-    ])));
+    let renamed = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed.changed_paths_since(&staged),
+        Some(BTreeSet::from([
+            repo.join("README.md").to_path_buf(),
+            repo.join("renamed.md").to_path_buf(),
+        ]))
+    );
     std::fs::remove_file(repo.join("other.txt")).unwrap();
-    let deleted = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
-    assert_eq!(deleted.changed_paths_since(&renamed), Some(BTreeSet::from([repo.join("other.txt").to_path_buf()])));
-    let restored: WorkspaceEvidenceIdentity = serde_json::from_value(serde_json::to_value(&deleted).unwrap()).unwrap();
-    assert_eq!(restored, deleted, "capture-local details do not change durable identity");
+    let deleted = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.changed_paths_since(&renamed),
+        Some(BTreeSet::from([repo.join("other.txt").to_path_buf()]))
+    );
+    let restored: WorkspaceEvidenceIdentity =
+        serde_json::from_value(serde_json::to_value(&deleted).unwrap()).unwrap();
+    assert_eq!(
+        restored, deleted,
+        "capture-local details do not change durable identity"
+    );
     assert!(restored.changed_paths_since(&renamed).is_none());
-    assert!(deleted.changed_paths_since(&WorkspaceEvidenceIdentity::unavailable(Some(repo.as_path()))).is_none());
+    assert!(
+        deleted
+            .changed_paths_since(&WorkspaceEvidenceIdentity::unavailable(Some(
+                repo.as_path()
+            )))
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -53,15 +86,51 @@ async fn verified_validation_paths_exclude_only_ignored_and_external_local_files
     std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
     std::fs::write(repo.join("ignored.txt"), "output").unwrap();
     let external = temp.path().parent().unwrap().join("outside-report.txt");
-    let paths = vec![("local".into(), repo.join("README.md").to_path_buf()),
+    let paths = vec![
+        ("local".into(), repo.join("README.md").to_path_buf()),
         ("local".into(), repo.join("ignored.txt").to_path_buf()),
-        ("local".into(), external.clone()), ("remote".into(), external)];
+        ("local".into(), external.clone()),
+        ("remote".into(), external),
+    ];
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let filtered = cache.validation_relevant_paths(repo.as_path(), paths.clone()).await;
+    let filtered = cache
+        .validation_relevant_paths(repo.as_path(), paths.clone())
+        .await;
     assert_eq!(filtered, vec![paths[0].clone(), paths[3].clone()]);
     run_git(repo.as_path(), &["add", "-f", "ignored.txt"]).await;
-    assert_eq!(cache.validation_relevant_paths(repo.as_path(), paths.clone()).await,
-        vec![paths[0].clone(), paths[1].clone(), paths[3].clone()]);
+    assert_eq!(
+        cache
+            .validation_relevant_paths(repo.as_path(), paths.clone())
+            .await,
+        vec![paths[0].clone(), paths[1].clone(), paths[3].clone()]
+    );
+}
+
+#[tokio::test]
+async fn validation_paths_without_a_repository_preserve_unverified_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path();
+    let paths = vec![
+        ("local".into(), cwd.join("src/report.py")),
+        ("local".into(), cwd.join(".codex/gitdiff/turn.patch")),
+        ("local".into(), cwd.join("pkg/__pycache__/report.cpython-312.pyc")),
+        ("local".into(), cwd.join("node_modules/dep/index.js")),
+        ("local".into(), cwd.join(".codex/hooks/check.py")),
+        // A file merely named like an output directory is still a source.
+        ("local".into(), cwd.join("target")),
+        ("remote".into(), cwd.join(".codex/remote.json")),
+    ];
+    for (_, path) in &paths {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "authored content").unwrap();
+    }
+    let filtered = GitWorkspaceCache::with_noop_watcher_for_tests()
+        .validation_relevant_paths(cwd, paths.clone())
+        .await;
+    assert_eq!(
+        filtered, paths,
+        "no repository or producer proof permits exclusion"
+    );
 }
 
 #[tokio::test]
@@ -71,29 +140,73 @@ async fn completion_boundary_batched_ignores_match_single_path_attribution() {
     std::fs::create_dir(repo.join("ignored")).unwrap();
     std::fs::write(repo.join("ignored/tracked.out"), "tracked").unwrap();
     run_git(repo.as_path(), &["add", "-f", "ignored/tracked.out"]).await;
-    let mut paths = (0..80).map(|index| repo.join(format!("result-{index}-{}.out", "x".repeat(100))).to_path_buf()).collect::<Vec<_>>();
+    let mut paths = (0..80)
+        .map(|index| {
+            repo.join(format!("result-{index}-{}.out", "x".repeat(100)))
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
     let expected = paths.iter().cloned().collect::<BTreeSet<_>>();
-    assert!(paths.iter().map(|path| path.strip_prefix(repo.as_path()).unwrap().to_str().unwrap().len() + 1).sum::<usize>() > 8 * 1024,
-        "fixture must cross the production ignore-query batch boundary");
-    paths.extend([repo.join("ignored").to_path_buf(), repo.join("ignored/tracked.out").to_path_buf(), repo.join("README.md").to_path_buf()]);
+    assert!(
+        paths
+            .iter()
+            .map(|path| path
+                .strip_prefix(repo.as_path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .len()
+                + 1)
+            .sum::<usize>()
+            > 8 * 1024,
+        "fixture must cross the production ignore-query batch boundary"
+    );
+    paths.extend([
+        repo.join("ignored").to_path_buf(),
+        repo.join("ignored/tracked.out").to_path_buf(),
+        repo.join("README.md").to_path_buf(),
+    ]);
     let ignored = git_ignored_validation_paths(repo.as_path(), &paths).await;
-    assert_eq!(ignored, expected, "every path in both batches must be classified");
+    assert_eq!(
+        ignored, expected,
+        "every path in both batches must be classified"
+    );
     // The full-set oracle above covers every output file. Compare the independent
     // single-path API once per behavior, including both ends of the batch split.
     for path in [&paths[0], &paths[79], &paths[80], &paths[81], &paths[82]] {
-        assert_eq!(ignored.contains(path), git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(path)).await, "{}", path.display());
+        assert_eq!(
+            ignored.contains(path),
+            git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(path)).await,
+            "{}",
+            path.display()
+        );
     }
     assert_eq!(ignored.len(), 80);
-    assert!(git_ignored_validation_paths(repo.join("missing-root").as_path(), &paths).await.is_empty());
+    assert!(
+        git_ignored_validation_paths(repo.join("missing-root").as_path(), &paths)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn evidence_reuse_transient_capture_failure_expires_without_a_workspace_change() {
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let initial = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
-    assert!(initial.identity.as_ref().is_some_and(|identity| !identity.unavailable));
-    let root = cache.resolve_workspace_root(repo.as_path()).await.unwrap().unwrap();
+    let initial = cache
+        .workspace_evidence_identity_with_attribution(repo.as_path())
+        .await;
+    assert!(
+        initial
+            .identity
+            .as_ref()
+            .is_some_and(|identity| !identity.unavailable)
+    );
+    let root = cache
+        .resolve_workspace_root(repo.as_path())
+        .await
+        .unwrap()
+        .unwrap();
     let key = WorkspaceEvidenceCaptureKey {
         repo_root: root.clone(),
         watcher_generation: cache.watcher_generation.load(Ordering::Acquire),
@@ -110,15 +223,20 @@ async fn evidence_reuse_transient_capture_failure_expires_without_a_workspace_ch
         entry.failed_capture = Some((key, failed, Instant::now()));
     }
     let captures = cache.workspace_evidence_capture_count();
-    let cached = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
+    let cached = cache
+        .workspace_evidence_identity_with_attribution(repo.as_path())
+        .await;
     assert!(cached.identity.unwrap().unavailable);
     assert_eq!(cache.workspace_evidence_capture_count(), captures);
     {
         let mut retention = cache.repository_retention.lock().unwrap();
         let entry = retention.latest_workspace_evidence.get_mut(&root).unwrap();
-        entry.failed_capture.as_mut().unwrap().2 = Instant::now() - WORKSPACE_FAILURE_RETRY_INTERVAL;
+        entry.failed_capture.as_mut().unwrap().2 =
+            Instant::now() - WORKSPACE_FAILURE_RETRY_INTERVAL;
     }
-    let recovered = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
+    let recovered = cache
+        .workspace_evidence_identity_with_attribution(repo.as_path())
+        .await;
     assert_eq!(recovered.identity, initial.identity);
     assert_eq!(cache.workspace_evidence_capture_count(), captures + 1);
 }
@@ -131,28 +249,51 @@ async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
     let build = repo.join("target/output.bin").to_path_buf();
     std::fs::write(&build, "build").unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let observed = cache.begin_source_path_change_observation(
-        repo.as_path(), &build, false,
-    ).await.unwrap();
+    let observed = cache
+        .begin_source_path_change_observation(repo.as_path(), &build, false)
+        .await
+        .unwrap();
     let before = cache.source_capture_generation.load(Ordering::Acquire);
-    cache.record_watched_source_change_event(Some(vec![build.clone()])).await;
-    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
+    cache
+        .record_watched_source_change_event(Some(vec![build.clone()]))
+        .await;
+    assert_eq!(
+        cache.source_capture_generation.load(Ordering::Acquire),
+        before
+    );
     assert!(!cache.source_path_change_observation_is_current(&observed));
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
     let other = repo.join("target/another.bin").to_path_buf();
     std::fs::write(&other, "next build").unwrap();
-    cache.record_watched_source_change_event(Some(vec![other])).await;
-    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
+    cache
+        .record_watched_source_change_event(Some(vec![other]))
+        .await;
+    assert_eq!(
+        cache.source_capture_generation.load(Ordering::Acquire),
+        before
+    );
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
     assert!(git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(&build)).await);
-    assert!(std::process::Command::new("git").args(["add", "-f", "target/output.bin"])
-        .current_dir(repo.as_path()).status().unwrap().success());
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "-f", "target/output.bin"])
+            .current_dir(repo.as_path())
+            .status()
+            .unwrap()
+            .success()
+    );
     // Force-added files, including changes reported only on their directory,
     // affect git status even though the directory itself is ignored.
-    for path in [build, repo.join("target").to_path_buf(), repo.join(".gitignore").to_path_buf()] {
+    for path in [
+        build,
+        repo.join("target").to_path_buf(),
+        repo.join(".gitignore").to_path_buf(),
+    ] {
         assert!(!git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(&path)).await);
         let before = cache.source_capture_generation.load(Ordering::Acquire);
-        cache.record_watched_source_change_event(Some(vec![path])).await;
+        cache
+            .record_watched_source_change_event(Some(vec![path]))
+            .await;
         assert!(cache.source_capture_generation.load(Ordering::Acquire) > before);
     }
 }
@@ -162,25 +303,63 @@ async fn git_internal_events_do_not_query_git_or_invalidate_snapshots() {
     let (_temp, repo) = create_clean_git_repo().await;
     let root = repo.as_path();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let source = cache.begin_source_path_change_observation(root, &root.join("file"), false).await.unwrap();
+    let source = cache
+        .begin_source_path_change_observation(root, &root.join("file"), false)
+        .await
+        .unwrap();
     for path in [
-        ".git/objects/aa/object", ".git/objects/pack/new.pack",
-        ".git/refs/codex/x", ".git/COMMIT_EDITMSG", ".git/ORIG_HEAD",
-        ".git/index.lock", ".git/HEAD", ".git/refs/heads/main",
-        ".git/packed-refs", ".git/config", ".git/objects-other/file",
+        ".git/objects/aa/object",
+        ".git/objects/pack/new.pack",
+        ".git/refs/codex/x",
+        ".git/COMMIT_EDITMSG",
+        ".git/ORIG_HEAD",
+        ".git/index.lock",
+        ".git/HEAD",
+        ".git/refs/heads/main",
+        ".git/packed-refs",
+        ".git/config",
+        ".git/objects-other/file",
     ] {
-        cache.record_watched_source_change_event(Some(vec![root.join(path)])).await;
-        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 0, "{path}");
-        assert!(cache.source_path_change_observation_is_current(&source), "{path}");
-        assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 0, "{path}");
+        cache
+            .record_watched_source_change_event(Some(vec![root.join(path)]))
+            .await;
+        assert_eq!(
+            cache.source_capture_generation.load(Ordering::Acquire),
+            0,
+            "{path}"
+        );
+        assert!(
+            cache.source_path_change_observation_is_current(&source),
+            "{path}"
+        );
+        assert_eq!(
+            cache.ignore_query_count.load(Ordering::Relaxed),
+            0,
+            "{path}"
+        );
     }
     assert!(!is_git_internal_source_event(&root.join("objects/file")));
-    assert!(!is_git_internal_source_event(&root.join(".git-other/objects/file")));
-    for path in [root.join(".git/index"), root.join(".git/info/exclude"), root.join(".git"), root.join("file")] {
+    assert!(!is_git_internal_source_event(
+        &root.join(".git-other/objects/file")
+    ));
+    for path in [
+        root.join(".git/index"),
+        root.join(".git/info/exclude"),
+        root.join(".git"),
+        root.join("file"),
+    ] {
         assert!(!is_git_internal_source_event(&path));
         let before = cache.source_capture_generation.load(Ordering::Acquire);
-        cache.record_watched_source_change_event(Some(vec![root.join(".git/objects/aa/object"), path])).await;
-        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before + 1);
+        cache
+            .record_watched_source_change_event(Some(vec![
+                root.join(".git/objects/aa/object"),
+                path,
+            ]))
+            .await;
+        assert_eq!(
+            cache.source_capture_generation.load(Ordering::Acquire),
+            before + 1
+        );
     }
 }
 
@@ -195,17 +374,32 @@ async fn git_internal_source_dependencies_are_invalidated_without_recapturing_wo
         let observations = cache
             .begin_source_path_change_observations(
                 root,
-                &[(path.clone(), false), (root.join("file"), false), (root.join(".git"), true)],
+                &[
+                    (path.clone(), false),
+                    (root.join("file"), false),
+                    (root.join(".git"), true),
+                ],
             )
             .await
             .expect("retained source watches");
         // A direct source read is a dependency even when Git status would not
         // change. Exercise the real watcher event owner, not a generic mutation.
         std::fs::write(&path, "changed source dependency\n").unwrap();
-        cache.record_watched_source_change_event(Some(vec![path])).await;
-        assert!(!cache.source_path_change_observation_is_current(&observations[0]), "{relative}");
-        assert!(cache.source_path_change_observation_is_current(&observations[1]), "{relative}");
-        assert!(!cache.source_path_change_observation_is_current(&observations[2]), "{relative}");
+        cache
+            .record_watched_source_change_event(Some(vec![path]))
+            .await;
+        assert!(
+            !cache.source_path_change_observation_is_current(&observations[0]),
+            "{relative}"
+        );
+        assert!(
+            cache.source_path_change_observation_is_current(&observations[1]),
+            "{relative}"
+        );
+        assert!(
+            !cache.source_path_change_observation_is_current(&observations[2]),
+            "{relative}"
+        );
         assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 0);
         assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 0);
     }
@@ -223,22 +417,48 @@ async fn git_internal_mixed_batches_and_flood_preserve_capture_isolation() {
     let source = root.join("file");
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     for (other, captures) in [(ignored, 0), (source.clone(), 1)] {
-        let observations = cache.begin_source_path_change_observations(root,
-            &[(internal.clone(), false), (other.clone(), false)],
-        ).await.unwrap();
-        cache.record_watched_source_change_event(Some(vec![internal.clone(), other])).await;
-        assert!(observations.iter().all(|value| cache.source_path_freshness(value) == SourceFreshness::Changed));
-        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), captures);
+        let observations = cache
+            .begin_source_path_change_observations(
+                root,
+                &[(internal.clone(), false), (other.clone(), false)],
+            )
+            .await
+            .unwrap();
+        cache
+            .record_watched_source_change_event(Some(vec![internal.clone(), other]))
+            .await;
+        assert!(
+            observations
+                .iter()
+                .all(|value| cache.source_path_freshness(value) == SourceFreshness::Changed)
+        );
+        assert_eq!(
+            cache.source_capture_generation.load(Ordering::Acquire),
+            captures
+        );
     }
-    let observation = cache.begin_source_path_change_observation(root, &source, false).await.unwrap();
+    let observation = cache
+        .begin_source_path_change_observation(root, &source, false)
+        .await
+        .unwrap();
     let queries = cache.ignore_query_count.load(Ordering::Relaxed);
     for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
-        cache.record_watched_source_change_event(Some(vec![root.join(format!(".git/objects/{index}"))])).await;
+        cache
+            .record_watched_source_change_event(Some(vec![
+                root.join(format!(".git/objects/{index}")),
+            ]))
+            .await;
     }
-    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Unknown);
+    assert_eq!(
+        cache.source_path_freshness(&observation),
+        SourceFreshness::Unknown
+    );
     assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 1);
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), queries);
-    assert_eq!(cache.source_change_journal.lock().unwrap().events.len(), SOURCE_CHANGE_JOURNAL_CAPACITY);
+    assert_eq!(
+        cache.source_change_journal.lock().unwrap().events.len(),
+        SOURCE_CHANGE_JOURNAL_CAPACITY
+    );
 }
 
 #[tokio::test]
@@ -249,16 +469,28 @@ async fn ignored_directory_proofs_expire_on_ignore_edits_and_rescans() {
     let path = repo.join("target/output").to_path_buf();
     std::fs::write(&path, "build").unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    cache.begin_source_path_change_observation(repo.as_path(), &path, false).await.unwrap();
-    cache.record_watched_source_change_event(Some(vec![path.clone()])).await;
+    cache
+        .begin_source_path_change_observation(repo.as_path(), &path, false)
+        .await
+        .unwrap();
+    cache
+        .record_watched_source_change_event(Some(vec![path.clone()]))
+        .await;
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
     cache.record_watched_source_change_event(None).await;
-    cache.record_watched_source_change_event(Some(vec![path.clone()])).await;
+    cache
+        .record_watched_source_change_event(Some(vec![path.clone()]))
+        .await;
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 2);
     std::fs::write(repo.join(".gitignore"), "# no exclusions\n").unwrap();
     let before = cache.source_capture_generation.load(Ordering::Acquire);
-    cache.record_watched_source_change_event(Some(vec![path])).await;
-    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before + 1);
+    cache
+        .record_watched_source_change_event(Some(vec![path]))
+        .await;
+    assert_eq!(
+        cache.source_capture_generation.load(Ordering::Acquire),
+        before + 1
+    );
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 3);
 }
 
@@ -359,8 +591,16 @@ async fn root_discovery_refills_slots_behind_a_blocked_first_resolution() {
         progress
     };
     let (roots, progress) = tokio::join!(resolve_roots_in_order(resolutions), observer);
-    assert!(progress.is_ok(), "a slow first root prevented independent probes");
-    assert_eq!(roots, (0..count).map(|index| (index != 1).then_some(index)).collect::<Vec<_>>());
+    assert!(
+        progress.is_ok(),
+        "a slow first root prevented independent probes"
+    );
+    assert_eq!(
+        roots,
+        (0..count)
+            .map(|index| (index != 1).then_some(index))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(active.load(Ordering::SeqCst), 0);
     assert_eq!(peak.load(Ordering::SeqCst), ROOT_DISCOVERY_CONCURRENCY);
 }
@@ -763,10 +1003,16 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
     cache.record_source_change_event(Some(vec![repo.join("untracked-0.txt").to_path_buf()]));
     cache.workspace_evidence_identity(repo.as_path()).await;
     assert_eq!(cache.workspace_evidence_capture_count(), 2);
-    cache.note_host_workspace_mutation_paths(repo.as_path(), &["oversized.bin".to_string()]).await;
+    cache
+        .note_host_workspace_mutation_paths(repo.as_path(), &["oversized.bin".to_string()])
+        .await;
     oversized.set_len(0).unwrap();
     let recovered = cache.workspace_evidence_identity(repo.as_path()).await;
-    assert!(recovered.as_ref().is_some_and(|identity| !identity.unavailable));
+    assert!(
+        recovered
+            .as_ref()
+            .is_some_and(|identity| !identity.unavailable)
+    );
     assert_eq!(cache.workspace_evidence_capture_count(), 3);
     // Cover both new explicit failures and old persisted None observations.
     for captured in [before, None] {
@@ -797,28 +1043,56 @@ async fn workspace_content_capture_rehashes_even_when_metadata_is_preserved() {
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let path = root.path().join("dirty.txt");
     std::fs::write(&path, b"first").unwrap();
-    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
-    let capture = || capture_workspace_metadata(
-        root.path().to_path_buf(),
-        vec![WorkspaceGenerationPath { path: "dirty.txt".into(), deleted: false }],
-        WorkspaceCaptureControl { deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE, cancellation: CancellationToken::new() },
-    );
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let capture = || {
+        capture_workspace_metadata(
+            root.path().to_path_buf(),
+            vec![WorkspaceGenerationPath {
+                path: "dirty.txt".into(),
+                deleted: false,
+            }],
+            WorkspaceCaptureControl {
+                deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
+                cancellation: CancellationToken::new(),
+            },
+        )
+    };
     let first = capture().await.unwrap().manifest;
     assert_eq!(capture().await.unwrap().manifest, first);
     // An in-place equal-length write can restore the original modification time
     // without changing file identity. Fresh evidence must still see its bytes.
     std::fs::write(&path, b"other").unwrap();
-    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
     let rewritten = capture().await.unwrap().manifest;
     assert_ne!(rewritten, first);
     // Replacement with the same size and mtime must not reuse the old digest.
     std::fs::rename(&path, root.path().join("old.txt")).unwrap();
     std::fs::write(&path, b"third").unwrap();
-    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
     let replacement = capture().await.unwrap().manifest;
     assert_ne!(replacement, rewritten);
     let future = SystemTime::now() + Duration::from_secs(60);
-    File::options().write(true).open(&path).unwrap().set_modified(future).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
     assert_eq!(capture().await.unwrap().manifest, replacement);
     assert_eq!(capture().await.unwrap().manifest, replacement);
     std::fs::write(&path, b"longer contents").unwrap();
@@ -834,10 +1108,19 @@ async fn parallel_workspace_hashes_preserve_manifest_order() {
         let path = format!("{index}.txt");
         let content = vec![b'a' + index; (8 - index as usize) * 1024];
         std::fs::write(root.path().join(&path), &content).unwrap();
-        expected.extend_from_slice(format!("{path}\0file\0{}\0{:x}\n", content.len(), Sha256::digest(&content)).as_bytes());
+        expected.extend_from_slice(
+            format!(
+                "{path}\0file\0{}\0{:x}\n",
+                content.len(),
+                Sha256::digest(&content)
+            )
+            .as_bytes(),
+        );
         paths.push(path);
     }
-    let actual = workspace_generation_metadata(root.path().to_path_buf(), paths).await.unwrap();
+    let actual = workspace_generation_metadata(root.path().to_path_buf(), paths)
+        .await
+        .unwrap();
     assert_eq!(actual.manifest, expected);
 }
 
@@ -1005,11 +1288,21 @@ fn nul_status_reader_handles_split_renames_conflicts_and_limits() {
     let mut reader = WorkspaceStatusReader::new();
     assert_eq!(reader.push(b"x unknown\0"), None);
     let mut reader = WorkspaceStatusReader::new();
-    reader.push(b"2 R. N... 100644 100644 100644 a b R100 renamed\0").unwrap();
-    assert!(reader.finish().is_none(), "rename destination without source is incomplete");
+    reader
+        .push(b"2 R. N... 100644 100644 100644 a b R100 renamed\0")
+        .unwrap();
+    assert!(
+        reader.finish().is_none(),
+        "rename destination without source is incomplete"
+    );
     let mut reader = WorkspaceStatusReader::new();
-    reader.push(b"1 .D N... 100644 100644 000000 a b same\0").unwrap();
-    assert!(reader.push(b"? same\0").is_none(), "conflicting deletion observations cannot certify content");
+    reader
+        .push(b"1 .D N... 100644 100644 000000 a b same\0")
+        .unwrap();
+    assert!(
+        reader.push(b"? same\0").is_none(),
+        "conflicting deletion observations cannot certify content"
+    );
 }
 
 #[tokio::test]
@@ -1074,7 +1367,10 @@ async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchang
     let first = capture_workspace_evidence_identity(repo.as_path())
         .await
         .expect("first identity");
-    let cached_first = cache.workspace_evidence_identity(repo.as_path()).await.expect("first shared-cache identity");
+    let cached_first = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("first shared-cache identity");
 
     std::fs::write(&readme, "other dirty value\n").expect("second dirty write");
     std::fs::File::options()
@@ -1090,14 +1386,20 @@ async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchang
     let second = capture_workspace_evidence_identity(repo.as_path())
         .await
         .expect("second identity");
-    let cached_second = cache.workspace_evidence_identity(repo.as_path()).await.expect("second shared-cache identity");
+    let cached_second = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("second shared-cache identity");
 
     assert_eq!(first_status, second_status);
     assert_eq!(first.index_identity, second.index_identity);
     assert_ne!(first.worktree_identity, second.worktree_identity);
     assert!(!cached_first.unavailable && !cached_second.unavailable);
     assert_eq!(cached_first.index_identity, cached_second.index_identity);
-    assert_ne!(cached_first.worktree_identity, cached_second.worktree_identity);
+    assert_ne!(
+        cached_first.worktree_identity,
+        cached_second.worktree_identity
+    );
 }
 
 #[tokio::test]
@@ -1848,7 +2150,11 @@ async fn source_path_alias_retarget_invalidates_internal_and_external_targets() 
     for external in [false, true] {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let target_root = if external { outside.path() } else { root.path() };
+        let target_root = if external {
+            outside.path()
+        } else {
+            root.path()
+        };
         let first = target_root.join("first");
         let second = target_root.join("second");
         std::fs::create_dir(&first).unwrap();
@@ -1864,12 +2170,17 @@ async fn source_path_alias_retarget_invalidates_internal_and_external_targets() 
         };
         link(&first);
         let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::new().unwrap())));
-        let observation = cache.begin_source_path_change_observation(
-            root.path(), &alias.join("input.rs"), false,
-        ).await.unwrap();
-        assert_eq!(observation.source_dependency(),
-            crate::tool_history::SourceDependencyV1::new(&alias.join("input.rs"), false));
-        cache.note_host_workspace_mutation_paths(root.path(), &["unrelated.md".into()]).await;
+        let observation = cache
+            .begin_source_path_change_observation(root.path(), &alias.join("input.rs"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            observation.source_dependency(),
+            crate::tool_history::SourceDependencyV1::new(&alias.join("input.rs"), false)
+        );
+        cache
+            .note_host_workspace_mutation_paths(root.path(), &["unrelated.md".into()])
+            .await;
         assert!(cache.source_path_change_observation_is_current(&observation));
         #[cfg(unix)]
         std::fs::remove_file(&alias).unwrap();
@@ -1880,15 +2191,26 @@ async fn source_path_alias_retarget_invalidates_internal_and_external_targets() 
             while cache.source_path_change_observation_is_current(&observation) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("native watch must observe alias retargeting");
-        assert_eq!(std::fs::read_to_string(first.join("input.rs")).unwrap(), "first");
-        assert_eq!(std::fs::read_to_string(alias.join("input.rs")).unwrap(), "second");
+        })
+        .await
+        .expect("native watch must observe alias retargeting");
+        assert_eq!(
+            std::fs::read_to_string(first.join("input.rs")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(alias.join("input.rs")).unwrap(),
+            "second"
+        );
         // Explicit mutation publication must retain the alias as well, even
         // though resolving it now yields a different target.
-        let current = cache.begin_source_path_change_observation(
-            root.path(), &alias.join("input.rs"), false,
-        ).await.unwrap();
-        cache.note_host_workspace_mutation_paths(root.path(), &["alias".into()]).await;
+        let current = cache
+            .begin_source_path_change_observation(root.path(), &alias.join("input.rs"), false)
+            .await
+            .unwrap();
+        cache
+            .note_host_workspace_mutation_paths(root.path(), &["alias".into()])
+            .await;
         assert!(!cache.source_path_change_observation_is_current(&current));
     }
 }
@@ -1909,13 +2231,19 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()])
         .await;
     assert!(cache.source_path_change_observation_is_current(&observation));
-    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Current);
+    assert_eq!(
+        cache.source_path_freshness(&observation),
+        SourceFreshness::Current
+    );
 
     cache
         .note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()])
         .await;
     assert!(!cache.source_path_change_observation_is_current(&observation));
-    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Changed);
+    assert_eq!(
+        cache.source_path_freshness(&observation),
+        SourceFreshness::Changed
+    );
 
     let uncertain = cache
         .begin_source_path_change_observation(root.path(), &source, false)
@@ -1923,7 +2251,10 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .expect("refreshed path observation");
     cache.note_host_workspace_mutation();
     assert!(!cache.source_path_change_observation_is_current(&uncertain));
-    assert_eq!(cache.source_path_freshness(&uncertain), SourceFreshness::Unknown);
+    assert_eq!(
+        cache.source_path_freshness(&uncertain),
+        SourceFreshness::Unknown
+    );
 
     let overflowed = cache
         .begin_source_path_change_observation(root.path(), &source, false)
@@ -1935,7 +2266,10 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
             .await;
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
-    assert_eq!(cache.source_path_freshness(&overflowed), SourceFreshness::Unknown);
+    assert_eq!(
+        cache.source_path_freshness(&overflowed),
+        SourceFreshness::Unknown
+    );
 }
 
 #[tokio::test]
@@ -2036,9 +2370,15 @@ fn path_relationships_preserve_case_on_case_sensitive_filesystems() {
         ("/repository/file", "/repo", false),
         ("/repo/file", "/repo/", true),
     ] {
-        assert_eq!(path_is_same_or_descendant_with_case_sensitivity(
-            Path::new(path), Path::new(ancestor), true,
-        ), expected, "{path} beneath {ancestor}");
+        assert_eq!(
+            path_is_same_or_descendant_with_case_sensitivity(
+                Path::new(path),
+                Path::new(ancestor),
+                true,
+            ),
+            expected,
+            "{path} beneath {ancestor}"
+        );
     }
     assert!(!path_is_same_or_descendant_with_case_sensitivity(
         Path::new("repo/src/Owner.rs"),
@@ -2500,9 +2840,13 @@ async fn explicit_local_workspace_capture_does_not_contact_remote_primary() {
     // A listening endpoint that never serves a request is an adversarial
     // primary: an explicitly local observation must not depend on its progress.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let remote = Arc::new(codex_exec_server::Environment::create_for_tests(
-        Some(format!("ws://{}", listener.local_addr().unwrap())),
-    ).unwrap());
+    let remote = Arc::new(
+        codex_exec_server::Environment::create_for_tests(Some(format!(
+            "ws://{}",
+            listener.local_addr().unwrap()
+        )))
+        .unwrap(),
+    );
     let local = Arc::new(codex_exec_server::Environment::create_for_tests(None).unwrap());
     let cwd = PathUri::from_abs_path(&repo);
     turn.environments = TurnEnvironmentSnapshot {
@@ -2514,13 +2858,21 @@ async fn explicit_local_workspace_capture_does_not_contact_remote_primary() {
         starting: Vec::new(),
     };
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let identity = tokio::time::timeout(std::time::Duration::from_secs(10),
+    let identity = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
         cache.workspace_evidence_for_uri(&turn, &cwd, LOCAL_ENVIRONMENT_ID),
-    ).await.expect("local capture must not wait for the remote primary").unwrap();
+    )
+    .await
+    .expect("local capture must not wait for the remote primary")
+    .unwrap();
     assert!(!identity.unavailable);
     assert_eq!(identity.repository_root.as_deref(), repo.as_path().to_str());
-    assert!(tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept()).await.is_err(),
-        "an explicit local capture must not open a remote connection");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "an explicit local capture must not open a remote connection"
+    );
 }
 
 #[tokio::test]

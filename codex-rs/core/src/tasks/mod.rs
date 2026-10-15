@@ -131,11 +131,7 @@ pub(crate) fn unfinished_turn_history_marker(
     tool_results: usize,
 ) -> Option<ResponseItem> {
     let guidance = crate::context::TurnAborted::unfinished_guidance(tool_calls, tool_results);
-    turn_boundary_history_marker(
-        marker,
-        &guidance,
-        &guidance,
-    )
+    turn_boundary_history_marker(marker, &guidance, &guidance)
 }
 
 fn turn_boundary_history_marker(
@@ -170,6 +166,27 @@ fn unsaved_turn_record_warning(turn_id: &str, unsaved: &str) -> String {
     format!(
         "Turn {turn_id} ended, but its record was not durably saved: {unsaved}. Its effects stand; resuming this thread after a crash or restart may not show that turn's final state."
     )
+}
+
+/// The last assistant message, commentary included, that this turn recorded,
+/// followed by a note naming the error that ended the turn.
+fn last_message_before_turn_error(
+    history: &[ResponseItem],
+    turn_id: &str,
+    plan_mode: bool,
+    error: &str,
+) -> Option<String> {
+    let message = history
+        .iter()
+        .rev()
+        .filter(|item| item.turn_id() == Some(turn_id))
+        .find_map(|item| {
+            crate::stream_events_utils::last_assistant_message_from_item(item, plan_mode)
+        })?;
+    let error = error.trim().trim_end_matches('.');
+    Some(format!(
+        "{message}\n\n(This turn ended on an error before its final answer: {error}. Send a message to resume.)"
+    ))
 }
 
 fn emit_turn_network_proxy_metric(
@@ -272,11 +289,13 @@ impl TurnTerminalOutcome {
                 | Self::ReturnedError(CodexErr::TurnAborted)
         ) && matches!(
             published,
-            Some(EventMsg::TurnComplete(TurnCompleteEvent { error: None, .. }))
-                | Some(EventMsg::TurnAborted(TurnAbortedEvent {
-                    reason: TurnAbortReason::Interrupted,
-                    ..
-                }))
+            Some(EventMsg::TurnComplete(TurnCompleteEvent {
+                error: None,
+                ..
+            })) | Some(EventMsg::TurnAborted(TurnAbortedEvent {
+                reason: TurnAbortReason::Interrupted,
+                ..
+            }))
         )
     }
 
@@ -1213,12 +1232,19 @@ impl Session {
 
         let history_marker = if abort_reason == Some(TurnAbortReason::Interrupted) {
             let mode = InterruptedTurnHistoryMarker::from_config_and_version(
-                turn_context.config.as_ref(), turn_context.multi_agent_version,
+                turn_context.config.as_ref(),
+                turn_context.multi_agent_version,
             );
-            if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 let history = self.clone_history().await;
                 let plan = self.services.plan_store.snapshot().await;
-                let guidance = crate::context::TurnAborted::shutdown_guidance(history.raw_items(), plan.as_ref());
+                let guidance = crate::context::TurnAborted::shutdown_guidance(
+                    history.raw_items(),
+                    plan.as_ref(),
+                );
                 turn_boundary_history_marker(mode, &guidance, &guidance)
             } else {
                 interrupted_turn_history_marker(mode)
@@ -1306,7 +1332,8 @@ impl Session {
             timing_snapshot.protocol_timing(),
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
-        ).await;
+        )
+        .await;
         if let TurnTerminalOutcome::Completed { result } = &finalization.outcome {
             timing.completion_assessment = result.completion_assessment.clone();
         }
@@ -1343,6 +1370,13 @@ impl Session {
             }),
             _ => turn_context.terminal_error.lock().await.clone(),
         };
+        if error.is_some()
+            && (abort_reason.is_none()
+                || matches!(finalization.outcome, TurnTerminalOutcome::WorkerJoinFailed(_)))
+        {
+            self.interrupt_spawned_agents_after_failed_turn(&turn_context)
+                .await;
+        }
         let last_agent_message = if last_agent_message.is_none()
             && surfaced_result.is_none()
             && turn_context.final_output_json_schema.is_none()
@@ -1352,6 +1386,27 @@ impl Session {
                 .map(|terminal| terminal.message.clone())
         } else {
             last_agent_message
+        };
+        // A turn that ends on an error has no final answer. Report the last
+        // message it showed instead of nothing, so clients and a parent agent
+        // keep the visible result, and say how the turn ended.
+        let last_agent_message = match &error {
+            Some(error)
+                if last_agent_message.is_none()
+                    && surfaced_result.is_none()
+                    && abort_reason.is_none()
+                    && turn_context.final_output_json_schema.is_none() =>
+            {
+                let history = self.clone_history().await;
+                last_message_before_turn_error(
+                    history.raw_items(),
+                    &turn_context.sub_id,
+                    turn_context.collaboration_mode.mode
+                        == codex_protocol::config_types::ModeKind::Plan,
+                    &error.message,
+                )
+            }
+            _ => last_agent_message,
         };
         let event = if let Some(reason) = abort_reason.clone() {
             EventMsg::TurnAborted(TurnAbortedEvent {
@@ -1404,9 +1459,9 @@ impl Session {
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
         self.publish_terminal_outcome(finalization, event).await;
         if cleared_active_turn
-            && finalization.outcome.allows_pending_input_restart(
-                finalization.published_terminal_event.as_ref(),
-            )
+            && finalization
+                .outcome
+                .allows_pending_input_restart(finalization.published_terminal_event.as_ref())
             && (abort_reason == Some(TurnAbortReason::Interrupted)
                 || required_tool_terminal.is_some()
                 || defer_pending_input
@@ -1441,6 +1496,75 @@ impl Session {
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
         }
+    }
+
+    /// A failed turn is not restarted, and completions from the agents it
+    /// started do not wake it, so agents still running would spend tokens on
+    /// results no turn reads. Interrupt them (they keep their work and can be
+    /// resumed) and tell the user which results wait for the next message.
+    pub(crate) async fn interrupt_spawned_agents_after_failed_turn(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Vec<String> {
+        let control = &self.services.agent_control;
+        let label = |thread_id: codex_protocol::ThreadId| {
+            control
+                .get_agent_metadata(thread_id)
+                .and_then(|metadata| metadata.agent_path)
+                .map_or_else(|| thread_id.to_string(), |path| path.as_str().to_string())
+        };
+        let mut interrupted = Vec::new();
+        if let Ok(subtree) = control
+            .list_live_agent_subtree_thread_ids(self.thread_id)
+            .await
+        {
+            for thread_id in subtree
+                .into_iter()
+                .filter(|thread_id| *thread_id != self.thread_id)
+            {
+                // A child's full submission queue must not hold this turn's
+                // terminal event.
+                if matches!(
+                    control.get_status(thread_id).await,
+                    crate::agent::AgentStatus::PendingInit | crate::agent::AgentStatus::Running
+                ) && tokio::time::timeout(
+                    Duration::from_secs(1),
+                    control.interrupt_agent(thread_id),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok())
+                {
+                    interrupted.push(label(thread_id));
+                }
+            }
+        }
+        let mut queued = Vec::new();
+        for author in self.input_queue.pending_mailbox_authors().await {
+            let author = author.as_str().to_string();
+            if !queued.contains(&author) {
+                queued.push(author);
+            }
+        }
+        if interrupted.is_empty() && queued.is_empty() {
+            return interrupted;
+        }
+        let mut message =
+            "This turn ended on an error, so it will not read results from agents.".to_string();
+        if !interrupted.is_empty() {
+            message.push_str(&format!(
+                " Interrupted the agents it started that were still running, to stop their token use: {}. They keep their work and can be resumed.",
+                crate::session::turn_execution::bounded_path_list(&interrupted)
+            ));
+        }
+        if !queued.is_empty() {
+            message.push_str(&format!(
+                " Results queued from {} will be delivered with your next message.",
+                crate::session::turn_execution::bounded_path_list(&queued)
+            ));
+        }
+        self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+            .await;
+        interrupted
     }
 
     async fn finalize_turn_terminal_fail_safe(
@@ -1479,7 +1603,8 @@ impl Session {
             timing_snapshot.protocol_timing(),
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
-        ).await;
+        )
+        .await;
         let event = if let Some(reason) = finalization.outcome.abort_reason() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
@@ -1523,9 +1648,9 @@ impl Session {
             _ => false,
         };
         if cleared_active_turn
-            && finalization.outcome.allows_pending_input_restart(
-                finalization.published_terminal_event.as_ref(),
-            )
+            && finalization
+                .outcome
+                .allows_pending_input_restart(finalization.published_terminal_event.as_ref())
             && (finalization.restart_for_pending_input || restart_for_terminal_outcome)
         {
             self.maybe_start_turn_for_pending_work().await;

@@ -129,12 +129,7 @@ async fn missing_receipt_for_amended_attempt_uses_effective_criteria() {
             "an old completion must not seal the correction attempt"
         );
         let receipt = coordinator
-            .seal_missing_receipt_for_attempt(
-                &path,
-                thread_id,
-                &status,
-                amended_attempt.attempt_id,
-            )
+            .seal_missing_receipt_for_attempt(&path, thread_id, &status, amended_attempt.attempt_id)
             .await
             .expect("fallback must satisfy the amended receipt contract")
             .expect("a missing correction receipt must be sealed");
@@ -340,7 +335,14 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
             .expect("metric runtime exists");
         for _ in 0..MAX_RECORDED_EVENTS + 1 {
             runtime
-                .record_usage(/*tokens*/ 1, /*calls*/ 1)
+                .record_usage(
+                    /*tokens*/
+                    crate::agent::task_metrics::TokenClassTotals {
+                        total: 1,
+                        ..Default::default()
+                    },
+                    /*calls*/ 1,
+                )
                 .expect("aggregation continues beyond the diagnostic limit");
         }
     }
@@ -418,11 +420,19 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
             .any(|attribute| attribute.key.as_str() == "state"
                 && attribute.value.as_str() == "needs_main")
     );
-    assert!(
-        !emitted
-            .iter()
-            .any(|metric| metric.name() == "codex.multi_agent.task.duplicate_work")
-    );
+    // Read-scope overlap is recorded at admission, so diagnostic saturation does
+    // not make it unknown; a lone assignment overlaps nothing.
+    let duplicate_work = emitted
+        .iter()
+        .find(|metric| metric.name() == "codex.multi_agent.task.duplicate_work")
+        .expect("admission overlap is always measurable");
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = duplicate_work.data() else {
+        panic!("duplicate-work histogram");
+    };
+    let points = histogram.data_points().collect::<Vec<_>>();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].count(), 1);
+    assert_eq!(points[0].sum(), 0.0);
     let findings = emitted
         .iter()
         .find(|metric| metric.name() == "codex.multi_agent.task.reviewer_finding")

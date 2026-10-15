@@ -119,6 +119,17 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         if object.get("artifact_id") == Some(&Value::Null) {
             projected.remove("artifact_id");
         }
+        // `canonical_uri` is the resolved `path` re-encoded as a file: URI for
+        // local reads. Host-owned locators (`skill:`, `context:`) and remote
+        // environments are not derivable, so only omit an exact re-encoding.
+        if let (Some(path), Some(uri)) = (
+            object.get("path").and_then(Value::as_str),
+            object.get("canonical_uri").and_then(Value::as_str),
+        ) && derived_file_uri(path).as_deref() == Some(uri)
+        {
+            projected.remove("canonical_uri");
+        }
+        project_selector_bindings(object, &mut projected);
         // Keep required retention and search fields even when reconstructible:
         // direct tool responses must still satisfy their advertised schema.
         if let Some(results) = projected.get_mut("results").and_then(Value::as_array_mut) {
@@ -160,6 +171,83 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         projected.insert("content".to_string(), Value::Array(retained));
     }
     (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
+}
+
+/// The `file:` URI for `path`, but only when it is a pure re-encoding.
+///
+/// `PathUri` percent-encodes reserved and non-ASCII bytes and has a lossy
+/// fallback for non-UTF-8 Windows paths, so a textual reconstruction is only
+/// provably identical when every byte is an unreserved path character.
+/// Anything else returns `None` and keeps `canonical_uri` in view rather than
+/// guessing at the encoding.
+fn derived_file_uri(path: &str) -> Option<String> {
+    let safe = |byte: u8| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'\\' | b'.' | b'-' | b'_' | b'~')
+    };
+    // `encoded_path` is always rooted at a single `/`. A Windows drive letter
+    // keeps its literal colon there; a colon anywhere else is reserved and gets
+    // escaped. A POSIX path is already rooted, so strip that root rather than
+    // emitting a second separator, which is how a UNC share is spelled.
+    // `checked` excludes the drive's own colon, which is the one reserved byte
+    // that survives encoding unescaped.
+    let (body, checked) = match path.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => (path, &path[2..]),
+        [b'/', rest @ ..] if rest.first() != Some(&b'/') => (&path[1..], &path[1..]),
+        _ => return None,
+    };
+    (!body.is_empty() && checked.bytes().all(safe))
+        .then(|| format!("file:///{}", body.replace('\\', "/")))
+        .filter(|uri| !uri.starts_with("file:////"))
+}
+
+/// A symbol/enclosing binding whose resolved range was delivered verbatim as a
+/// result selector restates that result. Bindings survive result sorting and
+/// merging, so a binding that no longer matches any delivered selector is the
+/// only record of the item's real extent: keep those, and keep every identity
+/// field, which no result carries.
+fn project_selector_bindings(
+    object: &serde_json::Map<String, Value>,
+    projected: &mut serde_json::Map<String, Value>,
+) {
+    let delivered = object
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter(|result| {
+                    result.get("status").and_then(Value::as_str) == Some("ok")
+                        && result.get("complete") == Some(&Value::Bool(true))
+                })
+                .filter_map(|result| result.get("selector"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if delivered.is_empty() {
+        return;
+    }
+    let Some(bindings) = projected
+        .get_mut("selector_bindings")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for binding in bindings {
+        let Some(binding) = binding.as_object_mut() else {
+            continue;
+        };
+        let restated = binding
+            .get("resolved_selectors")
+            .and_then(Value::as_array)
+            .is_some_and(|resolved| {
+                resolved.len() == 1 && delivered.contains(&&resolved[0])
+            });
+        // `syntax_error` warns that the range itself may be wrong, so its
+        // binding keeps the range it is warning about.
+        if restated && !binding.contains_key("syntax_error") {
+            binding.remove("resolved_selectors");
+        }
+    }
 }
 
 /// Search coordinates and hydrated evidence remain inline. Only omit aliases
@@ -491,6 +579,95 @@ mod tests {
             incomplete["results"][0]["exact_bytes"] = json!(9);
             incomplete["results"][0]["continuation"] = json!({"kind":"bytes","start":6,"end":8});
             assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &incomplete), Some(incomplete));
+        }
+    }
+
+    #[test]
+    fn read_display_omits_canonical_uri_only_when_it_re_encodes_path() {
+        let raw = json!({"artifact_id":null, "source_sha256":"sha", "complete":true,
+            "path":r"C:\repo\src\main.rs", "canonical_uri":"file:///C:/repo/src/main.rs",
+            "environment_id":"local",
+            "results":[{"selector":{"kind":"bytes","start":0,"end":4}, "status":"ok",
+                "complete":true, "text":"body"}]});
+        let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
+        assert!(compact.get("canonical_uri").is_none());
+        // The omitted locator is rebuilt from the path that stays in view.
+        assert_eq!(
+            derived_file_uri(compact["path"].as_str().unwrap()).as_deref(),
+            raw["canonical_uri"].as_str()
+        );
+        // POSIX paths re-encode the same way.
+        let mut posix = raw.clone();
+        posix["path"] = json!("/home/alice/src/main.rs");
+        posix["canonical_uri"] = json!("file:///home/alice/src/main.rs");
+        assert!(
+            model_visible_tool_result(&ToolName::plain("read_file"), &posix)
+                .unwrap()
+                .get("canonical_uri")
+                .is_none()
+        );
+        // Percent-encoding, host-owned locators and remote environments are not
+        // textually derivable, so the locator has to stay.
+        for (path, uri) in [
+            (r"C:\repo\Alice Smith\main.rs", "file:///C:/repo/Alice%20Smith/main.rs"),
+            ("skill:reviewer", "skill:reviewer"),
+            (r"C:\repo\src\main.rs", "vscode-remote://host/repo/src/main.rs"),
+        ] {
+            let mut opaque = raw.clone();
+            opaque["path"] = json!(path);
+            opaque["canonical_uri"] = json!(uri);
+            assert_eq!(
+                model_visible_tool_result(&ToolName::plain("read_file"), &opaque)
+                    .unwrap()["canonical_uri"],
+                json!(uri),
+                "kept for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_bindings_keep_ranges_that_results_no_longer_show() {
+        let delivered = json!({"kind":"lines","start":2,"end":2});
+        let raw = json!({"artifact_id":null, "source_sha256":"sha", "complete":true,
+            "results":[{"selector":delivered, "status":"ok", "complete":true, "text":"fn b(){}"}],
+            "selector_bindings":[{"selector_index":0, "qualified_name":"A::b", "kind":"fn",
+                "resolved_selectors":[delivered]}]});
+        let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
+        let binding = &compact["selector_bindings"][0];
+        assert!(binding.get("resolved_selectors").is_none());
+        // Identity and the request it answers stay; the range is the delivered
+        // result's own selector.
+        assert_eq!(binding["qualified_name"], "A::b");
+        assert_eq!(binding["kind"], "fn");
+        assert_eq!(binding["selector_index"], 0);
+        assert_eq!(compact["results"][0]["selector"], delivered);
+
+        // Merging and sorting are why bindings exist: when the delivered
+        // selector is a wider merged range, the binding is the only record of
+        // the item's real extent and must survive.
+        let mut merged = raw.clone();
+        merged["results"][0]["selector"] = json!({"kind":"lines","start":1,"end":121});
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("read_file"), &merged)
+                .unwrap()["selector_bindings"][0]["resolved_selectors"],
+            json!([delivered])
+        );
+
+        // A range that was resolved but never delivered, and a range the parser
+        // itself flagged as unreliable, both stay.
+        for mutate in [
+            |value: &mut Value| value["results"][0]["status"] = json!("invalid_selector"),
+            |value: &mut Value| value["results"][0]["complete"] = json!(false),
+            |value: &mut Value| value["selector_bindings"][0]["syntax_error"] = json!(true),
+        ] {
+            let mut guarded = raw.clone();
+            mutate(&mut guarded);
+            assert_eq!(
+                model_visible_tool_result(&ToolName::plain("read_file"), &guarded)
+                    .unwrap_or_else(|| guarded.clone())["selector_bindings"][0]
+                    ["resolved_selectors"],
+                json!([delivered])
+            );
         }
     }
 

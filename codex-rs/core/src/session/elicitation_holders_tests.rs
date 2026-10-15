@@ -62,7 +62,10 @@ async fn command_approval_holds_an_elicitation_until_response() {
     session
         .notify_approval("call-1", ReviewDecision::Approved)
         .await;
-    assert_eq!(request.await.expect("approval task"), ReviewDecision::Approved);
+    assert_eq!(
+        request.await.expect("approval task"),
+        ReviewDecision::Approved
+    );
     wait_until_released(&mut pause_state).await;
 }
 
@@ -93,7 +96,10 @@ async fn patch_approval_holds_an_elicitation_until_response() {
     session
         .notify_approval("call-1", ReviewDecision::Approved)
         .await;
-    assert_eq!(request.await.expect("approval task"), ReviewDecision::Approved);
+    assert_eq!(
+        request.await.expect("approval task"),
+        ReviewDecision::Approved
+    );
     wait_until_released(&mut pause_state).await;
 }
 
@@ -163,7 +169,8 @@ async fn request_user_input_holds_an_elicitation_until_response() {
     session
         .notify_user_input_response(
             "stray-turn",
-            RequestUserInputResponse { disposition: None,
+            RequestUserInputResponse {
+                disposition: None,
                 answers: HashMap::new(),
                 interrupted: true,
             },
@@ -194,7 +201,8 @@ async fn request_user_input_holds_an_elicitation_until_response() {
     events.recv().await.expect("request user input event");
     wait_until_held(&mut pause_state).await;
 
-    let response = RequestUserInputResponse { disposition: None,
+    let response = RequestUserInputResponse {
+        disposition: None,
         answers: HashMap::new(),
         interrupted: true,
     };

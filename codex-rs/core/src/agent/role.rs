@@ -186,7 +186,8 @@ mod reload {
         if preserve_current_provider {
             next_config.model_provider = config.model_provider.clone();
             next_config.model_providers.insert(
-                config.model_provider_id.clone(), config.model_provider.clone(),
+                config.model_provider_id.clone(),
+                config.model_provider.clone(),
             );
         }
         Ok(next_config)

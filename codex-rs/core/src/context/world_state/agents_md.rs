@@ -68,9 +68,10 @@ impl AgentsMdState {
         mut self,
         previous: impl FnOnce() -> Option<serde_json::Value>,
     ) -> Self {
-        if self.instructions.is_none() && self.freshness != AgentsMdFreshness::Refreshed
-            && let Some(previous) = previous()
-                .and_then(|value| serde_json::from_value::<AgentsMdSnapshot>(value).ok())
+        if self.instructions.is_none()
+            && self.freshness != AgentsMdFreshness::Refreshed
+            && let Some(previous) =
+                previous().and_then(|value| serde_json::from_value::<AgentsMdSnapshot>(value).ok())
             && let Some(body) = instruction_body(&previous)
         {
             self.instructions = Some(UserInstructions {
@@ -177,10 +178,15 @@ impl WorldStateSection for AgentsMdState {
         }
 
         if self.instructions.is_none() && self.freshness != AgentsMdFreshness::Refreshed {
-            return Some(Box::new(codex_context_fragments::RenderedContextFragment::new(
-                "developer",
-                format!("<repository_observation>\nAGENTS.md observation unavailable: {} This is not an instruction removal. Previously accepted instructions retain their original scope; applicability to a new scope is unverified. No automatic retry is requested.\n</repository_observation>", self.freshness.model_visible_description()),
-            )));
+            return Some(Box::new(
+                codex_context_fragments::RenderedContextFragment::new(
+                    "developer",
+                    format!(
+                        "<repository_observation>\nAGENTS.md observation unavailable: {} This is not an instruction removal. Previously accepted instructions retain their original scope; applicability to a new scope is unverified. No automatic retry is requested.\n</repository_observation>",
+                        self.freshness.model_visible_description()
+                    ),
+                ),
+            ));
         }
 
         let previous_may_contain_instructions = match previous {

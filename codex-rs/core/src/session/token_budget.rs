@@ -52,14 +52,21 @@ impl Session {
     ) -> codex_protocol::error::Result<()> {
         let turn = &step_context.turn;
         let history = self.clone_history().await;
-        let source = history.raw_items().iter().filter(|item| !matches!(item,
-            codex_protocol::models::ResponseItem::Message { id: Some(id), role, .. }
-                if role == "developer" && id.as_str().starts_with("msg_token_budget_")
-        )).cloned().collect::<Vec<_>>();
+        let source = history
+            .raw_items()
+            .iter()
+            .filter(|item| {
+                !matches!(item,
+                    codex_protocol::models::ResponseItem::Message { id: Some(id), role, .. }
+                        if role == "developer" && id.as_str().starts_with("msg_token_budget_")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let (retained, _, omitted_text) = crate::compact::build_task_input_checkpoint(&source);
-        let recovery = crate::compact::persist_task_compaction_text_recovery(
-            self, &source, omitted_text,
-        ).await?;
+        let recovery =
+            crate::compact::persist_task_compaction_text_recovery(self, &source, omitted_text)
+                .await?;
         let (initial_context, snapshot, digests) = self
             .build_initial_context_with_world_state_and_provenance(turn, &world_state)
             .await;
@@ -348,7 +355,9 @@ pub(super) async fn maybe_record(
                     &config.reminder_message_template,
                     base_window_tokens_remaining,
                 ));
-            response_item.set_id(Some(codex_protocol::ResponseItemId::new("msg_token_budget")));
+            response_item.set_id(Some(codex_protocol::ResponseItemId::new(
+                "msg_token_budget",
+            )));
             if let Err(error) = sess
                 .record_conversation_items(turn_context, std::slice::from_ref(&response_item))
                 .await
@@ -379,7 +388,9 @@ pub(super) async fn maybe_record(
 
     let mut response_item =
         ContextualUserFragment::into(crate::context::AutoCompactFallbackPrompt::new(prompt));
-    response_item.set_id(Some(codex_protocol::ResponseItemId::new("msg_token_budget")));
+    response_item.set_id(Some(codex_protocol::ResponseItemId::new(
+        "msg_token_budget",
+    )));
     if let Err(error) = sess
         .record_conversation_items(turn_context, std::slice::from_ref(&response_item))
         .await

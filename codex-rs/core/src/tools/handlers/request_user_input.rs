@@ -103,7 +103,10 @@ fn parse_user_input_with_header_fallback(
         Err(error) => error,
     };
     let mut value: serde_json::Value = parse_arguments(arguments)?;
-    let Some(questions) = value.get_mut("questions").and_then(serde_json::Value::as_array_mut) else {
+    let Some(questions) = value
+        .get_mut("questions")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return Err(original_error);
     };
     let mut repaired = false;

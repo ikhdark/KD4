@@ -44,8 +44,10 @@ mod tests {
                 }
                 assert_eq!(
                     treatment_from_headers(&headers),
-                    (enabled.is_some() || faster_model.is_some()).then(|| SafetyBufferingTreatment {
-                        faster_model: faster_model.map(str::to_owned),
+                    (enabled.is_some() || faster_model.is_some()).then(|| {
+                        SafetyBufferingTreatment {
+                            faster_model: faster_model.map(str::to_owned),
+                        }
                     }),
                 );
             }

@@ -113,7 +113,6 @@ impl ApplyPatchRuntime {
         }
     }
 
-
     async fn begin_workspace_tracking(
         &mut self,
         req: &ApplyPatchRequest,
@@ -469,8 +468,19 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 Ok(delta) => (delta, "none", false),
                 Err(failure) => {
                     let (error, delta) = failure.into_parts();
-                    if let codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) = &error {
-                        self.patch_mismatch = Some(mismatch.clone());
+                    // Preflight reports conflicts in order, so the first typed
+                    // mismatch is the one a retry must correct first.
+                    match &error {
+                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => {
+                            self.patch_mismatch = Some(mismatch.clone());
+                        }
+                        codex_apply_patch::ApplyPatchError::MultiplePatchConflicts {
+                            mismatches,
+                            ..
+                        } => {
+                            self.patch_mismatch = mismatches.first().cloned();
+                        }
+                        _ => {}
                     }
                     let kind = patch_failure_kind(&error);
                     let io_failure = matches!(error, codex_apply_patch::ApplyPatchError::IoError(_));
@@ -537,6 +547,7 @@ pub(crate) fn patch_failure_kind(error: &codex_apply_patch::ApplyPatchError) -> 
         ApplyPatchError::ParseError(_) => "parse",
         ApplyPatchError::IoError(_) => "io",
         ApplyPatchError::ComputeReplacements(_) => "replacement",
+        ApplyPatchError::MultiplePatchConflicts { .. } => "multiple_conflicts",
         ApplyPatchError::PathUri(_) => "path",
         ApplyPatchError::ImplicitInvocation => "implicit_invocation",
         ApplyPatchError::EnvironmentIdMismatch { .. } => "environment_mismatch",

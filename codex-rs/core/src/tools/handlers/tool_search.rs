@@ -50,7 +50,6 @@ const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 // qualifies a multiword query only within an explicit canonical source scope.
 const MIN_TOOL_ACTIVATION_RELEVANCE: f32 = 0.5;
 
-
 #[derive(Debug, Default)]
 struct ToolSearchTokenizer;
 
@@ -131,35 +130,60 @@ impl ToolSearchIndex {
         source: Option<&str>,
     ) -> ToolSearchQueryEvidence<'a> {
         let terms = tokens.iter().map(String::as_str).collect::<HashSet<_>>();
-        let indexed_terms = terms.iter().copied().filter(|term| {
-            self.postings.get(*term).is_some_and(|postings| {
-                source.is_none() || postings.iter().any(|(id, _)| {
-                    matches_source(id.info(search_infos), source)
+        let indexed_terms = terms
+            .iter()
+            .copied()
+            .filter(|term| {
+                self.postings.get(*term).is_some_and(|postings| {
+                    source.is_none()
+                        || postings
+                            .iter()
+                            .any(|(id, _)| matches_source(id.info(search_infos), source))
                 })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         // A scope may disambiguate one capability plus unknown task entities,
         // but must not erase known capabilities belonging to another source.
-        let single_scoped_capability = source.is_some() && indexed_terms.len() == 1
-            && terms.iter().filter(|term| self.postings.contains_key(**term)).count() == 1;
-        let minimum_matches = if terms.len() > 1 && !single_scoped_capability { 2 } else { 1 };
-        ToolSearchQueryEvidence { indexed_terms, minimum_matches }
+        let single_scoped_capability = source.is_some()
+            && indexed_terms.len() == 1
+            && terms
+                .iter()
+                .filter(|term| self.postings.contains_key(**term))
+                .count()
+                == 1;
+        let minimum_matches = if terms.len() > 1 && !single_scoped_capability {
+            2
+        } else {
+            1
+        };
+        ToolSearchQueryEvidence {
+            indexed_terms,
+            minimum_matches,
+        }
     }
 
     fn relevance(&self, evidence: &ToolSearchQueryEvidence<'_>, id: ToolSearchDocumentId) -> f32 {
         if evidence.indexed_terms.len() < evidence.minimum_matches {
             return 0.0;
         }
-        let matches = evidence.indexed_terms.iter().filter(|term| {
-            self.callable_terms[id.0].contains(**term)
-        }).count();
-        if matches < evidence.minimum_matches { return 0.0; }
+        let matches = evidence
+            .indexed_terms
+            .iter()
+            .filter(|term| self.callable_terms[id.0].contains(**term))
+            .count();
+        if matches < evidence.minimum_matches {
+            return 0.0;
+        }
         matches as f32 / evidence.indexed_terms.len() as f32
     }
 
     fn new(search_infos: &[ToolSearchInfo]) -> Self {
-        Self::new_with_callable_texts(search_infos,
-            search_infos.iter().map(|info| info.entry.callable_search_text()))
+        Self::new_with_callable_texts(
+            search_infos,
+            search_infos
+                .iter()
+                .map(|info| info.entry.callable_search_text()),
+        )
     }
 
     fn new_with_callable_texts(
@@ -175,11 +199,13 @@ impl ToolSearchIndex {
         // activation. Connector prose and output hints must not penalize the
         // operation merely by making the retrieval document longer.
         let mut callable_lengths = Vec::with_capacity(search_infos.len());
-        let callable_terms = callable_texts.map(|text| {
-            let tokens = tokenizer.tokenize(&text);
-            callable_lengths.push(tokens.len());
-            tokens.into_iter().collect::<HashSet<_>>()
-        }).collect::<Vec<_>>();
+        let callable_terms = callable_texts
+            .map(|text| {
+                let tokens = tokenizer.tokenize(&text);
+                callable_lengths.push(tokens.len());
+                tokens.into_iter().collect::<HashSet<_>>()
+            })
+            .collect::<Vec<_>>();
         let average_document_length = {
             let total_document_length = callable_lengths.iter().sum::<usize>();
             let average = if callable_lengths.is_empty() {
@@ -202,11 +228,12 @@ impl ToolSearchIndex {
             // Borrow common lowercase tokens; only new vocabulary needs an
             // owned posting key. Keep Unicode lowercasing identical to queries.
             for word in info.entry.search_text.unicode_words() {
-                let token = if word.is_ascii() && !word.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                    std::borrow::Cow::Borrowed(word)
-                } else {
-                    std::borrow::Cow::Owned(word.to_lowercase())
-                };
+                let token =
+                    if word.is_ascii() && !word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        std::borrow::Cow::Borrowed(word)
+                    } else {
+                        std::borrow::Cow::Owned(word.to_lowercase())
+                    };
                 *term_frequencies.entry(token).or_default() += 1;
             }
             for (token, term_frequency) in term_frequencies.drain() {
@@ -270,10 +297,16 @@ impl ToolSearchIndex {
         let mut by_source = HashMap::<_, BinaryHeap<Reverse<RankedToolSearchDocument>>>::new();
         let mut weak_by_source = HashMap::<_, BinaryHeap<Reverse<RankedToolSearchDocument>>>::new();
         for (id, score) in scores {
-            if !matches_source(id.info(search_infos), source) { continue; }
-            if !required.iter().all(|term| self.postings.get(term)
-                .is_some_and(|postings| postings.binary_search_by_key(&id, |(candidate, _)| *candidate).is_ok()))
-            {
+            if !matches_source(id.info(search_infos), source) {
+                continue;
+            }
+            if !required.iter().all(|term| {
+                self.postings.get(term).is_some_and(|postings| {
+                    postings
+                        .binary_search_by_key(&id, |(candidate, _)| *candidate)
+                        .is_ok()
+                })
+            }) {
                 continue;
             }
             let candidate = RankedToolSearchDocument { id, score };
@@ -281,8 +314,13 @@ impl ToolSearchIndex {
             // documents can evict a lower-scoring eligible capability.
             let eligible = exact_matches.contains(&id)
                 || self.relevance(&evidence, id) >= MIN_TOOL_ACTIVATION_RELEVANCE;
-            let heap = if eligible { &mut by_source } else { &mut weak_by_source };
-            let best = heap.entry(tool_search_info_diversity_key(id.info(search_infos)))
+            let heap = if eligible {
+                &mut by_source
+            } else {
+                &mut weak_by_source
+            };
+            let best = heap
+                .entry(tool_search_info_diversity_key(id.info(search_infos)))
                 .or_default();
             if best.len() < limit {
                 best.push(Reverse(candidate));
@@ -293,17 +331,31 @@ impl ToolSearchIndex {
         }
 
         let mut ranked = [by_source, weak_by_source].map(|heap| {
-            let mut best = heap.into_values().flatten().map(|candidate| candidate.0).collect::<Vec<_>>();
+            let mut best = heap
+                .into_values()
+                .flatten()
+                .map(|candidate| candidate.0)
+                .collect::<Vec<_>>();
             best.sort_unstable_by(|left, right| right.cmp(left));
-            diversify_search_result_ids(search_infos, best.into_iter().map(|candidate| candidate.id).collect(), limit)
+            diversify_search_result_ids(
+                search_infos,
+                best.into_iter().map(|candidate| candidate.id).collect(),
+                limit,
+            )
         });
-        (std::mem::take(&mut ranked[0]), std::mem::take(&mut ranked[1]))
+        (
+            std::mem::take(&mut ranked[0]),
+            std::mem::take(&mut ranked[1]),
+        )
     }
 }
 
 fn required_query_terms(query: &str) -> Vec<String> {
-    query.split_whitespace().filter_map(|term| term.strip_prefix('+'))
-        .flat_map(|term| ToolSearchTokenizer.tokenize(term)).collect()
+    query
+        .split_whitespace()
+        .filter_map(|term| term.strip_prefix('+'))
+        .flat_map(|term| ToolSearchTokenizer.tokenize(term))
+        .collect()
 }
 
 struct ToolSearchNameIndex {
@@ -950,7 +1002,11 @@ impl ToolSearchHandler {
                 },
             ]);
         }
-        let returned_names = result.tools.iter().flat_map(loadable_tool_names).collect::<HashSet<_>>();
+        let returned_names = result
+            .tools
+            .iter()
+            .flat_map(loadable_tool_names)
+            .collect::<HashSet<_>>();
         if let Some(ambiguity) = &result.exact_name_ambiguity
             && source == crate::tools::context::ToolCallSource::Direct
             && crate::tools::effective_tool_mode(&turn)
@@ -958,31 +1014,41 @@ impl ToolSearchHandler {
         {
             // Native tool-search outputs accept definitions only. Keep the
             // disambiguation receipt in the same call's existing history owner.
-            supplemental_contexts.extend([
-                codex_protocol::models::ResponseItem::Message {
-                    id: Some(codex_protocol::ResponseItemId::with_suffix(
-                        "msg_turn_advice_tool_search_ambiguous", &call_id,
-                    )),
-                    role: "developer".into(),
-                    content: vec![codex_protocol::models::ContentItem::InputText {
-                        text: format!("Ambiguous exact tool name; use a qualified alternative: {ambiguity}"),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ]);
+            supplemental_contexts.extend([codex_protocol::models::ResponseItem::Message {
+                id: Some(codex_protocol::ResponseItemId::with_suffix(
+                    "msg_turn_advice_tool_search_ambiguous",
+                    &call_id,
+                )),
+                role: "developer".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: format!(
+                        "Ambiguous exact tool name; use a qualified alternative: {ambiguity}"
+                    ),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }]);
         }
         for item in &mut supplemental_contexts {
             item.set_turn_id_if_missing(&turn.sub_id);
         }
         if source == crate::tools::context::ToolCallSource::Direct {
-            turn.queue_tool_search_context(&call_id, &result.activation_tools, supplemental_contexts).await;
+            turn.queue_tool_search_context(
+                &call_id,
+                &result.activation_tools,
+                supplemental_contexts,
+            )
+            .await;
         }
         Ok(boxed_tool_output(ToolSearchOutput {
             tools: result.serialized_tools.clone(),
             omitted_result_count: result.omitted_result_count,
-            activated_omitted_tools: result.activation_tools.iter()
-                .filter(|name| !returned_names.contains(*name) || result.supplemental_tools.contains(name))
+            activated_omitted_tools: result
+                .activation_tools
+                .iter()
+                .filter(|name| {
+                    !returned_names.contains(*name) || result.supplemental_tools.contains(name)
+                })
                 .map(|name| match &name.namespace {
                     Some(namespace) => format!("{namespace}.{}", name.name),
                     None => name.name.clone(),
@@ -1013,56 +1079,95 @@ fn loadable_tool_names(spec: &LoadableToolSpec) -> Vec<ToolName> {
 impl CoreToolRuntime for ToolSearchHandler {}
 
 impl ToolSearchHandler {
-    fn identity_query_key(&self, query: &str, limit: usize) -> Result<ToolSearchQueryKey, FunctionCallError> {
+    fn identity_query_key(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<ToolSearchQueryKey, FunctionCallError> {
         let mut key = validate_tool_search_query(query, limit)?;
         if !self.exact_name_index.contains_key(&key.query) {
             let folded = key.query.to_lowercase();
-            let mut alternatives = self.exact_name_index.keys()
+            let mut alternatives = self
+                .exact_name_index
+                .keys()
                 .filter(|name| name.to_lowercase() == folded)
-                .cloned().collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<_>>();
             alternatives.sort();
             match alternatives.as_slice() {
                 [name] => key.query = name.clone(),
                 // Preserve exact identities within batches and mixed queries;
                 // lowercasing them can select a different callable.
-                [] if key.query.split_whitespace().any(|term| self.exact_name_index.contains_key(term)) => {},
+                [] if key
+                    .query
+                    .split_whitespace()
+                    .any(|term| self.exact_name_index.contains_key(term)) => {}
                 [] => key.query = folded,
-                _ => return Err(FunctionCallError::RespondToModel(format!(
-                    "Ambiguous case-folded tool identity; use exact casing: {}",
-                    alternatives.join(", ")
-                ))),
+                _ => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "Ambiguous case-folded tool identity; use exact casing: {}",
+                        alternatives.join(", ")
+                    )));
+                }
             }
         }
         Ok(key)
     }
 
     fn identity_query_terms(&self, query: &str) -> Vec<String> {
-        query.split_whitespace().flat_map(|term| {
-            if self.exact_name_index.contains_key(term) {
-                vec![term.to_string()]
-            } else {
-                ToolSearchTokenizer.tokenize(term)
-            }
-        }).collect()
+        query
+            .split_whitespace()
+            .flat_map(|term| {
+                if self.exact_name_index.contains_key(term) {
+                    vec![term.to_string()]
+                } else {
+                    ToolSearchTokenizer.tokenize(term)
+                }
+            })
+            .collect()
     }
 
-    fn resolved_query_key(&self, query: &str, requested: Option<usize>) -> Result<ToolSearchQueryKey, FunctionCallError> {
-        let mut key = self.identity_query_key(query, requested.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT))?;
-        if requested.is_some() { return Ok(key); }
-        let names = self.exact_name_index.get(&key.query).into_iter().flatten()
+    fn resolved_query_key(
+        &self,
+        query: &str,
+        requested: Option<usize>,
+    ) -> Result<ToolSearchQueryKey, FunctionCallError> {
+        let mut key =
+            self.identity_query_key(query, requested.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT))?;
+        if requested.is_some() {
+            return Ok(key);
+        }
+        let names = self
+            .exact_name_index
+            .get(&key.query)
+            .into_iter()
+            .flatten()
             .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
             .flat_map(|id| {
-                let selected = id.name_index(&self.name_indexes).output_names_for(&key.query);
-                loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref()).into_iter()
-                    .filter(move |name| selected.is_some_and(|selected| selected.contains(&name.name)))
-            }).collect::<HashSet<_>>();
-        if names.len() == 1 { key.limit = 1; }
+                let selected = id
+                    .name_index(&self.name_indexes)
+                    .output_names_for(&key.query);
+                loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref())
+                    .into_iter()
+                    .filter(move |name| {
+                        selected.is_some_and(|selected| selected.contains(&name.name))
+                    })
+            })
+            .collect::<HashSet<_>>();
+        if names.len() == 1 {
+            key.limit = 1;
+        }
         Ok(key)
     }
 
     #[cfg(test)]
-    fn effective_limit(&self, query: &str, requested: Option<usize>) -> Result<usize, FunctionCallError> {
-        self.resolved_query_key(query, requested).map(|key| key.limit)
+    fn effective_limit(
+        &self,
+        query: &str,
+        requested: Option<usize>,
+    ) -> Result<usize, FunctionCallError> {
+        self.resolved_query_key(query, requested)
+            .map(|key| key.limit)
     }
 
     #[cfg(test)]
@@ -1074,27 +1179,44 @@ impl ToolSearchHandler {
         self.search_resolved(self.resolved_query_key(query, Some(limit))?)
     }
 
-    fn search_resolved(&self, key: ToolSearchQueryKey) -> Result<Arc<ToolSearchResult>, FunctionCallError> {
+    fn search_resolved(
+        &self,
+        key: ToolSearchQueryKey,
+    ) -> Result<Arc<ToolSearchResult>, FunctionCallError> {
         let limit = key.limit;
-        if key.source.is_some() && !self.search_infos.iter().any(|info| matches_source(info, key.source.as_deref())) {
-            let scopes = self.search_infos.iter().map(crate::tools::handlers::tool_search_spec::canonical_source)
+        if key.source.is_some()
+            && !self
+                .search_infos
+                .iter()
+                .any(|info| matches_source(info, key.source.as_deref()))
+        {
+            let scopes = self
+                .search_infos
+                .iter()
+                .map(crate::tools::handlers::tool_search_spec::canonical_source)
                 .collect::<std::collections::BTreeSet<_>>();
             let mut bytes = 0;
-            let alternatives = scopes.iter().take(16).filter_map(|scope| {
-                bytes += scope.len() + 7;
-                (bytes <= 1024).then(|| format!("source:{scope}"))
-            }).collect::<Vec<_>>();
+            let alternatives = scopes
+                .iter()
+                .take(16)
+                .filter_map(|scope| {
+                    bytes += scope.len() + 7;
+                    (bytes <= 1024).then(|| format!("source:{scope}"))
+                })
+                .collect::<Vec<_>>();
             return Err(FunctionCallError::RespondToModel(format!(
                 "No callable source `{}` exists in the current inventory. Use canonical scope tokens, not display names. Available: {} ({} omitted). Shared namespaces may contain multiple connectors.",
                 key.source.as_deref().unwrap_or_default(),
-                alternatives.join(", "), scopes.len() - alternatives.len(),
+                alternatives.join(", "),
+                scopes.len() - alternatives.len(),
             )));
         }
         let query_terms = ToolSearchTokenizer.tokenize(&key.query);
         let missing_names = if self.exact_name_index.contains_key(&key.query) {
             Vec::new()
         } else {
-            key.query.split_whitespace()
+            key.query
+                .split_whitespace()
                 .filter(|term| !self.exact_name_index.contains_key(*term))
                 .flat_map(|term| ToolSearchTokenizer.tokenize(term))
                 .filter(|term| term.contains('_') && !self.exact_name_index.contains_key(term))
@@ -1107,9 +1229,11 @@ impl ToolSearchHandler {
             && key.query.split_whitespace().count() > 1
             && query_terms.iter().all(|term| term.contains('_'))
             && key.query.split_whitespace().any(|name| {
-                self.exact_name_index.get(name).is_some_and(|ids| ids.iter().any(|id| {
-                    matches_source(id.info(&self.search_infos), key.source.as_deref())
-                }))
+                self.exact_name_index.get(name).is_some_and(|ids| {
+                    ids.iter().any(|id| {
+                        matches_source(id.info(&self.search_infos), key.source.as_deref())
+                    })
+                })
             });
         // Wholly missing name lookups remain strict. Mixed capability queries
         // may contain project/account/file identifiers.
@@ -1120,7 +1244,11 @@ impl ToolSearchHandler {
         {
             return Err(FunctionCallError::RespondToModel(format!(
                 "No deferred tool by these exact names exists in the current inventory: {}. Use plain-language capability terms to search for alternatives.",
-                missing_names.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
+                missing_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )));
         }
         if self.search_infos.is_empty() {
@@ -1148,33 +1276,62 @@ impl ToolSearchHandler {
         let required = required_query_terms(&key.query);
         let mut seen_exact = HashSet::new();
         let explicit_names = key.query.split_whitespace().collect::<Vec<_>>();
-        let explicit_multi_name = explicit_names.len() > 1 && explicit_names.iter().all(|term| {
-            let matches = self.exact_name_index.get(*term).into_iter().flatten()
-                .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
-                .collect::<Vec<_>>();
-            matches.len() == 1 && matches[0].name_index(&self.name_indexes)
-                .output_names_for(term).is_some_and(|names| names.len() == 1)
-        });
+        let explicit_multi_name = explicit_names.len() > 1
+            && explicit_names.iter().all(|term| {
+                let matches = self
+                    .exact_name_index
+                    .get(*term)
+                    .into_iter()
+                    .flatten()
+                    .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
+                    .collect::<Vec<_>>();
+                matches.len() == 1
+                    && matches[0]
+                        .name_index(&self.name_indexes)
+                        .output_names_for(term)
+                        .is_some_and(|names| names.len() == 1)
+            });
         let identity_terms = self.identity_query_terms(&key.query);
         let exact_terms = if self.exact_name_index.contains_key(&key.query) {
             vec![key.query.as_str()]
         } else {
-            explicit_names.into_iter().chain(identity_terms.iter().map(String::as_str)).collect()
+            explicit_names
+                .into_iter()
+                .chain(identity_terms.iter().map(String::as_str))
+                .collect()
         };
-        let exact_matches = exact_terms.into_iter()
+        let exact_matches = exact_terms
+            .into_iter()
             .filter_map(|term| self.exact_name_index.get(term))
-            .flatten().copied()
+            .flatten()
+            .copied()
             .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
-            .filter(|id| required.iter().all(|term|
-                self.exact_name_index.get(term).is_some_and(|ids| ids.contains(id))
-                || self.search_index.postings.get(term).is_some_and(|postings|
-                    postings.binary_search_by_key(id, |(candidate, _)| *candidate).is_ok())))
-            .filter(|id| seen_exact.insert(*id)).collect::<Vec<_>>();
+            .filter(|id| {
+                required.iter().all(|term| {
+                    self.exact_name_index
+                        .get(term)
+                        .is_some_and(|ids| ids.contains(id))
+                        || self
+                            .search_index
+                            .postings
+                            .get(term)
+                            .is_some_and(|postings| {
+                                postings
+                                    .binary_search_by_key(id, |(candidate, _)| *candidate)
+                                    .is_ok()
+                            })
+                })
+            })
+            .filter(|id| seen_exact.insert(*id))
+            .collect::<Vec<_>>();
         if partial_name_lookup || explicit_multi_name {
             // Name-only requests select exact identities, not ranked substitutes
             // that happen to share their case-folded capability terms.
             let mut result = self.search_output_tools(
-                exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref(),
+                exact_matches.iter().copied(),
+                Some(&key.query),
+                limit,
+                key.source.as_deref(),
             )?;
             result.unmatched_identifiers = missing_names;
             let result = Arc::new(result);
@@ -1182,8 +1339,12 @@ impl ToolSearchHandler {
             return Ok(result);
         }
         if exact_matches.len() == 1 && limit == 1 {
-            let mut result =
-                self.search_output_tools(exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref())?;
+            let mut result = self.search_output_tools(
+                exact_matches.iter().copied(),
+                Some(&key.query),
+                limit,
+                key.source.as_deref(),
+            )?;
             if result.omitted_result_count == 0 && !result.tools.is_empty() {
                 result.unmatched_identifiers = missing_names;
                 let result = Arc::new(result);
@@ -1193,9 +1354,13 @@ impl ToolSearchHandler {
         }
         let exact_match_count = exact_matches.len();
         let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
-        let (candidates, weak_candidates) =
-            self.search_index
-                .top_matches(&key.query, candidate_limit, &self.search_infos, key.source.as_deref(), &exact_matches);
+        let (candidates, weak_candidates) = self.search_index.top_matches(
+            &key.query,
+            candidate_limit,
+            &self.search_infos,
+            key.source.as_deref(),
+            &exact_matches,
+        );
         let candidate_count = candidates.len();
         let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
         let candidate_source_count = trace_enabled.then(|| {
@@ -1203,7 +1368,8 @@ impl ToolSearchHandler {
                 candidates.iter().map(|id| id.info(&self.search_infos)),
             )
         });
-        let results = promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit);
+        let results =
+            promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit);
         let result_count = results.len();
         let result_source_count = trace_enabled.then(|| {
             tool_search_info_diversity_count(results.iter().map(|id| id.info(&self.search_infos)))
@@ -1215,25 +1381,43 @@ impl ToolSearchHandler {
             .into_iter()
             .chain(candidates)
             .filter(|id| seen.insert(*id));
-        let selection = results.into_iter().chain(remaining).take(candidate_limit).chain(weak_candidates);
-        let mut result = self.search_output_tools(selection, Some(&key.query), limit, key.source.as_deref())?;
+        let selection = results
+            .into_iter()
+            .chain(remaining)
+            .take(candidate_limit)
+            .chain(weak_candidates);
+        let mut result =
+            self.search_output_tools(selection, Some(&key.query), limit, key.source.as_deref())?;
         result.unmatched_identifiers = missing_names;
         // Derive ambiguity before the caller's result limit can hide alternatives.
         // Only the complete query is an exact-name lookup; a multi-name request
         // must not be mislabeled as a collision.
-        let names = self.exact_name_index.get(&key.query).into_iter().flatten()
+        let names = self
+            .exact_name_index
+            .get(&key.query)
+            .into_iter()
+            .flatten()
             .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
             .flat_map(|id| {
-                let selected = id.name_index(&self.name_indexes).output_names_for(&key.query);
-                loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref()).into_iter()
+                let selected = id
+                    .name_index(&self.name_indexes)
+                    .output_names_for(&key.query);
+                loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref())
+                    .into_iter()
                     .filter(move |name| selected.is_some_and(|names| names.contains(&name.name)))
-            }).collect::<std::collections::BTreeSet<_>>();
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         if names.len() > 1 {
             let mut bytes = 0;
-            let alternatives = names.iter().take(8).map(ToString::to_string).take_while(|name| {
-                bytes += name.len();
-                bytes <= 2048
-            }).collect::<Vec<_>>();
+            let alternatives = names
+                .iter()
+                .take(8)
+                .map(ToString::to_string)
+                .take_while(|name| {
+                    bytes += name.len();
+                    bytes <= 2048
+                })
+                .collect::<Vec<_>>();
             result.exact_name_ambiguity = Some(serde_json::json!({
                 "match_count": names.len(),
                 "omitted_alternative_count": names.len() - alternatives.len(),
@@ -1281,21 +1465,36 @@ impl ToolSearchHandler {
         let mut unactivated_bytes = 0;
         let mut omitted_result_count = 0usize;
         let mut selected = HashSet::new();
-        let query_tokens = exact_query.map(|query| ToolSearchTokenizer.tokenize(query)).unwrap_or_default();
-        let identity_terms = exact_query.map(|query| self.identity_query_terms(query)).unwrap_or_default();
-        let evidence = self.search_index.query_evidence(&query_tokens, &self.search_infos, source);
+        let query_tokens = exact_query
+            .map(|query| ToolSearchTokenizer.tokenize(query))
+            .unwrap_or_default();
+        let identity_terms = exact_query
+            .map(|query| self.identity_query_terms(query))
+            .unwrap_or_default();
+        let evidence = self
+            .search_index
+            .query_evidence(&query_tokens, &self.search_infos, source);
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
             let relevant = exact_query.is_none_or(|query| {
-                std::iter::once(query).chain(query.split_whitespace()).chain(identity_terms.iter().map(String::as_str)).any(|term|
-                    self.exact_name_index.get(term).is_some_and(|ids| ids.contains(&result_id)))
-                    || self.search_index.relevance(&evidence, result_id) >= MIN_TOOL_ACTIVATION_RELEVANCE
+                std::iter::once(query)
+                    .chain(query.split_whitespace())
+                    .chain(identity_terms.iter().map(String::as_str))
+                    .any(|term| {
+                        self.exact_name_index
+                            .get(term)
+                            .is_some_and(|ids| ids.contains(&result_id))
+                    })
+                    || self.search_index.relevance(&evidence, result_id)
+                        >= MIN_TOOL_ACTIVATION_RELEVANCE
             });
             if !relevant {
                 for name in loadable_tool_names(result.output.as_ref()) {
                     let name = name.to_string();
                     let bytes = serde_json::to_vec(&name)
-                        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?.len() + 1;
+                        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+                        .len()
+                        + 1;
                     if unactivated_matches.len() < limit
                         && unactivated_bytes + bytes <= MAX_TOOL_SEARCH_RESULT_BYTES / 4
                         && !unactivated_matches.contains(&name)
@@ -1307,57 +1506,98 @@ impl ToolSearchHandler {
                 continue;
             }
             let exact_output_names = exact_query.and_then(|query| {
-                if let Some(names) = result_id.name_index(&self.name_indexes).output_names_for(query) {
+                if let Some(names) = result_id
+                    .name_index(&self.name_indexes)
+                    .output_names_for(query)
+                {
                     return Some(names.clone());
                 }
-                let names = std::iter::once(query).chain(query.split_whitespace()).chain(identity_terms.iter().map(String::as_str)).filter_map(|term|
-                    result_id.name_index(&self.name_indexes).output_names_for(term))
-                    .flatten().cloned().collect::<HashSet<_>>();
+                let names = std::iter::once(query)
+                    .chain(query.split_whitespace())
+                    .chain(identity_terms.iter().map(String::as_str))
+                    .filter_map(|term| {
+                        result_id
+                            .name_index(&self.name_indexes)
+                            .output_names_for(term)
+                    })
+                    .flatten()
+                    .cloned()
+                    .collect::<HashSet<_>>();
                 (!names.is_empty()).then_some(names)
             });
             // Select callable identities before charging the receipt budget.
             // A namespace is a container, not one callable.
-            let candidates: Box<dyn Iterator<Item = LoadableToolSpec> + '_> = match result.output.as_ref() {
+            let candidates: Box<dyn Iterator<Item = LoadableToolSpec> + '_> = match result
+                .output
+                .as_ref()
+            {
                 LoadableToolSpec::Function(_) => {
                     Box::new(std::iter::once_with(|| result.output.as_ref().clone()))
                 }
                 LoadableToolSpec::Namespace(namespace) => {
-                    let order = if let Some(query) = exact_query.filter(|_| namespace.tools.len() > 1 && exact_output_names.is_none()) {
+                    let order = if let Some(query) = exact_query
+                        .filter(|_| namespace.tools.len() > 1 && exact_output_names.is_none())
+                    {
                         // Rank callable descriptions before applying the callable
                         // limit. Share the authoritative output Arc; do not clone
                         // every schema merely to build ranking documents.
-                        let members = namespace.tools.iter().map(|member| {
-                            let ResponsesApiNamespaceTool::Function(tool) = member;
-                            let mut info = result_id.info(&self.search_infos).clone();
-                            info.entry.search_text = codex_tools::namespace_member_search_text(
-                                &namespace.name, &namespace.description, tool);
-                            info
-                        }).collect::<Vec<_>>();
+                        let members = namespace
+                            .tools
+                            .iter()
+                            .map(|member| {
+                                let ResponsesApiNamespaceTool::Function(tool) = member;
+                                let mut info = result_id.info(&self.search_infos).clone();
+                                info.entry.search_text = codex_tools::namespace_member_search_text(
+                                    &namespace.name,
+                                    &namespace.description,
+                                    tool,
+                                );
+                                info
+                            })
+                            .collect::<Vec<_>>();
                         // Each ranking document represents one callable, not
                         // the namespace Arc shared by these lightweight entries.
-                        let index = ToolSearchIndex::new_with_callable_texts(&members, namespace.tools.iter().map(|member| {
-                            let ResponsesApiNamespaceTool::Function(tool) = member;
-                            codex_tools::ToolSearchEntry::callable_function_search_text(tool)
-                        }));
-                        index.top_matches(query, members.len(), &members,
-                            source.map(|_| namespace.name.as_str()), &[]).0
-                            .into_iter().map(|id| id.0).collect::<Vec<_>>()
+                        let index = ToolSearchIndex::new_with_callable_texts(
+                            &members,
+                            namespace.tools.iter().map(|member| {
+                                let ResponsesApiNamespaceTool::Function(tool) = member;
+                                codex_tools::ToolSearchEntry::callable_function_search_text(tool)
+                            }),
+                        );
+                        index
+                            .top_matches(
+                                query,
+                                members.len(),
+                                &members,
+                                source.map(|_| namespace.name.as_str()),
+                                &[],
+                            )
+                            .0
+                            .into_iter()
+                            .map(|id| id.0)
+                            .collect::<Vec<_>>()
                     } else {
                         (0..namespace.tools.len()).collect()
                     };
-                    Box::new(order.into_iter().map(|index| &namespace.tools[index])
-                        .filter(move |tool| {
-                            let ResponsesApiNamespaceTool::Function(tool) = tool;
-                            exact_output_names.as_ref().is_none_or(|names| names.contains(&tool.name))
-                        })
-                        .map(|tool| {
-                            LoadableToolSpec::Namespace(ResponsesApiNamespace {
-                                name: namespace.name.clone(),
-                                description: namespace.description.clone(),
-                                tools: vec![tool.clone()],
+                    Box::new(
+                        order
+                            .into_iter()
+                            .map(|index| &namespace.tools[index])
+                            .filter(move |tool| {
+                                let ResponsesApiNamespaceTool::Function(tool) = tool;
+                                exact_output_names
+                                    .as_ref()
+                                    .is_none_or(|names| names.contains(&tool.name))
                             })
-                        }))
-                },
+                            .map(|tool| {
+                                LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                                    name: namespace.name.clone(),
+                                    description: namespace.description.clone(),
+                                    tools: vec![tool.clone()],
+                                })
+                            }),
+                    )
+                }
             };
             for candidate in candidates {
                 if selected.len() == limit {
@@ -1574,10 +1814,7 @@ fn strip_output_schema_descriptions(schema: &mut serde_json::Value) {
 }
 
 fn normalize_tool_search_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    query.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn validate_tool_search_query(
@@ -1627,7 +1864,11 @@ fn validate_tool_search_query(
         ));
     }
 
-    Ok(ToolSearchQueryKey { query, limit, source })
+    Ok(ToolSearchQueryKey {
+        query,
+        limit,
+        source,
+    })
 }
 
 fn matches_source(info: &ToolSearchInfo, source: Option<&str>) -> bool {
@@ -1667,8 +1908,16 @@ fn tool_search_cache_entry_fits_budget(
     }
 
     // Output schemas are owned by the typed tools but skipped by their serializer.
-    let mut schema_fits =
-        |tool: &ResponsesApiTool| serde_json::to_writer(&mut writer, &tool.output_schema.as_ref().map(codex_tools::ToolOutputSchema::to_value)).is_ok();
+    let mut schema_fits = |tool: &ResponsesApiTool| {
+        serde_json::to_writer(
+            &mut writer,
+            &tool
+                .output_schema
+                .as_ref()
+                .map(codex_tools::ToolOutputSchema::to_value),
+        )
+        .is_ok()
+    };
     result.tools.iter().all(|tool| match tool {
         LoadableToolSpec::Function(tool) => schema_fits(tool),
         LoadableToolSpec::Namespace(namespace) => namespace.tools.iter().all(|tool| {
@@ -1815,60 +2064,93 @@ mod tests {
 
     #[tokio::test]
     async fn native_and_hybrid_search_advice_expires_after_success_and_new_turn() {
-        use codex_protocol::models::{ContentItem, ResponseItem};
         use codex_protocol::ResponseItemId;
+        use codex_protocol::models::{ContentItem, ResponseItem};
         use codex_protocol::openai_models::{InputModality, ToolMode};
-        let is_advice = |item: &ResponseItem| matches!(item,
+        let is_advice = |item: &ResponseItem| {
+            matches!(item,
             ResponseItem::Message { id: Some(id), role, .. }
-                if role == "developer" && id.as_str().starts_with("msg_turn_advice_"));
+                if role == "developer" && id.as_str().starts_with("msg_turn_advice_"))
+        };
         for mode in [ToolMode::Direct, ToolMode::CodeMode] {
             let handler = ToolSearchHandler::new(vec![
-                search_info("calendar lookup", Some("calendar"), "calendar", "find_event"),
+                search_info(
+                    "calendar lookup",
+                    Some("calendar"),
+                    "calendar",
+                    "find_event",
+                ),
                 search_info("events lookup", Some("events"), "events", "find_event"),
             ]);
             let (session, mut turn, _events) = make_session_and_context_with_rx().await;
             Arc::get_mut(&mut turn).unwrap().model_info.tool_mode = Some(mode);
             let mut history = crate::context_manager::ContextManager::new();
-            for (id, query) in [("ambiguous", "find_event"), ("qualified", "mcp__calendar__find_event")] {
+            for (id, query) in [
+                ("ambiguous", "find_event"),
+                ("qualified", "mcp__calendar__find_event"),
+            ] {
                 let payload = ToolPayload::ToolSearch {
                     arguments: codex_protocol::models::SearchToolCallParams {
-                        query: query.into(), limit: Some(1),
+                        query: query.into(),
+                        limit: Some(1),
                     },
                 };
-                handler.handle(ToolInvocation {
-                    session: Arc::clone(&session),
-                    step_context: StepContext::for_test(Arc::clone(&turn)),
-                    cancellation_token: CancellationToken::new(),
-                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                    call_id: id.into(), tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-                    source: ToolCallSource::Direct, payload,
-                }).await.unwrap();
+                handler
+                    .handle(ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: StepContext::for_test(Arc::clone(&turn)),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                        call_id: id.into(),
+                        tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                        source: ToolCallSource::Direct,
+                        payload,
+                    })
+                    .await
+                    .unwrap();
                 let advice = turn.take_post_tool_contexts(id).await;
                 if id == "ambiguous" {
                     assert!(!advice.is_empty());
                     assert!(advice.iter().all(&is_advice));
-                    assert!(advice.iter().all(|item| item.turn_id() == Some(turn.sub_id.as_str())));
+                    assert!(
+                        advice
+                            .iter()
+                            .all(|item| item.turn_id() == Some(turn.sub_id.as_str()))
+                    );
                 } else {
                     assert!(advice.is_empty());
                 }
-                history.record_items(advice.iter(), codex_utils_output_truncation::TruncationPolicy::Tokens(10_000));
+                history.record_items(
+                    advice.iter(),
+                    codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+                );
             }
             let mut next = ResponseItem::Message {
-                id: Some(ResponseItemId::new("msg")), role: "user".into(),
-                content: vec![ContentItem::InputText {text:"Unrelated task".into()}],
-                phase: None, internal_chat_message_metadata_passthrough: None,
+                id: Some(ResponseItemId::new("msg")),
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: "Unrelated task".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
             };
             next.set_turn_id_if_missing("next-task");
-            history.record_items([&next], codex_utils_output_truncation::TruncationPolicy::Tokens(10_000));
-            let sampled = history.clone().prepare_for_sampling_prompt_with_completed_tool_projection(
-                &[InputModality::Text], crate::stable_context::StableContextTarget::Sampling,
-                None, &crate::git_workspace::GitWorkspaceCache::new(),
+            history.record_items(
+                [&next],
+                codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
             );
+            let sampled = history
+                .clone()
+                .prepare_for_sampling_prompt_with_completed_tool_projection(
+                    &[InputModality::Text],
+                    crate::stable_context::StableContextTarget::Sampling,
+                    None,
+                    &crate::git_workspace::GitWorkspaceCache::new(),
+                );
             assert!(!sampled.items().iter().any(&is_advice));
             assert!(history.raw_items().iter().any(&is_advice));
         }
     }
-
 
     #[tokio::test]
     async fn exact_function_search_returns_and_activates_only_the_requested_function() {
@@ -1945,7 +2227,15 @@ mod tests {
                 .expect("search invocation");
 
             assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(&turn, "search", &[output.to_response_item("search", &payload).into()]).await.unwrap();            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+            session
+                .record_tool_completion_ordered(
+                    &turn,
+                    "search",
+                    &[output.to_response_item("search", &payload).into()],
+                )
+                .await
+                .unwrap();
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
                 output.to_response_item("search", &payload)
             else {
                 panic!("expected search response");
@@ -1986,7 +2276,8 @@ mod tests {
             let normal = search_info("publication", None, "normal", "small");
             let normal_definition = serde_json::to_value(&normal.entry.output).unwrap();
             let mut oversized = search_info("publication", None, "large", "oversized");
-            let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output) else {
+            let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output)
+            else {
                 panic!("expected namespace");
             };
             if compacted {
@@ -2035,7 +2326,10 @@ mod tests {
                     .await
                     .unwrap();
                 let nested = output.code_mode_result(&payload);
-                assert_eq!(nested["activated_omitted_tools"], serde_json::json!(["mcp__large.oversized"]));
+                assert_eq!(
+                    nested["activated_omitted_tools"],
+                    serde_json::json!(["mcp__large.oversized"])
+                );
                 let codex_protocol::models::ResponseInputItem::ToolSearchOutput {
                     tools,
                     omitted_result_count,
@@ -2054,9 +2348,14 @@ mod tests {
                     turn.activated_deferred_tools(),
                     names.iter().cloned().collect()
                 );
-                session.record_tool_completion_ordered(
-                    &turn, &call_id, &[output.to_response_item(&call_id, &payload).into()],
-                ).await.unwrap();
+                session
+                    .record_tool_completion_ordered(
+                        &turn,
+                        &call_id,
+                        &[output.to_response_item(&call_id, &payload).into()],
+                    )
+                    .await
+                    .unwrap();
                 let history = session.clone_history().await;
                 assert!(history.raw_items().iter().any(|item| matches!(
                     item, codex_protocol::models::ResponseItem::ToolSearchOutput { call_id: id, .. }
@@ -2082,8 +2381,7 @@ mod tests {
                     })
                     .count();
                 assert_eq!(
-                    publication_count,
-                    0,
+                    publication_count, 0,
                     "schemas must remain in the callable catalog, not unbounded history"
                 );
             }
@@ -2103,25 +2401,39 @@ mod tests {
         Arc::get_mut(&mut turn).unwrap().model_info.tool_mode =
             Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
         turn.refresh_deferred_tool_capabilities(Arc::new(
-            [(ToolName::namespaced("mcp__fault", "oversized"), "v1".into())].into_iter().collect(),
+            [(ToolName::namespaced("mcp__fault", "oversized"), "v1".into())]
+                .into_iter()
+                .collect(),
         ));
         session.close_durable_history_commit_gate_for_test();
-        let result = handler.handle(ToolInvocation {
-            session,
-            step_context: StepContext::for_test(Arc::clone(&turn)),
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            call_id: "fault-search".into(),
-            tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-            source: ToolCallSource::CodeMode { cell_id: "test-cell".into(), parent_call_id: None, runtime_tool_call_id: "nested-search".into(), nested_deadline: None, cancellation_cause: None },
-            payload: ToolPayload::ToolSearch {
-                arguments: codex_protocol::models::SearchToolCallParams {
-                    query: "mcp__fault__oversized".into(), limit: Some(1),
+        let result = handler
+            .handle(ToolInvocation {
+                session,
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "fault-search".into(),
+                tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                source: ToolCallSource::CodeMode {
+                    cell_id: "test-cell".into(),
+                    parent_call_id: None,
+                    runtime_tool_call_id: "nested-search".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
                 },
-            },
-        }).await;
+                payload: ToolPayload::ToolSearch {
+                    arguments: codex_protocol::models::SearchToolCallParams {
+                        query: "mcp__fault__oversized".into(),
+                        limit: Some(1),
+                    },
+                },
+            })
+            .await;
         assert!(result.is_ok());
-        assert!(turn.activated_deferred_tools().contains(&ToolName::namespaced("mcp__fault", "oversized")));
+        assert!(
+            turn.activated_deferred_tools()
+                .contains(&ToolName::namespaced("mcp__fault", "oversized"))
+        );
     }
 
     #[test]
@@ -2132,10 +2444,11 @@ mod tests {
         );
     }
 
-
-
     #[tokio::test]
-    #[expect(clippy::print_stderr, reason = "reports search/resolve/invoke wall time alongside the dispatch-count regression assertions")]
+    #[expect(
+        clippy::print_stderr,
+        reason = "reports search/resolve/invoke wall time alongside the dispatch-count regression assertions"
+    )]
     async fn oversized_search_resolves_and_invokes_in_one_cell_without_schema_history() {
         struct Delegate {
             handler: ToolSearchHandler,
@@ -2143,9 +2456,11 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize,
         }
         impl codex_code_mode::CodeModeSessionDelegate for Delegate {
-            fn invoke_tool<'a>(&'a self, call: codex_code_mode::CodeModeNestedToolCall,
-                _cancel: codex_code_mode::NestedCancellation) -> codex_code_mode::ToolInvocationFuture<'a>
-            {
+            fn invoke_tool<'a>(
+                &'a self,
+                call: codex_code_mode::CodeModeNestedToolCall,
+                _cancel: codex_code_mode::NestedCancellation,
+            ) -> codex_code_mode::ToolInvocationFuture<'a> {
                 Box::pin(async move {
                     self.calls.fetch_add(1, Ordering::Relaxed);
                     if call.tool_name == ToolName::plain(TOOL_SEARCH_TOOL_NAME) {
@@ -2154,41 +2469,81 @@ mod tests {
                             arguments: serde_json::from_value(call.input.unwrap()).unwrap(),
                         };
                         let payload = invocation.payload.clone();
-                        let result = self.handler.handle(invocation).await.map_err(|error| error.to_string())?;
+                        let result = self
+                            .handler
+                            .handle(invocation)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         Ok(result.code_mode_result(&payload))
                     } else {
-                        assert_eq!(call.tool_name, ToolName::namespaced("mcp__large", "oversized"));
-                        assert!(self.invocation.step_context.turn.activated_deferred_tools().contains(&call.tool_name));
+                        assert_eq!(
+                            call.tool_name,
+                            ToolName::namespaced("mcp__large", "oversized")
+                        );
+                        assert!(
+                            self.invocation
+                                .step_context
+                                .turn
+                                .activated_deferred_tools()
+                                .contains(&call.tool_name)
+                        );
                         assert_eq!(call.input, Some(serde_json::json!({})));
                         Ok(serde_json::json!({"invoked": true}))
                     }
                 })
             }
-            fn notify<'a>(&'a self, _call: String, _cell: codex_code_mode::CellId, _text: String,
-                _cancel: CancellationToken) -> codex_code_mode::NotificationFuture<'a>
-            { Box::pin(async { Ok(()) }) }
+            fn notify<'a>(
+                &'a self,
+                _call: String,
+                _cell: codex_code_mode::CellId,
+                _text: String,
+                _cancel: CancellationToken,
+            ) -> codex_code_mode::NotificationFuture<'a> {
+                Box::pin(async { Ok(()) })
+            }
             fn cell_closed(&self, _cell: &codex_code_mode::CellId) {}
         }
         let mut info = search_info("publication", None, "large", "oversized");
-        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else { panic!() };
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
+            panic!()
+        };
         let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
-        tool.description = format!("{} authoritative-contract-tail", "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES));
+        tool.description = format!(
+            "{} authoritative-contract-tail",
+            "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES)
+        );
         let spec = ToolSpec::Namespace(namespace.clone());
         let handler = ToolSearchHandler::new(vec![info]);
         let specs = [handler.spec(), spec];
         let enabled_tools = codex_tools::collect_code_mode_tool_definitions(specs.iter()).into();
         let (session, mut turn, _events) = make_session_and_context_with_rx().await;
-        Arc::get_mut(&mut turn).unwrap().model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
+        Arc::get_mut(&mut turn).unwrap().model_info.tool_mode =
+            Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
         turn.refresh_deferred_tool_capabilities(Arc::new(
-            [(ToolName::namespaced("mcp__large", "oversized"), "v1".into())].into_iter().collect()));
+            [(ToolName::namespaced("mcp__large", "oversized"), "v1".into())]
+                .into_iter()
+                .collect(),
+        ));
         let delegate = Arc::new(Delegate {
-            handler, calls: std::sync::atomic::AtomicUsize::new(0),
+            handler,
+            calls: std::sync::atomic::AtomicUsize::new(0),
             invocation: ToolInvocation {
-                session: Arc::clone(&session), step_context: StepContext::for_test(turn),
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(turn),
                 cancellation_token: CancellationToken::new(),
                 tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                call_id: "oversized-search".into(), tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-                source: ToolCallSource::CodeMode { cell_id: "test-cell".into(), parent_call_id: None, runtime_tool_call_id: "nested-search".into(), nested_deadline: None, cancellation_cause: None }, payload: ToolPayload::Function { arguments: "{}".into() },
+                call_id: "oversized-search".into(),
+                tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                source: ToolCallSource::CodeMode {
+                    cell_id: "test-cell".into(),
+                    parent_call_id: None,
+                    runtime_tool_call_id: "nested-search".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                },
+                payload: ToolPayload::Function {
+                    arguments: "{}".into(),
+                },
             },
         });
         let runtime = codex_code_mode::InProcessCodeModeSession::with_delegate(delegate.clone());
@@ -2205,12 +2560,29 @@ if (!result.invoked) throw Error('invocation failed');
 text('one-cell-complete');
 "#.into(), yield_time_ms: None, max_output_tokens: Some(1000), default_tool_timeout_ms: None,
         }).await.unwrap().initial_response().await.unwrap();
-        eprintln!("oversized search/resolve/invoke wall time: {:?}; nested calls: 2", started.elapsed());
-        let codex_code_mode::RuntimeResponse::Result { error_text, content_items, .. } = result else { panic!("cell did not finish") };
+        eprintln!(
+            "oversized search/resolve/invoke wall time: {:?}; nested calls: 2",
+            started.elapsed()
+        );
+        let codex_code_mode::RuntimeResponse::Result {
+            error_text,
+            content_items,
+            ..
+        } = result
+        else {
+            panic!("cell did not finish")
+        };
         assert_eq!(error_text, None);
         assert!(format!("{content_items:?}").contains("one-cell-complete"));
-        assert_eq!(delegate.calls.load(Ordering::Relaxed), 2, "resolution must not add a dispatch or model round trip");
-        assert!(!format!("{:?}", session.clone_history().await.raw_items()).contains("authoritative-contract-tail"));
+        assert_eq!(
+            delegate.calls.load(Ordering::Relaxed),
+            2,
+            "resolution must not add a dispatch or model round trip"
+        );
+        assert!(
+            !format!("{:?}", session.clone_history().await.raw_items())
+                .contains("authoritative-contract-tail")
+        );
         runtime.shutdown().await.unwrap();
     }
 
@@ -2238,7 +2610,9 @@ text('one-cell-complete');
         let missing = handler.search("github get_file_contents", 1).unwrap();
         assert_eq!(missing.unmatched_identifiers, ["get_file_contents"]);
         assert!(missing.activation_tools.is_empty());
-        let result = handler.search("+github file contents", 1).expect("semantic search");
+        let result = handler
+            .search("+github file contents", 1)
+            .expect("semantic search");
 
         assert_eq!(
             result.activation_tools,
@@ -2254,9 +2628,20 @@ text('one-cell-complete');
         );
         let named = handler.search("please get_profile", 1).unwrap();
         assert_eq!(named.activation_tools, exact.activation_tools);
-        assert!(handler.search("+gmail file contents", 8).unwrap().activation_tools.is_empty());
-        assert!(ToolSearchHandler::new(Vec::new()).search("send_message_to_thread", 8)
-            .unwrap_err().to_string().contains("send_message_to_thread"));
+        assert!(
+            handler
+                .search("+gmail file contents", 8)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
+        assert!(
+            ToolSearchHandler::new(Vec::new())
+                .search("send_message_to_thread", 8)
+                .unwrap_err()
+                .to_string()
+                .contains("send_message_to_thread")
+        );
     }
 
     #[tokio::test]
@@ -2276,7 +2661,12 @@ text('one-cell-complete');
         info.entry.tool_names.push("available".to_string());
         let handler = ToolSearchHandler::new(vec![info]);
 
-        for query in ["oversized", "mcp__calendar__oversized", "mcp__calendar__oversized", "oversized"] {
+        for query in [
+            "oversized",
+            "mcp__calendar__oversized",
+            "mcp__calendar__oversized",
+            "oversized",
+        ] {
             let (session, turn, _events) = make_session_and_context_with_rx().await;
             turn.refresh_deferred_tool_capabilities(Arc::new(
                 ["oversized", "available"]
@@ -2310,7 +2700,15 @@ text('one-cell-complete');
                 .expect("search invocation");
 
             assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(&turn, "search", &[output.to_response_item("search", &payload).into()]).await.unwrap();            let codex_protocol::models::ResponseInputItem::ToolSearchOutput {
+            session
+                .record_tool_completion_ordered(
+                    &turn,
+                    "search",
+                    &[output.to_response_item("search", &payload).into()],
+                )
+                .await
+                .unwrap();
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput {
                 tools,
                 status,
                 omitted_result_count,
@@ -2323,7 +2721,10 @@ text('one-cell-complete');
             assert_eq!(status, "incomplete");
             assert_eq!(omitted_result_count, Some(1));
             let result = output.code_mode_result(&payload);
-            assert_eq!(result["activated_omitted_tools"], serde_json::json!(["mcp__calendar.oversized"]));
+            assert_eq!(
+                result["activated_omitted_tools"],
+                serde_json::json!(["mcp__calendar.oversized"])
+            );
             assert_eq!(result["status"], "incomplete");
             assert_eq!(result["tools"], serde_json::json!([]));
             assert!(
@@ -2405,7 +2806,15 @@ text('one-cell-complete');
                 .expect("search invocation");
 
             assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(&turn, "unicode-search", &[output.to_response_item("unicode-search", &payload).into()]).await.unwrap();            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+            session
+                .record_tool_completion_ordered(
+                    &turn,
+                    "unicode-search",
+                    &[output.to_response_item("unicode-search", &payload).into()],
+                )
+                .await
+                .unwrap();
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
                 output.to_response_item("unicode-search", &payload)
             else {
                 panic!("expected search output");
@@ -2608,7 +3017,15 @@ text('one-cell-complete');
                 .expect("search invocation");
 
             assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(&turn, "search", &[output.to_response_item("search", &payload).into()]).await.unwrap();            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+            session
+                .record_tool_completion_ordered(
+                    &turn,
+                    "search",
+                    &[output.to_response_item("search", &payload).into()],
+                )
+                .await
+                .unwrap();
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
                 output.to_response_item("search", &payload)
             else {
                 panic!("expected search response");
@@ -2624,19 +3041,27 @@ text('one-cell-complete');
         }
     }
 
-
-
     #[test]
     fn affordance_scoped_evidence_ignores_other_sources() {
         let target = search_info("search invoices", None, "finance", "lookup");
         let before = ToolSearchHandler::new(vec![target.clone()]);
-        let after = ToolSearchHandler::new(vec![target,
-            search_info("acme orion quarter", None, "other", "noise")]);
+        let after = ToolSearchHandler::new(vec![
+            target,
+            search_info("acme orion quarter", None, "other", "noise"),
+        ]);
         let query = "search invoices acme orion quarter source:mcp__finance";
-        assert_eq!(before.search(query, 1).unwrap().activation_tools,
-            after.search(query, 1).unwrap().activation_tools);
+        assert_eq!(
+            before.search(query, 1).unwrap().activation_tools,
+            after.search(query, 1).unwrap().activation_tools
+        );
         assert_eq!(after.search(query, 1).unwrap().activation_tools.len(), 1);
-        assert!(after.search("search invoices +acme source:mcp__finance", 1).unwrap().activation_tools.is_empty());
+        assert!(
+            after
+                .search("search invoices +acme source:mcp__finance", 1)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2648,10 +3073,14 @@ text('one-cell-complete');
         ]);
         for query in ["fetch_a fetch_b", "mcp__a.fetch_a mcp__a.fetch_b"] {
             let result = handler.search(query, 2).unwrap();
-            assert_eq!(result.activation_tools, vec![
-                ToolName::namespaced("mcp__a", "fetch_a"),
-                ToolName::namespaced("mcp__a", "fetch_b"),
-            ], "{query}");
+            assert_eq!(
+                result.activation_tools,
+                vec![
+                    ToolName::namespaced("mcp__a", "fetch_a"),
+                    ToolName::namespaced("mcp__a", "fetch_b"),
+                ],
+                "{query}"
+            );
         }
     }
 
@@ -2659,70 +3088,138 @@ text('one-cell-complete');
     fn partial_name_discovery_returns_only_available_exact_members() {
         let infos = vec![
             search_info("Spawn an agent", None, "agents", "spawn_agent"),
-            search_info("Legacy spawn_agent send_message followup_task", None, "agents", "legacy"),
+            search_info(
+                "Legacy spawn_agent send_message followup_task",
+                None,
+                "agents",
+                "legacy",
+            ),
             search_info("Send a message", None, "other", "send_message"),
         ];
         let handler = ToolSearchHandler::new(infos.clone());
         let query = "+source:mcp__agents spawn_agent followup_task unavailable_tool";
         let result = handler.search(query, 3).unwrap();
-        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__agents", "spawn_agent")]);
-        assert_eq!(result.unmatched_identifiers, ["followup_task", "unavailable_tool"]);
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__agents", "spawn_agent")]
+        );
+        assert_eq!(
+            result.unmatched_identifiers,
+            ["followup_task", "unavailable_tool"]
+        );
         assert!(result.unactivated_matches.is_empty());
         assert!(Arc::ptr_eq(&result, &handler.search(query, 3).unwrap()));
-        let scoped = handler.search("+source:mcp__agents spawn_agent send_message followup_task", 3).unwrap();
+        let scoped = handler
+            .search(
+                "+source:mcp__agents spawn_agent send_message followup_task",
+                3,
+            )
+            .unwrap();
         assert_eq!(scoped.activation_tools, result.activation_tools);
         assert!(handler.search("followup_task unavailable_tool", 3).is_err());
-        assert!(handler.search("spawn_agent followup_task source:mcp__other", 3).is_err());
+        assert!(
+            handler
+                .search("spawn_agent followup_task source:mcp__other", 3)
+                .is_err()
+        );
         let changed = ToolSearchHandler::new(infos.into_iter().skip(1).collect());
-        assert!(changed.search(query, 3).is_err(), "removed capabilities must not survive via metadata or a previous handler's cache");
+        assert!(
+            changed.search(query, 3).is_err(),
+            "removed capabilities must not survive via metadata or a previous handler's cache"
+        );
     }
 
     #[test]
     fn affordance_prohibitions_are_retrieval_only_not_activation_evidence() {
         let handler = ToolSearchHandler::new(vec![search_info(
-            "Preview drafts; cannot send email. Read labels.", None, "mail", "preview")]);
+            "Preview drafts; cannot send email. Read labels.",
+            None,
+            "mail",
+            "preview",
+        )]);
         let result = handler.search("send email", 1).unwrap();
         assert!(result.activation_tools.is_empty());
         assert_eq!(result.unactivated_matches.len(), 1);
         for query in ["preview drafts", "read labels", "preview"] {
-            assert_eq!(handler.search(query, 1).unwrap().activation_tools.len(), 1, "{query}");
+            assert_eq!(
+                handler.search(query, 1).unwrap().activation_tools.len(),
+                1,
+                "{query}"
+            );
         }
         let spec = ToolSpec::Namespace(ResponsesApiNamespace {
-            name: "mail".into(), description: "Mail operations".into(),
-            tools: [("preview", "Preview drafts; cannot send email."),
-                ("deliver", "Send email.")].into_iter().map(|(name, description)|
+            name: "mail".into(),
+            description: "Mail operations".into(),
+            tools: [
+                ("preview", "Preview drafts; cannot send email."),
+                ("deliver", "Send email."),
+            ]
+            .into_iter()
+            .map(|(name, description)| {
                 ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-                    name: name.into(), description: description.into(), strict: false,
-                    defer_loading: None, parameters: codex_tools::JsonSchema::default(), output_schema: None,
-                })).collect(),
+                    name: name.into(),
+                    description: description.into(),
+                    strict: false,
+                    defer_loading: None,
+                    parameters: codex_tools::JsonSchema::default(),
+                    output_schema: None,
+                })
+            })
+            .collect(),
         });
-        let handler = ToolSearchHandler::new(vec![ToolSearchInfo::from_tool_spec(&spec, None).unwrap()]);
-        assert_eq!(handler.search("send email", 2).unwrap().activation_tools,
-            vec![ToolName::namespaced("mail", "deliver")]);
+        let handler =
+            ToolSearchHandler::new(vec![ToolSearchInfo::from_tool_spec(&spec, None).unwrap()]);
+        assert_eq!(
+            handler.search("send email", 2).unwrap().activation_tools,
+            vec![ToolName::namespaced("mail", "deliver")]
+        );
     }
 
     #[test]
     fn affordance_not_only_activates_both_positive_capabilities() {
         let handler = ToolSearchHandler::new(vec![search_info(
             "Does not only read documents but also search records; do not delete files.",
-            None, "documents", "lookup",
+            None,
+            "documents",
+            "lookup",
         )]);
         for query in ["read documents", "search records"] {
-            assert_eq!(handler.search(query, 1).unwrap().activation_tools,
-                vec![ToolName::namespaced("mcp__documents", "lookup")], "{query}");
+            assert_eq!(
+                handler.search(query, 1).unwrap().activation_tools,
+                vec![ToolName::namespaced("mcp__documents", "lookup")],
+                "{query}"
+            );
         }
-        assert!(handler.search("delete files", 1).unwrap().activation_tools.is_empty());
+        assert!(
+            handler
+                .search("delete files", 1)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
     }
 
     #[test]
     fn affordance_source_verbosity_does_not_demote_unchanged_callable() {
         let target = search_info("search invoice amount", None, "a", "lookup");
         let mut infos = vec![target, search_info("search invoice", None, "b", "lookup")];
-        infos.extend((0..30).map(|i| search_info("unrelated metadata", None, "c", &format!("noise{i}"))));
-        let before = ToolSearchHandler::new(infos.clone()).search("search invoice amount", 1).unwrap();
-        infos[0].entry.search_text.push_str(&" connector".repeat(1000));
-        let after = ToolSearchHandler::new(infos).search("search invoice amount", 1).unwrap();
-        assert_eq!(before.activation_tools, vec![ToolName::namespaced("mcp__a", "lookup")]);
+        infos.extend(
+            (0..30).map(|i| search_info("unrelated metadata", None, "c", &format!("noise{i}"))),
+        );
+        let before = ToolSearchHandler::new(infos.clone())
+            .search("search invoice amount", 1)
+            .unwrap();
+        infos[0]
+            .entry
+            .search_text
+            .push_str(&" connector".repeat(1000));
+        let after = ToolSearchHandler::new(infos)
+            .search("search invoice amount", 1)
+            .unwrap();
+        assert_eq!(
+            before.activation_tools,
+            vec![ToolName::namespaced("mcp__a", "lookup")]
+        );
         assert_eq!(after.activation_tools, before.activation_tools);
     }
 
@@ -2733,48 +3230,89 @@ text('one-cell-complete');
         info.tool = info.tool.with_title("Export payroll");
         let info = executor_search_info(McpHandler::new(info).unwrap());
         let handler = ToolSearchHandler::new(vec![info.clone()]);
-        assert_eq!(handler.search("export payroll", 1).unwrap().activation_tools.len(), 1);
+        assert_eq!(
+            handler
+                .search("export payroll", 1)
+                .unwrap()
+                .activation_tools
+                .len(),
+            1
+        );
         let mut changed = info.clone();
         changed.entry.callable_title = None;
-        assert_ne!(tool_search_inventory_fingerprint(&[info]), tool_search_inventory_fingerprint(&[changed]));
+        assert_ne!(
+            tool_search_inventory_fingerprint(&[info]),
+            tool_search_inventory_fingerprint(&[changed])
+        );
     }
 
     #[test]
     fn affordance_parameter_words_and_output_only_locators() {
         let spec = ToolSpec::Function(ResponsesApiTool {
-            name: "lookup".into(), description: "Read records".into(), strict: false, defer_loading: None,
+            name: "lookup".into(),
+            description: "Read records".into(),
+            strict: false,
+            defer_loading: None,
             parameters: codex_tools::parse_tool_input_schema(&serde_json::json!({
                 "type":"object", "properties":{"includeArchived":{"type":"boolean"}}
-            })).unwrap(),
-            output_schema: Some(serde_json::json!({"type":"object", "properties":{
-                "continuationToken":{"type":"string"}
-            }}).into()),
+            }))
+            .unwrap(),
+            output_schema: Some(
+                serde_json::json!({"type":"object", "properties":{
+                    "continuationToken":{"type":"string"}
+                }})
+                .into(),
+            ),
         });
         let info = ToolSearchInfo::from_tool_spec(&spec, None).unwrap();
         let handler = ToolSearchHandler::new(vec![info]);
-        assert_eq!(handler.search("archived records", 1).unwrap().activation_tools.len(), 1);
+        assert_eq!(
+            handler
+                .search("archived records", 1)
+                .unwrap()
+                .activation_tools
+                .len(),
+            1
+        );
         let result = handler.search("continuation token", 1).unwrap();
         assert!(result.activation_tools.is_empty());
         assert_eq!(result.unactivated_matches, vec!["lookup"]);
     }
 
-
-
     #[test]
     fn affordance_required_postings_remain_sorted_and_exact() {
-        let infos = (0..400).map(|i| search_info(
-            if i % 2 == 0 { "search records common" } else { "search calendar" },
-            None, "a", &format!("op{i}")
-        )).collect::<Vec<_>>();
+        let infos = (0..400)
+            .map(|i| {
+                search_info(
+                    if i % 2 == 0 {
+                        "search records common"
+                    } else {
+                        "search calendar"
+                    },
+                    None,
+                    "a",
+                    &format!("op{i}"),
+                )
+            })
+            .collect::<Vec<_>>();
         let index = ToolSearchIndex::new(&infos);
         for postings in index.postings.values() {
             assert!(postings.windows(2).all(|pair| pair[0].0 < pair[1].0));
             for id in (0..infos.len()).map(ToolSearchDocumentId) {
-                assert_eq!(postings.binary_search_by_key(&id, |(candidate, _)| *candidate).is_ok(),
-                    postings.iter().any(|(candidate, _)| *candidate == id));
+                assert_eq!(
+                    postings
+                        .binary_search_by_key(&id, |(candidate, _)| *candidate)
+                        .is_ok(),
+                    postings.iter().any(|(candidate, _)| *candidate == id)
+                );
             }
         }
-        assert!(index.top_matches("+missing search records", 8, &infos, None, &[]).0.is_empty());
+        assert!(
+            index
+                .top_matches("+missing search records", 8, &infos, None, &[])
+                .0
+                .is_empty()
+        );
         let (selected, _) = index.top_matches("+common search records", 8, &infos, None, &[]);
         assert_eq!(selected.len(), 8);
         assert!(selected.iter().all(|id| id.0 % 2 == 0));
@@ -2785,9 +3323,14 @@ text('one-cell-complete');
         let text = "ASCII lowercase lower_case 42 İSTANBUL Straße Événement 中文 東京";
         let infos = vec![search_info(text, None, "a", "lookup")];
         let index = ToolSearchIndex::new(&infos);
-        let expected = ToolSearchTokenizer.tokenize(&infos[0].entry.search_text)
-            .into_iter().collect::<HashSet<_>>();
-        assert_eq!(index.postings.keys().cloned().collect::<HashSet<_>>(), expected);
+        let expected = ToolSearchTokenizer
+            .tokenize(&infos[0].entry.search_text)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            index.postings.keys().cloned().collect::<HashSet<_>>(),
+            expected
+        );
         assert!(index.postings.values().all(|postings| postings.len() == 1));
     }
 
@@ -2805,23 +3348,53 @@ text('one-cell-complete');
                     })).unwrap(), output_schema: None,
                 })).collect(),
             });
-            let handler = ToolSearchHandler::new(vec![ToolSearchInfo::from_tool_spec(&spec, None).unwrap()]);
-            assert_eq!(handler.search("recipient thread", 1).unwrap().activation_tools,
-                vec![ToolName::namespaced("mail", "operation0")]);
+            let handler =
+                ToolSearchHandler::new(vec![ToolSearchInfo::from_tool_spec(&spec, None).unwrap()]);
+            assert_eq!(
+                handler
+                    .search("recipient thread", 1)
+                    .unwrap()
+                    .activation_tools,
+                vec![ToolName::namespaced("mail", "operation0")]
+            );
         }
     }
 
     #[test]
     fn eligible_candidates_survive_high_ranking_weak_matches() {
-        let mut infos = (0..12).map(|index| search_info(
-            if index % 2 == 0 { "weather" } else { "forecast" },
-            None, "climate", &format!("operation{index}"))).collect::<Vec<_>>();
-        infos.push(search_info(&format!("weather forecast {}", "padding ".repeat(2000)),
-            None, "climate", "forecast_operation"));
+        let mut infos = (0..12)
+            .map(|index| {
+                search_info(
+                    if index % 2 == 0 {
+                        "weather"
+                    } else {
+                        "forecast"
+                    },
+                    None,
+                    "climate",
+                    &format!("operation{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        infos.push(search_info(
+            &format!("weather forecast {}", "padding ".repeat(2000)),
+            None,
+            "climate",
+            "forecast_operation",
+        ));
         let handler = ToolSearchHandler::new(infos);
         let result = handler.search("weather forecast", 1).unwrap();
-        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__climate", "forecast_operation")]);
-        let (_, weak) = handler.search_index.top_matches("weather forecast", 3, &handler.search_infos, None, &[]);
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__climate", "forecast_operation")]
+        );
+        let (_, weak) = handler.search_index.top_matches(
+            "weather forecast",
+            3,
+            &handler.search_infos,
+            None,
+            &[],
+        );
         assert_eq!(weak.len(), 3);
     }
 
@@ -2833,9 +3406,26 @@ text('one-cell-complete');
         let handler = ToolSearchHandler::new(vec![unrelated]);
         let weak = handler.search("archive messages", 8).unwrap();
         assert!(weak.activation_tools.is_empty());
-        assert_eq!(weak.unactivated_matches, vec![ToolName::namespaced("mcp__mail", "list_labels").to_string()]);
-        assert_eq!(handler.search("list_labels", 1).unwrap().activation_tools.len(), 1);
-        assert_eq!(handler.search("label colors", 1).unwrap().activation_tools.len(), 1);
+        assert_eq!(
+            weak.unactivated_matches,
+            vec![ToolName::namespaced("mcp__mail", "list_labels").to_string()]
+        );
+        assert_eq!(
+            handler
+                .search("list_labels", 1)
+                .unwrap()
+                .activation_tools
+                .len(),
+            1
+        );
+        assert_eq!(
+            handler
+                .search("label colors", 1)
+                .unwrap()
+                .activation_tools
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2845,33 +3435,72 @@ text('one-cell-complete');
             search_info("scan pet spritesheet", None, "pets", "validate_pet"),
             search_info("repository file inventory scan", None, "repo", "inventory"),
         ]);
-        assert_eq!(handler.search("weather", 1).unwrap().activation_tools.len(), 1);
-        assert!(handler.search("weather Zelphara", 1).unwrap().activation_tools.is_empty());
-        assert_eq!(handler.search("weather Zelphara source:mcp__climate", 1).unwrap().activation_tools,
-            vec![ToolName::namespaced("mcp__climate", "lookup")]);
-        for query in ["weather Zelphara source:mcp__pets", "repository file inventory scan source:mcp__pets",
-            "weather +Zelphara source:mcp__climate", "Zelphara source:mcp__climate"] {
-            assert!(handler.search(query, 8).unwrap().activation_tools.is_empty(), "{query}");
+        assert_eq!(
+            handler.search("weather", 1).unwrap().activation_tools.len(),
+            1
+        );
+        assert!(
+            handler
+                .search("weather Zelphara", 1)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
+        assert_eq!(
+            handler
+                .search("weather Zelphara source:mcp__climate", 1)
+                .unwrap()
+                .activation_tools,
+            vec![ToolName::namespaced("mcp__climate", "lookup")]
+        );
+        for query in [
+            "weather Zelphara source:mcp__pets",
+            "repository file inventory scan source:mcp__pets",
+            "weather +Zelphara source:mcp__climate",
+            "Zelphara source:mcp__climate",
+        ] {
+            assert!(
+                handler
+                    .search(query, 8)
+                    .unwrap()
+                    .activation_tools
+                    .is_empty(),
+                "{query}"
+            );
         }
-        let error = handler.search("weather source:climate", 1).unwrap_err().to_string();
+        let error = handler
+            .search("weather source:climate", 1)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("source:mcp__climate"));
     }
 
     #[test]
     fn verified10_task_identifiers_do_not_hide_capabilities() {
-        let handler = ToolSearchHandler::new(vec![search_info("archive messages", None, "mail", "archive_messages")]);
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "archive messages",
+            None,
+            "mail",
+            "archive_messages",
+        )]);
         let plain = handler.search("archive messages", 1).unwrap();
         let mixed = handler.search("archive messages project_alpha", 1).unwrap();
         assert!(!plain.activation_tools.is_empty());
         assert_eq!(plain.activation_tools, mixed.activation_tools);
         assert_eq!(mixed.unmatched_identifiers, vec!["project_alpha"]);
-        assert!(Arc::ptr_eq(&mixed, &handler.search("archive messages project_alpha", 1).unwrap()));
+        assert!(Arc::ptr_eq(
+            &mixed,
+            &handler.search("archive messages project_alpha", 1).unwrap()
+        ));
         assert!(handler.search("invented_tool", 1).is_err());
         assert!(handler.search("mail.invented_tool", 1).is_err());
         // Name-only batches preserve available exact tools and report unknown
         // names without activating fuzzy substitutes, as the query spec requires.
         let partial = handler.search("archive_messages invented_tool", 2).unwrap();
-        assert_eq!(partial.activation_tools, vec![ToolName::namespaced("mcp__mail", "archive_messages")]);
+        assert_eq!(
+            partial.activation_tools,
+            vec![ToolName::namespaced("mcp__mail", "archive_messages")]
+        );
         assert_eq!(partial.unmatched_identifiers, vec!["invented_tool"]);
         assert!(partial.unactivated_matches.is_empty());
     }
@@ -2879,19 +3508,32 @@ text('one-cell-complete');
     #[test]
     fn weak_matches_return_names_without_activation_and_exact_names_still_activate() {
         let handler = ToolSearchHandler::new(vec![
-            search_info("scan pet spritesheet", Some("Pets"), "pets", "_validate_pet_spritesheet"),
+            search_info(
+                "scan pet spritesheet",
+                Some("Pets"),
+                "pets",
+                "_validate_pet_spritesheet",
+            ),
             search_info("repository file inventory scan", None, "repo", "inventory"),
         ]);
         let result = handler.search("repository file inventory scan", 8).unwrap();
-        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__repo", "inventory")]);
-        assert_eq!(result.unactivated_matches, vec![
-            ToolName::namespaced("mcp__pets", "_validate_pet_spritesheet").to_string(),
-        ]);
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__repo", "inventory")]
+        );
+        assert_eq!(
+            result.unactivated_matches,
+            vec![ToolName::namespaced("mcp__pets", "_validate_pet_spritesheet").to_string(),]
+        );
         assert_eq!(result.serialized_tools.len(), 1);
         let exact = handler.search("_validate_pet_spritesheet", 1).unwrap();
-        assert_eq!(exact.activation_tools, vec![
-            ToolName::namespaced("mcp__pets", "_validate_pet_spritesheet"),
-        ]);
+        assert_eq!(
+            exact.activation_tools,
+            vec![ToolName::namespaced(
+                "mcp__pets",
+                "_validate_pet_spritesheet"
+            ),]
+        );
         assert!(exact.unactivated_matches.is_empty());
     }
 
@@ -3051,11 +3693,14 @@ text('one-cell-complete');
         );
         let limited = handler.search("find_event", 1).expect("limited lookup");
         assert_eq!(limited.activation_tools.len(), 1);
-        assert_eq!(limited.exact_name_ambiguity, Some(serde_json::json!({
-            "match_count": 2,
-            "omitted_alternative_count": 0,
-            "qualified_alternatives": ["mcp__calendar__find_event", "mcp__events__find_event"],
-        })));
+        assert_eq!(
+            limited.exact_name_ambiguity,
+            Some(serde_json::json!({
+                "match_count": 2,
+                "omitted_alternative_count": 0,
+                "qualified_alternatives": ["mcp__calendar__find_event", "mcp__events__find_event"],
+            }))
+        );
         assert!(exact.exact_name_ambiguity.is_none());
     }
 
@@ -3067,62 +3712,118 @@ text('one-cell-complete');
             tools: Vec::new(),
         };
         let infos = ["Read_Item", "read_item", "Write_Item"].map(|name| {
-            executor_search_info(DynamicToolHandler::new_in_namespace(
-                &namespace,
-                &DynamicToolFunctionSpec {
-                    name: name.to_string(),
-                    description: "Access records".to_string(),
-                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
-                    defer_loading: true,
-                },
-            ).unwrap())
+            executor_search_info(
+                DynamicToolHandler::new_in_namespace(
+                    &namespace,
+                    &DynamicToolFunctionSpec {
+                        name: name.to_string(),
+                        description: "Access records".to_string(),
+                        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                        defer_loading: true,
+                    },
+                )
+                .unwrap(),
+            )
         });
         let handler = ToolSearchHandler::new(infos.to_vec());
         for (query, expected, missing) in [
-            ("Read_Item Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
-            ("Read_Item read_item", vec!["Read_Item", "read_item"], vec![]),
-            ("exact.Read_Item exact.Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
-            ("Read_Item unknown_item", vec!["Read_Item"], vec!["unknown_item"]),
-            ("read_item Write_Item", vec!["Write_Item", "read_item"], vec![]),
-            ("Read_Item Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
+            (
+                "Read_Item Write_Item",
+                vec!["Read_Item", "Write_Item"],
+                vec![],
+            ),
+            (
+                "Read_Item read_item",
+                vec!["Read_Item", "read_item"],
+                vec![],
+            ),
+            (
+                "exact.Read_Item exact.Write_Item",
+                vec!["Read_Item", "Write_Item"],
+                vec![],
+            ),
+            (
+                "Read_Item unknown_item",
+                vec!["Read_Item"],
+                vec!["unknown_item"],
+            ),
+            (
+                "read_item Write_Item",
+                vec!["Write_Item", "read_item"],
+                vec![],
+            ),
+            (
+                "Read_Item Write_Item",
+                vec!["Read_Item", "Write_Item"],
+                vec![],
+            ),
         ] {
             let (session, turn, _events) = make_session_and_context_with_rx().await;
             turn.refresh_deferred_tool_capabilities(Arc::new(
-                ["Read_Item", "read_item", "Write_Item"].into_iter().map(|name| {
-                    (ToolName::namespaced("exact", name), "exact-v1".to_string())
-                }).collect(),
+                ["Read_Item", "read_item", "Write_Item"]
+                    .into_iter()
+                    .map(|name| (ToolName::namespaced("exact", name), "exact-v1".to_string()))
+                    .collect(),
             ));
             let payload = ToolPayload::ToolSearch {
                 arguments: codex_protocol::models::SearchToolCallParams {
-                    query: query.to_string(), limit: Some(8),
+                    query: query.to_string(),
+                    limit: Some(8),
                 },
             };
-            let output = handler.handle(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: StepContext::for_test(Arc::clone(&turn)),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                call_id: "search".to_string(),
-                tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-                source: ToolCallSource::Direct,
-                payload: payload.clone(),
-            }).await.expect("exact-case batch should resolve");
+            let output = handler
+                .handle(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    cancellation_token: CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                    call_id: "search".to_string(),
+                    tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("exact-case batch should resolve");
             assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(
-                &turn, "search", &[output.to_response_item("search", &payload).into()],
-            ).await.unwrap();
-            assert_eq!(turn.activated_deferred_tools(), expected.iter().map(|name| {
-                ToolName::namespaced("exact", *name)
-            }).collect(), "query: {query}");
+            session
+                .record_tool_completion_ordered(
+                    &turn,
+                    "search",
+                    &[output.to_response_item("search", &payload).into()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                turn.activated_deferred_tools(),
+                expected
+                    .iter()
+                    .map(|name| { ToolName::namespaced("exact", *name) })
+                    .collect(),
+                "query: {query}"
+            );
             let receipt = output.code_mode_result(&payload);
-            assert_eq!(receipt.get("unmatched_identifiers"),
-                (!missing.is_empty()).then(|| serde_json::json!(missing)).as_ref(), "query: {query}");
+            assert_eq!(
+                receipt.get("unmatched_identifiers"),
+                (!missing.is_empty())
+                    .then(|| serde_json::json!(missing))
+                    .as_ref(),
+                "query: {query}"
+            );
             let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
                 output.to_response_item("search", &payload)
-            else { panic!("expected search response"); };
-            let mut returned = tools.iter().flat_map(|tool| {
-                tool["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap())
-            }).collect::<Vec<_>>();
+            else {
+                panic!("expected search response");
+            };
+            let mut returned = tools
+                .iter()
+                .flat_map(|tool| {
+                    tool["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|tool| tool["name"].as_str().unwrap())
+                })
+                .collect::<Vec<_>>();
             returned.sort_unstable();
             assert_eq!(returned, expected, "query: {query}");
         }
@@ -3139,29 +3840,44 @@ text('one-cell-complete');
         for name in ["read_item", "Write_Item"] {
             let mut member = read.clone();
             member.name = name.to_string();
-            namespace.tools.push(ResponsesApiNamespaceTool::Function(member));
+            namespace
+                .tools
+                .push(ResponsesApiNamespaceTool::Function(member));
             info.entry.tool_names.push(name.to_string());
         }
         let handler = ToolSearchHandler::new(vec![info]);
-        for query in ["Read_Item Write_Item", "mcp__exact.Read_Item mcp__exact.Write_Item"] {
-            assert_eq!(handler.search(query, 8).unwrap().activation_tools, vec![
-                ToolName::namespaced("mcp__exact", "Read_Item"),
-                ToolName::namespaced("mcp__exact", "Write_Item"),
-            ], "query: {query}");
+        for query in [
+            "Read_Item Write_Item",
+            "mcp__exact.Read_Item mcp__exact.Write_Item",
+        ] {
+            assert_eq!(
+                handler.search(query, 8).unwrap().activation_tools,
+                vec![
+                    ToolName::namespaced("mcp__exact", "Read_Item"),
+                    ToolName::namespaced("mcp__exact", "Write_Item"),
+                ],
+                "query: {query}"
+            );
         }
     }
 
     #[test]
     fn exact_case_and_callable_aliases_resolve_the_same_contract() {
-        let infos = ["Read", "read", "read-file", "read_file"].map(|name| {
-            search_info("read files", None, "files", name)
-        });
+        let infos = ["Read", "read", "read-file", "read_file"]
+            .map(|name| search_info("read files", None, "files", name));
         let handler = ToolSearchHandler::new(infos.to_vec());
         for info in &infos {
             let name = loadable_tool_names(info.entry.output.as_ref())[0].clone();
             let alias = codex_tools::code_mode_name_for_tool_name(&name);
-            for query in [name.name.clone(), alias, format!("{}.{}", name.namespace.as_deref().unwrap(), name.name)] {
-                assert_eq!(handler.search(&query, 1).unwrap().activation_tools, vec![name.clone()]);
+            for query in [
+                name.name.clone(),
+                alias,
+                format!("{}.{}", name.namespace.as_deref().unwrap(), name.name),
+            ] {
+                assert_eq!(
+                    handler.search(&query, 1).unwrap().activation_tools,
+                    vec![name.clone()]
+                );
             }
         }
         assert!(handler.search("READ", 1).is_err());
@@ -3173,30 +3889,51 @@ text('one-cell-complete');
         for reverse in [false, true] {
             let (mut session, mut turn, _) = make_session_and_context_with_rx().await;
             Arc::get_mut(&mut turn).unwrap().sub_id = "ordered-search-regression".into();
-            let path = crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+            let path = crate::session::tests::attach_thread_persistence(
+                Arc::get_mut(&mut session).unwrap(),
+            )
+            .await;
             turn.refresh_deferred_tool_capabilities(Arc::new(
-                ["one", "two"].into_iter().map(|ns| (ToolName::namespaced(format!("mcp__{ns}"), "read"), "v1".into())).collect()
+                ["one", "two"]
+                    .into_iter()
+                    .map(|ns| {
+                        (
+                            ToolName::namespaced(format!("mcp__{ns}"), "read"),
+                            "v1".into(),
+                        )
+                    })
+                    .collect(),
             ));
             let handler = ToolSearchHandler::new(vec![
                 search_info("read", None, "one", "read"),
                 search_info("read", None, "two", "read"),
             ]);
             let payload = ToolPayload::ToolSearch {
-                arguments: codex_protocol::models::SearchToolCallParams { query: "read".into(), limit: Some(1) },
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: "read".into(),
+                    limit: Some(1),
+                },
             };
             let first_finished = tokio::sync::Notify::new();
             let run = async |id: &'static str, delayed: bool| {
                 if delayed {
                     first_finished.notified().await;
                 }
-                let output = handler.handle(ToolInvocation {
-                    session: Arc::clone(&session), step_context: StepContext::for_test(Arc::clone(&turn)),
-                    cancellation_token: CancellationToken::new(),
-                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                    call_id: id.into(), tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-                    source: ToolCallSource::Direct, payload: payload.clone(),
-                }).await.unwrap();
-                let mut item: codex_protocol::models::ResponseItem = output.to_response_item(id, &payload).into();
+                let output = handler
+                    .handle(ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: StepContext::for_test(Arc::clone(&turn)),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                        call_id: id.into(),
+                        tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                        source: ToolCallSource::Direct,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let mut item: codex_protocol::models::ResponseItem =
+                    output.to_response_item(id, &payload).into();
                 item.set_id(Some(codex_protocol::ResponseItemId::with_suffix("tso", id)));
                 if !delayed {
                     first_finished.notify_one();
@@ -3207,20 +3944,32 @@ text('one-cell-complete');
             assert!(session.clone_history().await.raw_items().is_empty());
             assert!(turn.activated_deferred_tools().is_empty());
             for (id, item) in [("first", first), ("second", second)] {
-                session.record_tool_completion_ordered(&turn, id, &[item]).await.unwrap();
+                session
+                    .record_tool_completion_ordered(&turn, id, &[item])
+                    .await
+                    .unwrap();
             }
             session.flush_rollout().await.unwrap();
-            let (persisted, _, errors) = crate::rollout::RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            let (persisted, _, errors) = crate::rollout::RolloutRecorder::load_rollout_items(&path)
+                .await
+                .unwrap();
             assert_eq!(errors, 0);
-            let persisted = persisted.into_iter().filter_map(|item| match item {
-                codex_protocol::protocol::RolloutItem::ResponseItem(item) => Some(item),
-                _ => None,
-            }).collect::<Vec<_>>();
+            let persisted = persisted
+                .into_iter()
+                .filter_map(|item| match item {
+                    codex_protocol::protocol::RolloutItem::ResponseItem(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             // Stable fixture identities allow comparison of complete histories,
             // including metadata and repeated schema payloads.
             let history = session.clone_history().await;
             assert_eq!(persisted.as_slice(), history.raw_items());
-            histories.push((history.raw_items().to_vec(), turn.deferred_tool_activation_revision(), turn.activated_deferred_tools()));
+            histories.push((
+                history.raw_items().to_vec(),
+                turn.deferred_tool_activation_revision(),
+                turn.activated_deferred_tools(),
+            ));
             session.live_thread().unwrap().shutdown().await.unwrap();
         }
         assert_eq!(histories[0], histories[1]);
@@ -3231,29 +3980,52 @@ text('one-cell-complete');
     async fn aborted_search_does_not_publish_staged_context_or_activations() {
         let (session, turn, _) = make_session_and_context_with_rx().await;
         turn.refresh_deferred_tool_capabilities(Arc::new(
-            ["one", "two"].into_iter().map(|ns| (ToolName::namespaced(format!("mcp__{ns}"), "read"), "v1".into())).collect()
+            ["one", "two"]
+                .into_iter()
+                .map(|ns| {
+                    (
+                        ToolName::namespaced(format!("mcp__{ns}"), "read"),
+                        "v1".into(),
+                    )
+                })
+                .collect(),
         ));
         let handler = ToolSearchHandler::new(vec![
             search_info("read", None, "one", "read"),
             search_info("read", None, "two", "read"),
         ]);
         let payload = ToolPayload::ToolSearch {
-            arguments: codex_protocol::models::SearchToolCallParams { query: "read".into(), limit: Some(1) },
+            arguments: codex_protocol::models::SearchToolCallParams {
+                query: "read".into(),
+                limit: Some(1),
+            },
         };
-        let output = handler.handle(ToolInvocation {
-            session: Arc::clone(&session), step_context: StepContext::for_test(Arc::clone(&turn)),
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            call_id: "aborted".into(), tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-            source: ToolCallSource::Direct, payload: payload.clone(),
-        }).await.unwrap();
-        let mut item: codex_protocol::models::ResponseItem = output.to_response_item("aborted", &payload).into();
-        let codex_protocol::models::ResponseItem::ToolSearchOutput { status, tools, .. } = &mut item else {
+        let output = handler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "aborted".into(),
+                tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let mut item: codex_protocol::models::ResponseItem =
+            output.to_response_item("aborted", &payload).into();
+        let codex_protocol::models::ResponseItem::ToolSearchOutput { status, tools, .. } =
+            &mut item
+        else {
             panic!("expected tool search output");
         };
         *status = "aborted".into();
         tools.clear();
-        session.record_tool_completion_ordered(&turn, "aborted", &[item]).await.unwrap();
+        session
+            .record_tool_completion_ordered(&turn, "aborted", &[item])
+            .await
+            .unwrap();
         assert!(turn.activated_deferred_tools().is_empty());
         assert!(turn.pending_post_tool_contexts.lock().await.is_empty());
         assert_eq!(session.clone_history().await.raw_items().len(), 1);
@@ -3295,8 +4067,12 @@ text('one-cell-complete');
     #[test]
     fn search_reuses_normalized_query_results_and_keys_by_limit() {
         let search_infos = vec![executor_search_info(
-            McpHandler::new(tool_info("calendar", "create_event", "Create calendar events"))
-                .expect("MCP tool should convert"),
+            McpHandler::new(tool_info(
+                "calendar",
+                "create_event",
+                "Create calendar events",
+            ))
+            .expect("MCP tool should convert"),
         )];
         let handler = ToolSearchHandler::new(search_infos);
 
@@ -3328,11 +4104,14 @@ text('one-cell-complete');
         };
         let payload = ToolPayload::ToolSearch {
             arguments: codex_protocol::models::SearchToolCallParams {
-                query: "calendar events".into(), limit: None,
+                query: "calendar events".into(),
+                limit: None,
             },
         };
-        let response = crate::tools::context::ToolOutput::to_response_item(&output, "cached", &payload);
-        let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } = response else {
+        let response =
+            crate::tools::context::ToolOutput::to_response_item(&output, "cached", &payload);
+        let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } = response
+        else {
             panic!("cached search must retain typed output");
         };
         assert_eq!(tools, second.serialized_tools);
@@ -3391,9 +4170,16 @@ text('one-cell-complete');
         namespace.tools = [
             ("create_event", "Create a calendar event"),
             ("export_archive", "Export archived invoices for accounting"),
-        ].into_iter().map(|(name, description)| ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: name.into(), description: description.into(), ..template.clone()
-        })).collect();
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: name.into(),
+                description: description.into(),
+                ..template.clone()
+            })
+        })
+        .collect();
         let namespace = namespace.clone();
         let handler = ToolSearchHandler::new(vec![
             ToolSearchInfo::from_tool_spec(&ToolSpec::Namespace(namespace), None).unwrap(),
@@ -3454,8 +4240,18 @@ text('one-cell-complete');
             .await
             .expect("search must still activate oversized exact matches");
 
-            assert!(turn.activated_deferred_tools().is_empty());
-            session.record_tool_completion_ordered(&turn, "large-activation-search", &[output.to_response_item("large-activation-search", &payload).into()]).await.unwrap();        let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+        assert!(turn.activated_deferred_tools().is_empty());
+        session
+            .record_tool_completion_ordered(
+                &turn,
+                "large-activation-search",
+                &[output
+                    .to_response_item("large-activation-search", &payload)
+                    .into()],
+            )
+            .await
+            .unwrap();
+        let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
             output.to_response_item("large-activation-search", &payload)
         else {
             panic!("expected search output");
@@ -3474,9 +4270,12 @@ text('one-cell-complete');
             panic!("expected namespace");
         };
         let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
-        tool.output_schema = Some(serde_json::json!({
-            "const": "x".repeat(MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES)
-        }).into());
+        tool.output_schema = Some(
+            serde_json::json!({
+                "const": "x".repeat(MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES)
+            })
+            .into(),
+        );
         let handler = ToolSearchHandler::new(vec![info]);
 
         let result = handler.search("calendar", 1).unwrap();
@@ -3585,7 +4384,8 @@ text('one-cell-complete');
     #[test]
     fn exact_name_search_recovers_a_definition_that_exceeds_the_result_budget() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output)
+        else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -3763,7 +4563,8 @@ text('one-cell-complete');
     #[test]
     fn token_backfire_oversized_exact_match_stays_activatable() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
-        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output)
+        else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -3799,14 +4600,14 @@ text('one-cell-complete');
         );
     }
 
-
-
     #[test]
     fn search_compacts_container_descriptions_without_changing_selection() {
         let mut first = search_info("first", None, "first", "run");
         let mut second = search_info("second", None, "second", "run");
         for search_info in [&mut first, &mut second] {
-            let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut search_info.entry.output) else {
+            let LoadableToolSpec::Namespace(namespace) =
+                Arc::make_mut(&mut search_info.entry.output)
+            else {
                 panic!("test search info should be a namespace");
             };
             namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES / 2);
@@ -3832,7 +4633,8 @@ text('one-cell-complete');
     fn semantic_search_preserves_best_match_when_receipt_requires_compaction() {
         let mut oversized = search_info("capability", None, "oversized", "run");
         let later = search_info("capability extra terms", None, "later", "run");
-        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output) else {
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut oversized.entry.output)
+        else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
@@ -4111,13 +4913,25 @@ text('one-cell-complete');
 
     #[test]
     fn discovery_recovers_small_sources_before_shortlist_truncation() {
-        let mut infos = (0..100).map(|index| search_info_with_source(
-            "shared capability", "large", &format!("operation_{index}"),
-        )).collect::<Vec<_>>();
-        infos.push(search_info_with_source("shared capability", "small", "lookup"));
-        let result = ToolSearchHandler::new(infos).search("shared capability", 2).unwrap();
+        let mut infos = (0..100)
+            .map(|index| {
+                search_info_with_source("shared capability", "large", &format!("operation_{index}"))
+            })
+            .collect::<Vec<_>>();
+        infos.push(search_info_with_source(
+            "shared capability",
+            "small",
+            "lookup",
+        ));
+        let result = ToolSearchHandler::new(infos)
+            .search("shared capability", 2)
+            .unwrap();
         assert_eq!(result.activation_tools.len(), 2);
-        assert!(result.activation_tools.contains(&ToolName::namespaced("mcp__small", "lookup")));
+        assert!(
+            result
+                .activation_tools
+                .contains(&ToolName::namespaced("mcp__small", "lookup"))
+        );
     }
 
     #[test]
@@ -4127,13 +4941,31 @@ text('one-cell-complete');
             search_info_with_source("scan pet spritesheet", "pets", "validate_pet"),
             search_info_with_source("repository file inventory scan", "repo", "inventory"),
         ]);
-        let result = handler.search("create calendar event for Zelphara on 20490317", 8).unwrap();
-        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__calendar", "create_event")]);
-        for query in ["scan Zelphara 20490317", "repository file inventory scan Zelphara"] {
+        let result = handler
+            .search("create calendar event for Zelphara on 20490317", 8)
+            .unwrap();
+        assert_eq!(
+            result.activation_tools,
+            vec![ToolName::namespaced("mcp__calendar", "create_event")]
+        );
+        for query in [
+            "scan Zelphara 20490317",
+            "repository file inventory scan Zelphara",
+        ] {
             let result = handler.search(query, 8).unwrap();
-            assert!(!result.activation_tools.contains(&ToolName::namespaced("mcp__pets", "validate_pet")));
+            assert!(
+                !result
+                    .activation_tools
+                    .contains(&ToolName::namespaced("mcp__pets", "validate_pet"))
+            );
         }
-        assert!(handler.search("create calendar event +Zelphara", 8).unwrap().activation_tools.is_empty());
+        assert!(
+            handler
+                .search("create calendar event +Zelphara", 8)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4142,14 +4974,40 @@ text('one-cell-complete');
             search_info_with_source("create calendar event", "alpha", "create_event"),
             search_info_with_source("create calendar event alpha", "beta", "create_event"),
         ]);
-        let scoped = handler.search("create calendar event source:mcp__alpha", 8).unwrap();
-        assert_eq!(scoped.activation_tools, vec![ToolName::namespaced("mcp__alpha", "create_event")]);
-        assert_eq!(handler.search("create calendar event", 8).unwrap().activation_tools.len(), 2);
+        let scoped = handler
+            .search("create calendar event source:mcp__alpha", 8)
+            .unwrap();
+        assert_eq!(
+            scoped.activation_tools,
+            vec![ToolName::namespaced("mcp__alpha", "create_event")]
+        );
+        assert_eq!(
+            handler
+                .search("create calendar event", 8)
+                .unwrap()
+                .activation_tools
+                .len(),
+            2
+        );
         assert!(handler.search("create source:alpha", 8).is_err());
-        assert!(handler.search("create source:mcp__alpha source:mcp__beta", 8).is_err());
+        assert!(
+            handler
+                .search("create source:mcp__alpha source:mcp__beta", 8)
+                .is_err()
+        );
         assert!(handler.search("create source:", 8).is_err());
-        assert!(Arc::ptr_eq(&scoped, &handler.search("create calendar event source:mcp__alpha", 8).unwrap()));
-        assert!(Arc::ptr_eq(&scoped, &handler.search("+source:mcp__alpha create calendar event", 8).unwrap()));
+        assert!(Arc::ptr_eq(
+            &scoped,
+            &handler
+                .search("create calendar event source:mcp__alpha", 8)
+                .unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &scoped,
+            &handler
+                .search("+source:mcp__alpha create calendar event", 8)
+                .unwrap()
+        ));
         assert!(handler.search("create +source:alpha", 8).is_err());
         for query in [
             "create +source:",
@@ -4160,7 +5018,13 @@ text('one-cell-complete');
         ] {
             assert!(handler.search(query, 8).is_err(), "{query}");
         }
-        assert!(handler.search("create +unavailable +source:mcp__alpha", 8).unwrap().activation_tools.is_empty());
+        assert!(
+            handler
+                .search("create +unavailable +source:mcp__alpha", 8)
+                .unwrap()
+                .activation_tools
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4170,17 +5034,36 @@ text('one-cell-complete');
             search_info_with_source("shared capability target", "beta", "other"),
         ]);
         assert_eq!(handler.effective_limit("target", None).unwrap(), 1);
-        assert_eq!(handler.effective_limit("mcp__alpha.target", None).unwrap(), 1);
+        assert_eq!(
+            handler.effective_limit("mcp__alpha.target", None).unwrap(),
+            1
+        );
         assert_eq!(handler.effective_limit("target", Some(8)).unwrap(), 8);
-        assert_eq!(handler.effective_limit("target capability", None).unwrap(), TOOL_SEARCH_DEFAULT_LIMIT);
-        assert_eq!(handler.search("mcp__alpha.target", 1).unwrap().activation_tools,
-            vec![ToolName::namespaced("mcp__alpha", "target")]);
+        assert_eq!(
+            handler.effective_limit("target capability", None).unwrap(),
+            TOOL_SEARCH_DEFAULT_LIMIT
+        );
+        assert_eq!(
+            handler
+                .search("mcp__alpha.target", 1)
+                .unwrap()
+                .activation_tools,
+            vec![ToolName::namespaced("mcp__alpha", "target")]
+        );
         let ambiguous = ToolSearchHandler::new(vec![
             search_info_with_source("target", "alpha", "target"),
             search_info_with_source("target", "beta", "target"),
         ]);
-        assert_eq!(ambiguous.effective_limit("target", None).unwrap(), TOOL_SEARCH_DEFAULT_LIMIT);
-        assert_eq!(ambiguous.effective_limit("target source:mcp__alpha", None).unwrap(), 1);
+        assert_eq!(
+            ambiguous.effective_limit("target", None).unwrap(),
+            TOOL_SEARCH_DEFAULT_LIMIT
+        );
+        assert_eq!(
+            ambiguous
+                .effective_limit("target source:mcp__alpha", None)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -4190,10 +5073,18 @@ text('one-cell-complete');
             tool.tool.description = None;
             let mcp = McpHandler::new(tool).unwrap();
             let spec = mcp.spec();
-            for info in [mcp.search_info().unwrap(), ToolSearchInfo::from_tool_spec(&spec, None).unwrap()] {
+            for info in [
+                mcp.search_info().unwrap(),
+                ToolSearchInfo::from_tool_spec(&spec, None).unwrap(),
+            ] {
                 let handler = ToolSearchHandler::new(vec![info]);
-                assert_eq!(handler.search("export calendar events", 1).unwrap().activation_tools,
-                    vec![mcp.tool_name()]);
+                assert_eq!(
+                    handler
+                        .search("export calendar events", 1)
+                        .unwrap()
+                        .activation_tools,
+                    vec![mcp.tool_name()]
+                );
             }
         }
     }

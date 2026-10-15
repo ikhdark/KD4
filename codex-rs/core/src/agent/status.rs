@@ -83,7 +83,8 @@ pub(crate) fn agent_status_from_task(
         }
         _ => receipt.summary.as_str(),
     };
-    if !plain_message && receipt.status == AgentStatusClaim::Completed
+    if !plain_message
+        && receipt.status == AgentStatusClaim::Completed
         && !task.workspace_status.pending_gates.is_empty()
     {
         // Execution finished; acceptance is still owned by the durable gates.
@@ -201,9 +202,7 @@ mod tests {
             ),
             (
                 TurnAbortReason::ProcessLost,
-                AgentStatus::Errored(
-                    "The process was lost before the turn completed.".to_string(),
-                ),
+                AgentStatus::Errored("The process was lost before the turn completed.".to_string()),
             ),
         ] {
             assert_eq!(
@@ -332,6 +331,7 @@ mod tests {
                 relation: None,
                 architecture_contract_ref: None,
                 integration_plan: IntegrationPlan::SingleWriter,
+                benign_read_overlap_count: 0,
                 task_capsule: None,
                 created_at: now,
             },
@@ -362,6 +362,7 @@ mod tests {
                 next_action: None,
                 architecture_contract: None,
                 evidence_epoch: 0,
+                read_scope_fingerprint: None,
                 sealed_at: now,
             }),
             validation_calls: Vec::new(),

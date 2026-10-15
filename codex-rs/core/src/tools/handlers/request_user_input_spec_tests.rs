@@ -32,7 +32,11 @@ fn header_length_is_machine_readable_without_changing_question_text() {
         assert!(validator.is_valid(&json!(text)), "{text}");
     }
     assert!(!validator.is_valid(&json!("Harness scope")));
-    assert!(schema["properties"]["questions"]["items"]["properties"]["question"].get("maxLength").is_none());
+    assert!(
+        schema["properties"]["questions"]["items"]["properties"]["question"]
+            .get("maxLength")
+            .is_none()
+    );
 }
 
 #[test]
@@ -184,18 +188,28 @@ fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms() {
     };
     for (input, expected) in [
         (None, None),
-        (Some(MIN_AUTO_RESOLUTION_MS - 1), Some(MIN_AUTO_RESOLUTION_MS)),
+        (
+            Some(MIN_AUTO_RESOLUTION_MS - 1),
+            Some(MIN_AUTO_RESOLUTION_MS),
+        ),
         (Some(MIN_AUTO_RESOLUTION_MS), Some(MIN_AUTO_RESOLUTION_MS)),
         (Some(120_000), Some(120_000)),
         (Some(MAX_AUTO_RESOLUTION_MS), Some(MAX_AUTO_RESOLUTION_MS)),
-        (Some(MAX_AUTO_RESOLUTION_MS + 1), Some(MAX_AUTO_RESOLUTION_MS)),
+        (
+            Some(MAX_AUTO_RESOLUTION_MS + 1),
+            Some(MAX_AUTO_RESOLUTION_MS),
+        ),
     ] {
         // Normalization receives protocol-valid questions from the handler.
         // Round-trip the fixture so impossible choice counts cannot pass here.
-        let args = serde_json::from_value(serde_json::to_value(RequestUserInputArgs {
-            questions: vec![question.clone()],
-            auto_resolution_ms: input,
-        }).unwrap()).expect("normalization fixture must pass protocol validation");
+        let args = serde_json::from_value(
+            serde_json::to_value(RequestUserInputArgs {
+                questions: vec![question.clone()],
+                auto_resolution_ms: input,
+            })
+            .unwrap(),
+        )
+        .expect("normalization fixture must pass protocol validation");
         assert_eq!(
             normalize_request_user_input_args(args),
             Ok(RequestUserInputArgs {

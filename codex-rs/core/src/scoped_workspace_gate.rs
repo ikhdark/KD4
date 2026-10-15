@@ -49,7 +49,9 @@ impl Access {
         match (self, other) {
             (Self::Read, Self::Read) => false,
             (Self::Additions(left), Self::Additions(right)) => left.iter().any(|left| {
-                right.iter().any(|right| left.starts_with(right) || right.starts_with(left))
+                right
+                    .iter()
+                    .any(|right| left.starts_with(right) || right.starts_with(left))
             }),
             _ => true,
         }
@@ -78,7 +80,10 @@ pub(crate) struct WorkspaceLease {
 
 impl Drop for WorkspaceLease {
     fn drop(&mut self) {
-        self.gate.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.gate
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|claim| !Arc::ptr_eq(&claim.identity, &self.identity));
         self.gate.changed.notify_waiters();
     }
@@ -87,9 +92,13 @@ impl Drop for WorkspaceLease {
 impl WorkspaceLease {
     pub(crate) fn downgrade(self) -> Self {
         {
-            let mut claims = self.gate.claims.lock()
+            let mut claims = self
+                .gate
+                .claims
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(claim) = claims.iter_mut()
+            if let Some(claim) = claims
+                .iter_mut()
                 .find(|claim| Arc::ptr_eq(&claim.identity, &self.identity))
                 && matches!(claim.access, Access::Write)
             {
@@ -111,15 +120,31 @@ impl WorkspaceLease {
 
 impl ScopedWorkspaceGate {
     pub(crate) fn holders(&self, limit: usize) -> (usize, Vec<WorkspaceGateHolder>) {
-        let claims = self.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let claims = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let holders = claims.iter().filter_map(|claim| claim.holder.as_ref());
-        (holders.clone().count(), holders.take(limit).cloned().collect())
+        (
+            holders.clone().count(),
+            holders.take(limit).cloned().collect(),
+        )
     }
 
     async fn acquire(self: Arc<Self>, access: Access) -> WorkspaceLease {
-        let lease = WorkspaceLease { gate: Arc::clone(&self), identity: Arc::new(()) };
-        self.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Claim { identity: Arc::clone(&lease.identity), access, admitted: false, holder: None });
+        let lease = WorkspaceLease {
+            gate: Arc::clone(&self),
+            identity: Arc::new(()),
+        };
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Claim {
+                identity: Arc::clone(&lease.identity),
+                access,
+                admitted: false,
+                holder: None,
+            });
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -127,25 +152,34 @@ impl ScopedWorkspaceGate {
             // between that inspection and awaiting the notification.
             changed.as_mut().enable();
             {
-                let mut claims = self.claims.lock()
+                let mut claims = self
+                    .claims
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Only this lease's Drop removes its claim, and the lease is
                 // still owned by this future until admission or cancellation.
-                #[expect(clippy::expect_used, reason = "the live lease exclusively owns claim removal")]
-                let index = claims.iter().position(|claim| {
-                    Arc::ptr_eq(&claim.identity, &lease.identity)
-                }).expect("live admission owns its claim");
+                #[expect(
+                    clippy::expect_used,
+                    reason = "the live lease exclusively owns claim removal"
+                )]
+                let index = claims
+                    .iter()
+                    .position(|claim| Arc::ptr_eq(&claim.identity, &lease.identity))
+                    .expect("live admission owns its claim");
                 // A later disjoint request may pass, but never a conflicting
                 // request ahead of an older waiter (including an opaque writer).
                 let blocked = claims.iter().enumerate().any(|(other_index, other)| {
-                    other_index != index && (other.admitted || other_index < index)
+                    other_index != index
+                        && (other.admitted || other_index < index)
                         && claims[index].access.conflicts(&other.access)
                 });
                 if !blocked {
                     claims[index].admitted = true;
-                    claims[index].holder = WORKSPACE_GATE_CALL.try_with(|call| {
-                        call.admitted(matches!(claims[index].access, Access::Read))
-                    }).ok();
+                    claims[index].holder = WORKSPACE_GATE_CALL
+                        .try_with(|call| {
+                            call.admitted(matches!(claims[index].access, Access::Read))
+                        })
+                        .ok();
                     return lease;
                 }
             }
@@ -154,16 +188,27 @@ impl ScopedWorkspaceGate {
     }
 
     fn try_acquire(self: Arc<Self>, access: Access) -> Result<WorkspaceLease, ()> {
-        let mut claims = self.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut claims = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if claims.iter().any(|claim| access.conflicts(&claim.access)) {
             return Err(());
         }
         let identity = Arc::new(());
-        let holder = WORKSPACE_GATE_CALL.try_with(|call| {
-            call.admitted(matches!(access, Access::Read))
-        }).ok();
-        claims.push(Claim { identity: Arc::clone(&identity), access, admitted: true, holder });
-        Ok(WorkspaceLease { gate: Arc::clone(&self), identity })
+        let holder = WORKSPACE_GATE_CALL
+            .try_with(|call| call.admitted(matches!(access, Access::Read)))
+            .ok();
+        claims.push(Claim {
+            identity: Arc::clone(&identity),
+            access,
+            admitted: true,
+            holder,
+        });
+        Ok(WorkspaceLease {
+            gate: Arc::clone(&self),
+            identity,
+        })
     }
 
     pub(crate) async fn read_owned(self: Arc<Self>) -> WorkspaceLease {
@@ -207,7 +252,10 @@ impl NativeAdditions {
         let root = tokio::fs::canonicalize(root).await.ok()?;
         let mut directories = BTreeSet::new();
         for path in paths {
-            if path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            if path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
                 return None;
             }
             let target = cwd.join(path);
@@ -217,7 +265,8 @@ impl NativeAdditions {
             }
             if cfg!(windows) {
                 let stem = name.split('.').next()?.to_ascii_uppercase();
-                if name.ends_with('.') || name.ends_with(' ')
+                if name.ends_with('.')
+                    || name.ends_with(' ')
                     || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
                     || ["COM", "LPT"].iter().any(|prefix| {
                         stem.strip_prefix(*prefix).is_some_and(|suffix| {
@@ -230,9 +279,11 @@ impl NativeAdditions {
             }
             let parent = tokio::fs::canonicalize(target.parent()?).await.ok()?;
             let relative = parent.strip_prefix(&root).ok()?;
-            if relative.components().any(|part| part.as_os_str().to_str()
-                .is_some_and(|part| part.eq_ignore_ascii_case(".git")))
-                || name.eq_ignore_ascii_case(".git")
+            if relative.components().any(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .is_some_and(|part| part.eq_ignore_ascii_case(".git"))
+            }) || name.eq_ignore_ascii_case(".git")
             {
                 return None;
             }
@@ -250,14 +301,25 @@ impl NativeAdditions {
                 parent
             });
         }
-        Some(Self { root, cwd: cwd.to_path_buf(), paths: paths.to_vec(), directories })
+        Some(Self {
+            root,
+            cwd: cwd.to_path_buf(),
+            paths: paths.to_vec(),
+            directories,
+        })
     }
 
     pub(crate) async fn acquire(self, gate: Arc<ScopedWorkspaceGate>) -> WorkspaceLease {
-        let lease = Arc::clone(&gate).acquire(Access::Additions(self.directories.clone())).await;
+        let lease = Arc::clone(&gate)
+            .acquire(Access::Additions(self.directories.clone()))
+            .await;
         // A preceding opaque writer may have replaced a parent or created a
         // target while we waited. Do not retain a stale footprint in that case.
-        if Self::resolve(&self.root, &self.cwd, &self.paths).await.as_ref() == Some(&self) {
+        if Self::resolve(&self.root, &self.cwd, &self.paths)
+            .await
+            .as_ref()
+            == Some(&self)
+        {
             lease
         } else {
             drop(lease);
@@ -284,10 +346,14 @@ mod tests {
         assert!(Arc::clone(&gate).try_read_owned().is_err());
 
         drop(reader);
-        let writer = tokio::time::timeout(Duration::from_secs(1), writer).await.unwrap();
+        let writer = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .unwrap();
         assert!(futures::poll!(&mut later_reader).is_pending());
         let observer = writer.downgrade();
-        let later_reader = tokio::time::timeout(Duration::from_secs(1), later_reader).await.unwrap();
+        let later_reader = tokio::time::timeout(Duration::from_secs(1), later_reader)
+            .await
+            .unwrap();
         assert!(Arc::clone(&gate).try_write_owned().is_err());
         drop((observer, later_reader));
         assert!(Arc::clone(&gate).try_write_owned().is_ok());
@@ -299,30 +365,39 @@ mod tests {
         std::fs::create_dir(root.path().join("left")).unwrap();
         std::fs::create_dir(root.path().join("right")).unwrap();
         let gate = Arc::new(ScopedWorkspaceGate::default());
-        let addition = NativeAdditions::resolve(
-            root.path(), root.path(), &[PathBuf::from("left/new")],
-        ).await.unwrap();
+        let addition =
+            NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("left/new")])
+                .await
+                .unwrap();
         let writer = Arc::clone(&gate).write_owned().await;
         let pending = addition.acquire(Arc::clone(&gate));
         tokio::pin!(pending);
         assert!(futures::poll!(&mut pending).is_pending());
         std::fs::write(root.path().join("left/new"), "created by preceding writer").unwrap();
         drop(writer);
-        let fallback = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap();
+        let fallback = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap();
 
         // The target is now an update, not an addition. It must hold an opaque
         // write lease, excluding even a genuinely disjoint addition.
-        let disjoint = NativeAdditions::resolve(
-            root.path(), root.path(), &[PathBuf::from("right/new")],
-        ).await.unwrap();
+        let disjoint =
+            NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("right/new")])
+                .await
+                .unwrap();
         // Isolate admission from later filesystem awaits: Pending here can
         // only mean the existing lease excludes this resolved footprint.
         let disjoint = Arc::clone(&gate).acquire(Access::Additions(disjoint.directories));
         tokio::pin!(disjoint);
         assert!(futures::poll!(&mut disjoint).is_pending());
         drop(fallback);
-        let _disjoint = tokio::time::timeout(Duration::from_secs(1), disjoint).await.unwrap();
-        assert_eq!(std::fs::read(root.path().join("left/new")).unwrap(), b"created by preceding writer");
+        let _disjoint = tokio::time::timeout(Duration::from_secs(1), disjoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("left/new")).unwrap(),
+            b"created by preceding writer"
+        );
     }
 
     #[tokio::test]
@@ -333,23 +408,44 @@ mod tests {
         let paths = |name: &str| vec![PathBuf::from(name)];
         let gate = Arc::new(ScopedWorkspaceGate::default());
         let left = NativeAdditions::resolve(root.path(), root.path(), &paths("left/new"))
-            .await.unwrap().acquire(Arc::clone(&gate)).await;
-        let right = tokio::time::timeout(Duration::from_secs(1),
+            .await
+            .unwrap()
+            .acquire(Arc::clone(&gate))
+            .await;
+        let right = tokio::time::timeout(
+            Duration::from_secs(1),
             NativeAdditions::resolve(root.path(), root.path(), &paths("right/new"))
-                .await.unwrap().acquire(Arc::clone(&gate)),
-        ).await.expect("disjoint additions must not wait");
+                .await
+                .unwrap()
+                .acquire(Arc::clone(&gate)),
+        )
+        .await
+        .expect("disjoint additions must not wait");
         assert!(Arc::clone(&gate).try_read_owned().is_err());
         assert!(Arc::clone(&gate).try_write_owned().is_err());
-        assert!(tokio::time::timeout(Duration::from_millis(20),
-            NativeAdditions::resolve(root.path(), root.path(), &paths("left/other"))
-                .await.unwrap().acquire(Arc::clone(&gate)),
-        ).await.is_err(), "same-directory waiter must remain excluded");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                NativeAdditions::resolve(root.path(), root.path(), &paths("left/other"))
+                    .await
+                    .unwrap()
+                    .acquire(Arc::clone(&gate)),
+            )
+            .await
+            .is_err(),
+            "same-directory waiter must remain excluded"
+        );
         // The timed-out waiter must not leave a stale queue claim.
         drop(left);
-        let left = tokio::time::timeout(Duration::from_secs(1),
+        let left = tokio::time::timeout(
+            Duration::from_secs(1),
             NativeAdditions::resolve(root.path(), root.path(), &paths("left/other"))
-                .await.unwrap().acquire(Arc::clone(&gate)),
-        ).await.unwrap();
+                .await
+                .unwrap()
+                .acquire(Arc::clone(&gate)),
+        )
+        .await
+        .unwrap();
         drop(left);
         drop(right);
         let exclusive = Arc::clone(&gate).try_write_owned().unwrap();
@@ -359,7 +455,11 @@ mod tests {
         drop((first_reader, second_reader));
         std::fs::write(root.path().join("left/existing"), "existing").unwrap();
         for path in ["left/existing", "missing/new", ".git", "left/../right/new"] {
-            assert!(NativeAdditions::resolve(root.path(), root.path(), &paths(path)).await.is_none());
+            assert!(
+                NativeAdditions::resolve(root.path(), root.path(), &paths(path))
+                    .await
+                    .is_none()
+            );
         }
     }
 }

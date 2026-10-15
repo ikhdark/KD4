@@ -217,8 +217,14 @@ fn cold_review_context_is_attempt_bound_and_structurally_excludes_worker_history
     .expect("valid cold-review context");
     assert_eq!(context.assignment, assignment);
     assert_eq!(context.attempt_id, attempt_id);
-    assert_eq!(context.applicable_instructions, vec!["nearest AGENTS policy"]);
-    assert_eq!(context.attempt_specific_diff, "diff --git a/src/lib.rs b/src/lib.rs");
+    assert_eq!(
+        context.applicable_instructions,
+        vec!["nearest AGENTS policy"]
+    );
+    assert_eq!(
+        context.attempt_specific_diff,
+        "diff --git a/src/lib.rs b/src/lib.rs"
+    );
     assert_eq!(context.relevant_contracts, vec!["source owner contract"]);
     assert_eq!(context.nearest_tests, vec!["owner_test"]);
     assert_eq!(

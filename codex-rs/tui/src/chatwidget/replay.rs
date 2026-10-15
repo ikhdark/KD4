@@ -175,8 +175,23 @@ impl ChatWidget {
             ThreadItem::ExitedReviewMode { .. } => {
                 self.exit_review_mode_after_item();
             }
-            ThreadItem::ContextCompaction { .. } => {
-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            ThreadItem::ContextCompaction {
+                tokens_before,
+                tokens_after,
+                omitted_image_count,
+                omitted_text,
+                ..
+            } => {
+                let message = match codex_app_server_protocol::describe_context_compaction(
+                    tokens_before,
+                    tokens_after,
+                    omitted_image_count,
+                    omitted_text,
+                ) {
+                    Some(detail) => format!("Context compacted: {detail}"),
+                    None => "Context compacted".to_string(),
+                };
+                self.add_info_message(message, /*hint*/ None);
             }
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {

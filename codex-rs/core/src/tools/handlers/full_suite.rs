@@ -33,7 +33,10 @@ pub(crate) async fn check_full_suite_command(
     let local_cwd = local_cwd.map(Path::to_path_buf);
     crate::tools::run_blocking_command_analysis(move || {
         // An unknown or remote working directory stays governed.
-        if local_cwd.as_deref().is_some_and(|cwd| !in_kd4_checkout(cwd)) {
+        if local_cwd
+            .as_deref()
+            .is_some_and(|cwd| !in_kd4_checkout(cwd))
+        {
             return Ok(false);
         }
         check_command(&command, shell_type, 0)
@@ -248,9 +251,26 @@ fn visibly_runs_tests(script: &str) -> bool {
                     "just" => just_recipe_index(rest).is_some_and(|recipe| {
                         rest[recipe].starts_with("core-test") || rest[recipe].starts_with("test")
                     }),
-                    "rust_test_runner.py" => rest.iter().any(|arg| {
-                        matches!(arg.as_str(), "run-target" | "run-gate" | "check-gates")
-                    }),
+                    "rust_test_runner.py" => {
+                        // Exempt only a literal subcommand help query, not a
+                        // script that merely contains --help elsewhere. Use
+                        // raw arguments: basename normalization can turn an
+                        // option value such as path/--help into a help flag.
+                        let mut args = statement.split_whitespace().skip(index + 1);
+                        if matches!(
+                            (args.next(), args.next(), args.next()),
+                            (
+                                Some("run-target" | "run-gate" | "check-gates"),
+                                Some("--help" | "-h"),
+                                None
+                            )
+                        ) {
+                            return false;
+                        }
+                        rest.iter().any(|arg| {
+                            matches!(arg.as_str(), "run-target" | "run-gate" | "check-gates")
+                        })
+                    }
                     _ => false,
                 }
             })
@@ -588,7 +608,12 @@ mod tests {
             // assertion cannot detect shell extraction/recursion regressions.
             assert_eq!(
                 check_command(
-                    &["pwsh".into(), "-NoProfile".into(), "-Command".into(), script.into()],
+                    &[
+                        "pwsh".into(),
+                        "-NoProfile".into(),
+                        "-Command".into(),
+                        script.into()
+                    ],
                     Some(ShellType::PowerShell),
                     0,
                 ),
@@ -604,6 +629,58 @@ mod tests {
             "if ($true) { cargo nextest run --no-fail-fast --retries 0 }",
             "iex 'cargo test --workspace'",
             "just test-fast -p codex-core | Select-Object -Last 5",
+        ] {
+            assert!(visibly_runs_tests(script), "{script}");
+        }
+    }
+
+    #[test]
+    fn full_suite_opaque_runner_help_does_not_hide_test_launches() {
+        let help = "python -I -B scripts/build/rust_test_runner.py run-target --help";
+        let batch = format!(
+            "python -I -B scripts/build/rust_test_runner.py --help; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; {help}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; python -B scripts/maintenance/root_maintenance.py test-python --help; python -B scripts/maintenance/root_maintenance.py audit-scripts --help"
+        );
+        for script in [
+            batch,
+            format!("if ($true) {{ {help} }}"),
+            "if ($true) { python scripts/build/rust_test_runner.py run-gate -h }".into(),
+            "if ($true) { python scripts/build/rust_test_runner.py check-gates --help }".into(),
+        ] {
+            assert!(!visibly_runs_tests(&script), "{script}");
+            assert_eq!(
+                check_command(
+                    &["pwsh".into(), "-Command".into(), script.clone()],
+                    Some(ShellType::PowerShell),
+                    0,
+                ),
+                Ok(false),
+                "{script}",
+            );
+        }
+        for script in [
+            format!("{help}; foreach ($i in 1,2) {{ cargo test --no-fail-fast }}"),
+            format!(
+                "{help}; if ($true) {{ python scripts/build/rust_test_runner.py run-target core_lib --all }}"
+            ),
+        ] {
+            assert!(visibly_runs_tests(&script), "{script}");
+            assert!(
+                check_command(
+                    &["pwsh".into(), "-Command".into(), script.clone()],
+                    Some(ShellType::PowerShell),
+                    0,
+                )
+                .is_err(),
+                "{script}",
+            );
+        }
+        // Ambiguous tokens must not gain the opaque-script exemption. These
+        // helper checks deliberately do not constrain the structured parser's
+        // separate handling of focused tests or forwarded help arguments.
+        for script in [
+            "python scripts/build/rust_test_runner.py run-target path/--help",
+            "python scripts/build/rust_test_runner.py run-target core_lib -- --help",
+            "python scripts/build/rust_test_runner.py run-target core_lib; Write-Output --help",
         ] {
             assert!(visibly_runs_tests(script), "{script}");
         }
@@ -666,6 +743,54 @@ mod tests {
             } else {
                 assert!(result.is_err(), "{script}: {result:?}");
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn full_suite_powershell_data_output_is_not_a_test_launch() {
+        for script in [
+            "$commands = @('cargo test --workspace'); foreach ($command in $commands) { Write-Output $command }",
+            "foreach ($command in @('just test-fast', 'cargo test')) { Write-Output $command }",
+        ] {
+            assert_eq!(
+                check_full_suite_command(
+                    &[
+                        "pwsh".into(),
+                        "-NoProfile".into(),
+                        "-Command".into(),
+                        script.into(),
+                    ],
+                    Some(ShellType::PowerShell),
+                    None,
+                )
+                .await,
+                Ok(false),
+                "{script}",
+            );
+        }
+        // Similar-looking scripts that actually invoke tests must still fail
+        // closed. Quoted command text alone must never grant admission.
+        for script in [
+            "$commands = @('cargo test --workspace'); foreach ($command in $commands) { Invoke-Expression $command }",
+            "foreach ($command in @('cargo test')) { Write-Output $(cargo test --workspace) }",
+            "foreach ($command in @('cargo test')) { cargo test --workspace }",
+        ] {
+            assert!(
+                check_full_suite_command(
+                    &[
+                        "pwsh".into(),
+                        "-NoProfile".into(),
+                        "-Command".into(),
+                        script.into(),
+                    ],
+                    Some(ShellType::PowerShell),
+                    None,
+                )
+                .await
+                .is_err(),
+                "{script}",
+            );
         }
     }
 

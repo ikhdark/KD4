@@ -306,7 +306,10 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
     }
 
     assert!(saw_turn_complete, "expected turn to complete");
-    assert!(saw_model_shell_end, "the model's original command must finish successfully");
+    assert!(
+        saw_model_shell_end,
+        "the model's original command must finish successfully"
+    );
     assert!(
         saw_user_shell_end,
         "expected user shell command to finish while turn was active"
@@ -322,7 +325,8 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
         "active turn should continue and issue the follow-up model request"
     );
     assert!(
-        mock.requests()[1].function_call_output_text(call_id)
+        mock.requests()[1]
+            .function_call_output_text(call_id)
             .expect("model shell result in follow-up request")
             .contains("model-shell")
     );
@@ -367,9 +371,15 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     // Pipe reads may split even this short output at arbitrary byte boundaries.
     let mut streamed_stdout = Vec::new();
     let end_event = loop {
-        let event = wait_for_event(&test.codex, |ev| matches!(ev,
-            EventMsg::ExecCommandOutputDelta(_) | EventMsg::ExecCommandEnd(_) | EventMsg::Error(_)
-        )).await;
+        let event = wait_for_event(&test.codex, |ev| {
+            matches!(
+                ev,
+                EventMsg::ExecCommandOutputDelta(_)
+                    | EventMsg::ExecCommandEnd(_)
+                    | EventMsg::Error(_)
+            )
+        })
+        .await;
         match event {
             EventMsg::ExecCommandOutputDelta(event) => {
                 assert_eq!(event.call_id, begin_event.call_id);
@@ -416,17 +426,23 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     let (items, _, parse_errors) =
         codex_rollout::RolloutRecorder::load_rollout_items(&rollout_path).await?;
     assert_eq!(parse_errors, 0);
-    let persisted_shell_messages = items.iter().filter(|item| {
-        matches!(item,
-            codex_protocol::protocol::RolloutItem::ResponseItem(
-                codex_protocol::models::ResponseItem::Message { role, content, .. }
-            ) if role == "user" && content.iter().any(|part| matches!(part,
-                codex_protocol::models::ContentItem::InputText { text }
-                    if text.replace("\r\n", "\n") == command_message
-            ))
-        )
-    }).count();
-    assert_eq!(persisted_shell_messages, 1, "the model-visible shell result must be persisted exactly once");
+    let persisted_shell_messages = items
+        .iter()
+        .filter(|item| {
+            matches!(item,
+                codex_protocol::protocol::RolloutItem::ResponseItem(
+                    codex_protocol::models::ResponseItem::Message { role, content, .. }
+                ) if role == "user" && content.iter().any(|part| matches!(part,
+                    codex_protocol::models::ContentItem::InputText { text }
+                        if text.replace("\r\n", "\n") == command_message
+                ))
+            )
+        })
+        .count();
+    assert_eq!(
+        persisted_shell_messages, 1,
+        "the model-visible shell result must be persisted exactly once"
+    );
 
     Ok(())
 }
@@ -468,7 +484,8 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
     };
 
     assert_eq!(
-        exit_code, Some(0),
+        exit_code,
+        Some(0),
         "shell command should execute successfully. stdout=`{stdout}`, stderr=`{stderr}`",
     );
     assert_eq!(stdout.trim(), "not-set");
@@ -534,7 +551,10 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
         .context("function_call_output present for shell_command call")?;
 
     let truncation_headers = output.matches("Total output lines:").count();
-    assert!(output.lines().any(|line| line == "Exit code: 0"), "fixture command must succeed: {output}");
+    assert!(
+        output.lines().any(|line| line == "Exit code: 0"),
+        "fixture command must succeed: {output}"
+    );
 
     assert_eq!(
         truncation_headers, 1,

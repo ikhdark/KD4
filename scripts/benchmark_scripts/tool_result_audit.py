@@ -127,11 +127,40 @@ def source_read_paths(source):
 
 
 def execution_timings(records):
-    """Merge deltas, then apply only unambiguous terminal evidence."""
+    """Merge additive checkpoint fields, rejecting contradictory non-null values.
+
+    Complementary nested measurements may fill missing fields, not revise them.
+    kd4 records a checkpointed request again when it changes: a later record
+    revises a request recorded in flight (explicit null completedMs) and the
+    retrospective fields of a completed one. Explicit terminal arrays remain
+    authoritative replacements of checkpoint arrays; contradictory entries
+    within a terminal array are still rejected.
+    """
     turns = {}
     terminals = TerminalProfiles()
+    in_flight = set()
 
-    def merge(turn, timing, line, terminal=False):
+    def merge_fields(previous, incoming, line, path, revisable=frozenset()):
+        # ``revisable`` names fields a later record may change; None allows all.
+        nested = None if revisable is None else frozenset()
+        for name, value in incoming.items():
+            if value is None:
+                continue
+            old = previous.get(name)
+            if isinstance(old, dict) and isinstance(value, dict):
+                merge_fields(old, value, line, f"{path}.{name}", nested)
+            elif (old is not None and old != value
+                  and revisable is not None and name not in revisable):
+                raise ValueError(f"conflicting timing measurement {path}.{name} in record {line}")
+            else:
+                # Own nested mappings; merging must not mutate captured records.
+                if isinstance(value, dict):
+                    previous[name] = {}
+                    merge_fields(previous[name], value, line, f"{path}.{name}", nested)
+                else:
+                    previous[name] = value
+
+    def merge(turn_key, turn, timing, line, terminal=False):
         for field, identity in (("modelRequests", "samplingRequestId"), ("toolCalls", "callId")):
             if field not in timing:
                 continue
@@ -140,22 +169,36 @@ def execution_timings(records):
                 turn["terminal_fields"].append(field)
             for item in timing[field]:
                 key = item.get(identity)
+                if key is None and field == "modelRequests" and item.get("generationIndex") is not None:
+                    # kd4 starts compaction generations without a request ID; its
+                    # checkpoint identity is the request ID plus generation.
+                    key = ("generation", item["generationIndex"])
                 if key is None:
                     raise ValueError(f"missing {identity} in timing record {line}")
+                if field == "modelRequests" and item.get(identity) is not None:
+                    # The runtime checkpoints by request ID AND generation.
+                    key = ("request", key, item.get("generationIndex"))
                 previous = turn[field].setdefault(key, {})
-                previous.update({k: v for k, v in item.items() if v is not None})
+                revisable = frozenset()
+                if (not terminal and field == "modelRequests" and previous
+                        and previous.get("generationIndex") == item.get("generationIndex")):
+                    revisable = (None if (turn_key, key) in in_flight and previous.get("completedMs") is None
+                                 else frozenset({"nextStructuredActionChanged"}))
+                merge_fields(previous, item, line, f"{field}[{key}]", revisable)
+                if not terminal and field == "modelRequests" and "completedMs" in item and item["completedMs"] is None:
+                    in_flight.add((turn_key, key))
 
     current = None
     for line, row, _ in records:
         payload = row.get("payload", {})
         kind = payload.get("type")
-        if kind == "task_started":
+        if row["type"] == "event_msg" and kind == "task_started":
             current = payload.get("turn_id")
         checkpoint = payload.get("timing_checkpoint") or {}
         if row["type"] == "sampling_boundary":
             turn_id = checkpoint.get("turn_id", current)
             timing = checkpoint.get("timing", checkpoint)
-        elif kind in TERMINAL_EVENTS:
+        elif row["type"] == "event_msg" and kind in TERMINAL_EVENTS:
             turn_id = payload.get("turn_id", current)
             timing = payload.get("timing") or {}
         else:
@@ -168,13 +211,14 @@ def execution_timings(records):
             "terminal_fields": [], "terminal_records": [],
             "conflicting_terminal": False, "counters": {},
         })
-        terminal = kind in TERMINAL_EVENTS
+        terminal = row["type"] == "event_msg" and kind in TERMINAL_EVENTS
         if terminal:
-            terminals.add(key, {"timing": payload.get("timing"), "status": kind, "line": line})
+            terminals.add(key, {"timing": payload.get("timing"), "status": kind, "line": line,
+                                "error": payload.get("error"), "reason": payload.get("reason")})
             turn["terminal_records"].append(line)
         else:
             turn["checkpoint_records"].append(line)
-            merge(turn, timing, line)
+            merge(key, turn, timing, line)
     for key, terminal in terminals.records.items():
         turn = turns[key]
         if key in terminals.conflicts:
@@ -186,7 +230,7 @@ def execution_timings(records):
         turn["terminal_record"] = terminal["line"]
         timing = terminal["timing"] or {}
         turn["counters"] = timing.get("counters") or {}
-        merge(turn, timing, terminal["line"], terminal=True)
+        merge(key, turn, timing, terminal["line"], terminal=True)
     return [{**turn, **{field: list(turn[field].values())
                        for field in ("modelRequests", "toolCalls")}}
             for turn in turns.values()]
@@ -326,6 +370,9 @@ def execution_context_audit(records):
     turns = []
     categories = collections.Counter()
     usage = collections.Counter()
+    request_usages = []
+    usage_conflicts = []
+    duplicate_usage_records = 0
     bulk = collections.defaultdict(list)
     boundaries = {}
     outputs = []
@@ -439,6 +486,32 @@ def execution_context_audit(records):
     request_boundaries_by_turn = collections.defaultdict(list)
     for timing in execution_timings(records):
         requests = timing["modelRequests"]
+        # Timing rows are keyed by request AND generation; provider usage is
+        # scoped to the sampling request within this turn, as in _token_report.
+        # Keep the timing rows intact and reconcile usage separately. A missing
+        # ID cannot prove two generations refer to the same provider request.
+        by_request = {}
+        conflicting_requests = set()
+        for index, request in enumerate(requests):
+            request_id = request.get("samplingRequestId")
+            key = (("request", request_id) if isinstance(request_id, str) and request_id
+                   else ("row", index))
+            duplicate_usage_records += key in by_request
+            observed = by_request.setdefault(key, {})
+            for name, value in (request.get("tokenUsage") or {}).items():
+                if value is None:
+                    continue
+                if name in observed and observed[name] != value:
+                    conflicting_requests.add(key)
+                else:
+                    observed[name] = value
+        for key, tokens in by_request.items():
+            if key in conflicting_requests:
+                usage_conflicts.append({"turn_id": timing["turn_id"],
+                                        "sampling_request_id": key[1]})
+                tokens = {}
+            request_usages.append(tokens)
+            usage.update({k: v for k, v in tokens.items() if type(v) is int})
         for field in ("modelRequests", "toolCalls"):
             bulk[field].append(encoded(timing.get(field, [])))
         rounds = []
@@ -481,7 +554,6 @@ def execution_context_audit(records):
             previous = input_tokens
             if boundary is not None:
                 previous_boundary = boundary
-            usage.update({k: v for k, v in tokens.items() if isinstance(v, int)})
             categories.update(
                 {
                     k: context[k]
@@ -534,16 +606,14 @@ def execution_context_audit(records):
         output["subsequent_requests_in_turn"] = exposure
         output["raw_replay_estimated_tokens"] = ((output["bytes"] + 3) // 4) * exposure
     reconciliation = {"status": "unavailable", "last_token_count": last_reported_usage,
-                      "request_minus_cumulative": {}}
+                      "request_minus_cumulative": {}, "conflicting_requests": usage_conflicts}
     # Observed sums are useful, but cannot fill missing request fields with zero
     # when deriving totals or claiming agreement with cumulative usage.
     complete_fields = set(usage)
-    for turn in turns:
-        for request in turn["rounds"]:
-            complete_fields.intersection_update(
-                key for key, value in request["provider_usage"].items()
-                if type(value) is int and value >= 0
-            )
+    for tokens in request_usages:
+        complete_fields.intersection_update(
+            key for key, value in tokens.items() if type(value) is int and value >= 0
+        )
     if last_reported_usage is not None:
         fields = {
             "input_tokens": ("inputTokens",),
@@ -563,6 +633,8 @@ def execution_context_audit(records):
                 else "matched" if len(differences) == len(fields)
                 else "partial_match"
             )
+    if usage_conflicts:
+        reconciliation["status"] = "conflicting_request_usage"
     if conflicting:
         reconciliation["status"] = "conflicting_terminal_evidence"
     return {
@@ -575,12 +647,9 @@ def execution_context_audit(records):
             "terminal_turns": len(terminal),
             "unfinished_turn_ids": sorted(started - terminal - conflicting, key=str),
             "conflicting_terminal_turn_ids": sorted(conflicting, key=str),
-            "requests_with_usage": sum(
-                bool(r["provider_usage"]) for t in turns for r in t["rounds"]
-            ),
-            "requests_without_usage": sum(
-                not r["provider_usage"] for t in turns for r in t["rounds"]
-            ),
+            "requests_with_usage": sum(bool(tokens) for tokens in request_usages),
+            "requests_without_usage": sum(not tokens for tokens in request_usages),
+            "deduplicated_usage_records": duplicate_usage_records,
         },
         "provider_usage_totals": dict(usage),
         "provider_usage_reconciliation": reconciliation,
@@ -610,6 +679,7 @@ def execution_context_audit(records):
             "Matching text blocks are byte-equal evidence, not proof they are semantically unnecessary or current.",
             "Repeated-block matching is budgeted; matching_blocks_coverage reports skipped candidate pairs. Repeated bytes are a lower bound when coverage is incomplete. Four-line indexing excludes only pairs that cannot meet the minimum block length.",
             "Terminal arrays take precedence; otherwise incremental checkpoints are merged by request/call identity, never summed as independent requests.",
+            "Generation timing rows remain separate; provider usage and usage coverage count each identified sampling request once within its turn. Missing IDs remain independent. Conflicting request usage is excluded from observed totals and leaves aggregate reconciliation unverified; per-generation usage remains raw evidence.",
             "Conflicting terminal timing or status quarantines the entire turn's timing, usage, counters, and completion classification; direct dispatch/output records remain observations.",
             "Aborted turns are terminal, not successful completions; terminal status does not establish complete usage or resolved tools.",
             "Unfinished executions report observed usage only; requests without usage and uncheckpointed tail work are not assumed free or complete.",

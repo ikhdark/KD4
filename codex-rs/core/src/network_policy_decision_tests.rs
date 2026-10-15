@@ -24,7 +24,11 @@ fn network_approval_context_requires_ask_from_decider() {
         NetworkDecisionSource::ProxyState,
     ] {
         payload.source = source;
-        assert_eq!(network_approval_context_from_payload(&payload), None, "{source:?}");
+        assert_eq!(
+            network_approval_context_from_payload(&payload),
+            None,
+            "{source:?}"
+        );
     }
     payload.source = NetworkDecisionSource::Decider;
     assert_eq!(

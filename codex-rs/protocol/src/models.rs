@@ -1964,7 +1964,10 @@ impl<'de> Deserialize<'de> for SearchToolCallParams {
                 "{error}. tool_search accepts only query and limit; to restrict a provider, put source:<canonical namespace> in query."
             ))
         })?;
-        Ok(Self { query: params.query, limit: params.limit })
+        Ok(Self {
+            query: params.query,
+            limit: params.limit,
+        })
     }
 }
 
@@ -2456,6 +2459,17 @@ mod tests {
     }
 
     #[test]
+    fn default_base_instructions_state_that_missing_agents_md_needs_no_probe() {
+        let instructions = BaseInstructions::default();
+        for required in [
+            "AGENTS.md files from the project root to the working directory are supplied automatically",
+            "if none is supplied, none applies there; do not probe for one",
+        ] {
+            assert!(instructions.text.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
     fn default_base_instructions_narrow_audits_without_replacing_coverage() {
         let instructions = BaseInstructions::default();
         for required in [
@@ -2630,22 +2644,27 @@ mod tests {
                 is_error: Some(is_error),
                 meta: None,
             };
-            let wire = serde_json::to_value(ResponseItem::from(
-                ResponseInputItem::McpToolCallOutput {
+            let wire =
+                serde_json::to_value(ResponseItem::from(ResponseInputItem::McpToolCallOutput {
                     call_id: "encrypted-call".into(),
                     output: result,
-                },
-            ))
-            .expect("serialize provider output");
-            let items = wire["output"].as_array().expect("mixed content stays native");
-            assert!(items.iter().any(|item| item == &serde_json::json!({
-                "type": "encrypted_content", "encrypted_content": "enc_opaque"
-            })));
-            assert!(items.iter().any(|item| item == &serde_json::json!({
-                "type": "input_text", "text": "{\"receipt\":42}"
-            })));
+                }))
+                .expect("serialize provider output");
+            let items = wire["output"]
+                .as_array()
+                .expect("mixed content stays native");
+            assert!(items.iter().any(|item| item
+                == &serde_json::json!({
+                    "type": "encrypted_content", "encrypted_content": "enc_opaque"
+                })));
+            assert!(items.iter().any(|item| item
+                == &serde_json::json!({
+                    "type": "input_text", "text": "{\"receipt\":42}"
+                })));
             assert_eq!(
-                items.iter().any(|item| item["text"] == "MCP tool reported an error."),
+                items
+                    .iter()
+                    .any(|item| item["text"] == "MCP tool reported an error."),
                 is_error,
             );
         }

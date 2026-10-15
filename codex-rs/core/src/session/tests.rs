@@ -3,6 +3,8 @@ use super::*;
 
 #[path = "comprehension_continuation_tests.rs"]
 mod comprehension_continuation_tests;
+#[path = "rollout_activity_tests.rs"]
+mod rollout_activity_tests;
 
 #[tokio::test]
 async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
@@ -11,16 +13,27 @@ async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
         polls: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl codex_extension_api::ContextContributor for Contributor {
-        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
-            _: &'a codex_extension_api::ExtensionData)
-            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
             Box::pin(async move {
                 self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
-                let mut fragments = vec![codex_extension_api::PromptFragment::developer_capability(
-                    if phase == 0 { "small catalog".to_string() } else { "catalog ".repeat(30_000) })];
+                let mut fragments =
+                    vec![codex_extension_api::PromptFragment::developer_capability(
+                        if phase == 0 {
+                            "small catalog".to_string()
+                        } else {
+                            "catalog ".repeat(30_000)
+                        },
+                    )];
                 if phase < 2 {
-                    fragments.push(codex_extension_api::PromptFragment::separate_developer("required source sentinel"));
+                    fragments.push(codex_extension_api::PromptFragment::separate_developer(
+                        "required source sentinel",
+                    ));
                 }
                 fragments
             })
@@ -30,7 +43,10 @@ async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
     let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
-    registry.prompt_contributor(Arc::new(Contributor { phase: phase.clone(), polls: polls.clone() }));
+    registry.prompt_contributor(Arc::new(Contributor {
+        phase: phase.clone(),
+        polls: polls.clone(),
+    }));
     session.services.extensions = Arc::new(registry.build());
     let session = Arc::new(session);
     let step = StepContext::for_test(Arc::new(turn));
@@ -42,18 +58,34 @@ async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
         if revision == 1 {
             assert!(text.contains("Context contribution INCOMPLETE"), "{text}");
             assert!(!text.contains(&crate::stable_context::turn_contribution_removal(index)));
-            let references = session.state.lock().await.tool_history_state().artifact_references();
-            let id = references.keys().find(|id| text.contains(id.as_str())).unwrap();
+            let references = session
+                .state
+                .lock()
+                .await
+                .tool_history_state()
+                .artifact_references();
+            let id = references
+                .keys()
+                .find(|id| text.contains(id.as_str()))
+                .unwrap();
             let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-                session.codex_home().await.as_path(), &session.thread_id().to_string(), id).await.unwrap();
+                session.codex_home().await.as_path(),
+                &session.thread_id().to_string(),
+                id,
+            )
+            .await
+            .unwrap();
             let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(recovered["items"][0]["text"], "required source sentinel");
         }
         if revision == 2 {
             assert!(text.contains(&crate::stable_context::turn_contribution_removal(index)));
         }
-        session.compare_and_record_context_updates(prepared, session.services.planning_generation())
-            .await.unwrap().unwrap();
+        session
+            .compare_and_record_context_updates(prepared, session.services.planning_generation())
+            .await
+            .unwrap()
+            .unwrap();
     }
     assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
@@ -94,10 +126,10 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::SessionId;
@@ -2089,8 +2121,8 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
         StdDuration::from_secs(2),
         stream.take(4096).read_to_end(&mut buffer),
     )
-        .await
-        .expect("timed out waiting for proxy response")?;
+    .await
+    .expect("timed out waiting for proxy response")?;
     let response = String::from_utf8_lossy(&buffer);
 
     assert!(
@@ -2476,19 +2508,44 @@ async fn reload_user_config_layer_preserves_explicit_ignore_but_reloads_empty_en
             .loader_overrides(LoaderOverrides {
                 ignore_user_config: ignored,
                 ..LoaderOverrides::without_managed_config_for_tests()
-            }).build().await.unwrap();
-        assert!(config.config_layer_stack.effective_config().get("apps").is_none());
-        session.state.lock().await.session_configuration.original_config_do_not_use = Arc::new(config);
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            config
+                .config_layer_stack
+                .effective_config()
+                .get("apps")
+                .is_none()
+        );
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .original_config_do_not_use = Arc::new(config);
         std::fs::write(&path, "[apps.calendar]\nenabled = false\n").unwrap();
         session.reload_user_config_layer().await;
         let config = session.get_config().await;
-        assert_eq!(config.config_layer_stack.effective_config().get("apps").is_some(), !ignored,
-            "empty enabled config remains reloadable, explicitly ignored config does not");
-        let replacement = config.config_layer_stack.with_user_config(
-            &path, toml::from_str("[apps.calendar]\nenabled = true\n").unwrap(),
+        assert_eq!(
+            config
+                .config_layer_stack
+                .effective_config()
+                .get("apps")
+                .is_some(),
+            !ignored,
+            "empty enabled config remains reloadable, explicitly ignored config does not"
         );
-        assert_eq!(replacement.effective_config().get("apps").is_some(), !ignored,
-            "replacing layer contents must preserve its disabled provenance");
+        let replacement = config.config_layer_stack.with_user_config(
+            &path,
+            toml::from_str("[apps.calendar]\nenabled = true\n").unwrap(),
+        );
+        assert_eq!(
+            replacement.effective_config().get("apps").is_some(),
+            !ignored,
+            "replacing layer contents must preserve its disabled provenance"
+        );
     }
 }
 
@@ -2589,7 +2646,12 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
             source: codex_hooks::SessionStartSource::Startup,
         },
     };
-    assert!(session.hooks().preview_session_start(&request, /*turn_id*/ None).is_empty());
+    assert!(
+        session
+            .hooks()
+            .preview_session_start(&request, /*turn_id*/ None)
+            .is_empty()
+    );
 
     let config = session.get_config().await;
     let hook_list = codex_hooks::list_hooks(codex_hooks::HooksConfig {
@@ -2626,7 +2688,13 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
 
     session.reload_user_config_layer().await;
 
-    assert_eq!(session.hooks().preview_session_start(&request, /*turn_id*/ None).len(), 1);
+    assert_eq!(
+        session
+            .hooks()
+            .preview_session_start(&request, /*turn_id*/ None)
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -2696,12 +2764,23 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
             source: codex_hooks::SessionStartSource::Startup,
         },
     };
-    assert!(session.hooks().preview_session_start(&request, /*turn_id*/ None).is_empty());
+    assert!(
+        session
+            .hooks()
+            .preview_session_start(&request, /*turn_id*/ None)
+            .is_empty()
+    );
 
     let next_config = load_latest_config_for_session(&session).await;
     session.refresh_runtime_config(next_config).await;
 
-    assert_eq!(session.hooks().preview_session_start(&request, /*turn_id*/ None).len(), 1);
+    assert_eq!(
+        session
+            .hooks()
+            .preview_session_start(&request, /*turn_id*/ None)
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -2766,7 +2845,6 @@ fn refresh_runtime_config_cancelled_during_hook_preparation_keeps_accepted_state
         assert!(!Arc::ptr_eq(&session.hooks(), &original_hooks));
     });
 }
-
 
 #[tokio::test]
 async fn reload_user_config_layer_preserves_tool_suggest_on_invalid_reload() {
@@ -3082,11 +3160,15 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
         serde_json::json!({"type":"function_call_output","call_id":"read","output":"recorded evidence"}),
         serde_json::json!({"type":"function_call","call_id":"build","name":"exec_command","arguments":"{}"}),
     ] {
-        cut_short.push(RolloutItem::ResponseItem(serde_json::from_value(item).unwrap()));
+        cut_short.push(RolloutItem::ResponseItem(
+            serde_json::from_value(item).unwrap(),
+        ));
     }
     let boundary = super::unfinished_turn_boundary_items(&cut_short, &turn_context);
-    assert!(matches!(boundary.last(), Some(RolloutItem::EventMsg(EventMsg::TurnAborted(event)))
-        if event.reason == TurnAbortReason::ProcessLost && event.duration_ms.is_none()));
+    assert!(
+        matches!(boundary.last(), Some(RolloutItem::EventMsg(EventMsg::TurnAborted(event)))
+        if event.reason == TurnAbortReason::ProcessLost && event.duration_ms.is_none())
+    );
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -3171,7 +3253,6 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
     );
 }
 
-
 /// Raw response events are opt-in, while recording history is unconditional.
 #[tokio::test]
 async fn raw_response_items_resume_after_a_consumer_requests_them() {
@@ -3208,7 +3289,11 @@ async fn raw_response_items_resume_after_a_consumer_requests_them() {
             raw_items.push(raw.item);
         }
     }
-    assert_eq!(raw_items, history[1..], "emit the newly recorded item exactly once");
+    assert_eq!(
+        raw_items,
+        history[1..],
+        "emit the newly recorded item exactly once"
+    );
 }
 
 #[tokio::test]
@@ -3354,7 +3439,10 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
 
     let recorded_item = session.clone_history().await.raw_items()[0].clone();
     assert!(
-        recorded_item.id().expect("agent message id").starts_with("amsg_")
+        recorded_item
+            .id()
+            .expect("agent message id")
+            .starts_with("amsg_")
     );
     assert_eq!(
         strip_response_item_ids(std::slice::from_ref(&recorded_item)),
@@ -3401,7 +3489,6 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
         std::slice::from_ref(&recorded_item)
     );
 }
-
 
 #[tokio::test]
 async fn prepares_image_failures_before_history_insertion() {
@@ -4906,18 +4993,34 @@ async fn thread_rollback_drops_last_turn_from_history() {
 async fn thread_rollback_append_failure_preserves_live_history_and_context() {
     let (mut session, turn, _events) = make_session_and_context_with_rx().await;
     let rollout_path = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
-    let history = vec![user_message("retain request"), assistant_message("retain answer")];
-    session.record_conversation_items(&turn, &history).await.unwrap();
+    let history = vec![
+        user_message("retain request"),
+        assistant_message("retain answer"),
+    ];
+    session
+        .record_conversation_items(&turn, &history)
+        .await
+        .unwrap();
     session.flush_rollout().await.unwrap();
     let before = session.clone_history().await.into_raw_items();
-    session.state.lock().await.set_reference_context_item(Some(turn.to_turn_context_item()));
+    session
+        .state
+        .lock()
+        .await
+        .set_reference_context_item(Some(turn.to_turn_context_item()));
     let reference = session.reference_context_item().await;
     let bytes = tokio::fs::read(&rollout_path).await.unwrap();
     session.live_thread().unwrap().shutdown().await.unwrap();
     let rollback = EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 });
-    let replay = before.iter().cloned().map(RolloutItem::ResponseItem)
-        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone()))).collect();
-    session.commit_rollback_history(&turn, replay, rollback).await
+    let replay = before
+        .iter()
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone())))
+        .collect();
+    session
+        .commit_rollback_history(&turn, replay, rollback)
+        .await
         .expect_err("the ordered append must fail before publication");
     assert_eq!(session.clone_history().await.raw_items(), before);
     assert_eq!(session.reference_context_item().await, reference);
@@ -4927,27 +5030,54 @@ async fn thread_rollback_append_failure_preserves_live_history_and_context() {
 #[tokio::test]
 async fn thread_rollback_barrier_failure_fences_retry_before_publication() {
     let (mut session, turn, _events) = make_session_and_context_with_rx().await;
-    let path = attach_thread_persistence_with_materialization(
-        Arc::get_mut(&mut session).unwrap(), false,
-    ).await;
-    let before = vec![user_message("retained request"), assistant_message("retained answer")];
-    session.replace_history(before.clone(), Some(turn.to_turn_context_item())).await;
+    let path =
+        attach_thread_persistence_with_materialization(Arc::get_mut(&mut session).unwrap(), false)
+            .await;
+    let before = vec![
+        user_message("retained request"),
+        assistant_message("retained answer"),
+    ];
+    session
+        .replace_history(before.clone(), Some(turn.to_turn_context_item()))
+        .await;
     tokio::fs::create_dir_all(&path).await.unwrap();
     let rollback = EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 });
-    let replay = before.iter().cloned().map(RolloutItem::ResponseItem)
-        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone()))).collect::<Vec<_>>();
-    let error = session.commit_rollback_history(&turn, replay.clone(), rollback.clone()).await.unwrap_err();
+    let replay = before
+        .iter()
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone())))
+        .collect::<Vec<_>>();
+    let error = session
+        .commit_rollback_history(&turn, replay.clone(), rollback.clone())
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("unconfirmed"));
     assert_eq!(session.clone_history().await.raw_items(), before);
     assert!(session.durable_history_commit_gate.is_closed());
     tokio::fs::remove_dir(&path).await.unwrap();
-    assert!(session.commit_rollback_history(&turn, replay, rollback).await.is_err());
+    assert!(
+        session
+            .commit_rollback_history(&turn, replay, rollback)
+            .await
+            .is_err()
+    );
     // Repair may make the original queued marker durable, but never a second one.
-    session.live_thread().unwrap().flush_durable().await.unwrap();
+    session
+        .live_thread()
+        .unwrap()
+        .flush_durable()
+        .await
+        .unwrap();
     let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
     assert_eq!(errors, 0);
-    assert_eq!(items.iter().filter(|item| matches!(item,
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))).count(), 1);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))))
+            .count(),
+        1
+    );
     assert_eq!(session.clone_history().await.raw_items(), before);
 }
 
@@ -5430,7 +5560,10 @@ async fn thread_rollback_fails_when_turn_in_progress() {
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
     let error_event = wait_for_thread_rollback_failed(&rx).await;
-    assert_eq!(error_event.message, "Cannot rollback while a turn is in progress.");
+    assert_eq!(
+        error_event.message,
+        "Cannot rollback while a turn is in progress."
+    );
     assert_eq!(
         error_event.codex_error_info,
         Some(CodexErrorInfo::ThreadRollbackFailed)
@@ -5780,7 +5913,10 @@ async fn turn_context_with_model_updates_model_fields() {
         .await;
 
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
-    assert!(updated.full_suite_budget.admit(true).is_err(), "switching models must not reset full-suite admission");
+    assert!(
+        updated.full_suite_budget.admit(true).is_err(),
+        "switching models must not reset full-suite admission"
+    );
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
     assert!(Arc::ptr_eq(
@@ -5812,9 +5948,18 @@ async fn turn_context_with_model_updates_model_fields() {
     let (updated_identity, updated_build) = updated.runtime_identity().await;
     assert_eq!(updated_identity, updated.runtime_identity().await.0);
     assert_eq!(original_build, updated_build);
-    assert!(updated_build.is_some(), "current process identity is independent of session creation metadata");
-    assert_eq!(original_identity["config_layers_v1"], updated_identity["config_layers_v1"]);
-    assert_ne!(original_identity["turn_settings_v1"], updated_identity["turn_settings_v1"]);
+    assert!(
+        updated_build.is_some(),
+        "current process identity is independent of session creation metadata"
+    );
+    assert_eq!(
+        original_identity["config_layers_v1"],
+        updated_identity["config_layers_v1"]
+    );
+    assert_ne!(
+        original_identity["turn_settings_v1"],
+        updated_identity["turn_settings_v1"]
+    );
 }
 
 #[tokio::test]
@@ -5951,7 +6096,10 @@ pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf 
 async fn reconstruction_keeps_rollout_gap_after_compaction() {
     let (mut session, turn, _events) = make_session_and_context_with_rx().await;
     let path = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
-    session.record_conversation_items(&turn, &[user_message("original constraint")]).await.unwrap();
+    session
+        .record_conversation_items(&turn, &[user_message("original constraint")])
+        .await
+        .unwrap();
     session.live_thread().unwrap().shutdown().await.unwrap();
     let mut bytes = tokio::fs::read(&path).await.unwrap();
     bytes.extend_from_slice(b"\nmalformed middle record\n");
@@ -5964,9 +6112,14 @@ async fn reconstruction_keeps_rollout_gap_after_compaction() {
     tokio::fs::write(&path, &bytes).await.unwrap();
     let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
     assert_eq!(errors, 1);
-    let rebuilt = session.reconstruct_history_from_rollout(&turn, &items).await;
-    assert!(rebuilt.history.iter().any(|item| serde_json::to_string(item).unwrap()
-        .contains("1 malformed rollout records")));
+    let rebuilt = session
+        .reconstruct_history_from_rollout(&turn, &items)
+        .await;
+    assert!(rebuilt.history.iter().any(|item| {
+        serde_json::to_string(item)
+            .unwrap()
+            .contains("1 malformed rollout records")
+    }));
     assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
 }
 
@@ -6074,14 +6227,28 @@ fn get_service_tier_requires_enabled_fast_mode_and_supported_explicit_choice() {
         for fast_mode_enabled in [false, true] {
             for (configured, supported) in [
                 (None, None),
-                (Some(ServiceTier::Fast.request_value()), Some(ServiceTier::Fast.request_value())),
+                (
+                    Some(ServiceTier::Fast.request_value()),
+                    Some(ServiceTier::Fast.request_value()),
+                ),
                 (Some(ServiceTier::Flex.request_value()), None),
                 (Some("unsupported"), None),
-                (Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE), Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)),
+                (
+                    Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                    Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                ),
             ] {
                 assert_eq!(
-                    get_service_tier(configured.map(str::to_owned), fast_mode_enabled, &model_info),
-                    if fast_mode_enabled { supported.map(str::to_owned) } else { None },
+                    get_service_tier(
+                        configured.map(str::to_owned),
+                        fast_mode_enabled,
+                        &model_info
+                    ),
+                    if fast_mode_enabled {
+                        supported.map(str::to_owned)
+                    } else {
+                        None
+                    },
                     "model_default={model_default:?}, enabled={fast_mode_enabled}, configured={configured:?}"
                 );
             }
@@ -9081,23 +9248,41 @@ async fn shutdown_deadline_retains_accepted_history_commit_and_reports_uncertain
                 model_provider: config.model_provider_id.clone(),
             },
         },
-    ).await.expect("create thread persistence");
+    )
+    .await
+    .expect("create thread persistence");
     let owned = Arc::get_mut(&mut session).expect("fixture owns session");
     owned.services.thread_store = thread_store;
     owned.services.live_thread = Some(live_thread);
-    session.spawn_task(
-        turn,
-        Vec::new(),
-        NeverEndingTask { kind: TaskKind::Regular, listen_to_cancellation_token: true },
-    ).await;
+    session
+        .spawn_task(
+            turn,
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
     let accepted_commit = session.retain_tool_dispatch_commit();
     tokio::time::pause();
-    assert!(tokio::time::timeout(
-        Duration::from_secs(15),
-        handlers::shutdown(&session, "held-history-shutdown".into()),
-    ).await.expect("accepted commit must not make shutdown wait indefinitely"));
-    assert!(!session.terminal_tasks.is_empty(), "finalizer keeps ownership of pending work");
-    assert_eq!(store.calls().await.shutdown_thread, 0, "writer must remain open for the accepted commit");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            handlers::shutdown(&session, "held-history-shutdown".into()),
+        )
+        .await
+        .expect("accepted commit must not make shutdown wait indefinitely")
+    );
+    assert!(
+        !session.terminal_tasks.is_empty(),
+        "finalizer keeps ownership of pending work"
+    );
+    assert_eq!(
+        store.calls().await.shutdown_thread,
+        0,
+        "writer must remain open for the accepted commit"
+    );
     let mut uncertainty_reported = false;
     loop {
         let event = events.try_recv().expect("shutdown completion is queued");
@@ -9109,7 +9294,10 @@ async fn shutdown_deadline_retains_accepted_history_commit_and_reports_uncertain
                 uncertainty_reported |= error.message.contains("durability is unconfirmed");
             }
             EventMsg::ShutdownComplete => {
-                assert!(uncertainty_reported, "ShutdownComplete must not attest unsaved history");
+                assert!(
+                    uncertainty_reported,
+                    "ShutdownComplete must not attest unsaved history"
+                );
                 break;
             }
             _ => {}
@@ -9117,12 +9305,15 @@ async fn shutdown_deadline_retains_accepted_history_commit_and_reports_uncertain
     }
     drop(accepted_commit);
     tokio::time::timeout(Duration::from_secs(10), session.terminal_tasks.wait())
-        .await.expect("retained finalizer finishes once the accepted commit completes");
+        .await
+        .expect("retained finalizer finishes once the accepted commit completes");
     tokio::time::timeout(Duration::from_secs(10), async {
         while store.calls().await.shutdown_thread == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-    }).await.expect("owned writer shutdown follows the retained finalizer");
+    })
+    .await
+    .expect("owned writer shutdown follows the retained finalizer");
 }
 
 #[tokio::test]
@@ -9608,8 +9799,10 @@ impl codex_tools::ToolExecutor<codex_tools::ToolCall> for RecoveryToolStub {
 
     fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async {
-            Ok(Box::new(codex_tools::JsonToolOutput::new(serde_json::json!({})))
-                as Box<dyn codex_tools::ToolOutput>)
+            Ok(
+                Box::new(codex_tools::JsonToolOutput::new(serde_json::json!({})))
+                    as Box<dyn codex_tools::ToolOutput>,
+            )
         })
     }
 }
@@ -10282,31 +10475,75 @@ async fn mcp_refresh_ack_preserves_newer_identical_requests_and_lost_publication
         let pause = Arc::new(super::mcp::TestMcpStartupPause::new());
         let worker_session = Arc::clone(&session);
         let worker_context = Arc::clone(&context);
-        let worker = tokio::spawn(super::mcp::with_test_mcp_startup_pause(Arc::clone(&pause), async move {
-            worker_session.refresh_mcp_servers_if_requested(&worker_context).await;
-        }));
-        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire()).await.unwrap().unwrap().forget();
+        let worker = tokio::spawn(super::mcp::with_test_mcp_startup_pause(
+            Arc::clone(&pause),
+            async move {
+                worker_session
+                    .refresh_mcp_servers_if_requested(&worker_context)
+                    .await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
         if replace_identical {
             // A distinct submission may carry identical JSON (e.g. changed host capabilities).
             super::handlers::refresh_mcp_servers(&session, requested.clone()).await;
         } else {
             // Exercise the existing compare-and-publish loser path without claiming
             // this artificial two-caller arrangement is a normal dispatch ordering.
-            session.refresh_mcp_servers_now(&context, &context.config).await;
+            session
+                .refresh_mcp_servers_now(&context, &context.config)
+                .await;
         }
-        let remaining = session.pending_mcp_server_refresh_config.lock().await.clone().unwrap();
+        let remaining = session
+            .pending_mcp_server_refresh_config
+            .lock()
+            .await
+            .clone()
+            .unwrap();
         pause.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
-        assert!(session.pending_mcp_server_refresh_config.lock().await.as_ref()
-            .is_some_and(|pending| Arc::ptr_eq(pending, &remaining)),
-            "completion must neither erase a newer request nor acknowledge an unapplied catalog");
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            session
+                .pending_mcp_server_refresh_config
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, &remaining)),
+            "completion must neither erase a newer request nor acknowledge an unapplied catalog"
+        );
         session.refresh_mcp_servers_if_requested(&context).await;
-        assert!(session.pending_mcp_server_refresh_config.lock().await.is_none());
-        assert!(codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config()).contains_key("requested"));
-        let invalid = McpServerRefreshConfig { mcp_servers: json!([]), ..requested };
+        assert!(
+            session
+                .pending_mcp_server_refresh_config
+                .lock()
+                .await
+                .is_none()
+        );
+        assert!(
+            codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config())
+                .contains_key("requested")
+        );
+        let invalid = McpServerRefreshConfig {
+            mcp_servers: json!([]),
+            ..requested
+        };
         super::handlers::refresh_mcp_servers(&session, invalid).await;
         session.refresh_mcp_servers_if_requested(&context).await;
-        assert!(session.pending_mcp_server_refresh_config.lock().await.is_none(), "invalid input must not become an infinite retry");
+        assert!(
+            session
+                .pending_mcp_server_refresh_config
+                .lock()
+                .await
+                .is_none(),
+            "invalid input must not become an infinite retry"
+        );
     }
 }
 
@@ -10652,15 +10889,14 @@ async fn compacted_history_installs_application_policy_in_live_and_durable_histo
             .await
             .unwrap();
         let (rollout, _, errors) = RolloutRecorder::load_rollout_items(&fixture.rollout_path)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(errors, 0);
         let installed = rollout
             .into_iter()
-            .filter_map(|item| {
-                match item {
-                    RolloutItem::Compacted(item) => item.replacement_history,
-                    _ => None,
-                }
+            .filter_map(|item| match item {
+                RolloutItem::Compacted(item) => item.replacement_history,
+                _ => None,
             })
             .next_back()
             .unwrap();
@@ -11411,8 +11647,8 @@ async fn plugin_availability_change_reuses_the_mcp_manager() {
 
 #[tokio::test]
 async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
     use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -11430,8 +11666,9 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
                 "resources/templates/list" => serde_json::json!({"resourceTemplates": []}),
                 _ => return ResponseTemplate::new(400),
             };
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": result}),
+            )
         })
         .mount(&server)
         .await;
@@ -11447,14 +11684,22 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
     let step_context = session.capture_step_context(turn_context).await.unwrap();
 
     let mut refresh_config = step_context.turn.config.as_ref().clone();
-    refresh_config.mcp_servers.set(serde_json::from_value::<HashMap<String, McpServerConfig>>(
-        serde_json::json!({"newer": {"url": format!("{}/mcp", server.uri())}}),
-    )?)?;
+    refresh_config
+        .mcp_servers
+        .set(serde_json::from_value::<HashMap<String, McpServerConfig>>(
+            serde_json::json!({"newer": {"url": format!("{}/mcp", server.uri())}}),
+        )?)?;
     session
         .refresh_mcp_servers_now(step_context.turn.as_ref(), &refresh_config)
         .await;
-    assert!(session.services.latest_mcp_runtime().manager()
-        .wait_for_server_ready("newer", Duration::from_secs(5)).await);
+    assert!(
+        session
+            .services
+            .latest_mcp_runtime()
+            .manager()
+            .wait_for_server_ready("newer", Duration::from_secs(5))
+            .await
+    );
 
     let router = crate::session::turn::built_tools(
         session.as_ref(),
@@ -11472,13 +11717,23 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
 
     // A new turn captures the working replacement. Without this positive
     // contrast, two snapshots lacking resources make the old-step check vacuous.
-    let fresh_turn = session.new_default_turn_with_sub_id("fresh-mcp".to_string()).await;
+    let fresh_turn = session
+        .new_default_turn_with_sub_id("fresh-mcp".to_string())
+        .await;
     let fresh_step = session.capture_step_context(fresh_turn).await?;
     let fresh_router = crate::session::turn::built_tools(
-        session.as_ref(), &fresh_step, &[], &CancellationToken::new(),
-    ).await?;
-    assert!(fresh_router.registered_tool_names_for_test().iter()
-        .any(|name| name.to_string() == "list_mcp_resources"));
+        session.as_ref(),
+        &fresh_step,
+        &[],
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert!(
+        fresh_router
+            .registered_tool_names_for_test()
+            .iter()
+            .any(|name| name.to_string() == "list_mcp_resources")
+    );
     Ok(())
 }
 
@@ -11520,8 +11775,14 @@ async fn network_context_labels_proxy_configuration_separately_from_network_acce
         let profile_is_disabled = matches!(permission_profile, PermissionProfile::Disabled);
         let domains = NetworkDomainPermissionsToml {
             entries: std::collections::BTreeMap::from([
-                ("api.example.com".to_string(), NetworkDomainPermissionToml::Allow),
-                ("blocked.example.com".to_string(), NetworkDomainPermissionToml::Deny),
+                (
+                    "api.example.com".to_string(),
+                    NetworkDomainPermissionToml::Allow,
+                ),
+                (
+                    "blocked.example.com".to_string(),
+                    NetworkDomainPermissionToml::Deny,
+                ),
             ]),
         };
         let constraints = NetworkConstraints {
@@ -11563,13 +11824,10 @@ async fn network_context_labels_proxy_configuration_separately_from_network_acce
                 .into_iter()
                 .cloned()
                 .collect();
-            config.config_layer_stack = ConfigLayerStack::new(
-                layers,
-                requirements,
-                requirements_toml,
-            )
-            .expect("network requirements should be accepted")
-            .into();
+            config.config_layer_stack =
+                ConfigLayerStack::new(layers, requirements, requirements_toml)
+                    .expect("network requirements should be accepted")
+                    .into();
             config.permissions.network = Some(network_spec);
         })
         .await?;
@@ -12181,10 +12439,8 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
     );
 
     assert!(
-        developer_messages
-            .iter()
-            .flatten()
-            .any(|text| *text == crate::stable_context::turn_contribution_text(1, "prompt extension enabled")),
+        developer_messages.iter().flatten().any(|text| *text
+            == crate::stable_context::turn_contribution_text(1, "prompt extension enabled")),
         "expected prompt extension developer text, got {developer_messages:?}"
     );
 }
@@ -12353,7 +12609,9 @@ async fn prepared_context_update_polls_contributors_once_across_planning_and_com
     assert_eq!(world_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let history = session.clone_history().await;
     let texts = developer_input_texts(history.raw_items());
-    assert!(texts.contains(&crate::stable_context::turn_contribution_text(1, "prepared thread context").as_str()));
+    assert!(texts.contains(
+        &crate::stable_context::turn_contribution_text(1, "prepared thread context").as_str()
+    ));
     assert!(texts.contains(
         &crate::stable_context::turn_contribution_text(0, "prepared turn context").as_str()
     ));
@@ -12455,14 +12713,22 @@ async fn prepared_context_update_replaces_and_removes_turn_fragments_without_sta
 async fn thread_contribution_timeout_replacement_and_removal_use_effective_state() {
     struct Contributor(Arc<std::sync::atomic::AtomicUsize>);
     impl codex_extension_api::ContextContributor for Contributor {
-        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData, _: &'a codex_extension_api::ExtensionData)
-            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
             Box::pin(async move {
                 match self.0.load(std::sync::atomic::Ordering::SeqCst) {
                     1 => std::future::pending().await,
                     4 => Vec::new(),
-                    3 => vec![codex_extension_api::PromptFragment::developer_policy("policy B")],
-                    _ => vec![codex_extension_api::PromptFragment::developer_policy("policy A: never modify X")],
+                    3 => vec![codex_extension_api::PromptFragment::developer_policy(
+                        "policy B",
+                    )],
+                    _ => vec![codex_extension_api::PromptFragment::developer_policy(
+                        "policy A: never modify X",
+                    )],
                 }
             })
         }
@@ -12478,12 +12744,30 @@ async fn thread_contribution_timeout_replacement_and_removal_use_effective_state
         phase.store(next, std::sync::atomic::Ordering::SeqCst);
         let before = session.clone_history().await.raw_items().len();
         let prepared = session.prepare_context_update(&step).await;
-        session.compare_and_record_context_updates(prepared, session.services.planning_generation()).await.unwrap();
+        session
+            .compare_and_record_context_updates(prepared, session.services.planning_generation())
+            .await
+            .unwrap();
         let history = session.clone_history().await;
         let added = developer_input_texts(&history.raw_items()[before..]);
-        if matches!(next, 1 | 2) { assert!(added.is_empty(), "timeout and unchanged recovery must be silent: {added:?}"); }
-        if next == 3 { assert_eq!(added, vec![crate::stable_context::turn_contribution_text(1, "policy B").as_str()]); }
-        if next == 4 { assert_eq!(added, vec![crate::stable_context::turn_contribution_removal(1).as_str()]); }
+        if matches!(next, 1 | 2) {
+            assert!(
+                added.is_empty(),
+                "timeout and unchanged recovery must be silent: {added:?}"
+            );
+        }
+        if next == 3 {
+            assert_eq!(
+                added,
+                vec![crate::stable_context::turn_contribution_text(1, "policy B").as_str()]
+            );
+        }
+        if next == 4 {
+            assert_eq!(
+                added,
+                vec![crate::stable_context::turn_contribution_removal(1).as_str()]
+            );
+        }
     }
 }
 
@@ -12491,12 +12775,24 @@ async fn thread_contribution_timeout_replacement_and_removal_use_effective_state
 async fn required_extension_policy_precedes_oversized_capabilities_whole() {
     struct Contributor;
     impl codex_extension_api::ContextContributor for Contributor {
-        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData, _: &'a codex_extension_api::ExtensionData)
-            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
-            Box::pin(async { vec![
-                codex_extension_api::PromptFragment::developer_capability("optional".repeat(30_000)),
-                codex_extension_api::PromptFragment::developer_policy(format!("{}Never modify X.{}", "a".repeat(5000), "b".repeat(5000))),
-            ] })
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            Box::pin(async {
+                vec![
+                    codex_extension_api::PromptFragment::developer_capability(
+                        "optional".repeat(30_000),
+                    ),
+                    codex_extension_api::PromptFragment::developer_policy(format!(
+                        "{}Never modify X.{}",
+                        "a".repeat(5000),
+                        "b".repeat(5000)
+                    )),
+                ]
+            })
         }
     }
     let (mut session, turn) = make_session_and_context().await;
@@ -12505,8 +12801,16 @@ async fn required_extension_policy_precedes_oversized_capabilities_whole() {
     session.services.extensions = Arc::new(registry.build());
     let items = build_initial_context(&session, &Arc::new(turn)).await;
     let text = developer_input_texts(&items).join("\n");
-    assert!(text.contains(&format!("{}Never modify X.{}", "a".repeat(5000), "b".repeat(5000))));
-    assert!(text.len() < 200_000, "optional capability text must yield: {} bytes", text.len());
+    assert!(text.contains(&format!(
+        "{}Never modify X.{}",
+        "a".repeat(5000),
+        "b".repeat(5000)
+    )));
+    assert!(
+        text.len() < 200_000,
+        "optional capability text must yield: {} bytes",
+        text.len()
+    );
 }
 
 #[tokio::test]
@@ -12565,14 +12869,20 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
     )));
     assert_eq!(
         developer_input_texts(&built.turn_context_items)[0],
-        crate::stable_context::turn_contribution_text(context_contribution_index(0, 20_000, false), "useful envelope-budget contribution")
+        crate::stable_context::turn_contribution_text(
+            context_contribution_index(0, 20_000, false),
+            "useful envelope-budget contribution"
+        )
     );
     assert!(
         developer_input_texts(&built.turn_context_items)[1..]
             .iter()
             .enumerate()
             .all(|(index, text)| *text
-                == crate::stable_context::turn_contribution_text(context_contribution_index(0, 20_001 + index, false), "x"))
+                == crate::stable_context::turn_contribution_text(
+                    context_contribution_index(0, 20_001 + index, false),
+                    "x"
+                ))
     );
     let serialized_bytes: usize = built
         .turn_context_items
@@ -12751,16 +13061,32 @@ async fn turn_context_refresh_omits_stalled_contributors_after_shared_deadline()
 
 #[tokio::test]
 async fn contributor_sources_survive_timeout_update_and_removal_without_replaying_permissions() {
-    struct Contributor { first: bool, phase: Arc<std::sync::atomic::AtomicUsize> }
+    struct Contributor {
+        first: bool,
+        phase: Arc<std::sync::atomic::AtomicUsize>,
+    }
     impl codex_extension_api::ContextContributor for Contributor {
-        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
-            _: &'a codex_extension_api::ExtensionData) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
             Box::pin(async move {
                 let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
-                if self.first && phase == 1 { return std::future::pending().await; }
-                if self.first && phase == 3 { return Vec::new(); }
+                if self.first && phase == 1 {
+                    return std::future::pending().await;
+                }
+                if self.first && phase == 3 {
+                    return Vec::new();
+                }
                 vec![codex_extension_api::PromptFragment::separate_developer(
-                    format!("custom {} version {}", if self.first { "first" } else { "second" }, phase.min(2)))]
+                    format!(
+                        "custom {} version {}",
+                        if self.first { "first" } else { "second" },
+                        phase.min(2)
+                    ),
+                )]
             })
         }
     }
@@ -12768,7 +13094,12 @@ async fn contributor_sources_survive_timeout_update_and_removal_without_replayin
     turn.developer_instructions = Some("stable permissions sentinel".into());
     let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-    for first in [true, false] { builder.prompt_contributor(Arc::new(Contributor { first, phase: Arc::clone(&phase) })); }
+    for first in [true, false] {
+        builder.prompt_contributor(Arc::new(Contributor {
+            first,
+            phase: Arc::clone(&phase),
+        }));
+    }
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
     let step = StepContext::for_test(Arc::new(turn));
@@ -12776,10 +13107,16 @@ async fn contributor_sources_survive_timeout_update_and_removal_without_replayin
         phase.store(revision, std::sync::atomic::Ordering::SeqCst);
         let before = session.clone_history().await.raw_items().len();
         let prepared = session.prepare_context_update(&step).await;
-        session.compare_and_record_context_updates(prepared, session.services.planning_generation()).await.unwrap().unwrap();
+        session
+            .compare_and_record_context_updates(prepared, session.services.planning_generation())
+            .await
+            .unwrap()
+            .unwrap();
         let history = session.clone_history().await;
         let added = developer_input_texts(&history.raw_items()[before..]).join("\n");
-        if revision > 0 { assert!(!added.contains("stable permissions sentinel")); }
+        if revision > 0 {
+            assert!(!added.contains("stable permissions sentinel"));
+        }
         let first = context_contribution_index(0, 0, true);
         let second = context_contribution_index(1, 0, true);
         if revision == 1 {
@@ -12787,10 +13124,24 @@ async fn contributor_sources_survive_timeout_update_and_removal_without_replayin
             // or replaced with an unavailable notice.
             assert!(!added.contains("custom first"));
             assert!(!added.contains(&crate::stable_context::turn_contribution_removal(first)));
-            assert!(added.contains(&crate::stable_context::turn_contribution_text(second, "custom second version 1")));
+            assert!(
+                added.contains(&crate::stable_context::turn_contribution_text(
+                    second,
+                    "custom second version 1"
+                ))
+            );
         }
-        if revision == 2 { assert!(added.contains(&crate::stable_context::turn_contribution_text(first, "custom first version 2"))); }
-        if revision == 3 { assert!(added.contains(&crate::stable_context::turn_contribution_removal(first))); }
+        if revision == 2 {
+            assert!(
+                added.contains(&crate::stable_context::turn_contribution_text(
+                    first,
+                    "custom first version 2"
+                ))
+            );
+        }
+        if revision == 3 {
+            assert!(added.contains(&crate::stable_context::turn_contribution_removal(first)));
+        }
     }
 }
 
@@ -12798,25 +13149,71 @@ async fn contributor_sources_survive_timeout_update_and_removal_without_replayin
 async fn oversized_additional_context_recovers_middle_fact_without_changing_authority() {
     use codex_protocol::protocol::{AdditionalContextEntry, AdditionalContextKind};
     let (session, _) = make_session_and_context().await;
-    for kind in [AdditionalContextKind::Application, AdditionalContextKind::Untrusted] {
-        let count = if kind == AdditionalContextKind::Application { 2_000 } else { 20_000 };
-        let value = format!("{} MIDDLE-ONLY-FACT {}", "<x>".repeat(count), "tail".repeat(count));
-        let source = indexmap::IndexMap::from([("source".to_string(), AdditionalContextEntry { value: value.clone(), kind })]);
-        let prepared = session.recoverable_additional_context(source.clone()).await.unwrap();
+    for kind in [
+        AdditionalContextKind::Application,
+        AdditionalContextKind::Untrusted,
+    ] {
+        let count = if kind == AdditionalContextKind::Application {
+            2_000
+        } else {
+            20_000
+        };
+        let value = format!(
+            "{} MIDDLE-ONLY-FACT {}",
+            "<x>".repeat(count),
+            "tail".repeat(count)
+        );
+        let source = indexmap::IndexMap::from([(
+            "source".to_string(),
+            AdditionalContextEntry {
+                value: value.clone(),
+                kind,
+            },
+        )]);
+        let prepared = session
+            .recoverable_additional_context(source.clone())
+            .await
+            .unwrap();
         assert_eq!(prepared["source"].kind, kind);
         if kind == AdditionalContextKind::Application {
-            assert_eq!(prepared["source"].value, value, "application policy is delivered whole");
+            assert_eq!(
+                prepared["source"].value, value,
+                "application policy is delivered whole"
+            );
             continue;
         }
-        assert!(prepared["source"].value.contains("INCOMPLETE INLINE CONTEXT"));
-        let references = session.state.lock().await.tool_history_state().artifact_references();
-        let id = references.keys().find(|id| prepared["source"].value.contains(id.as_str())).unwrap();
+        assert!(
+            prepared["source"]
+                .value
+                .contains("INCOMPLETE INLINE CONTEXT")
+        );
+        let references = session
+            .state
+            .lock()
+            .await
+            .tool_history_state()
+            .artifact_references();
+        let id = references
+            .keys()
+            .find(|id| prepared["source"].value.contains(id.as_str()))
+            .unwrap();
         let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-            session.codex_home().await.as_path(), &session.thread_id().to_string(), id).await.unwrap();
+            session.codex_home().await.as_path(),
+            &session.thread_id().to_string(),
+            id,
+        )
+        .await
+        .unwrap();
         let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(recovered["items"][0]["value"], value);
         assert_eq!(recovered["items"][0]["kind"], "untrusted");
-        assert_eq!(session.recoverable_additional_context(source).await.unwrap(), prepared);
+        assert_eq!(
+            session
+                .recoverable_additional_context(source)
+                .await
+                .unwrap(),
+            prepared
+        );
     }
 }
 
@@ -12824,12 +13221,28 @@ async fn oversized_additional_context_recovers_middle_fact_without_changing_auth
 fn policy_admission_never_cuts_a_negation_and_has_priority_over_capabilities() {
     let mut budget = ModelContextBudget::new(100);
     let policy = "Required: do not publish. Keep the investigation local.";
-    let admitted = take_prompt_fragment(codex_extension_api::PromptFragment::developer_policy(policy), &mut budget, "turn").unwrap();
+    let admitted = take_prompt_fragment(
+        codex_extension_api::PromptFragment::developer_policy(policy),
+        &mut budget,
+        "turn",
+    )
+    .unwrap();
     assert_eq!(admitted.1, policy);
     let remaining = budget.remaining_bytes();
-    assert!(take_prompt_fragment(codex_extension_api::PromptFragment::developer_policy("prohibition ".repeat(1_000)), &mut budget, "turn").is_none());
+    assert!(
+        take_prompt_fragment(
+            codex_extension_api::PromptFragment::developer_policy("prohibition ".repeat(1_000)),
+            &mut budget,
+            "turn"
+        )
+        .is_none()
+    );
     assert_eq!(budget.remaining_bytes(), remaining);
-    let capability = take_prompt_fragment(codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(1_000)), &mut budget, "turn");
+    let capability = take_prompt_fragment(
+        codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(1_000)),
+        &mut budget,
+        "turn",
+    );
     // A capability only gets what the policy left: truncated or dropped, never admitted whole.
     assert!(capability.is_none_or(|(_, text)| text.len() <= remaining));
 }
@@ -12839,29 +13252,59 @@ async fn verified10_additional_context_has_no_four_kilobyte_recovery_cliff() {
     use codex_protocol::protocol::{AdditionalContextEntry, AdditionalContextKind};
     let (session, _) = make_session_and_context().await;
     for value in ["a".repeat(3999), "a".repeat(4001), "<&>".repeat(1500)] {
-        let values = indexmap::IndexMap::from([("source".into(), AdditionalContextEntry {
-            value, kind: AdditionalContextKind::Untrusted,
-        })]);
-        let prepared = session.recoverable_additional_context(values.clone()).await.unwrap();
+        let values = indexmap::IndexMap::from([(
+            "source".into(),
+            AdditionalContextEntry {
+                value,
+                kind: AdditionalContextKind::Untrusted,
+            },
+        )]);
+        let prepared = session
+            .recoverable_additional_context(values.clone())
+            .await
+            .unwrap();
         assert_eq!(prepared, values);
         let admitted = crate::state::AdditionalContextStore::default().merge(prepared);
         assert_eq!(admitted.len(), 1);
         assert!(matches!(&admitted[0], ResponseInputItem::Message { role, .. } if role == "user"));
     }
-    assert!(session.state.lock().await.tool_history_state().artifact_references().is_empty());
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .tool_history_state()
+            .artifact_references()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn capability_flood_registered_before_policy_cannot_displace_the_policy() {
     struct Flood;
     impl codex_extension_api::ContextContributor for Flood {
-        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
-            _: &'a codex_extension_api::ExtensionData) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
-            Box::pin(async { vec![codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(12_000))] })
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            Box::pin(async {
+                vec![codex_extension_api::PromptFragment::developer_capability(
+                    "catalog ".repeat(12_000),
+                )]
+            })
         }
-        fn contribute_turn_context<'a>(&'a self, _: codex_extension_api::TurnContextContributionInput<'a>)
-            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
-            Box::pin(async { vec![codex_extension_api::PromptFragment::developer_policy("Do not publish. Local investigation only.")] })
+        fn contribute_turn_context<'a>(
+            &'a self,
+            _: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>>
+        {
+            Box::pin(async {
+                vec![codex_extension_api::PromptFragment::developer_policy(
+                    "Do not publish. Local investigation only.",
+                )]
+            })
         }
     }
     let (mut session, turn) = make_session_and_context().await;
@@ -12869,7 +13312,11 @@ async fn capability_flood_registered_before_policy_cannot_displace_the_policy() 
     builder.prompt_contributor(Arc::new(Flood));
     session.services.extensions = Arc::new(builder.build());
     let items = build_initial_context(&session, &Arc::new(turn)).await;
-    assert!(developer_input_texts(&items).iter().any(|text| text.contains("Do not publish. Local investigation only.")));
+    assert!(
+        developer_input_texts(&items)
+            .iter()
+            .any(|text| text.contains("Do not publish. Local investigation only."))
+    );
 }
 
 #[tokio::test]
@@ -13109,15 +13556,33 @@ async fn world_state_timeout_preserves_last_success_and_unchanged_recovery_is_si
     let calls_before_render = calls.load(std::sync::atomic::Ordering::SeqCst);
     let (replacement, replacement_snapshot) = timed_out_world_state.render_full_with_snapshot();
     let replacement = crate::context_manager::updates::merge_contextual_fragments(replacement);
-    assert_eq!(developer_input_texts(&replacement).iter().filter(|text| text.contains(TIMEOUT_WORLD_STATE_BODY)).count(), 1);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), calls_before_render);
+    assert_eq!(
+        developer_input_texts(&replacement)
+            .iter()
+            .filter(|text| text.contains(TIMEOUT_WORLD_STATE_BODY))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_before_render
+    );
     {
         let mut state = session.state.lock().await;
         state.history.replace(replacement);
         state.history.set_world_state_baseline(replacement_snapshot);
     }
     let continued_timeout = session.build_world_state_for_step(&step_context).await;
-    assert!(session.state.lock().await.history.update_world_state(&continued_timeout).0.is_empty());
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .history
+            .update_world_state(&continued_timeout)
+            .0
+            .is_empty()
+    );
 
     stalled.store(false, std::sync::atomic::Ordering::SeqCst);
     let recovered_world_state = session.build_world_state_for_step(&step_context).await;
@@ -13339,7 +13804,6 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     );
 }
 
-
 #[tokio::test]
 async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
     let (session, mut turn) = make_session_and_context().await;
@@ -13351,20 +13815,23 @@ async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
 ### Git\nPreserve branch rules.\n</app-context>\noutside-after";
     turn.developer_instructions = Some(original.to_string());
     let mut outcome = SkillLoadOutcome::default();
-    outcome.skills = [("alpha", "database migrations"), ("beta", "image generation")]
-        .into_iter()
-        .map(|(name, description)| SkillMetadata {
-            name: name.to_string(),
-            description: description.repeat(10),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-        })
-        .collect();
+    outcome.skills = [
+        ("alpha", "database migrations"),
+        ("beta", "image generation"),
+    ]
+    .into_iter()
+    .map(|(name, description)| SkillMetadata {
+        name: name.to_string(),
+        description: description.repeat(10),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
+        scope: SkillScope::Repo,
+        plugin_id: None,
+    })
+    .collect();
     let snapshot = HostSkillsSnapshot::new(Arc::new(outcome));
     turn.turn_skills = TurnSkillsContext::new(snapshot.clone());
     let mut turn = Arc::new(turn);
@@ -13422,11 +13889,20 @@ async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
     for unsupported in [
         original.replace("# Codex desktop context", "# Custom context"),
         original.replace("</app-context>", ""),
-        original.replace("Keep unknown rules.", "```\n### Automations\nKeep unknown rules.\n```"),
+        original.replace(
+            "Keep unknown rules.",
+            "```\n### Automations\nKeep unknown rules.\n```",
+        ),
     ] {
-        Arc::get_mut(&mut turn).expect("unique fixture turn").developer_instructions = Some(unsupported);
+        Arc::get_mut(&mut turn)
+            .expect("unique fixture turn")
+            .developer_instructions = Some(unsupported);
         let built = build_initial_context(&session, &turn).await;
-        assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
+        assert!(
+            developer_input_texts(&built)
+                .join("\n")
+                .contains("Use automation_update")
+        );
     }
 }
 
@@ -13905,9 +14381,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(Some(previous_context_item.clone()));
-        state
-            .history
-            .set_world_state_baseline(world_state_snapshot);
+        state.history.set_world_state_baseline(world_state_snapshot);
     }
     let rollout_path = attach_thread_persistence(&mut session).await;
 
@@ -13960,45 +14434,90 @@ async fn same_slug_catalog_approval_change_refreshes_projected_permission_contex
 
     let (session, mut turn) = make_session_and_context().await;
     Arc::make_mut(&mut turn.config).include_permissions_instructions = true;
-    turn.approval_policy.set(AskForApproval::OnRequest).expect("allow on-request approvals");
+    turn.approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("allow on-request approvals");
     turn.permission_profile = PermissionProfile::read_only();
     turn.model_info.model_messages = Some(ModelMessages {
-        token_budget: None, instructions_template: None, instructions_variables: None,
-        approvals: Some(ApprovalMessages { on_request: Some("catalog approval policy A".into()) }),
+        token_budget: None,
+        instructions_template: None,
+        instructions_variables: None,
+        approvals: Some(ApprovalMessages {
+            on_request: Some("catalog approval policy A".into()),
+        }),
     });
     let session = Arc::new(session);
     let first = Arc::new(turn);
     let step = StepContext::for_test(Arc::clone(&first));
-    session.record_context_updates_and_set_reference_context_item(&step).await.unwrap();
+    session
+        .record_context_updates_and_set_reference_context_item(&step)
+        .await
+        .unwrap();
     commit_test_context_baseline(&session, "approval-A").await;
-    assert!(developer_input_texts(session.clone_history().await.raw_items())
-        .iter().any(|text| text.contains("catalog approval policy A")));
+    assert!(
+        developer_input_texts(session.clone_history().await.raw_items())
+            .iter()
+            .any(|text| text.contains("catalog approval policy A"))
+    );
     let unchanged = session.prepare_context_update(&step).await;
-    assert!(unchanged.context_items().is_empty(), "unchanged permission wording must not reinject");
+    assert!(
+        unchanged.context_items().is_empty(),
+        "unchanged permission wording must not reinject"
+    );
     drop(unchanged);
     drop(step);
     let mut next = Arc::try_unwrap(first).unwrap_or_else(|_| panic!("unique turn"));
     let slug = next.model_info.slug.clone();
     next.sub_id.push_str("-next");
-    next.model_info.model_messages.as_mut().unwrap().approvals.as_mut().unwrap().on_request =
-        Some("catalog approval policy B".into());
+    next.model_info
+        .model_messages
+        .as_mut()
+        .unwrap()
+        .approvals
+        .as_mut()
+        .unwrap()
+        .on_request = Some("catalog approval policy B".into());
     assert_eq!(next.model_info.slug, slug, "only catalog wording changes");
     let step = StepContext::for_test(Arc::new(next));
     let prepared = session.prepare_context_update(&step).await;
-    assert!(developer_input_texts(prepared.context_items()).iter()
-        .any(|text| text.contains("catalog approval policy B")), "same-slug candidate must carry new permissions");
-    session.compare_and_record_context_updates(prepared, session.services.planning_generation())
-        .await.unwrap().expect("commit changed permissions");
+    assert!(
+        developer_input_texts(prepared.context_items())
+            .iter()
+            .any(|text| text.contains("catalog approval policy B")),
+        "same-slug candidate must carry new permissions"
+    );
+    session
+        .compare_and_record_context_updates(prepared, session.services.planning_generation())
+        .await
+        .unwrap()
+        .expect("commit changed permissions");
     commit_test_context_baseline(&session, "approval-B").await;
     let history = session.clone_history().await;
     let projected = crate::stable_context::project_stable_context(
-        history.raw_items().to_vec().into(), crate::stable_context::StableContextTarget::Sampling,
+        history.raw_items().to_vec().into(),
+        crate::stable_context::StableContextTarget::Sampling,
     );
     let text = developer_input_texts(&projected.items);
-    assert!(!text.iter().any(|text| text.contains("catalog approval policy A")), "old catalog instructions must leave provider input");
-    assert_eq!(text.iter().filter(|text| text.contains("catalog approval policy B")).count(), 1);
-    assert!(session.prepare_context_update(&step).await.context_items().is_empty(),
-        "committed new permission receipt must settle back to the delta path");
+    assert!(
+        !text
+            .iter()
+            .any(|text| text.contains("catalog approval policy A")),
+        "old catalog instructions must leave provider input"
+    );
+    assert_eq!(
+        text.iter()
+            .filter(|text| text.contains("catalog approval policy B"))
+            .count(),
+        1
+    );
+    assert!(
+        session
+            .prepare_context_update(&step)
+            .await
+            .context_items()
+            .is_empty(),
+        "committed new permission receipt must settle back to the delta path"
+    );
 }
 
 #[tokio::test]
@@ -14954,7 +15473,12 @@ async fn self_aborting_task_runs_interrupt_hook_before_durable_abort() -> anyhow
         ),
         ..HooksConfig::default()
     });
-    assert_eq!(hooks.preview_interrupt(session.thread_id, &turn_context.sub_id).len(), 1);
+    assert_eq!(
+        hooks
+            .preview_interrupt(session.thread_id, &turn_context.sub_id)
+            .len(),
+        1
+    );
     session.services.hooks.store(Arc::new(hooks));
 
     session
@@ -15877,7 +16401,10 @@ fn owned_history_preparation_preserves_payload_and_assigns_identity_once() {
     assert_eq!(prepared.len(), 1);
     assert!(prepared[0].id().is_some_and(|id| !id.is_empty()));
     assert_eq!(prepared[0].turn_id(), Some("turn-owned"));
-    let ResponseItem::FunctionCallOutput { call_id, output, .. } = &prepared[0] else {
+    let ResponseItem::FunctionCallOutput {
+        call_id, output, ..
+    } = &prepared[0]
+    else {
         panic!("preparation must preserve the output variant");
     };
     assert_eq!(call_id, "owned-preparation");
@@ -16762,8 +17289,6 @@ async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
     assert!(matches!(event.msg, EventMsg::TurnAborted(_)));
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
     struct StopPanic;
@@ -16824,7 +17349,11 @@ async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
         .await
         .expect("steer pending input into active turn");
 
-        let terminal = sess.active_turn.lock().await.as_ref()
+        let terminal = sess
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
             .and_then(|active| active.terminal.clone())
             .expect("original turn has a terminal coordinator");
         finish.cancel();
@@ -17345,8 +17874,6 @@ async fn late_idle_start_rejection_and_cancellation_notify_once_without_reentran
     }
 }
 
-
-
 #[tokio::test]
 async fn steer_input_requires_active_turn() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
@@ -17414,7 +17941,10 @@ async fn steer_input_enforces_expected_turn_id() {
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await.is_empty(),
+        sess.input_queue
+            .get_pending_input(&sess.active_turn)
+            .await
+            .is_empty(),
         "rejected steering must not be admitted"
     );
     let turn_id = sess
@@ -17430,7 +17960,10 @@ async fn steer_input_enforces_expected_turn_id() {
     assert_eq!(turn_id, tc.sub_id);
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::UserInput { content: steer_input, client_id: None }]
+        vec![TurnInput::UserInput {
+            content: steer_input,
+            client_id: None
+        }]
     );
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
@@ -17480,8 +18013,6 @@ async fn steer_input_rejects_non_regular_turns() {
         sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 }
-
-
 
 #[tokio::test]
 #[expect(
@@ -17691,9 +18222,11 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
             );
         };
         assert_eq!(reset_role, "developer");
-        assert!(matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
+        assert!(
+            matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
             if text.contains("stable-source")
-                && text.contains("previous_value_obsolete=\"true\"")));
+                && text.contains("previous_value_obsolete=\"true\""))
+        );
         assert_eq!(role, "developer");
         assert_eq!(content, &vec![ContentItem::InputText {
             text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),
@@ -17727,8 +18260,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 }
-
-
 
 #[tokio::test]
 async fn abort_empty_active_turn_preserves_pending_input() {
@@ -18513,9 +19044,8 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                     ContentItem::InputText { text }
                         if text.starts_with("<workspace_evidence_invalidation>") =>
                     {
-                        text.lines().find_map(|line| {
-                            serde_json::from_str::<serde_json::Value>(line).ok()
-                        })
+                        text.lines()
+                            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                     }
                     _ => None,
                 })
@@ -18530,14 +19060,19 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                 assert_eq!(notice["reason_code"], "missing_observation");
                 let guidance = serde_json::to_string(items.as_ref()).unwrap();
                 assert!(guidance.contains("report the affected claim as unverified"));
-                assert!(guidance.contains("read_tool_output recovers historical bytes, not freshness"));
+                assert!(
+                    guidance.contains("read_tool_output recovers historical bytes, not freshness")
+                );
                 assert!(guidance.contains("not a request to rerun tests or builds"));
                 assert!(
                     !notice.to_string().contains(&original_text),
                     "{case}/{route}: invalidation must not promote tool bytes into developer instructions"
                 );
             } else {
-                assert!(notices.is_empty(), "{case}/{route}: repository history remains usable");
+                assert!(
+                    notices.is_empty(),
+                    "{case}/{route}: repository history remains usable"
+                );
             }
         }
         resumed
@@ -19119,7 +19654,8 @@ async fn cancelled_user_input_response_does_not_fence_the_turn() {
         let admission = terminal.acquire_sampling_admission().await.unwrap();
         let mut notification = Box::pin(session.notify_user_input_response(
             &turn_context.sub_id,
-            RequestUserInputResponse { disposition: None,
+            RequestUserInputResponse {
+                disposition: None,
                 answers: Default::default(),
                 interrupted: true,
             },

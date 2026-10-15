@@ -232,7 +232,6 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
-pub(crate) mod token_budget;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -245,6 +244,7 @@ mod rollout_reconstruction;
 pub(crate) mod session;
 pub(crate) mod step_context;
 pub(crate) mod time_reminder;
+pub(crate) mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 pub(crate) mod turn_execution;
@@ -852,7 +852,8 @@ impl Codex {
             || config.token_budget_startup_config.is_none()
         {
             let config = Arc::make_mut(&mut config);
-            config.prepare_token_budget_for_startup()
+            config
+                .prepare_token_budget_for_startup()
                 .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
             let auth = auth_manager.auth_cached();
             token_budget::apply_experimental_context(config, auth.as_ref(), &model_info)
@@ -1297,9 +1298,16 @@ fn take_prompt_fragment(
 fn context_contribution_index(producer: usize, fragment: usize, thread: bool) -> usize {
     // Cantor pairing is injective; source identity cannot shift when another
     // contributor times out or an earlier fragment fails admission.
-    let sum = producer.checked_add(fragment).expect("context source count fits usize");
-    let pair = sum.checked_mul(sum + 1).expect("context source count fits usize") / 2 + fragment;
-    pair.checked_mul(2).and_then(|value| value.checked_add(usize::from(thread)))
+    let sum = producer
+        .checked_add(fragment)
+        .expect("context source count fits usize");
+    let pair = sum
+        .checked_mul(sum + 1)
+        .expect("context source count fits usize")
+        / 2
+        + fragment;
+    pair.checked_mul(2)
+        .and_then(|value| value.checked_add(usize::from(thread)))
         .expect("context source identity fits usize")
 }
 
@@ -1340,7 +1348,8 @@ fn take_prompt_fragment_with_identity(
         })
     };
     if slot == PromptSlot::DeveloperPolicy {
-        return budget.try_take_bytes(message_bytes(&rendered))
+        return budget
+            .try_take_bytes(message_bytes(&rendered))
             .then(|| (slot, identify(&rendered)));
     }
     let text = budget.clone().take(&rendered)?;
@@ -1488,24 +1497,40 @@ fn unfinished_turn_boundary_items(
     else {
         return Vec::new();
     };
-    let start = rollout_items.iter().rposition(|item| {
-        matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
-    }).unwrap_or(0);
+    let start = rollout_items
+        .iter()
+        .rposition(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
+        .unwrap_or(0);
     let mut calls = std::collections::HashSet::new();
     let mut results = std::collections::HashSet::new();
     for item in &rollout_items[start..] {
         match item {
-            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. }
-                | ResponseItem::CustomToolCall { call_id, .. }) => {
+            RolloutItem::ResponseItem(
+                ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::CustomToolCall { call_id, .. },
+            ) => {
                 calls.insert(call_id);
             }
-            RolloutItem::ResponseItem(ResponseItem::LocalShellCall { call_id: Some(call_id), .. }
-                | ResponseItem::ToolSearchCall { call_id: Some(call_id), .. }) => {
+            RolloutItem::ResponseItem(
+                ResponseItem::LocalShellCall {
+                    call_id: Some(call_id),
+                    ..
+                }
+                | ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    ..
+                },
+            ) => {
                 calls.insert(call_id);
             }
-            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }
+            RolloutItem::ResponseItem(
+                ResponseItem::FunctionCallOutput { call_id, .. }
                 | ResponseItem::CustomToolCallOutput { call_id, .. }
-                | ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }) => {
+                | ResponseItem::ToolSearchOutput {
+                    call_id: Some(call_id),
+                    ..
+                },
+            ) => {
                 results.insert(call_id);
             }
             _ => {}
@@ -1555,14 +1580,20 @@ struct StepContextTimer {
 impl StepContextTimer {
     fn start(step: &'static str) -> Self {
         tracing::info!(step, "step context phase started");
-        Self { step, started: std::time::Instant::now() }
+        Self {
+            step,
+            started: std::time::Instant::now(),
+        }
     }
 }
 
 impl Drop for StepContextTimer {
     fn drop(&mut self) {
-        tracing::info!(step = self.step, duration_ms = self.started.elapsed().as_secs_f64() * 1000.0,
-            "step context phase finished");
+        tracing::info!(
+            step = self.step,
+            duration_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "step context phase finished"
+        );
     }
 }
 
@@ -1743,8 +1774,10 @@ impl Session {
 
     async fn flush_rollout_with_durability(&self, durable: bool) -> std::io::Result<()> {
         crate::tools::command_output_artifact::sync_tool_output_artifacts(
-            self.codex_home().await.as_path(), &self.thread_id.to_string(),
-        ).await?;
+            self.codex_home().await.as_path(),
+            &self.thread_id.to_string(),
+        )
+        .await?;
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
@@ -2211,9 +2244,12 @@ impl Session {
             &turn_context.model_info.slug,
         );
         if invalidate_unified_exec_sessions {
-            self.services.unified_exec_manager.exclude_process_ids(
-                rollout_reconstruction::historical_process_ids(rollout_items),
-            ).await;
+            self.services
+                .unified_exec_manager
+                .exclude_process_ids(rollout_reconstruction::historical_process_ids(
+                    rollout_items,
+                ))
+                .await;
             rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
             rollout_reconstruction::append_unsettled_tool_recovery(&mut history, rollout_items);
         }
@@ -2223,7 +2259,10 @@ impl Session {
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
         if let Some(plan) = plan {
-            self.services.plan_store.restore_with_lineage(Some(plan), plan_lineage).await;
+            self.services
+                .plan_store
+                .restore_with_lineage(Some(plan), plan_lineage)
+                .await;
         } else {
             // Older rollouts only carried checklist state in direct tool output.
             self.services
@@ -2577,12 +2616,10 @@ impl Session {
         let config_toml_paths = {
             let state = self.state.lock().await;
             let config = &state.session_configuration.original_config_do_not_use;
-            let user_layers = config
-                .config_layer_stack
-                .get_user_layers(
-                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                    /*include_disabled*/ true,
-                );
+            let user_layers = config.config_layer_stack.get_user_layers(
+                ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                /*include_disabled*/ true,
+            );
             if user_layers.is_empty() {
                 vec![
                     state
@@ -2591,7 +2628,8 @@ impl Session {
                         .join(CONFIG_TOML_FILE),
                 ]
             } else {
-                user_layers.into_iter()
+                user_layers
+                    .into_iter()
                     .filter(|layer| !layer.is_disabled())
                     .filter_map(|layer| match &layer.name {
                         ConfigLayerSource::User { file, .. } => Some(file.clone()),
@@ -2925,11 +2963,16 @@ impl Session {
             return true;
         };
 
-        let receipt = turn_context.agent_task_binding.get().and_then(Option::as_ref)
-            .map(|binding| format!(
-                "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
-                binding.assignment_id, binding.attempt_id,
-            ));
+        let receipt = turn_context
+            .agent_task_binding
+            .get()
+            .and_then(Option::as_ref)
+            .map(|binding| {
+                format!(
+                    "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
+                    binding.assignment_id, binding.attempt_id,
+                )
+            });
         let Some(communication) = inter_agent_completion_communication(
             parent_agent_path,
             child_agent_path.clone(),
@@ -3005,8 +3048,8 @@ impl Session {
         persist: bool,
         publication_receipt: Option<&mut Option<EventMsg>>,
     ) {
-        // Reject transient events before entering the persistence stack. Live delivery remains
-        // independent and follows below.
+        // Normal history and opt-in activity share the ordered writer, but never append the
+        // same event twice. Activity remains observational and cannot enter model history.
         if persist
             && self
                 .live_thread()
@@ -3023,6 +3066,13 @@ impl Session {
             } else {
                 self.persist_rollout_items(&rollout_items).await;
             }
+        } else if persist
+            && self.features.enabled(Feature::RolloutActivity)
+            && codex_rollout::is_rollout_activity_event(&event.msg)
+            && let Some(live_thread) = self.live_thread()
+            && let Err(error) = live_thread.append_activity_event_ordered(&event.msg).await
+        {
+            error!("failed to queue rollout activity event: {error:#}");
         }
         if self.services.rollout_thread_trace.is_enabled() {
             let trace = self.services.rollout_thread_trace.clone();
@@ -3713,7 +3763,8 @@ impl Session {
         sub_id: &str,
         response: RequestUserInputResponse,
     ) {
-        self.notify_user_input_response_for_request(sub_id, None, response).await;
+        self.notify_user_input_response_for_request(sub_id, None, response)
+            .await;
     }
 
     #[expect(
@@ -3897,7 +3948,12 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn notify_dynamic_tool_response(&self, turn_id: &str, call_id: &str, response: DynamicToolResponse) {
+    pub async fn notify_dynamic_tool_response(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+        response: DynamicToolResponse,
+    ) {
         let entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
@@ -4136,12 +4192,14 @@ impl Session {
             })
             .collect::<Vec<_>>();
         let persistence_timing = Arc::clone(&turn_context.turn_timing_state);
-        let publish_search_context = items.iter().any(|item| matches!(
-            item,
-            ResponseItem::ToolSearchOutput { call_id: Some(call_id), status, .. }
-                if Some(call_id) == post_tool_context_call_id.as_ref()
-                    && matches!(status.as_str(), "completed" | "incomplete")
-        ));
+        let publish_search_context = items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::ToolSearchOutput { call_id: Some(call_id), status, .. }
+                    if Some(call_id) == post_tool_context_call_id.as_ref()
+                        && matches!(status.as_str(), "completed" | "incomplete")
+            )
+        });
         let mut raw_items = items.to_vec();
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
@@ -4358,8 +4416,13 @@ impl Session {
                         step_context.loaded_agents_md.as_deref(),
                         step_context.agents_md_stable_context.as_ref(),
                         step_context.agents_md_freshness,
-                    ).with_unavailable_fallback(|| previous_world_state.snapshot()
-                        .section("agents_md").cloned()),
+                    )
+                    .with_unavailable_fallback(|| {
+                        previous_world_state
+                            .snapshot()
+                            .section("agents_md")
+                            .cloned()
+                    }),
                 )
             },
         );
@@ -4491,7 +4554,8 @@ impl Session {
             agents_md_observation.stable_context,
             agents_md_observation.freshness,
         );
-        step_context.plan_sampling_revision = Some(self.services.plan_store.sampling_revision().await);
+        step_context.plan_sampling_revision =
+            Some(self.services.plan_store.sampling_revision().await);
         Ok(Arc::new(step_context))
     }
 
@@ -4619,8 +4683,12 @@ impl Session {
     ) -> std::io::Result<()> {
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
-        session.durable_history_commits_in_flight.fetch_add(1, Ordering::AcqRel);
-        let in_flight = DurableHistoryCommitInFlight { session: Arc::clone(&session) };
+        session
+            .durable_history_commits_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        let in_flight = DurableHistoryCommitInFlight {
+            session: Arc::clone(&session),
+        };
         tokio::spawn(async move {
             let _in_flight = in_flight;
             let _commit_permit = session.durable_history_commit_gate.acquire().await
@@ -4864,7 +4932,10 @@ impl Session {
         }
     }
 
-    async fn poll_thread_context_contributors(&self, estimate: bool) -> Vec<Option<Vec<PromptFragment>>> {
+    async fn poll_thread_context_contributors(
+        &self,
+        estimate: bool,
+    ) -> Vec<Option<Vec<PromptFragment>>> {
         // Poll contributors concurrently, but yield their fragments in registration order.
         let mut pending = FuturesOrdered::new();
         let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
@@ -5135,11 +5206,16 @@ impl Session {
         // refresh appends to existing history, so it must also retract cleared slots.
         if turn_context.config.include_collaboration_mode_instructions
             && let Some(collab_instructions) =
-                CollaborationModeInstructions::from_collaboration_mode(&turn_context.collaboration_mode)
-                    .map(|instructions| instructions.render())
-                    .or_else(|| crate::context_manager::updates::build_collaboration_mode_update_item(
-                        represented_context, turn_context,
-                    ))
+                CollaborationModeInstructions::from_collaboration_mode(
+                    &turn_context.collaboration_mode,
+                )
+                .map(|instructions| instructions.render())
+                .or_else(|| {
+                    crate::context_manager::updates::build_collaboration_mode_update_item(
+                        represented_context,
+                        turn_context,
+                    )
+                })
         {
             developer_sections.push(collab_instructions);
         }
@@ -5151,15 +5227,22 @@ impl Session {
         // authoring the call. A second, differently worded copy at a different
         // authority level is work the model has to redo every generation.
         if self.features.enabled(Feature::Personality)
-            && let Some(personality_message) =
-                turn_context.personality.and_then(|personality|
+            && let Some(personality_message) = turn_context
+                .personality
+                .and_then(|personality| {
                     crate::context_manager::updates::personality_message_for(
-                        &turn_context.model_info, personality,
+                        &turn_context.model_info,
+                        personality,
                     )
-                ).map(|message| PersonalitySpecInstructions::new(message).render())
-                    .or_else(|| crate::context_manager::updates::build_personality_update_item(
-                        represented_context, turn_context, true,
-                    ))
+                })
+                .map(|message| PersonalitySpecInstructions::new(message).render())
+                .or_else(|| {
+                    crate::context_manager::updates::build_personality_update_item(
+                        represented_context,
+                        turn_context,
+                        true,
+                    )
+                })
         {
             developer_sections.push(personality_message);
         }
@@ -5204,37 +5287,69 @@ impl Session {
         let retained_history = self.clone_history().await;
         let fallback_context = if represented_digests.is_none() {
             let state = self.state.lock().await;
-            state.pending_context_baseline().map(|candidate| candidate.turn_context_item)
+            state
+                .pending_context_baseline()
+                .map(|candidate| candidate.turn_context_item)
                 .or_else(|| state.reference_context_item())
-        } else { None };
-        let retention_digests = represented_digests.or_else(|| fallback_context.as_ref()
-            .and_then(|context| context.context_provenance.as_ref())
-            .map(|provenance| provenance.fragment_digests.as_slice()));
+        } else {
+            None
+        };
+        let retention_digests = represented_digests.or_else(|| {
+            fallback_context
+                .as_ref()
+                .and_then(|context| context.context_provenance.as_ref())
+                .map(|provenance| provenance.fragment_digests.as_slice())
+        });
         let mut retained_contributions = Vec::new();
         let thread = self.poll_thread_context_contributors(estimate).await;
-        let turn = self.poll_turn_context_contributors(turn_context, estimate).await;
+        let turn = self
+            .poll_turn_context_contributors(turn_context, estimate)
+            .await;
         for (scope, batches) in [("thread", thread), ("turn", turn)] {
             for (producer, batch) in batches.into_iter().enumerate() {
                 let prefix = format!("turn-contributor:{scope}:{producer}:");
                 let Some(batch) = batch else {
                     let retained_before = retained_contributions.len();
-                    for digest in retention_digests.into_iter().flatten().filter(|digest| digest.key.starts_with(&prefix)) {
-                        let Some(index) = digest.key.rsplit(':').next().and_then(|index| index.parse::<usize>().ok()) else { continue; };
+                    for digest in retention_digests
+                        .into_iter()
+                        .flatten()
+                        .filter(|digest| digest.key.starts_with(&prefix))
+                    {
+                        let Some(index) = digest
+                            .key
+                            .rsplit(':')
+                            .next()
+                            .and_then(|index| index.parse::<usize>().ok())
+                        else {
+                            continue;
+                        };
                         let marker = format!("<turn_context_contribution index=\"{index}\">");
-                        let retained = retained_history.raw_items().iter().rev().filter(|item|
-                            scope == "thread" || item.turn_id() == Some(turn_context.sub_id.as_str())
-                        ).find_map(|item| {
-                            let ResponseItem::Message { role, content, .. } = item else { return None; };
-                            let slot = match role.as_str() {
-                                "developer" => PromptSlot::SeparateDeveloper,
-                                "user" => PromptSlot::ContextualUser,
-                                _ => return None,
-                            };
-                            content.iter().find_map(|part| match part {
-                                codex_protocol::models::ContentItem::InputText { text } if text.starts_with(&marker) => Some((slot, text.clone())),
-                                _ => None,
+                        let retained = retained_history
+                            .raw_items()
+                            .iter()
+                            .rev()
+                            .filter(|item| {
+                                scope == "thread"
+                                    || item.turn_id() == Some(turn_context.sub_id.as_str())
                             })
-                        });
+                            .find_map(|item| {
+                                let ResponseItem::Message { role, content, .. } = item else {
+                                    return None;
+                                };
+                                let slot = match role.as_str() {
+                                    "developer" => PromptSlot::SeparateDeveloper,
+                                    "user" => PromptSlot::ContextualUser,
+                                    _ => return None,
+                                };
+                                content.iter().find_map(|part| match part {
+                                    codex_protocol::models::ContentItem::InputText { text }
+                                        if text.starts_with(&marker) =>
+                                    {
+                                        Some((slot, text.clone()))
+                                    }
+                                    _ => None,
+                                })
+                            });
                         let (slot, text) = retained.unwrap_or_else(|| (PromptSlot::SeparateDeveloper,
                             crate::stable_context::turn_contribution_text(index,
                                 "Source temporarily unavailable and its prior body is no longer retained. This is not successful deletion; do not infer the missing instructions.")));
@@ -5249,23 +5364,35 @@ impl Session {
                 };
                 for (fragment_index, fragment) in batch.into_iter().enumerate() {
                     // Pair registration and source-local positions before admission.
-                    let index = context_contribution_index(producer, fragment_index, scope == "thread");
+                    let index =
+                        context_contribution_index(producer, fragment_index, scope == "thread");
                     contributions.push((format!("{prefix}{index}"), index, fragment));
                 }
             }
         }
-        contributions.sort_by_key(|(_, _, fragment)| fragment.slot() != PromptSlot::DeveloperPolicy);
+        contributions
+            .sort_by_key(|(_, _, fragment)| fragment.slot() != PromptSlot::DeveloperPolicy);
         for (_, _, text) in &retained_contributions {
-            if !extension_context_budget.try_take(text) { extension_context_budget = ModelContextBudget::new(0); }
+            if !extension_context_budget.try_take(text) {
+                extension_context_budget = ModelContextBudget::new(0);
+            }
         }
         let mut rendered_turn_context_fragments = retained_contributions;
         for (key, index, fragment) in contributions {
             let policy = fragment.slot() == PromptSlot::DeveloperPolicy;
             let admitted = take_prompt_fragment_with_identity(
-                fragment.clone(), &mut extension_context_budget, &turn_context.sub_id, Some(index),
+                fragment.clone(),
+                &mut extension_context_budget,
+                &turn_context.sub_id,
+                Some(index),
             );
-            let admitted = if admitted.is_none() && (policy || retention_digests.into_iter().flatten()
-                .any(|digest| digest.key == key)) {
+            let admitted = if admitted.is_none()
+                && (policy
+                    || retention_digests
+                        .into_iter()
+                        .flatten()
+                        .any(|digest| digest.key == key))
+            {
                 let recovery = if estimate {
                     "Exact recovery is established at admission.".to_string()
                 } else {
@@ -5278,17 +5405,28 @@ impl Session {
                     }
                 };
                 let notice = if policy {
-                    format!("Required policy INCOMPLETE: no policy excerpt was admitted. Do not proceed with actions requiring it until recovered in full. {recovery}")
+                    format!(
+                        "Required policy INCOMPLETE: no policy excerpt was admitted. Do not proceed with actions requiring it until recovered in full. {recovery}"
+                    )
                 } else {
-                    format!("Context contribution INCOMPLETE: the producer still returned this source, but its body exceeded the admission budget. This is not a source removal. Recover it before relying on its contents. {recovery}")
+                    format!(
+                        "Context contribution INCOMPLETE: the producer still returned this source, but its body exceeded the admission budget. This is not a source removal. Recover it before relying on its contents. {recovery}"
+                    )
                 };
-                Some((if fragment.slot() == PromptSlot::ContextualUser {
-                    PromptSlot::ContextualUser
-                } else {
-                    PromptSlot::SeparateDeveloper
-                }, crate::stable_context::turn_contribution_text(index, &notice)))
-            } else { admitted };
-            let Some((slot, text)) = admitted else { continue; };
+                Some((
+                    if fragment.slot() == PromptSlot::ContextualUser {
+                        PromptSlot::ContextualUser
+                    } else {
+                        PromptSlot::SeparateDeveloper
+                    },
+                    crate::stable_context::turn_contribution_text(index, &notice),
+                ))
+            } else {
+                admitted
+            };
+            let Some((slot, text)) = admitted else {
+                continue;
+            };
             rendered_turn_context_fragments.push((key, slot, text));
         }
         // Opaque extension contributions never share a message with typed stable
@@ -5305,7 +5443,11 @@ impl Session {
             });
 
         let mut stable_items = Vec::new();
-        stable_items.extend(Self::build_context_contribution_items_from_rendered_fragments(unavailable_items.clone()));
+        stable_items.extend(
+            Self::build_context_contribution_items_from_rendered_fragments(
+                unavailable_items.clone(),
+            ),
+        );
         if let Some(message) =
             crate::context_manager::updates::build_developer_update_item(stable_developer_sections)
         {
@@ -5333,47 +5475,67 @@ impl Session {
         // Model catalog approval wording can change without a model slug/settings
         // change. The typed TurnContextItem cannot reconstruct that prior text, so
         // retain the rendered permission identity in the existing fragment receipt.
-        let rendered_permissions = turn_context.config.include_permissions_instructions.then(|| {
-            PermissionsInstructions::from_permission_profile(
-                &turn_context.permission_profile,
-                turn_context.approval_policy.value(),
-                ApprovalPromptContext::new(
-                    turn_context.model_info.model_messages.as_ref()
-                        .and_then(|messages| messages.approvals.as_ref()),
-                ),
-                self.services.exec_policy.current().as_ref(),
-                turn_context.cwd(),
-                turn_context.config.features.enabled(Feature::ExecPermissionApprovals),
-                turn_context.config.features.enabled(Feature::RequestPermissionsTool),
-            ).render()
-        });
+        let rendered_permissions =
+            turn_context
+                .config
+                .include_permissions_instructions
+                .then(|| {
+                    PermissionsInstructions::from_permission_profile(
+                        &turn_context.permission_profile,
+                        turn_context.approval_policy.value(),
+                        ApprovalPromptContext::new(
+                            turn_context
+                                .model_info
+                                .model_messages
+                                .as_ref()
+                                .and_then(|messages| messages.approvals.as_ref()),
+                        ),
+                        self.services.exec_policy.current().as_ref(),
+                        turn_context.cwd(),
+                        turn_context
+                            .config
+                            .features
+                            .enabled(Feature::ExecPermissionApprovals),
+                        turn_context
+                            .config
+                            .features
+                            .enabled(Feature::RequestPermissionsTool),
+                    )
+                    .render()
+                });
         let mut fragment_digests = digest_context_fragments(&stable_items);
         if let Some(permissions) = rendered_permissions.as_ref()
-            && let Some(item) = crate::context_manager::updates::build_developer_update_item(vec![permissions.clone()])
+            && let Some(item) = crate::context_manager::updates::build_developer_update_item(vec![
+                permissions.clone(),
+            ])
         {
             let mut digest = digest_context_fragments(&[item]).remove(0);
             digest.key = "rendered-permissions".to_string();
             fragment_digests.push(digest);
         }
-        fragment_digests.extend(rendered_turn_context_fragments.iter().map(
-            |(key, slot, text)| {
-                let item = Self::build_context_contribution_items_from_rendered_fragments(vec![(
-                    *slot,
-                    text.clone(),
-                )]);
-                let mut digest = digest_context_fragments(&item).remove(0);
-                digest.key = key.clone();
-                digest
-            },
-        ));
+        fragment_digests.extend(
+            rendered_turn_context_fragments
+                .iter()
+                .map(|(key, slot, text)| {
+                    let item = Self::build_context_contribution_items_from_rendered_fragments(
+                        vec![(*slot, text.clone())],
+                    );
+                    let mut digest = digest_context_fragments(&item).remove(0);
+                    digest.key = key.clone();
+                    digest
+                }),
+        );
         // A timeout is not an authoritative empty snapshot. Keep the exact
         // earlier source identities so it cannot revoke or rename its neighbors.
         // Only exact same-scope retained bodies count as delivered; a digest alone
         // must never assert that an absent instruction survived replacement.
         fragment_digests.sort_by(|a, b| a.key.cmp(&b.key));
         let turn_context_items = Self::build_context_contribution_items_from_rendered_fragments(
-            rendered_turn_context_fragments.into_iter().map(|(_, slot, text)| (slot, text))
-                .chain(unavailable_items).collect(),
+            rendered_turn_context_fragments
+                .into_iter()
+                .map(|(_, slot, text)| (slot, text))
+                .chain(unavailable_items)
+                .collect(),
         );
         let full_context_required = represented_context.is_none()
             || represented_digests.is_some_and(|represented| {
@@ -5716,7 +5878,10 @@ impl Session {
         bytes: u64,
         sha256: String,
     ) {
-        if let Err(error) = self.try_register_tool_artifact_origin(artifact_id, call_id, bytes, sha256).await {
+        if let Err(error) = self
+            .try_register_tool_artifact_origin(artifact_id, call_id, bytes, sha256)
+            .await
+        {
             tracing::warn!(%error, "failed to register artifact provenance");
         }
     }
@@ -5734,9 +5899,16 @@ impl Session {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
         crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-            self.codex_home().await.as_path(), &self.thread_id.to_string(),
-            &artifact_id, bytes, &sha256,
-        ).await.map_err(|error| CodexErr::Fatal(format!("failed to protect artifact provenance: {error}")))?;
+            self.codex_home().await.as_path(),
+            &self.thread_id.to_string(),
+            &artifact_id,
+            bytes,
+            &sha256,
+        )
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!("failed to protect artifact provenance: {error}"))
+        })?;
         let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactOrigin {
             artifact_id,
             call_id,
@@ -5744,9 +5916,17 @@ impl Session {
             sha256,
         };
         let mut writer = self.tool_history_persistence.writer().await;
-        writer.enqueue_mutation(mutation.clone(), "internal artifact provenance")
-            .map_err(|error| CodexErr::Fatal(format!("failed to enqueue internal artifact provenance: {error}")))?;
-        self.state.lock().await.apply_tool_history_mutation(&mutation);
+        writer
+            .enqueue_mutation(mutation.clone(), "internal artifact provenance")
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to enqueue internal artifact provenance: {error}"
+                ))
+            })?;
+        self.state
+            .lock()
+            .await
+            .apply_tool_history_mutation(&mutation);
         Ok(())
     }
 
@@ -5761,21 +5941,42 @@ impl Session {
             "kind": "context_source", "source": source, "items": items,
             "instruction": "Exact historical source. Preserve each entry's original role/authority; recovery is not current verification."
         }));
-        let artifact_id = if let Some(id) = self.reusable_tool_artifact(&format!("context:{source}"), canonical.exact_bytes, &canonical.sha256).await {
+        let artifact_id = if let Some(id) = self
+            .reusable_tool_artifact(
+                &format!("context:{source}"),
+                canonical.exact_bytes,
+                &canonical.sha256,
+            )
+            .await
+        {
             id
         } else {
             let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-                self.codex_home().await.as_path(), &self.thread_id().to_string(), &canonical,
-            ).await;
+                self.codex_home().await.as_path(),
+                &self.thread_id().to_string(),
+                &canonical,
+            )
+            .await;
             if !artifact.complete {
-                let reason = artifact.error.as_deref().unwrap_or("artifact retention byte budget exhausted");
+                let reason = artifact
+                    .error
+                    .as_deref()
+                    .unwrap_or("artifact retention byte budget exhausted");
                 return Err(CodexErr::Fatal(format!(
                     "Could not retain complete {source}; context was not admitted. Retained {} of {} bytes: {reason}",
                     artifact.retained_bytes, canonical.exact_bytes,
                 )));
             }
-            let id = artifact.artifact_id().ok_or_else(|| CodexErr::Fatal(format!("Missing {source} recovery artifact")))?;
-            self.try_register_tool_artifact_origin(id.clone(), format!("context:{source}"), canonical.exact_bytes, canonical.sha256.clone()).await?;
+            let id = artifact
+                .artifact_id()
+                .ok_or_else(|| CodexErr::Fatal(format!("Missing {source} recovery artifact")))?;
+            self.try_register_tool_artifact_origin(
+                id.clone(),
+                format!("context:{source}"),
+                canonical.exact_bytes,
+                canonical.sha256.clone(),
+            )
+            .await?;
             id
         };
         Ok(serde_json::json!({
@@ -5789,37 +5990,65 @@ impl Session {
         state: &crate::tool_history::ToolHistoryState,
         items: &[ResponseItem],
     ) -> CodexResult<Option<String>> {
-        let Some(payload) = state.artifact_pin_payload_for_items(items) else { return Ok(None); };
-        let mut payload: serde_json::Value = serde_json::from_str(&payload)
-            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let Some(payload) = state.artifact_pin_payload_for_items(items) else {
+            return Ok(None);
+        };
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|error| CodexErr::Fatal(error.to_string()))?;
         if payload["omitted_artifact_count"].as_u64().unwrap_or(0) != 0
-            || payload["omitted_detail_count"].as_u64().unwrap_or(0) != 0 {
+            || payload["omitted_detail_count"].as_u64().unwrap_or(0) != 0
+        {
             let mut retained = state.clone();
             retained.retain_for_history(items);
             let pins = retained.artifact_recovery_directory();
-            let members = pins.as_array().into_iter().flatten()
-                .filter_map(|pin| pin["artifact_id"].as_str().map(str::to_string)).collect();
-            let directory = self.retain_context_source("artifact_directory", pins).await?;
+            let members = pins
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|pin| pin["artifact_id"].as_str().map(str::to_string))
+                .collect();
+            let directory = self
+                .retain_context_source("artifact_directory", pins)
+                .await?;
             #[expect(
                 clippy::expect_used,
                 reason = "successful retain_context_source always constructs an envelope with a string artifact_id"
             )]
-            let artifact_id = directory["artifact_id"].as_str().expect("retained directory ID").to_string();
+            let artifact_id = directory["artifact_id"]
+                .as_str()
+                .expect("retained directory ID")
+                .to_string();
             let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactDirectory {
                 artifact_id,
                 members,
             };
-            let _permit = self.tool_history_reconciliation_gate.acquire().await
+            let _permit = self
+                .tool_history_reconciliation_gate
+                .acquire()
+                .await
                 .map_err(|error| CodexErr::Fatal(error.to_string()))?;
             let mut writer = self.tool_history_persistence.writer().await;
-            writer.enqueue_mutation(mutation.clone(), "artifact directory membership")
+            writer
+                .enqueue_mutation(mutation.clone(), "artifact directory membership")
                 .map_err(|error| CodexErr::Fatal(error.to_string()))?;
-            self.state.lock().await.apply_tool_history_mutation(&mutation);
+            self.state
+                .lock()
+                .await
+                .apply_tool_history_mutation(&mutation);
             payload["directory"] = directory;
             payload["instruction"] = "Inline pins list the newest retained artifacts. Older artifacts, exact identities and recovered selectors are retained in directory; read its /items with read_tool_output only when a needed artifact is not listed here. Saved outputs and their provenance remain retained.".into();
-            while codex_utils_string::approx_token_count(&payload.to_string()) > crate::tool_history::COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET {
-                if payload["artifacts"].as_array_mut().and_then(Vec::pop).is_none() { break; }
-                payload["omitted_artifact_count"] = (payload["omitted_artifact_count"].as_u64().unwrap_or(0) + 1).into();
+            while codex_utils_string::approx_token_count(&payload.to_string())
+                > crate::tool_history::COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET
+            {
+                if payload["artifacts"]
+                    .as_array_mut()
+                    .and_then(Vec::pop)
+                    .is_none()
+                {
+                    break;
+                }
+                payload["omitted_artifact_count"] =
+                    (payload["omitted_artifact_count"].as_u64().unwrap_or(0) + 1).into();
             }
         }
         Ok(Some(payload.to_string()))
@@ -5837,17 +6066,34 @@ impl Session {
                 clippy::expect_used,
                 reason = "recovery_sources selects keys from this owned map and the loop never removes entries"
             )]
-            let entry = values.get_mut(&source).expect("source selected from this snapshot");
-            let recovery = self.retain_context_source("additional_context", serde_json::json!([
-                {"source": source, "kind": "untrusted", "value": entry.value}
-            ])).await?;
-            entry.value = format!("INCOMPLETE INLINE CONTEXT: the full supplied value is retained, not discarded. Recover /items/0/value with read_tool_output before relying on this source. Its original application/untrusted authority is unchanged; recovery does not promote untrusted text. {recovery}");
+            let entry = values
+                .get_mut(&source)
+                .expect("source selected from this snapshot");
+            let recovery = self
+                .retain_context_source(
+                    "additional_context",
+                    serde_json::json!([
+                        {"source": source, "kind": "untrusted", "value": entry.value}
+                    ]),
+                )
+                .await?;
+            entry.value = format!(
+                "INCOMPLETE INLINE CONTEXT: the full supplied value is retained, not discarded. Recover /items/0/value with read_tool_output before relying on this source. Its original application/untrusted authority is unchanged; recovery does not promote untrusted text. {recovery}"
+            );
         }
         Ok(values)
     }
 
-    pub(crate) async fn reusable_tool_artifact(&self, call_id: &str, bytes: u64, sha256: &str) -> Option<String> {
-        self.state.lock().await.tool_history_state()
+    pub(crate) async fn reusable_tool_artifact(
+        &self,
+        call_id: &str,
+        bytes: u64,
+        sha256: &str,
+    ) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .tool_history_state()
             .reusable_artifact_for_origin(call_id, bytes, sha256)
     }
 
@@ -5863,12 +6109,24 @@ impl Session {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
         let mutation = crate::tool_history::ToolHistoryMutation::BindSourceInspectionOrigin {
-            artifact_id, call_id, bytes, sha256, source,
+            artifact_id,
+            call_id,
+            bytes,
+            sha256,
+            source,
         };
         let mut writer = self.tool_history_persistence.writer().await;
-        writer.enqueue_mutation(mutation.clone(), "source inspection origin")
-            .map_err(|error| CodexErr::Fatal(format!("failed to enqueue source inspection origin: {error}")))?;
-        self.state.lock().await.apply_tool_history_mutation(&mutation);
+        writer
+            .enqueue_mutation(mutation.clone(), "source inspection origin")
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to enqueue source inspection origin: {error}"
+                ))
+            })?;
+        self.state
+            .lock()
+            .await
+            .apply_tool_history_mutation(&mutation);
         Ok(())
     }
 
@@ -5879,7 +6137,10 @@ impl Session {
         sha256: &str,
         attempt_id: codex_agent_task_store::AttemptId,
     ) -> Option<(String, crate::tool_history::SourceInspectionOrigin)> {
-        self.state.lock().await.tool_history_state()
+        self.state
+            .lock()
+            .await
+            .tool_history_state()
             .completed_source_inspection(artifact_id, bytes, sha256, attempt_id)
     }
 
@@ -5904,11 +6165,20 @@ impl Session {
         }
     }
 
-    pub(crate) async fn record_tool_history_recovery(&self, artifact_id: String, recovery_call_id: String, selectors: Vec<serde_json::Value>) {
+    pub(crate) async fn record_tool_history_recovery(
+        &self,
+        artifact_id: String,
+        recovery_call_id: String,
+        selectors: Vec<serde_json::Value>,
+    ) {
         let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mutation = crate::tool_history::ToolHistoryMutation::RecordArtifactRecovery { artifact_id: artifact_id.clone(), recovery_call_id, selectors };
+        let mutation = crate::tool_history::ToolHistoryMutation::RecordArtifactRecovery {
+            artifact_id: artifact_id.clone(),
+            recovery_call_id,
+            selectors,
+        };
         let mut writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         if !state.apply_tool_history_mutation(&mutation) {
@@ -5937,7 +6207,8 @@ impl Session {
         // the session-state lock orders snapshots, and the persistence worker
         // commits those snapshots in the same order without delaying relay.
         drop(workspace_gate_guard);
-        self.register_workspace_evidence_batch(vec![observation]).await;
+        self.register_workspace_evidence_batch(vec![observation])
+            .await;
     }
 
     pub(crate) async fn register_workspace_evidence_batch(
@@ -5954,9 +6225,12 @@ impl Session {
         let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         for observation in observations {
-            let mutation = crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
+            let mutation =
+                crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
             state.apply_tool_history_mutation(&mutation);
-            if let Err(err) = persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata") {
+            if let Err(err) =
+                persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata")
+            {
                 tracing::warn!(
                     "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
                 );
@@ -6240,9 +6514,15 @@ impl Session {
         }
         // Explicit tombstones replace contributions that disappeared, even when
         // another stable change also selects the full startup context.
-        let removed_indices = represented_fragment_digests.into_iter().flatten()
-            .filter(|digest| digest.key.starts_with("turn-contributor:")
-                && !fragment_digests.iter().any(|current| current.key == digest.key))
+        let removed_indices = represented_fragment_digests
+            .into_iter()
+            .flatten()
+            .filter(|digest| {
+                digest.key.starts_with("turn-contributor:")
+                    && !fragment_digests
+                        .iter()
+                        .any(|current| current.key == digest.key)
+            })
             .filter_map(|digest| digest.key.rsplit(':').next()?.parse::<usize>().ok());
         if let Some(removals) = crate::context_manager::updates::build_developer_update_item(
             removed_indices
@@ -6446,7 +6726,11 @@ impl Session {
         result
     }
 
-    pub(crate) async fn calibrated_prompt_tokens(&self, turn_context: &TurnContext, local: i64) -> i64 {
+    pub(crate) async fn calibrated_prompt_tokens(
+        &self,
+        turn_context: &TurnContext,
+        local: i64,
+    ) -> i64 {
         self.state.lock().await.prompt_token_calibration.estimate(
             &turn_context.config.model_provider_id,
             &turn_context.model_info.slug,
@@ -6461,10 +6745,9 @@ impl Session {
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
             // Release the timing lock before acquiring session state.
-            let calibration = turn_context.turn_timing_state.prompt_token_calibration_sample(
-                &turn_context.model_info.slug,
-                token_usage,
-            );
+            let calibration = turn_context
+                .turn_timing_state
+                .prompt_token_calibration_sample(&turn_context.model_info.slug, token_usage);
             let token_info = {
                 let mut state = self.state.lock().await;
                 state.prompt_token_calibration.observe(
@@ -6499,7 +6782,14 @@ impl Session {
                 .task_coordinator()
                 .record_task_usage_for_source(
                     &turn_context.session_source,
-                    token_usage.total_tokens.max(0) as u64,
+                    crate::agent::task_metrics::TokenClassTotals {
+                        input: token_usage.input_tokens.max(0) as u64,
+                        cached_input: token_usage.cached_input_tokens.max(0) as u64,
+                        output: token_usage.output_tokens.max(0) as u64,
+                        reasoning_output: token_usage.reasoning_output_tokens.max(0) as u64,
+                        total: token_usage.total_tokens.max(0) as u64,
+                    },
+                    // One accounted model response per call to this method.
                     1,
                 );
         } else {
@@ -6531,6 +6821,21 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Outputs retired to recovery pins leave every later prompt, but the
+    /// provider's last usage still counts them until the next request. Remove
+    /// the estimated saving so compaction pressure reflects the next prompt.
+    pub(crate) async fn discount_retired_context_tokens(&self, retired_tokens: i64) {
+        let mut state = self.state.lock().await;
+        let Some(mut info) = state.token_info() else {
+            return;
+        };
+        let usage = &mut info.last_token_usage;
+        usage.total_tokens = usage.total_tokens.saturating_sub(retired_tokens).max(0);
+        usage.input_tokens = usage.input_tokens.saturating_sub(retired_tokens).max(0);
+        usage.cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+        state.set_token_info(Some(info));
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
@@ -6586,7 +6891,9 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
-        turn_context.turn_timing_state.observe_credits(new_rate_limits.credits.as_ref());
+        turn_context
+            .turn_timing_state
+            .observe_credits(new_rate_limits.credits.as_ref());
         self.record_rate_limits_info(new_rate_limits).await;
         self.send_token_count_event(turn_context).await;
     }
@@ -6751,8 +7058,12 @@ impl Session {
             return Err(SteerInputError::EmptyInput);
         }
         let input_for_telemetry = input.clone();
-        let additional_context = self.recoverable_additional_context(additional_context).await
-            .map_err(|error| SteerInputError::AdditionalContextUnavailable { message: error.to_string() })?;
+        let additional_context = self
+            .recoverable_additional_context(additional_context)
+            .await
+            .map_err(|error| SteerInputError::AdditionalContextUnavailable {
+                message: error.to_string(),
+            })?;
         // Acquire context guards without changing live state. Rejection or a
         // dropped caller while waiting for queue admission must have no effects.
         let mut state = self.state.lock().await;

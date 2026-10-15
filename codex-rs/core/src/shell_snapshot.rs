@@ -51,6 +51,7 @@ use tracing::info_span;
 pub(crate) struct ShellSnapshot {
     config: Option<Arc<ShellSnapshotConfig>>,
     tasks: tokio_util::task::TaskTracker,
+    builder_tasks: tokio_util::task::TaskTracker,
 }
 
 struct ShellSnapshotConfig {
@@ -61,6 +62,7 @@ struct ShellSnapshotConfig {
     environment_variables: HashMap<String, String>,
     remote_environment_policy: ExecEnvPolicy,
     tasks: tokio_util::task::TaskTracker,
+    builder_tasks: tokio_util::task::TaskTracker,
 }
 
 pub(crate) struct ShellSnapshotFile {
@@ -118,6 +120,7 @@ impl ShellSnapshot {
         shell_environment_policy: ShellEnvironmentPolicy,
     ) -> Self {
         let tasks = tokio_util::task::TaskTracker::new();
+        let builder_tasks = tokio_util::task::TaskTracker::new();
         Self {
             config: Some(Arc::new(ShellSnapshotConfig {
                 codex_home,
@@ -129,8 +132,10 @@ impl ShellSnapshot {
                     &shell_environment_policy,
                 ),
                 tasks: tasks.clone(),
+                builder_tasks: builder_tasks.clone(),
             })),
             tasks,
+            builder_tasks,
         }
     }
 
@@ -138,11 +143,18 @@ impl ShellSnapshot {
         Self {
             config: None,
             tasks: tokio_util::task::TaskTracker::new(),
+            builder_tasks: tokio_util::task::TaskTracker::new(),
         }
     }
 
-    pub(crate) fn tasks(&self) -> tokio_util::task::TaskTracker {
+    // Deletions are shared with inheriting sessions; builders and accepted
+    // writes are drained only by the session that started them.
+    pub(crate) fn cleanup_tasks(&self) -> tokio_util::task::TaskTracker {
         self.tasks.clone()
+    }
+
+    pub(crate) fn builder_tasks(&self) -> tokio_util::task::TaskTracker {
+        self.builder_tasks.clone()
     }
 
     pub(crate) async fn build(
@@ -393,7 +405,7 @@ impl ShellSnapshot {
         };
         let write_path = path.clone();
         let snapshot = config
-            .tasks
+            .builder_tasks
             .spawn(async move {
                 if let Err(err) = filesystem
                     .write_file(&write_path, snapshot.contents.as_bytes().to_vec(), None)

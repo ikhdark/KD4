@@ -1,6 +1,8 @@
 use super::ContextualUserFragment;
 use codex_protocol::models::{ContentItem, ResponseItem};
-use codex_protocol::protocol::{EventMsg, RolloutItem, TurnTiming, TurnTimingModelRequest, TurnTimingProviderTokenUsage};
+use codex_protocol::protocol::{
+    EventMsg, RolloutItem, TurnTiming, TurnTimingModelRequest, TurnTimingProviderTokenUsage,
+};
 
 /// Recover only recorded evidence. Missing timestamps and incomplete requests
 /// remain unknown; this must never masquerade as a complete terminal profile.
@@ -18,10 +20,12 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
     for item in items {
         match item {
             RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                if role == "developer" => {
+                if role == "developer" =>
+            {
                 for part in content {
                     if let ContentItem::InputText { text } = part
                         && text.starts_with("<completed_phase_checkpoint>")
+                        && !crate::tool_history::is_pressure_retirement_checkpoint_text(text)
                     {
                         checkpoint = Some(text.as_str());
                     }
@@ -46,11 +50,17 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
                     }
                     timing_observed_at = Some(observation.observed_at_unix_ms);
                 }
-                if let Some(request) = timing.model_requests.iter_mut().find(|request|
-                    request.sampling_request_id.as_deref() == Some(value.sampling_request_id.as_str()))
-                {
-                    if !request.physical_attempt_ids.contains(&value.physical_attempt_id) {
-                        request.physical_attempt_ids.push(value.physical_attempt_id.clone());
+                if let Some(request) = timing.model_requests.iter_mut().find(|request| {
+                    request.sampling_request_id.as_deref()
+                        == Some(value.sampling_request_id.as_str())
+                }) {
+                    if !request
+                        .physical_attempt_ids
+                        .contains(&value.physical_attempt_id)
+                    {
+                        request
+                            .physical_attempt_ids
+                            .push(value.physical_attempt_id.clone());
                     }
                 } else {
                     timing.model_requests.push(TurnTimingModelRequest {
@@ -70,11 +80,14 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
                     {
                         let usage = &info.last_token_usage;
                         request.output_tokens = usage.output_tokens.max(0) as u64;
-                        request.reasoning_output_tokens = usage.reasoning_output_tokens.max(0) as u64;
+                        request.reasoning_output_tokens =
+                            usage.reasoning_output_tokens.max(0) as u64;
                         request.token_usage = Some(TurnTimingProviderTokenUsage {
                             input_tokens: usage.input_tokens.max(0) as u64,
                             cached_input_tokens: usage.cached_input_tokens.max(0) as u64,
-                            visible_output_tokens: request.output_tokens.saturating_sub(request.reasoning_output_tokens),
+                            visible_output_tokens: request
+                                .output_tokens
+                                .saturating_sub(request.reasoning_output_tokens),
                             reasoning_tokens: request.reasoning_output_tokens,
                             total_tokens: usage.total_tokens.max(0) as u64,
                         });
@@ -86,28 +99,42 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
         }
     }
     timing.counters.logical_generation_count = timing.model_requests.len() as u32;
-    timing.counters.model_request_count = timing.model_requests.iter()
-        .map(|request| request.physical_attempt_ids.len() as u32).sum();
+    timing.counters.model_request_count = timing
+        .model_requests
+        .iter()
+        .map(|request| request.physical_attempt_ids.len() as u32)
+        .sum();
     timing.profile_valid = false;
     timing.classification_complete = false;
     timing.completed_at_unix_ms = None;
     let mut notice = match timing_observed_at {
-        Some(observed_at) => format!("Recovered partial timing includes recorded phase totals through Unix millisecond {observed_at}, plus retained sampling identities and token usage. Those totals are only the observed prefix, not the final duration. The tail after that checkpoint and process-loss time remain unknown; this is not a valid complete timing profile."),
-        None => String::from("Recovered partial timing contains only recorded sampling identities and token usage. Duration, completion time, and unrecorded phases remain unknown; this is not a valid complete timing profile."),
+        Some(observed_at) => format!(
+            "Recovered partial timing includes recorded phase totals through Unix millisecond {observed_at}, plus retained sampling identities and token usage. Those totals are only the observed prefix, not the final duration. The tail after that checkpoint and process-loss time remain unknown; this is not a valid complete timing profile."
+        ),
+        None => String::from(
+            "Recovered partial timing contains only recorded sampling identities and token usage. Duration, completion time, and unrecorded phases remain unknown; this is not a valid complete timing profile.",
+        ),
     };
-    notice.push_str("\n\nIn flight at the last retained timing checkpoint (not a crash-time inventory):");
+    notice.push_str(
+        "\n\nIn flight at the last retained timing checkpoint (not a crash-time inventory):",
+    );
     let mut in_flight = 0;
     for call in &timing.tool_calls {
-        let handler_running = call.handler_entry_at_ms.is_some() && call.handler_exit_at_ms.is_none();
-        let process_running = call.process_spawned_at_ms.is_some() && call.process_exited_at_ms.is_none();
+        let handler_running =
+            call.handler_entry_at_ms.is_some() && call.handler_exit_at_ms.is_none();
+        let process_running =
+            call.process_spawned_at_ms.is_some() && call.process_exited_at_ms.is_none();
         if handler_running || process_running {
             in_flight += 1;
             notice.push('\n');
-            notice.push_str(&serde_json::json!({
-                "call_id": call.call_id, "tool": call.tool_name,
-                "parent_call_id": call.parent_call_id, "cell_id": call.parent_cell_id,
-                "handler_in_flight": handler_running, "process_in_flight": process_running,
-            }).to_string());
+            notice.push_str(
+                &serde_json::json!({
+                    "call_id": call.call_id, "tool": call.tool_name,
+                    "parent_call_id": call.parent_call_id, "cell_id": call.parent_cell_id,
+                    "handler_in_flight": handler_running, "process_in_flight": process_running,
+                })
+                .to_string(),
+            );
         }
     }
     if in_flight == 0 {
@@ -136,7 +163,12 @@ fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
     timing.model_requests = merge_by_identity(
         previous.model_requests,
         std::mem::take(&mut timing.model_requests),
-        |request| (request.sampling_request_id.clone(), request.generation_index),
+        |request| {
+            (
+                request.sampling_request_id.clone(),
+                request.generation_index,
+            )
+        },
     );
     timing.tool_calls = merge_by_identity(
         previous.tool_calls,
@@ -185,14 +217,23 @@ impl TurnAborted {
         let checkpoint = history.iter().rev().find_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "developer" => {
                 content.iter().rev().find_map(|part| match part {
-                    ContentItem::InputText { text } if text.starts_with("<completed_phase_checkpoint>") => Some(text.as_str()),
+                    ContentItem::InputText { text }
+                        if text.starts_with("<completed_phase_checkpoint>")
+                            && !crate::tool_history::is_pressure_retirement_checkpoint_text(
+                                text,
+                            ) =>
+                    {
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
             }
             _ => None,
         });
         let plan = plan.and_then(|plan| serde_json::to_string(plan).ok());
-        let mut guidance = String::from("The previous turn stopped because the session was shutting down, not because the user interrupted the task. Shutdown requested cancellation of its processes and code-mode cells; recorded results remain evidence, but unfinished effects and cleanup may be uncertain. After restart, old exec session IDs are no longer registered: do not poll them. Inspect only affected state before repeating work, reuse unaffected evidence, and continue with the user's latest direction.");
+        let mut guidance = String::from(
+            "The previous turn stopped because the session was shutting down, not because the user interrupted the task. Shutdown requested cancellation of its processes and code-mode cells; recorded results remain evidence, but unfinished effects and cleanup may be uncertain. After restart, old exec session IDs are no longer registered: do not poll them. Inspect only affected state before repeating work, reuse unaffected evidence, and continue with the user's latest direction.",
+        );
         append_retained_work(&mut guidance, checkpoint, plan.as_deref());
         guidance
     }
@@ -205,7 +246,9 @@ impl TurnAborted {
         } else {
             "Some child commands may still be running; inspect their OS-level state only if relevant before repeating work."
         };
-        format!("Recovery detected a lost process, not a user interruption. The previous turn has no recorded completion. Its retained history contains {tool_calls} tool call(s) and {tool_results} tool result(s). Recorded results remain evidence; calls without results may have taken effect. {process_guidance} The previous app-server's exec session IDs are no longer registered: do not call write_stdin with those old IDs. Reconcile affected workspace state before repeating commands. The exact loss time and duration are unknown; this notice records discovery on resume. Continue with the user's latest direction.")
+        format!(
+            "Recovery detected a lost process, not a user interruption. The previous turn has no recorded completion. Its retained history contains {tool_calls} tool call(s) and {tool_results} tool result(s). Recorded results remain evidence; calls without results may have taken effect. {process_guidance} The previous app-server's exec session IDs are no longer registered: do not call write_stdin with those old IDs. Reconcile affected workspace state before repeating commands. The exact loss time and duration are unknown; this notice records discovery on resume. Continue with the user's latest direction."
+        )
     }
 
     pub(crate) fn new(guidance: impl Into<String>) -> Self {

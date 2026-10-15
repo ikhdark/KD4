@@ -5,8 +5,14 @@ use codex_protocol::ResponseItemId;
 #[test]
 fn salience_repository_observations_do_not_revoke_or_outlive_instruction_bodies() {
     let body = text_message("user", &repository("Never deploy."));
-    let old = text_message("developer", "<repository_observation>cached</repository_observation>");
-    let latest = text_message("developer", "<repository_observation>refreshed</repository_observation>");
+    let old = text_message(
+        "developer",
+        "<repository_observation>cached</repository_observation>",
+    );
+    let latest = text_message(
+        "developer",
+        "<repository_observation>refreshed</repository_observation>",
+    );
     let projected = project_compaction_context(vec![body.clone(), old, latest.clone()].into());
     assert_eq!(projected, vec![body, latest.clone()]);
     let replacement = text_message("user", &repository("New scope: read only."));
@@ -220,10 +226,12 @@ fn trusted_context_producer_marker_survives_rollout_serialization() {
     assert_ne!(provider.id(), resumed.id());
     let normalized = provider.clone();
     normalize_provider_context_item_id(&mut provider);
-    assert_eq!(provider, normalized, "provider ID normalization is idempotent");
-    let provider_projection = project_stable_context(
-        vec![provider.clone()].into(), StableContextTarget::Sampling,
+    assert_eq!(
+        provider, normalized,
+        "provider ID normalization is idempotent"
     );
+    let provider_projection =
+        project_stable_context(vec![provider.clone()].into(), StableContextTarget::Sampling);
     assert_eq!(provider_projection.items.as_ref(), &[provider]);
     assert!(provider_projection.manifest.components().is_empty());
 
@@ -296,7 +304,9 @@ fn tagged_root_orchestration_replaces_the_previous_variant() {
 
     assert_eq!(visible_text(&projection.items), vec![current]);
     assert_eq!(projection.items.len(), 1);
-    assert!(matches!(&projection.items[0], ResponseItem::Message { role, .. } if role == "developer"));
+    assert!(
+        matches!(&projection.items[0], ResponseItem::Message { role, .. } if role == "developer")
+    );
     assert_eq!(projection.manifest.components().len(), 1);
     assert!(projection.manifest.components().iter().any(|component| {
         component.kind == StableContextKind::RootCoordinator
@@ -702,8 +712,6 @@ fn generic_preparation_target_retains_all_recognized_history() {
     );
 }
 
-
-
 #[test]
 fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history() {
     let old = repository("old");
@@ -856,9 +864,11 @@ fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
             .count(),
         1
     );
-    assert!(second.manifest.components().iter().any(|component| {
-        component.kind == StableContextKind::Repository && component.active
-    }));
+    assert!(
+        second.manifest.components().iter().any(|component| {
+            component.kind == StableContextKind::Repository && component.active
+        })
+    );
 }
 
 #[test]
@@ -909,8 +919,8 @@ fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
         }));
     }
     // The catalog identity is not scoped to the turn or the surrounding task.
-    let catalog_identities = [("turn-1", "select"), ("turn-2", "select again")].map(
-        |(turn_id, task)| {
+    let catalog_identities =
+        [("turn-1", "select"), ("turn-2", "select again")].map(|(turn_id, task)| {
             project_stable_context(
                 vec![
                     text_message_for_turn("developer", catalog, turn_id),
@@ -927,8 +937,7 @@ fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
             .expect("catalog component")
             .identity
             .clone()
-        },
-    );
+        });
     assert_eq!(catalog_identities[0], catalog_identities[1]);
 }
 
@@ -949,8 +958,6 @@ fn collaboration_reset_removes_plan_and_the_reset_notice() {
     assert!(!visible.contains(&plan.as_str()));
     assert!(!visible.contains(&reset.as_str()));
 }
-
-
 
 #[test]
 fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
@@ -1017,13 +1024,34 @@ fn freshness_only_repository_notice_keeps_the_substantive_instructions() {
 }
 #[test]
 fn survivability_quoted_reset_notices_do_not_revoke_live_instructions() {
-    let repo = repository(&format!("Never edit protected.txt. Example: `{REPOSITORY_REMOVAL_NOTICE}`"));
-    let mode = collaboration(&format!("Remain read-only. Example: `{COLLABORATION_RESET_NOTICE}`"));
-    let projected = project_stable_context(vec![text_message("user", &repo), text_message("developer", &mode)].into(), StableContextTarget::Sampling);
+    let repo = repository(&format!(
+        "Never edit protected.txt. Example: `{REPOSITORY_REMOVAL_NOTICE}`"
+    ));
+    let mode = collaboration(&format!(
+        "Remain read-only. Example: `{COLLABORATION_RESET_NOTICE}`"
+    ));
+    let projected = project_stable_context(
+        vec![
+            text_message("user", &repo),
+            text_message("developer", &mode),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
     let visible = visible_text(&projected.items);
     assert!(visible.contains(&repo.as_str()));
     assert!(visible.contains(&mode.as_str()));
-    let removed = project_stable_context(vec![text_message("user", &repo), text_message("user", &format!("{}\n", repository(REPOSITORY_REMOVAL_NOTICE)))].into(), StableContextTarget::Sampling);
+    let removed = project_stable_context(
+        vec![
+            text_message("user", &repo),
+            text_message(
+                "user",
+                &format!("{}\n", repository(REPOSITORY_REMOVAL_NOTICE)),
+            ),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
     assert!(removed.items.is_empty());
 }
 
@@ -1033,11 +1061,19 @@ fn survivability_ambiguity_is_local_to_affected_component_kinds() {
     let new = "<permissions instructions>current restriction</permissions instructions>";
     let malformed = "<app-context>unfinished";
     let app = "<app-context>last known app context</app-context>";
-    let input: Arc<[ResponseItem]> = vec![text_message("developer", old), text_message("developer", new), text_message("developer", app), text_message("developer", malformed)].into();
+    let input: Arc<[ResponseItem]> = vec![
+        text_message("developer", old),
+        text_message("developer", new),
+        text_message("developer", app),
+        text_message("developer", malformed),
+    ]
+    .into();
     let projected = project_stable_context(Arc::clone(&input), StableContextTarget::Sampling);
     let visible = visible_text(&projected.items);
     assert!(!visible.contains(&old));
-    for retained in [new, app, malformed] { assert!(visible.contains(&retained)); }
+    for retained in [new, app, malformed] {
+        assert!(visible.contains(&retained));
+    }
     assert!(projected.manifest.fail_open());
     let generic = project_stable_context(Arc::clone(&input), StableContextTarget::FailOpen);
     assert!(Arc::ptr_eq(&generic.items, &input));

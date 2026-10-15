@@ -209,7 +209,10 @@ pub(crate) struct TurnTimingState {
 /// Only current wait counts and the existing event sink, not an execution history.
 #[derive(Default)]
 struct LiveTurnPhase {
-    sink: Option<(String, async_channel::Sender<codex_protocol::protocol::Event>)>,
+    sink: Option<(
+        String,
+        async_channel::Sender<codex_protocol::protocol::Event>,
+    )>,
     gates: [u32; 4],
     sampling: Option<NextSampleBlockReason>,
     published: Vec<codex_protocol::protocol::HarnessPhase>,
@@ -223,13 +226,20 @@ impl LiveTurnPhase {
             HarnessPhase::DiffTracker,
             HarnessPhase::WorkspaceGate,
             HarnessPhase::EvidenceTracker,
-        ].into_iter().zip(self.gates).filter_map(|(phase, count)| (count > 0).then_some(phase))
-            .collect::<Vec<_>>();
+        ]
+        .into_iter()
+        .zip(self.gates)
+        .filter_map(|(phase, count)| (count > 0).then_some(phase))
+        .collect::<Vec<_>>();
         let sampling = match self.sampling {
             Some(NextSampleBlockReason::WaitingForDelivery) => Some(HarnessPhase::Delivery),
-            Some(NextSampleBlockReason::WaitingForProcessCleanup) => Some(HarnessPhase::ProcessCleanup),
+            Some(NextSampleBlockReason::WaitingForProcessCleanup) => {
+                Some(HarnessPhase::ProcessCleanup)
+            }
             Some(NextSampleBlockReason::WaitingForGate) => Some(HarnessPhase::WorkspaceGate),
-            Some(NextSampleBlockReason::ReadyToSample) if phases.is_empty() => Some(HarnessPhase::ReadyToSample),
+            Some(NextSampleBlockReason::ReadyToSample) if phases.is_empty() => {
+                Some(HarnessPhase::ReadyToSample)
+            }
             _ => None,
         };
         if let Some(phase) = sampling
@@ -237,7 +247,9 @@ impl LiveTurnPhase {
         {
             phases.push(phase);
         }
-        if phases == self.published { return; }
+        if phases == self.published {
+            return;
+        }
         self.published = phases.clone();
         if let Some((turn_id, sender)) = &self.sink {
             // The session event channel is unbounded. Closed means its consumer exited.
@@ -245,7 +257,8 @@ impl LiveTurnPhase {
                 id: turn_id.clone(),
                 msg: codex_protocol::protocol::EventMsg::TurnPhaseChanged(
                     codex_protocol::protocol::TurnPhaseChangedEvent {
-                        turn_id: turn_id.clone(), phases,
+                        turn_id: turn_id.clone(),
+                        phases,
                     },
                 ),
             });
@@ -540,12 +553,16 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
-                    setup_phase_ns: request.setup_phases.as_ref().map_or_else(
-                        BTreeMap::new,
-                        |phases| phases.protocol_phases(&mut saturation_count),
-                    ),
+                    setup_phase_ns: request
+                        .setup_phases
+                        .as_ref()
+                        .map_or_else(BTreeMap::new, |phases| {
+                            phases.protocol_phases(&mut saturation_count)
+                        }),
                     request_sha256_by_attempt: request.request_sha256_by_attempt.clone(),
-                    request_section_sha256_by_attempt: request.request_section_sha256_by_attempt.clone(),
+                    request_section_sha256_by_attempt: request
+                        .request_section_sha256_by_attempt
+                        .clone(),
                     response_id_by_attempt: request.response_id_by_attempt.clone(),
                     generation_index: request.generation_index,
                     generation_reason: request.generation_reason,
@@ -600,14 +617,12 @@ impl TurnTimingSnapshot {
         // Keep action-change telemetry, but do not let it hide unchanged state.
         let observational_nonprogress_tokens = diagnostic_token_aggregate(
             &profile.model_requests,
-            |request| request.progress_kinds.is_empty()
-                && request.unchanged_relevant_state,
+            |request| request.progress_kinds.is_empty() && request.unchanged_relevant_state,
             /*input_only*/ false,
         );
         let observational_nonprogress_latency = diagnostic_latency_aggregate(
             &profile.model_requests,
-            |request| request.progress_kinds.is_empty()
-                && request.unchanged_relevant_state,
+            |request| request.progress_kinds.is_empty() && request.unchanged_relevant_state,
             &mut saturation_count,
         );
         let purpose_aggregates = purpose_aggregates(&profile.model_requests, &mut saturation_count);
@@ -692,7 +707,9 @@ impl TurnTimingSnapshot {
                 .tool_output_projection_truncation_count,
             tool_output_omitted_section_count: profile.counters.tool_output_omitted_section_count,
             tool_output_recovery_call_count: profile.counters.tool_output_recovery_call_count,
-            tool_output_in_cell_recovery_call_count: profile.counters.tool_output_in_cell_recovery_call_count,
+            tool_output_in_cell_recovery_call_count: profile
+                .counters
+                .tool_output_in_cell_recovery_call_count,
             tool_output_recovery_retruncation_count: profile
                 .counters
                 .tool_output_recovery_retruncation_count,
@@ -752,9 +769,11 @@ pub(crate) async fn retain_turn_timing_details(
     codex_home: &std::path::Path,
     thread_id: &str,
 ) -> TurnTiming {
-    if timing.tool_calls.iter().all(|call| {
-        call.lifecycle_events.is_empty() && call.timer_waits.is_empty()
-    }) {
+    if timing
+        .tool_calls
+        .iter()
+        .all(|call| call.lifecycle_events.is_empty() && call.timer_waits.is_empty())
+    {
         return timing;
     }
     let Ok(bytes) = serde_json::to_vec(&timing.tool_calls) else {
@@ -766,7 +785,9 @@ pub(crate) async fn retain_turn_timing_details(
     // particular, do not cancel between creating a file and retention cleanup.
     let artifact = tokio::spawn(async move {
         crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home, &thread_id, &bytes,
+            &codex_home,
+            &thread_id,
+            &bytes,
         )
         .await
     });
@@ -780,8 +801,11 @@ async fn retain_turn_timing_artifact(
     artifact: tokio::task::JoinHandle<crate::tools::command_output_artifact::RawOutputArtifact>,
 ) -> TurnTiming {
     if let Ok(Ok(crate::tools::command_output_artifact::RawOutputArtifact::Stored {
-        id, truncated: false, ..
-    })) = tokio::time::timeout(TURN_TIMING_STORAGE_TIMEOUT, artifact).await {
+        id,
+        truncated: false,
+        ..
+    })) = tokio::time::timeout(TURN_TIMING_STORAGE_TIMEOUT, artifact).await
+    {
         timing.tool_call_details_artifact_id = Some(id.to_string());
         for call in &mut timing.tool_calls {
             call.lifecycle_events.clear();
@@ -1554,12 +1578,25 @@ impl Drop for TurnPreparationPhaseGuard<'_> {
 }
 
 impl TurnTimingState {
-    pub(crate) fn observe_credits(&self, credits: Option<&codex_protocol::protocol::CreditsSnapshot>) {
-        let Some(credits) = credits.filter(|credits| !credits.unlimited) else { return; };
-        let Some(balance) = credits.balance.as_deref().and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0) else { return; };
+    pub(crate) fn observe_credits(
+        &self,
+        credits: Option<&codex_protocol::protocol::CreditsSnapshot>,
+    ) {
+        let Some(credits) = credits.filter(|credits| !credits.unlimited) else {
+            return;
+        };
+        let Some(balance) = credits
+            .balance
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+        else {
+            return;
+        };
         let mut state = self.state();
-        if state.completed_snapshot.is_some() { return; }
+        if state.completed_snapshot.is_some() {
+            return;
+        }
         state.starting_credit_balance.get_or_insert(balance);
         state.last_credit_balance = Some(balance);
     }
@@ -1584,12 +1621,17 @@ impl TurnTimingState {
         turn_id: String,
         sender: async_channel::Sender<codex_protocol::protocol::Event>,
     ) {
-        self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sink =
-            Some((turn_id, sender));
+        self.live_phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sink = Some((turn_id, sender));
     }
 
     pub(crate) fn adjust_live_gate(&self, gate: usize, entering: bool) {
-        let mut live = self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .live_phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         live.gates[gate] = if entering {
             live.gates[gate].saturating_add(1)
         } else {
@@ -1599,7 +1641,10 @@ impl TurnTimingState {
     }
 
     fn set_live_sampling_phase(&self, reason: Option<NextSampleBlockReason>) {
-        let mut live = self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .live_phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         live.sampling = reason;
         live.publish();
     }
@@ -1708,9 +1753,14 @@ impl TurnTimingState {
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
-                && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
+                && request
+                    .physical_attempt_ids
+                    .iter()
+                    .any(|id| id == physical_attempt_id)
         }) {
-            request.request_sha256_by_attempt.insert(physical_attempt_id.to_owned(), hash);
+            request
+                .request_sha256_by_attempt
+                .insert(physical_attempt_id.to_owned(), hash);
         }
     }
 
@@ -1725,25 +1775,44 @@ impl TurnTimingState {
     ) {
         let sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
             .ok()
-            .map(|fields| fields.into_iter().map(|(key, value)| {
-                (key, format!("{:x}", Sha256::digest(value.to_string().as_bytes())))
-            }).collect());
+            .map(|fields| {
+                fields
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            format!("{:x}", Sha256::digest(value.to_string().as_bytes())),
+                        )
+                    })
+                    .collect()
+            });
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
-                && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
-        }) && let Some(sections) = sections {
-            request.request_section_sha256_by_attempt.insert(physical_attempt_id.to_owned(), sections);
+                && request
+                    .physical_attempt_ids
+                    .iter()
+                    .any(|id| id == physical_attempt_id)
+        }) && let Some(sections) = sections
+        {
+            request
+                .request_section_sha256_by_attempt
+                .insert(physical_attempt_id.to_owned(), sections);
         }
         state.refresh_completed_request_diagnostics();
     }
 
     pub(crate) fn record_model_response_id(&self, attempt_id: &str, response_id: &str) {
         let mut state = self.state();
-        if let Some(request) = state.model_requests.iter_mut().rev()
-            .find(|request| request.physical_attempt_ids.iter().any(|id| id == attempt_id))
-        {
-            request.response_id_by_attempt.insert(attempt_id.to_owned(), response_id.to_owned());
+        if let Some(request) = state.model_requests.iter_mut().rev().find(|request| {
+            request
+                .physical_attempt_ids
+                .iter()
+                .any(|id| id == attempt_id)
+        }) {
+            request
+                .response_id_by_attempt
+                .insert(attempt_id.to_owned(), response_id.to_owned());
         }
     }
 
@@ -2809,24 +2878,37 @@ impl TurnTimingState {
             request.next_structured_action_changed = true;
             // Publishing a final answer or blocker changes the communication
             // state even when it performs no further tool or repository work.
-            request.unchanged_relevant_state = unchanged_relevant_state && !request.final_answer_emitted;
+            request.unchanged_relevant_state =
+                unchanged_relevant_state && !request.final_answer_emitted;
             terminal_interpretation = request.final_answer_emitted
                 && request.model_emitted_tool_call_count == 0
-                && request.generation_purpose == Some(TurnTimingGenerationPurpose::ArtifactContinuation);
+                && request.generation_purpose
+                    == Some(TurnTimingGenerationPurpose::ArtifactContinuation);
         }
         if terminal_interpretation {
             // Classify observed terminal communication, not a predicted purpose.
             // A preamble or a generation that also calls tools is not terminal.
             for request in &mut state.model_requests {
                 if request.generation_index == generation_index {
-                    request.generation_purpose = Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
+                    request.generation_purpose =
+                        Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
                 }
             }
-            state.counters.generations_by_purpose.artifact_continuation =
-                state.counters.generations_by_purpose.artifact_continuation.saturating_sub(1);
-            state.counters.generations_by_purpose.terminal_completion_reasoning =
-                state.counters.generations_by_purpose.terminal_completion_reasoning.saturating_add(1);
-            state.current_generation_purpose = Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
+            state.counters.generations_by_purpose.artifact_continuation = state
+                .counters
+                .generations_by_purpose
+                .artifact_continuation
+                .saturating_sub(1);
+            state
+                .counters
+                .generations_by_purpose
+                .terminal_completion_reasoning = state
+                .counters
+                .generations_by_purpose
+                .terminal_completion_reasoning
+                .saturating_add(1);
+            state.current_generation_purpose =
+                Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
         }
     }
 
@@ -2879,7 +2961,10 @@ impl TurnTimingState {
         let sections = request
             .request_section_sha256_by_attempt
             .get(request.physical_attempt_ids.last()?)?;
-        let expected_model = format!("{:x}", Sha256::digest(serde_json::json!(model).to_string().as_bytes()));
+        let expected_model = format!(
+            "{:x}",
+            Sha256::digest(serde_json::json!(model).to_string().as_bytes())
+        );
         if sections.get("model") != Some(&expected_model)
             || request.token_usage.as_ref()?.input_tokens != usage.input_tokens as u64
         {
@@ -3300,7 +3385,9 @@ impl TurnTimingState {
             state.advance(self.clock.sample().time.monotonic_ns);
             // Ordinary requests start collecting at history preparation. Retry
             // and compaction attempts may enter directly at this boundary.
-            state.pending_request_setup.get_or_insert_with(Default::default);
+            state
+                .pending_request_setup
+                .get_or_insert_with(Default::default);
             if state.current_generation_index.is_none() {
                 state.start_generation(
                     TurnTimingGenerationReason::Other,
@@ -3479,11 +3566,7 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
-        if let ResponseEvent::OutputItemDone(ResponseItem::Message {
-            role,
-            phase,
-            ..
-        }) = event
+        if let ResponseEvent::OutputItemDone(ResponseItem::Message { role, phase, .. }) = event
             && role == "assistant"
             && records_visible_output
             && let Some(request) = state.model_requests.last_mut()
@@ -4170,7 +4253,9 @@ impl TurnTimingStateInner {
             .legacy
             .complete(self.last_monotonic_ns.unwrap_or(sample.time.monotonic_ns));
         let snapshot = TurnTimingSnapshot {
-            credit_delta: self.starting_credit_balance.zip(self.last_credit_balance)
+            credit_delta: self
+                .starting_credit_balance
+                .zip(self.last_credit_balance)
                 .map(|(start, end)| (start - end).to_string()),
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),

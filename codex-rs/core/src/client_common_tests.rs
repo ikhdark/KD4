@@ -12,15 +12,27 @@ use super::*;
 
 #[test]
 fn schema_artifact_and_request_bytes_share_canonical_literals_and_sets() {
-    let artifact = |schema: &str| ToolSchemaArtifact::new(vec![ToolSpec::Function(codex_tools::ResponsesApiTool {
-        name: "canonical".into(), description: String::new(), strict: false, defer_loading: None,
-        parameters: serde_json::from_str(schema).unwrap(), output_schema: None,
-    })]);
-    let a = artifact(r#"{"type":["object","null"],"required":["b","a"],"default":{"z":1,"a":{"z":2,"a":3}}}"#);
-    let b = artifact(r#"{"default":{"a":{"a":3,"z":2},"z":1},"required":["a","b"],"type":["null","object"]}"#);
+    let artifact = |schema: &str| {
+        ToolSchemaArtifact::new(vec![ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "canonical".into(),
+            description: String::new(),
+            strict: false,
+            defer_loading: None,
+            parameters: serde_json::from_str(schema).unwrap(),
+            output_schema: None,
+        })])
+    };
+    let a = artifact(
+        r#"{"type":["object","null"],"required":["b","a"],"default":{"z":1,"a":{"z":2,"a":3}}}"#,
+    );
+    let b = artifact(
+        r#"{"default":{"a":{"a":3,"z":2},"z":1},"required":["a","b"],"type":["null","object"]}"#,
+    );
     assert_eq!(a.serialized(), b.serialized());
     assert_eq!(a.digest(), b.digest());
-    let wire = serde_json::to_vec(&codex_tools::create_tools_json_for_responses_api(b.specs()).unwrap()).unwrap();
+    let wire =
+        serde_json::to_vec(&codex_tools::create_tools_json_for_responses_api(b.specs()).unwrap())
+            .unwrap();
     assert_eq!(a.serialized(), wire);
 }
 
@@ -81,8 +93,10 @@ fn responses_lite_request_copies_strip_image_details() {
         let formatted = |use_responses_lite| match representation {
             0 => prompt.get_formatted_input_for_request(use_responses_lite),
             1 => prompt.get_formatted_fallback_input_for_request(use_responses_lite),
-            2 => prompt.get_formatted_tool_history_fallback_input_for_request(use_responses_lite, false),
-            3 => prompt.get_formatted_tool_history_fallback_input_for_request(use_responses_lite, true),
+            2 => prompt
+                .get_formatted_tool_history_fallback_input_for_request(use_responses_lite, false),
+            3 => prompt
+                .get_formatted_tool_history_fallback_input_for_request(use_responses_lite, true),
             _ => unreachable!(),
         };
         let stripped = formatted(true);
@@ -125,7 +139,11 @@ fn responses_lite_request_copies_strip_image_details() {
                 },
             ]
         );
-        assert_eq!(formatted(false), original, "representation {representation}");
+        assert_eq!(
+            formatted(false),
+            original,
+            "representation {representation}"
+        );
     }
 }
 

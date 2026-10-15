@@ -220,18 +220,36 @@ async fn apply_patch_cli_multiple_chunks() -> Result<()> {
 
     let harness = apply_patch_harness().await?;
     let cases = [
-        ("multi.txt", "line1\nline2\nline3\nline4\n",
+        (
+            "multi.txt",
+            "line1\nline2\nline3\nline4\n",
             "@@\n-line2\n+changed2\n@@\n-line4\n+changed4",
-            "line1\nchanged2\nline3\nchanged4\n"),
-        ("no_newline.txt", "no newline at end",
+            "line1\nchanged2\nline3\nchanged4\n",
+        ),
+        (
+            "no_newline.txt",
+            "no newline at end",
             "@@\n-no newline at end\n+first line\n+second line",
-            "first line\nsecond line"),
-        ("insert_only.txt", "alpha\nomega\n",
-            "@@\n alpha\n+beta\n omega", "alpha\nbeta\nomega\n"),
-        ("tail.txt", "alpha\nlast\n",
-            "@@\n-last\n+end\n*** End of File", "alpha\nend\n"),
-        ("multi_ctx.txt", "fn a\nx=10\ny=2\nfn b\nx=10\ny=20\n",
-            "@@ fn b\n-x=10\n+x=11", "fn a\nx=10\ny=2\nfn b\nx=11\ny=20\n"),
+            "first line\nsecond line",
+        ),
+        (
+            "insert_only.txt",
+            "alpha\nomega\n",
+            "@@\n alpha\n+beta\n omega",
+            "alpha\nbeta\nomega\n",
+        ),
+        (
+            "tail.txt",
+            "alpha\nlast\n",
+            "@@\n-last\n+end\n*** End of File",
+            "alpha\nend\n",
+        ),
+        (
+            "multi_ctx.txt",
+            "fn a\nx=10\ny=2\nfn b\nx=10\ny=20\n",
+            "@@ fn b\n-x=10\n+x=11",
+            "fn a\nx=10\ny=2\nfn b\nx=11\ny=20\n",
+        ),
     ];
     let mut patch = "*** Begin Patch\n".to_string();
     for (path, before, hunks, _) in &cases {
@@ -268,8 +286,6 @@ async fn apply_patch_cli_moves_file_to_new_directory() -> Result<()> {
     );
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_move_overwrites_existing_destination() -> Result<()> {
@@ -551,7 +567,10 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()
         .parent()
         .expect("cwd should have parent")
         .join("escape.txt");
-    assert!(!escape_path.exists(), "isolated escape target starts absent");
+    assert!(
+        !escape_path.exists(),
+        "isolated escape target starts absent"
+    );
 
     let patch = "*** Begin Patch\n*** Add File: ../escape.txt\n+outside\n*** End Patch";
     let call_id = "apply-path-traversal";
@@ -725,7 +744,10 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()
     harness.submit("attempt partial apply patch").await?;
 
     let output = harness.apply_patch_output(call_id).await;
-    assert!(output.contains("apply_patch verification failed"), "{output}");
+    assert!(
+        output.contains("apply_patch verification failed"),
+        "{output}"
+    );
     assert!(output.contains("Failed to read file to update"), "{output}");
     assert!(output.contains("missing.txt"), "{output}");
     assert!(
@@ -976,8 +998,6 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
     Ok(())
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
     require_network!();
@@ -1007,8 +1027,6 @@ async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
     );
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> {
@@ -1070,12 +1088,18 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     assert!(first_diff.contains("diff --git"), "{first_diff}");
     assert!(first_diff.contains("--- /dev/null") || first_diff.contains("--- a/"));
     assert!(first_diff.contains("+++ b/"));
-    assert!(first_diff.contains("agg/a.txt") && first_diff.contains("+v1\n"), "{first_diff}");
+    assert!(
+        first_diff.contains("agg/a.txt") && first_diff.contains("+v1\n"),
+        "{first_diff}"
+    );
     assert!(diff.contains("agg/a.txt"), "diff missing a.txt");
     assert!(diff.contains("agg/b.txt"), "diff missing b.txt");
     // Final content reflects v2 for a.txt
     assert!(diff.contains("+v2\n") && diff.contains("+B\n"), "{diff}");
-    assert!(!diff.contains("+v1\n"), "aggregate must replace intermediate contents: {diff}");
+    assert!(
+        !diff.contains("+v1\n"),
+        "aggregate must replace intermediate contents: {diff}"
+    );
     assert_eq!(harness.read_file_text("agg/a.txt").await?, "v2\n");
     assert_eq!(harness.read_file_text("agg/b.txt").await?, "B\n");
     Ok(())
@@ -1217,11 +1241,15 @@ async fn apply_patch_preserves_aggregated_diff_after_unreadable_preimage_refusal
     let diff = last_diff.expect("successful patch diff must survive a side-effect-free refusal");
     assert!(diff.contains("partial/success.txt") && diff.contains("+ok"));
     let failure = harness.custom_tool_call_output(call_inexact).await;
-    assert!(failure.contains("destination preimage is unreadable"), "{failure}");
+    assert!(
+        failure.contains("destination preimage is unreadable"),
+        "{failure}"
+    );
     assert_eq!(harness.read_file_text("partial/success.txt").await?, "ok\n");
     let binary_path = PathUri::from_host_native_path(harness.path("binary.dat"))?;
-    assert_eq!(test.fs().read_file(&binary_path, None).await?, vec![0xff, 0xfe, 0xfd]);
+    assert_eq!(
+        test.fs().read_file(&binary_path, None).await?,
+        vec![0xff, 0xfe, 0xfd]
+    );
     Ok(())
 }
-
-

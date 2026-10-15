@@ -20,12 +20,12 @@ mod suite {
     mod external_auth;
     #[path = "otel.rs"]
     mod otel;
+    #[path = "request_lifecycle_latency.rs"]
+    mod request_lifecycle_latency;
     #[path = "responses_api_proxy_headers.rs"]
     mod responses_api_proxy_headers;
     #[path = "responses_headers.rs"]
     mod responses_headers;
-    #[path = "request_lifecycle_latency.rs"]
-    mod request_lifecycle_latency;
     #[path = "websocket_fallback.rs"]
     mod websocket_fallback;
 }

@@ -56,13 +56,18 @@ def _timestamp_ms(value: object) -> float | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1_000
-    except ValueError:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.timestamp() * 1_000
+    except (ValueError, OverflowError, OSError):
         return None
 
 
 def _tool_name(item: dict[str, Any]) -> str | None:
     item_type = item.get("type")
+    if not isinstance(item_type, str):
+        return None
     if item_type in {"function_call", "custom_tool_call"}:
         name = item.get("name")
         return name if isinstance(name, str) else None
@@ -135,7 +140,7 @@ def _turn_id(payload: dict[str, Any]) -> str | None:
 
 @dataclass
 class _Turn:
-    started_ms: float
+    started_ms: float | None
     turn_id: str | None = None
     user_input_ms: float | None = None
     useful_tool_emitted_ms: float | None = None
@@ -153,10 +158,8 @@ class TerminalProfiles:
     def add(self, key, record):
         if key in self.records:
             old = self.records[key]
-            if (old["timing"], old.get("status")) == (
-                record["timing"],
-                record.get("status"),
-            ):
+            if all(old.get(field) == record.get(field)
+                   for field in ("timing", "status", "lifecycle", "error", "reason")):
                 self.duplicates += 1
             else:
                 self.conflicts.add(key)
@@ -253,7 +256,6 @@ def analyze_records(
             timestamp_ms = _timestamp_ms(record.get("timestamp"))
             if timestamp_ms is None:
                 exclusions["invalidTimestamps"] += 1
-                continue
             payload = record.get("payload")
             if not isinstance(payload, dict):
                 continue
@@ -276,6 +278,8 @@ def analyze_records(
                 terminal = {
                     "timing": payload.get("timing"),
                     "status": payload_type,
+                    "error": payload.get("error"),
+                    "reason": payload.get("reason"),
                     "active": active,
                 }
                 if key in terminals.records:
@@ -309,6 +313,7 @@ def analyze_records(
                 tool_name = _tool_name(payload)
                 if (
                     tool_name is not None
+                    and timestamp_ms is not None
                     and active.useful_tool_emitted_ms is None
                     and is_useful_tool(tool_name)
                 ):
@@ -356,7 +361,8 @@ def analyze_records(
                     exclusions["incompleteCanonicalMilestones"] += 1
             # Legacy reconstruction needs the captured start; canonical
             # milestones above are self-contained turn-clock offsets.
-            elif active is not None and active.useful_tool_emitted_ms is not None:
+            elif (active is not None and active.started_ms is not None
+                  and active.useful_tool_emitted_ms is not None):
                 row = {
                     "startToUsefulToolEmittedMs": active.useful_tool_emitted_ms
                     - active.started_ms

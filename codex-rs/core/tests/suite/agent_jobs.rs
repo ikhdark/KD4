@@ -284,8 +284,6 @@ fn parse_csv_records(input: &str) -> std::result::Result<Vec<Vec<String>>, &'sta
     Ok(records)
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csv_spawning_requires_enabled_feature_in_v2_turns() -> Result<()> {
     use sqlx::Connection;
@@ -321,7 +319,8 @@ async fn csv_spawning_requires_enabled_feature_in_v2_turns() -> Result<()> {
 
         let created_before = test.thread_manager.list_thread_created_ids().await;
         // Admission follows the configured capability, not parsed user wording.
-        test.submit_turn("Use subagents to process the CSV.").await?;
+        test.submit_turn("Use subagents to process the CSV.")
+            .await?;
 
         let request_bodies = server
             .received_requests()

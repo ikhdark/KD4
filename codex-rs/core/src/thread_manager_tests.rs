@@ -1687,7 +1687,11 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
         .expect("start thread to roll back");
     assert!(!started.was_already_running);
     started.thread.ensure_rollout_materialized().await;
-    started.thread.flush_rollout().await.expect("flush created thread");
+    started
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush created thread");
     let persisted = thread_store
         .read_thread(ReadThreadParams {
             thread_id: started.thread_id,
@@ -1827,7 +1831,11 @@ async fn missing_error_path_rollback_resumed_thread_preserves_persistence_and_ow
     assert!(Arc::ptr_eq(&resumed.thread, &reused.thread));
 
     resumed.thread.ensure_rollout_materialized().await;
-    resumed.thread.flush_rollout().await.expect("flush resumed thread");
+    resumed
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush resumed thread");
     let persisted_before = thread_store
         .read_thread(ReadThreadParams {
             thread_id: resumed.thread_id,
@@ -1836,10 +1844,15 @@ async fn missing_error_path_rollback_resumed_thread_preserves_persistence_and_ow
         })
         .await
         .expect("resumed thread data must exist before rollback");
-    let history_before = persisted_before.history.expect("persisted resumed history").items;
-    assert!(history_before.iter().any(|item| {
-        response_item_matches_ignoring_id(item, &user_msg("hello"))
-    }));
+    let history_before = persisted_before
+        .history
+        .expect("persisted resumed history")
+        .items;
+    assert!(
+        history_before
+            .iter()
+            .any(|item| { response_item_matches_ignoring_id(item, &user_msg("hello")) })
+    );
 
     assert!(
         manager
@@ -2381,7 +2394,8 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
 
     assert_eq!(
         serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
-        serde_json::to_value(&history.get_rollout_items()[..3]).expect("serialize expected history")
+        serde_json::to_value(&history.get_rollout_items()[..3])
+            .expect("serialize expected history")
     );
 }
 

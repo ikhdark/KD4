@@ -41,6 +41,76 @@ fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
 }
 
 #[test]
+fn unknown_keys_from_other_layers_name_that_layer_instead_of_the_user_config() {
+    let table: Table = toml::from_str("future_feature = true\nmistyped_local = true").unwrap();
+    let event = crate::unknown_features_warning_event_with_origins(
+        Some(&table),
+        "/home/u/.codex/config.toml",
+        |key| {
+            (key == "future_feature").then(|| "enterprise-managed (Acme, 42)".to_string())
+        },
+    )
+    .unwrap();
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("unknown settings must be visible warnings");
+    };
+
+    // The managed key names its own layer; the user's own key is unchanged.
+    assert!(
+        warning
+            .message
+            .contains("future_feature (from enterprise-managed (Acme, 42))"),
+        "{}",
+        warning.message
+    );
+    let preview: serde_json::Value = serde_json::from_str(
+        warning
+            .message
+            .split_once("Compatibility preview (no settings changed): ")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(preview[0]["source"], "enterprise-managed (Acme, 42)");
+    assert_eq!(
+        preview[0]["suggested_action"],
+        "set by enterprise-managed (Acme, 42); contact that configuration's owner"
+    );
+    // A key the user really did set keeps the spelling advice and their path.
+    assert_eq!(preview[1]["key"], "mistyped_local");
+    assert_eq!(preview[1]["source"], "/home/u/.codex/config.toml");
+    assert_eq!(
+        preview[1]["suggested_action"],
+        "check the configuration owner and spelling; no automatic migration is known"
+    );
+}
+
+#[test]
+fn removed_apps_mcp_path_override_is_not_reported_as_a_spelling_mistake() {
+    // `FeaturesToml::removed_apps_mcp_path_override` already parses this key and
+    // logs that it is removed and ignored, so the warning must agree with the
+    // parser rather than telling the user to check their spelling.
+    let table: Table = toml::from_str("apps_mcp_path_override = true").unwrap();
+    let event = crate::unknown_features_warning_event(Some(&table), "config.toml").unwrap();
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("unknown settings must be visible warnings");
+    };
+    let preview: serde_json::Value = serde_json::from_str(
+        warning
+            .message
+            .split_once("Compatibility preview (no settings changed): ")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(preview[0]["classification"], "removed");
+    assert_eq!(
+        preview[0]["suggested_action"],
+        "review removal of this inactive setting"
+    );
+}
+
+#[test]
 fn feature_membership_is_independent_and_enumeration_preserves_enum_order() {
     let mut features = Features::default();
     let mut expected = std::collections::BTreeSet::new();

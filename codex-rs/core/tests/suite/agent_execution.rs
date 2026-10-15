@@ -144,13 +144,14 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
         ]),
     )
     .await;
-    let first_followup = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| {
-            has_function_call_output(request, "first-call")
-                && !has_function_call_output(request, "hold-parent")
-        },
-        sse(vec![
+    let first_followup =
+        mount_sse_once_match(
+            &server,
+            |request: &wiremock::Request| {
+                has_function_call_output(request, "first-call")
+                    && !has_function_call_output(request, "hold-parent")
+            },
+            sse(vec![
             ev_response_created("first-followup-response"),
             ev_function_call("hold-parent", "request_user_input", &json!({
                 "questions": [{
@@ -163,8 +164,8 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
             }).to_string()),
             ev_completed("first-followup-response"),
         ]),
-    )
-    .await;
+        )
+        .await;
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| has_function_call_output(request, "hold-parent"),
@@ -186,25 +187,31 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
             .enable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
         config.multi_agent_v2.max_concurrent_threads_per_session = 2;
-        config.features.enable(Feature::DefaultModeRequestUserInput)
+        config
+            .features
+            .enable(Feature::DefaultModeRequestUserInput)
             .expect("enable the parent lifetime barrier");
     });
     let test = builder.build(&server).await?;
-    test.codex.submit(Op::UserInput {
-        items: vec![UserInput::Text {
-            text: FIRST_PROMPT.to_string(), text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: FIRST_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
     // Keep the root's execution slot occupied until the child's admission has
     // been observed. An immediate parent completion races the nested spawn.
     let question = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(question) => Some(question.clone()),
         _ => None,
-    }).await;
+    })
+    .await;
     assert_eq!(question.call_id, "hold-parent");
 
     let second_output = tokio::time::timeout(Duration::from_secs(10), async {
@@ -247,17 +254,24 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     );
     assert_eq!(test.thread_manager.list_thread_ids().await.len(), 2);
 
-    test.codex.submit(Op::UserInputAnswer {
-        id: question.turn_id.clone(),
-        call_id: Some(question.call_id),
-        response: RequestUserInputResponse {
-            disposition: None,
-            answers: [("release".to_string(), RequestUserInputAnswer {
-                answers: vec!["Yes".to_string()],
-            })].into_iter().collect(),
-            interrupted: false,
-        },
-    }).await?;
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: question.turn_id.clone(),
+            call_id: Some(question.call_id),
+            response: RequestUserInputResponse {
+                disposition: None,
+                answers: [(
+                    "release".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes".to_string()],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                interrupted: false,
+            },
+        })
+        .await?;
     wait_for_event(&test.codex, |event| match event {
         EventMsg::TurnComplete(completed) => {
             assert_eq!(completed.turn_id, question.turn_id);
@@ -266,7 +280,8 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
             true
         }
         _ => false,
-    }).await;
+    })
+    .await;
 
     Ok(())
 }
@@ -303,7 +318,9 @@ text(wake.timed_out ? "overlap_wait_timed_out" : "overlap_wait_woke");
         } else {
             ""
         };
-        let batch_script = format!("{wait_prefix}{}{wait_suffix}", r#"
+        let batch_script = format!(
+            "{wait_prefix}{}{wait_suffix}",
+            r#"
 const spawn = resolve_tool("agents.spawn_agent");
 const outcomes = await Promise.allSettled([0, 1, 2, 3].map(i =>
     spawn({task_name: "batch_" + i, message: "Return batch result " + i})));
@@ -326,38 +343,50 @@ for (let attempt = 0; attempt < 256; attempt++) {
     // fixture backoff prevents repeatedly reading that same queued wake.
     await new Promise(resolve => setTimeout(resolve, 10));
 }
-"#);
+"#
+        );
         mount_sse_once_match(
             &server,
             |request: &wiremock::Request| {
-                request_has_last_message_input_text(request, "user", "Run the four independent agents")
+                request_has_last_message_input_text(
+                    request,
+                    "user",
+                    "Run the four independent agents",
+                )
             },
             sse(vec![
                 ev_response_created("batch-start"),
                 ev_custom_tool_call("batch", "exec", &batch_script),
                 ev_completed("batch-start"),
             ]),
-        ).await;
+        )
+        .await;
         for worker in 0..4 {
             let objective = format!("Return batch result {worker}");
             let response = sse(vec![
                 ev_response_created(&format!("child-{worker}")),
-                ev_assistant_message(&format!("result-{worker}"), &format!("batch-result-{worker}")),
+                ev_assistant_message(
+                    &format!("result-{worker}"),
+                    &format!("batch-result-{worker}"),
+                ),
                 ev_completed(&format!("child-{worker}")),
             ]);
             mount_sse_once_match(
                 &server,
                 move |request: &wiremock::Request| has_task_capsule_objective(request, &objective),
                 response,
-            ).await;
+            )
+            .await;
         }
         let finish = mount_sse_once_match(
             &server,
             |request: &wiremock::Request| {
                 serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
-                    body["input"].as_array().is_some_and(|items| items.iter().any(|item| {
-                        item["type"] == "custom_tool_call_output" && item["call_id"] == "batch"
-                    }))
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "custom_tool_call_output" && item["call_id"] == "batch"
+                        })
+                    })
                 })
             },
             sse(vec![
@@ -365,12 +394,21 @@ for (let attempt = 0; attempt < 256; attempt++) {
                 ev_assistant_message("batch-answer", "All four results collected"),
                 ev_completed("batch-finish"),
             ]),
-        ).await;
+        )
+        .await;
         let mut builder = test_codex()
             .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = true)
             .with_config(|config| {
-                for feature in [Feature::Collab, Feature::MultiAgentV2, Feature::CodeMode, Feature::CodeModeOnly] {
-                    config.features.enable(feature).expect("enable batch fixture");
+                for feature in [
+                    Feature::Collab,
+                    Feature::MultiAgentV2,
+                    Feature::CodeMode,
+                    Feature::CodeModeOnly,
+                ] {
+                    config
+                        .features
+                        .enable(feature)
+                        .expect("enable batch fixture");
                 }
                 config.multi_agent_v2.max_concurrent_threads_per_session = 5;
                 config.multi_agent_v2.min_wait_timeout_ms = 0;
@@ -380,40 +418,74 @@ for (let attempt = 0; attempt < 256; attempt++) {
         let outcome = tokio::time::timeout(
             Duration::from_secs(45),
             test.submit_turn_and_capture_completion("Run the four independent agents"),
-        ).await;
+        )
+        .await;
         let completion_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut terminal_results = std::collections::BTreeMap::new();
         for id in test.thread_manager.list_thread_ids().await {
             let thread = test.thread_manager.get_thread(id).await?;
-            if let Some(path) = thread.config_snapshot().await.session_source.get_agent_path() {
+            if let Some(path) = thread
+                .config_snapshot()
+                .await
+                .session_source
+                .get_agent_path()
+            {
                 terminal_results.insert(path.to_string(), thread.agent_status().await);
             }
         }
         let cleanup_started = std::time::Instant::now();
-        let shutdown = test.thread_manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
+        let shutdown = test
+            .thread_manager
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
         let cleanup_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0;
         let completed = outcome.context("batch timed out")??;
         assert_eq!(completed.error, None);
-        assert_eq!(completed.last_agent_message.as_deref(), Some("All four results collected"));
+        assert_eq!(
+            completed.last_agent_message.as_deref(),
+            Some("All four results collected")
+        );
         let request = finish.single_request();
-        let (_, success) = request.custom_tool_call_output_content_and_success("batch")
+        let (_, success) = request
+            .custom_tool_call_output_content_and_success("batch")
             .expect("batch output");
         assert_ne!(success, Some(false), "the batch cell must succeed");
         let output = request.custom_tool_call_output("batch").to_string();
-        anyhow::ensure!(shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(), "{shutdown:?}");
-        anyhow::ensure!(shutdown.completed.len() == 5, "lost or duplicated child: {shutdown:?}; batch output: {output}");
+        anyhow::ensure!(
+            shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(),
+            "{shutdown:?}"
+        );
+        anyhow::ensure!(
+            shutdown.completed.len() == 5,
+            "lost or duplicated child: {shutdown:?}; batch output: {output}"
+        );
         let requests = server.received_requests().await.unwrap_or_default();
         for worker in 0..4 {
             let objective = format!("Return batch result {worker}");
-            let count = requests.iter().filter(|request| has_task_capsule_objective(request, &objective)).count();
-            anyhow::ensure!(count == 1, "child {worker} must execute exactly once, got {count}; {output}");
+            let count = requests
+                .iter()
+                .filter(|request| has_task_capsule_objective(request, &objective))
+                .count();
+            anyhow::ensure!(
+                count == 1,
+                "child {worker} must execute exactly once, got {count}; {output}"
+            );
         }
-        anyhow::ensure!(output.contains("batch_complete"), "collection failed: {output}");
+        anyhow::ensure!(
+            output.contains("batch_complete"),
+            "collection failed: {output}"
+        );
         if overlapping_wait {
-            anyhow::ensure!(output.contains("overlap_wait_"), "missing wait outcome: {output}");
+            anyhow::ensure!(
+                output.contains("overlap_wait_"),
+                "missing wait outcome: {output}"
+            );
         }
         for worker in 0..4 {
-            anyhow::ensure!(output.contains(&format!("batch-result-{worker}")), "lost result: {output}");
+            anyhow::ensure!(
+                output.contains(&format!("batch-result-{worker}")),
+                "lost result: {output}"
+            );
             assert_eq!(
                 terminal_results.get(&format!("/root/batch_{worker}")),
                 Some(&AgentStatus::Completed(Some(format!(
@@ -421,16 +493,25 @@ for (let attempt = 0; attempt < 256; attempt++) {
                 )))),
             );
         }
-        let model_requests = requests.iter().filter(|request| request.url.path().ends_with("/responses")).count();
-        anyhow::ensure!(model_requests == 6, "unexpected coordination cycles: {model_requests}");
-        eprintln!("multi_agent_batch_benchmark {}", json!({
-            "trial": trial, "agents": 4, "model_requests": model_requests,
-            "overlapping_wait": overlapping_wait,
-            "overlap_wait_timed_out": output.contains("overlap_wait_timed_out"),
-            "parent_completion_ms": completion_ms, "cleanup_ms": cleanup_ms,
-            "total_ms": started.elapsed().as_secs_f64() * 1000.0,
-            "provider": "scripted_loopback", "correct": true,
-        }));
+        let model_requests = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count();
+        anyhow::ensure!(
+            model_requests == 6,
+            "unexpected coordination cycles: {model_requests}"
+        );
+        eprintln!(
+            "multi_agent_batch_benchmark {}",
+            json!({
+                "trial": trial, "agents": 4, "model_requests": model_requests,
+                "overlapping_wait": overlapping_wait,
+                "overlap_wait_timed_out": output.contains("overlap_wait_timed_out"),
+                "parent_completion_ms": completion_ms, "cleanup_ms": cleanup_ms,
+                "total_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "provider": "scripted_loopback", "correct": true,
+            })
+        );
     }
     Ok(())
 }
@@ -454,7 +535,8 @@ async fn code_mode_only_discovers_spawns_and_receives_from_real_subagent() -> Re
         call_id: &str,
     ) -> String {
         let output = request.custom_tool_call_output(call_id);
-        let (_, success) = request.custom_tool_call_output_content_and_success(call_id)
+        let (_, success) = request
+            .custom_tool_call_output_content_and_success(call_id)
             .expect("probe output");
         assert_ne!(success, Some(false), "the probe cell must succeed");
         match &output["output"] {
@@ -597,7 +679,8 @@ text("list-proof:" + JSON.stringify(listed));
             .collect::<Vec<_>>()
             .join("\n");
         anyhow::ensure!(
-            developer_text.contains("may be called there"),
+            developer_text.contains("deferred inside `functions.exec`")
+                && developer_text.contains("resolve and call in the same cell"),
             "missing nested-call guidance"
         );
         anyhow::ensure!(

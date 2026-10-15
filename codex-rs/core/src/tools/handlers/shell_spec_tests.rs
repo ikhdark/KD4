@@ -41,7 +41,10 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains("correct only the failed search"));
         assert!(description.contains("`rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden`"));
         assert!(description.contains("Prefer native `read_file` with batched selectors"));
-        assert!(description.contains("Keep shell reads for required encoding, streaming, or transformations"));
+        assert!(
+            description
+                .contains("Keep shell reads for required encoding, streaming, or transformations")
+        );
         // Base instructions own inspection order, retention and re-read policy.
         for owned_elsewhere in [
             "Read known files directly",
@@ -131,9 +134,15 @@ fn stall_timeout_schema_is_available_on_all_command_routes() {
         (create_foreign_shell_command_tool(options, false), true),
     ] {
         let spec = serde_json::to_value(spec).unwrap();
-        let field = if spec["name"] == "exec_command" { "cmd" } else { "command" };
+        let field = if spec["name"] == "exec_command" {
+            "cmd"
+        } else {
+            "command"
+        };
         let schema = &spec["parameters"];
-        let description = schema["properties"]["stall_timeout_ms"]["description"].as_str().unwrap();
+        let description = schema["properties"]["stall_timeout_ms"]["description"]
+            .as_str()
+            .unwrap();
         assert!(description.contains("Defaults to 60000 ms"));
         if resumable {
             assert!(description.contains("Silence never terminates the command"));
@@ -182,7 +191,10 @@ fn command_declarations_preserve_input_alternatives_and_return_contracts() {
         }
         assert!(declaration.contains("Promise<"));
         if definition.name == "exec_command" {
-            let schema = definition.output_schema.as_ref().expect("structured return contract");
+            let schema = definition
+                .output_schema
+                .as_ref()
+                .expect("structured return contract");
             assert!(schema["properties"].get("session_id").is_some());
             assert!(schema["properties"].get("execution_state").is_some());
             assert!(schema["properties"].get("session_capabilities").is_some());
@@ -804,10 +816,13 @@ fn uncertainty_command_wait_budget_accepts_lower_configured_owner_caps() {
     for cap in [5_000, 30_000, 300_000] {
         let tool = serde_json::to_value(create_write_stdin_tool_with_max_timeout(cap)).unwrap();
         let validator = jsonschema::validator_for(&tool["parameters"]).unwrap();
-        assert!(validator.is_valid(&json!({
-            "session_id": 1, "incarnation": "original", "wait_for_output": false,
-            "yield_time_ms": 300_000
-        })), "await_command's deadline must reach the clamping owner for cap {cap}");
+        assert!(
+            validator.is_valid(&json!({
+                "session_id": 1, "incarnation": "original", "wait_for_output": false,
+                "yield_time_ms": 300_000
+            })),
+            "await_command's deadline must reach the clamping owner for cap {cap}"
+        );
     }
 }
 
@@ -898,13 +913,19 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
     ] {
         let output = ExecCommandToolOutput {
             output_ranges: None,
-            process_output: Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
-                aggregated_output: b"evidence".to_vec(),
-                stdout: b"{}".to_vec(),
-                stderr: if search_no_match { Vec::new() } else { b"progress".to_vec() },
-                aggregated_output_is_exact: true,
-                streams_are_exact: true,
-            })),
+            process_output: Some(std::sync::Arc::new(
+                crate::unified_exec::ProcessOutputSnapshot {
+                    aggregated_output: b"evidence".to_vec(),
+                    stdout: b"{}".to_vec(),
+                    stderr: if search_no_match {
+                        Vec::new()
+                    } else {
+                        b"progress".to_vec()
+                    },
+                    aggregated_output_is_exact: true,
+                    streams_are_exact: true,
+                },
+            )),
             error: None,
             validation: None,
             event_call_id: "lifecycle".into(),
@@ -914,18 +935,20 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             truncation_policy: TruncationPolicy::Tokens(10_000),
             max_output_tokens: Some(0),
             process_id,
-            session_capabilities: process_id.map(|_| crate::tools::context::ExecSessionCapabilities {
-                incarnation: uuid::Uuid::nil(),
-                stdin: false,
-                interrupt: false,
-                cancellation: true,
-                polling: true,
-                observation: Some(crate::tools::context::ExecSilenceObservation {
-                    silent_for_ms: 60_000,
-                    reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
-                    process_exited,
-                    termination_requested: false,
-                }),
+            session_capabilities: process_id.map(|_| {
+                crate::tools::context::ExecSessionCapabilities {
+                    incarnation: uuid::Uuid::nil(),
+                    stdin: false,
+                    interrupt: false,
+                    cancellation: true,
+                    polling: true,
+                    observation: Some(crate::tools::context::ExecSilenceObservation {
+                        silent_for_ms: 60_000,
+                        reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
+                        process_exited,
+                        termination_requested: false,
+                    }),
+                }
             }),
             exit_code,
             process_exited,
@@ -942,19 +965,31 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         assert_eq!(result["execution_state"], expected);
         assert_eq!(result["exit_code"], json!(exit_code));
         assert!(validator.is_valid(&result), "{result}");
-        assert_eq!(result.get("search_no_match"), search_no_match.then_some(&json!(true)));
+        assert_eq!(
+            result.get("search_no_match"),
+            search_no_match.then_some(&json!(true))
+        );
         if process_id.is_some() {
-            assert_eq!(result["session_capabilities"]["observation"]["silent_for_ms"], 60_000);
+            assert_eq!(
+                result["session_capabilities"]["observation"]["silent_for_ms"],
+                60_000
+            );
             for invalid_value in [json!(-1), json!(1.5), json!("60000")] {
                 let mut invalid = result.clone();
                 invalid["session_capabilities"]["observation"]["silent_for_ms"] = invalid_value;
                 assert!(!validator.is_valid(&invalid));
             }
         }
-        assert_eq!(result["streams_complete"], process_exited && process_id.is_none());
+        assert_eq!(
+            result["streams_complete"],
+            process_exited && process_id.is_none()
+        );
         if result["streams_complete"] == true {
             assert_eq!(result["stdout"], "{}");
-            assert_eq!(result["stderr"], if search_no_match { "" } else { "progress" });
+            assert_eq!(
+                result["stderr"],
+                if search_no_match { "" } else { "progress" }
+            );
         } else {
             assert!(result.get("stdout").is_none());
         }

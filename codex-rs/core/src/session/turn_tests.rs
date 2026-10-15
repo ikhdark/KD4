@@ -4,15 +4,23 @@ use super::*;
 fn uncertainty_completion_warnings_use_owner_assessment_not_final_wording() {
     let mut assessment = codex_protocol::protocol::TurnCompletionAssessment::default();
     assert!(completion_verification_warning(&assessment).is_none());
-    assessment.advisories.push("Checklist accounting only".into());
+    assessment
+        .advisories
+        .push("Checklist accounting only".into());
     assert!(completion_verification_warning(&assessment).is_none());
-    assessment.verification_gaps.push("Required compatibility remains untested.".into());
+    assessment
+        .verification_gaps
+        .push("Required compatibility remains untested.".into());
     let warning = completion_verification_warning(&assessment).unwrap();
     assert!(warning.contains("Required compatibility remains untested."));
     assert!(warning.contains("not a verified completion"));
     assessment.verification_gaps.clear();
     assessment.failed_checks.push("Reader V1 failed".into());
-    assert!(completion_verification_warning(&assessment).unwrap().contains("Reader V1 failed"));
+    assert!(
+        completion_verification_warning(&assessment)
+            .unwrap()
+            .contains("Reader V1 failed")
+    );
     assessment.failed_checks.clear();
     assert!(completion_verification_warning(&assessment).is_none());
 }
@@ -236,8 +244,10 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
     use codex_config::ConfigLayerStack;
     use codex_config::ConfigRequirements;
     use codex_config::ConfigRequirementsToml;
-    let (session, mut turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
-    Arc::get_mut(&mut turn).unwrap().multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    let (session, mut turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn).unwrap().multi_agent_version =
+        codex_protocol::protocol::MultiAgentVersion::V2;
     let layer = serde_json::from_value(serde_json::json!({"hooks": {
         "UserPromptSubmit": [{"hooks": [{
             "type": "command",
@@ -308,57 +318,165 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
         }
     }
     assert!(stopped, "the real hook must have blocked the prompt");
-    let stopped = run_hooks_and_record_inputs_detailed(&session, &turn, vec![
-        TurnInput::UserInput { content: vec![UserInput::Text { text: "blocked continuation".into(), text_elements: Vec::new() }], client_id: None },
-    ]).await.unwrap();
+    let stopped = run_hooks_and_record_inputs_detailed(
+        &session,
+        &turn,
+        vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "blocked continuation".into(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }],
+    )
+    .await
+    .unwrap();
     assert!(stopped.should_stop);
     assert!(!stopped.accepted_context_input);
-    let continuing = run_hooks_and_record_inputs_detailed(&session, &turn, vec![
-        TurnInput::ResponseItem(crate::compact::compaction_context_message("Accepted ongoing context".to_string())),
-        TurnInput::UserInput { content: vec![UserInput::Text { text: "Use subagents".to_string(), text_elements: Vec::new() }], client_id: None },
-    ]).await.unwrap();
+    let continuing = run_hooks_and_record_inputs_detailed(
+        &session,
+        &turn,
+        vec![
+            TurnInput::ResponseItem(crate::compact::compaction_context_message(
+                "Accepted ongoing context".to_string(),
+            )),
+            TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "Use subagents".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+        ],
+    )
+    .await
+    .unwrap();
     assert!(!continuing.should_stop);
     assert!(continuing.accepted_context_input);
+    assert!(continuing.renews_generation_budget);
+    // A child's result is accepted context, but it does not renew the
+    // generation budget of the turn it reports to.
+    let report = run_hooks_and_record_inputs_detailed(
+        &session,
+        &turn,
+        vec![TurnInput::InterAgentCommunication(
+            codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::try_from("/root/worker").unwrap(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "child result".to_string(),
+                true,
+            ),
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(!report.should_stop);
+    assert!(report.accepted_context_input);
+    assert!(!report.renews_generation_budget);
 }
 
 #[tokio::test]
 async fn pending_input_closed_writer_restores_entire_rejected_batch() {
-    let (mut session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
-    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
-    session.live_thread().expect("writer").shutdown().await.expect("close writer");
-    let input = ["first rejected steer", "second rejected steer"].map(|text| TurnInput::UserInput {
-        content: vec![UserInput::Text { text: text.into(), text_elements: Vec::new() }],
-        client_id: None,
-    }).to_vec();
-    session.input_queue.restore_transferred_startup_input(input.clone()).await;
-    let drained = session.input_queue.get_pending_input(&session.active_turn).await;
+    let (mut session, turn, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("unique session"),
+    )
+    .await;
+    session
+        .live_thread()
+        .expect("writer")
+        .shutdown()
+        .await
+        .expect("close writer");
+    let input = ["first rejected steer", "second rejected steer"]
+        .map(|text| TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        })
+        .to_vec();
+    session
+        .input_queue
+        .restore_transferred_startup_input(input.clone())
+        .await;
+    let drained = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await;
     assert_eq!(drained, input);
-    assert!(run_hooks_and_record_inputs_detailed(&session, &turn, drained).await.is_err());
+    assert!(
+        run_hooks_and_record_inputs_detailed(&session, &turn, drained)
+            .await
+            .is_err()
+    );
     assert!(session.clone_history().await.raw_items().is_empty());
-    assert!(events.try_recv().is_err(), "rejected inputs must not publish lifecycle events");
-    assert_eq!(session.input_queue.get_pending_input(&session.active_turn).await, input);
-    assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+    assert!(
+        events.try_recv().is_err(),
+        "rejected inputs must not publish lifecycle events"
+    );
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        input
+    );
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn pending_input_cancelled_waiter_keeps_prefix_and_restores_only_rejected_suffix() {
     // A real local writer, a FIFO commit gate, and no model request. Cancellation
     // occurs while the first commit is blocked; the writer then closes between items.
-    let (mut session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
-    let input = ["owned prefix", "rejected suffix one", "rejected suffix two"].map(|text| {
-        TurnInput::ResponseItem(crate::compact::compaction_context_message(text.into()))
-    }).to_vec();
-    session.input_queue.restore_transferred_startup_input(input.clone()).await;
-    let drained = session.input_queue.get_pending_input(&session.active_turn).await;
-    let held = session.durable_history_commit_gate.acquire().await.expect("hold first commit");
-    let mut waiter = Box::pin(run_hooks_and_record_inputs_detailed(&session, &turn, drained));
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("unique session"),
+    )
+    .await;
+    let input = ["owned prefix", "rejected suffix one", "rejected suffix two"]
+        .map(|text| {
+            TurnInput::ResponseItem(crate::compact::compaction_context_message(text.into()))
+        })
+        .to_vec();
+    session
+        .input_queue
+        .restore_transferred_startup_input(input.clone())
+        .await;
+    let drained = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await;
+    let held = session
+        .durable_history_commit_gate
+        .acquire()
+        .await
+        .expect("hold first commit");
+    let mut waiter = Box::pin(run_hooks_and_record_inputs_detailed(
+        &session, &turn, drained,
+    ));
     assert!(futures::poll!(waiter.as_mut()).is_pending());
     tokio::time::timeout(Duration::from_secs(5), async {
-        while session.durable_history_commits_in_flight.load(Ordering::Acquire) == 0 {
+        while session
+            .durable_history_commits_in_flight
+            .load(Ordering::Acquire)
+            == 0
+        {
             tokio::task::yield_now().await;
         }
-    }).await.expect("first owned commit starts");
+    })
+    .await
+    .expect("first owned commit starts");
     // Let the just-spawned commit poll the held semaphore before queuing the
     // test's next permit. FIFO ordering then gives us the boundary after item 1.
     tokio::task::yield_now().await;
@@ -366,27 +484,72 @@ async fn pending_input_cancelled_waiter_keeps_prefix_and_restores_only_rejected_
     assert!(futures::poll!(between_items.as_mut()).is_pending());
     drop(waiter);
     assert!(session.clone_history().await.raw_items().is_empty());
-    assert!(!session.terminal_tasks.is_empty(), "batch owner survives waiter cancellation");
+    assert!(
+        !session.terminal_tasks.is_empty(),
+        "batch owner survives waiter cancellation"
+    );
     drop(held);
     let boundary = tokio::time::timeout(Duration::from_secs(5), between_items)
-        .await.expect("first commit releases FIFO gate").expect("gate open");
+        .await
+        .expect("first commit releases FIFO gate")
+        .expect("gate open");
     let history = session.clone_history().await.into_raw_items();
-    assert_eq!(history.len(), 1, "must close the actual writer after exactly the accepted prefix");
-    assert!(serde_json::to_string(&history[0]).unwrap().contains("owned prefix"));
-    session.live_thread().expect("writer").shutdown().await.expect("close writer between items");
+    assert_eq!(
+        history.len(),
+        1,
+        "must close the actual writer after exactly the accepted prefix"
+    );
+    assert!(
+        serde_json::to_string(&history[0])
+            .unwrap()
+            .contains("owned prefix")
+    );
+    session
+        .live_thread()
+        .expect("writer")
+        .shutdown()
+        .await
+        .expect("close writer between items");
     drop(boundary);
     session.terminal_tasks.close();
     tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
-        .await.expect("cancelled batch owner settles failure and restores suffix");
-    let restored = session.input_queue.get_pending_input(&session.active_turn).await;
-    assert_eq!(restored, input[1..], "accepted prefix must never be submitted twice");
-    assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+        .await
+        .expect("cancelled batch owner settles failure and restores suffix");
+    let restored = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await;
+    assert_eq!(
+        restored,
+        input[1..],
+        "accepted prefix must never be submitted twice"
+    );
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .is_empty()
+    );
     assert_eq!(session.clone_history().await.into_raw_items(), history);
-    let stored = session.live_thread().expect("writer").load_history(false).await.expect("stored history");
-    let stored_items = stored.items.into_iter().filter_map(|item| match item {
-        codex_protocol::protocol::RolloutItem::ResponseItem(item) => Some(item), _ => None,
-    }).collect::<Vec<_>>();
-    assert_eq!(stored_items, history, "cancelled waiter must preserve accepted prefix exactly once on disk");
+    let stored = session
+        .live_thread()
+        .expect("writer")
+        .load_history(false)
+        .await
+        .expect("stored history");
+    let stored_items = stored
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            codex_protocol::protocol::RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored_items, history,
+        "cancelled waiter must preserve accepted prefix exactly once on disk"
+    );
 }
 
 #[tokio::test]
@@ -406,9 +569,14 @@ async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
 #[tokio::test]
 async fn sampling_uses_latest_tier_instead_of_the_turn_start_snapshot() {
     let (session, mut turn) = crate::session::tests::make_session_and_context().await;
-    Arc::make_mut(&mut turn.config).features.enable(Feature::FastMode).unwrap();
+    Arc::make_mut(&mut turn.config)
+        .features
+        .enable(Feature::FastMode)
+        .unwrap();
     turn.model_info.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
-        id: "priority".into(), name: "Priority".into(), description: "Priority processing".into(),
+        id: "priority".into(),
+        name: "Priority".into(),
+        description: "Priority processing".into(),
     }];
     Arc::make_mut(&mut turn.config).service_tier = Some("default".into());
     {
@@ -417,8 +585,16 @@ async fn sampling_uses_latest_tier_instead_of_the_turn_start_snapshot() {
             state.session_configuration.service_tier = Some(tier.into());
         }
     }
-    assert_eq!(service_tier_for_sampling(&session, &turn).await.as_deref(), Some("priority"));
-    session.state.lock().await.session_configuration.service_tier = None;
+    assert_eq!(
+        service_tier_for_sampling(&session, &turn).await.as_deref(),
+        Some("priority")
+    );
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .service_tier = None;
     assert_eq!(service_tier_for_sampling(&session, &turn).await, None);
 }
 
@@ -573,10 +749,14 @@ fn arc_identity_short_circuits_equivalence_check() {
     ));
     assert_eq!(comparison_count.load(Ordering::Relaxed), 1);
     let unequal = Arc::new([1_u8, 2, 4]);
-    assert!(!arc_identity_or_equivalent(&shared, &unequal, |left, right| {
-        comparison_count.fetch_add(1, Ordering::Relaxed);
-        left == right
-    }));
+    assert!(!arc_identity_or_equivalent(
+        &shared,
+        &unequal,
+        |left, right| {
+            comparison_count.fetch_add(1, Ordering::Relaxed);
+            left == right
+        }
+    ));
     assert_eq!(comparison_count.load(Ordering::Relaxed), 2);
 }
 
@@ -1351,7 +1531,8 @@ fn continuation_prefetch_returns_before_capture_and_overlaps_step_context() -> R
     )
 }
 
-async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl() -> Result<()> {
+async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl() -> Result<()>
+{
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let mut completed = responses::ev_completed("prefetch");
@@ -1365,30 +1546,41 @@ async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_
             Vec::new(),
             home.path(),
             move |config| config.model_provider = provider,
-        ).await;
+        )
+        .await;
     let cancellation = CancellationToken::new();
     let step = session.capture_step_context(Arc::clone(&turn)).await?;
     let router = built_tools(&session, &step, &[], &cancellation).await?;
     assert!(step.set_tool_router(router).is_ok(), "first router");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let runtime = ToolCallRuntime::new(Arc::clone(&session), step, Arc::clone(&tracker));
-    session.record_conversation_items(&turn, &[
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "read_file".to_string(),
-            namespace: None,
-            arguments: r#"{"path":"source.rs"}"#.to_string(),
-            call_id: "workspace-read".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "workspace-read".to_string(),
-            output: FunctionCallOutputPayload::from_text("source".to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ]).await?;
-    assert!(session.clone_history().await.requires_workspace_evidence_validation());
+    session
+        .record_conversation_items(
+            &turn,
+            &[
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "read_file".to_string(),
+                    namespace: None,
+                    arguments: r#"{"path":"source.rs"}"#.to_string(),
+                    call_id: "workspace-read".to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "workspace-read".to_string(),
+                    output: FunctionCallOutputPayload::from_text("source".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+        )
+        .await?;
+    assert!(
+        session
+            .clone_history()
+            .await
+            .requires_workspace_evidence_validation()
+    );
     let metadata = turn.turn_metadata_state.to_responses_metadata(
         session.installation_id.clone(),
         session.current_window_id().await,
@@ -1398,31 +1590,48 @@ async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_
     let cache = &session.services.git_workspace;
     let pause = cache.pause_next_workspace_evidence_capture();
     let captures_before = cache.workspace_evidence_capture_count();
-    let result = tokio::time::timeout(Duration::from_secs(10), try_run_sampling_request(
-        runtime,
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        Arc::new(ExtensionData::new(turn.sub_id.clone())),
-        &mut client,
-        &metadata,
-        tracker,
-        &Prompt::default(),
-        &ModelGenerationId { turn_id: turn.sub_id.clone(), ordinal: 0 },
-        &mut None,
-        Arc::new(Mutex::new(None)),
-        cancellation,
-        &mut SamplingAttemptProgress::default(),
-    )).await.expect("sampling must return without joining the paused capture")?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        try_run_sampling_request(
+            runtime,
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            Arc::new(ExtensionData::new(turn.sub_id.clone())),
+            &mut client,
+            &metadata,
+            tracker,
+            &Prompt::default(),
+            &ModelGenerationId {
+                turn_id: turn.sub_id.clone(),
+                ordinal: 0,
+            },
+            &mut None,
+            Arc::new(Mutex::new(None)),
+            cancellation,
+            &mut SamplingAttemptProgress::default(),
+        ),
+    )
+    .await
+    .expect("sampling must return without joining the paused capture")?;
     assert!(result.needs_follow_up);
     assert!(result.prefetched_workspace_identity.is_none());
-    let (_, handle) = result.continuation_workspace_prefetch.expect("owned pending capture");
+    let (_, handle) = result
+        .continuation_workspace_prefetch
+        .expect("owned pending capture");
     tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started()).await?;
-    tokio::time::timeout(Duration::from_secs(10), session.capture_step_context(Arc::clone(&turn)))
-        .await.expect("next step context must proceed while the workspace capture is paused")?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        session.capture_step_context(Arc::clone(&turn)),
+    )
+    .await
+    .expect("next step context must proceed while the workspace capture is paused")?;
     assert!(!handle.is_finished());
     pause.release();
     tokio::time::timeout(Duration::from_secs(10), handle).await??;
-    assert_eq!(cache.workspace_evidence_capture_count(), captures_before + 1);
+    assert_eq!(
+        cache.workspace_evidence_capture_count(),
+        captures_before + 1
+    );
     requests.single_request();
     Ok(())
 }
@@ -1441,14 +1650,24 @@ async fn local_compaction_reuses_pending_capture_and_rejects_stale_revision() {
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let revision = tracker.lock().await.current_mutation_revision();
     for stale in [false, true] {
-        let mut pending = Some((revision, AbortOnDropHandle::new(tokio::spawn(async { None }))));
+        let mut pending = Some((
+            revision,
+            AbortOnDropHandle::new(tokio::spawn(async { None })),
+        ));
         if stale {
             tracker.lock().await.record_unknown_mutation();
         }
         let mut identity = None;
         reuse_workspace_prefetch_for_local_compaction(
-            &session, &turn, &tracker, &mut pending, &mut identity, &CancellationToken::new(),
-        ).await.unwrap();
+            &session,
+            &turn,
+            &tracker,
+            &mut pending,
+            &mut identity,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert!(pending.is_none());
         // Some(None) preserves a completed non-Git capture, suppressing reprobes.
         assert_eq!(identity, if stale { None } else { Some(None) });
@@ -1461,13 +1680,25 @@ async fn local_compaction_pending_capture_is_cancellable() {
     Arc::make_mut(&mut turn.config).compact_prompt = Some("local summary".into());
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let revision = tracker.lock().await.current_mutation_revision();
-    let mut pending = Some((revision, AbortOnDropHandle::new(tokio::spawn(std::future::pending()))));
+    let mut pending = Some((
+        revision,
+        AbortOnDropHandle::new(tokio::spawn(std::future::pending())),
+    ));
     let mut identity = None;
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    assert!(matches!(reuse_workspace_prefetch_for_local_compaction(
-        &session, &turn, &tracker, &mut pending, &mut identity, &cancellation,
-    ).await, Err(CodexErr::TurnAborted)));
+    assert!(matches!(
+        reuse_workspace_prefetch_for_local_compaction(
+            &session,
+            &turn,
+            &tracker,
+            &mut pending,
+            &mut identity,
+            &cancellation,
+        )
+        .await,
+        Err(CodexErr::TurnAborted)
+    ));
     assert!(pending.is_none());
     assert!(identity.is_none());
 }
@@ -2080,8 +2311,6 @@ fn recommended_plugin_candidate(id: &str, name: &str) -> DiscoverableTool {
     .into()
 }
 
-
-
 #[test]
 fn named_recommended_plugin_is_the_only_injected_candidate() {
     for (task, expected) in [
@@ -2095,21 +2324,24 @@ fn named_recommended_plugin_is_the_only_injected_candidate() {
         ("", vec![]),
     ] {
         let selected = task_relevant_recommended_plugins(
-            &[ContentItem::InputText { text: task.to_string() }],
+            &[ContentItem::InputText {
+                text: task.to_string(),
+            }],
             vec![
                 recommended_plugin_candidate("design-tool", "Figma"),
                 recommended_plugin_candidate("notion", "Notion"),
             ],
         );
         assert_eq!(
-            selected.iter().map(DiscoverableTool::name).collect::<Vec<_>>(),
+            selected
+                .iter()
+                .map(DiscoverableTool::name)
+                .collect::<Vec<_>>(),
             expected,
             "{task}"
         );
     }
 }
-
-
 
 #[test]
 fn recommended_plugin_catalog_is_bounded_by_rendered_bytes() {
@@ -2236,23 +2468,56 @@ fn logical_generation_budget_allows_bounded_regular_and_one_terminal_generation(
 }
 
 #[test]
-fn retained_evidence_analysis_and_owned_polling_preserve_generation_capacity() {
+fn owned_polling_credits_are_capped_so_the_forced_synthesis_stays_reachable() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..32 {
-        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-    }
-    for _ in 0..256 {
+    // Every generation only monitors owned processes; the first credits keep
+    // the allowance, later ones spend it.
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS + MAX_MONITORING_GENERATION_CREDITS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
         budget.observe_progress(true);
-    }
-    for _ in 32..MAX_REGULAR_LOGICAL_GENERATIONS {
-        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-        budget.observe_progress(false);
     }
     assert_eq!(
         budget.admit(false),
         LogicalGenerationAdmission::Terminal { forced: true }
     );
+    // New instructions renew the allowance and the credits.
+    budget.accepted_user_input();
+    for _ in 0..MAX_MONITORING_GENERATION_CREDITS {
+        assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+        budget.observe_progress(true);
+    }
+    assert_eq!(budget.regular_generations, 0);
+}
+
+#[test]
+fn only_mail_from_the_owner_renews_the_generation_budget() {
+    let mail = |author: &str, recipient: &str| {
+        TurnInput::InterAgentCommunication(codex_protocol::protocol::InterAgentCommunication::new(
+            codex_protocol::AgentPath::try_from(author).unwrap(),
+            codex_protocol::AgentPath::try_from(recipient).unwrap(),
+            Vec::new(),
+            "message".to_string(),
+            true,
+        ))
+    };
+    for (author, recipient, renews) in [
+        ("/root/worker", "/root", false),
+        ("/root/worker", "/root/reviewer", false),
+        ("/root/worker", "/root/worker2", false),
+        ("/root", "/root/worker", true),
+        ("/root/worker", "/root/worker/helper", true),
+    ] {
+        let input = mail(author, recipient);
+        assert!(
+            resets_turn_execution(&input),
+            "mail is still accepted context"
+        );
+        assert_eq!(
+            renews_generation_budget(&input),
+            renews,
+            "{author} -> {recipient}"
+        );
+    }
 }
 
 #[test]
@@ -2349,7 +2614,12 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
         crate::session::tests::make_session_and_context_with_rx().await;
 
     let history_before = session.clone_history().await;
-    record_forced_terminal_budget_boundary(session.as_ref(), turn_context.as_ref()).await;
+    record_forced_terminal_budget_boundary(
+        session.as_ref(),
+        turn_context.as_ref(),
+        ForcedTerminalReason::GenerationBudget,
+    )
+    .await;
 
     let history = session.clone_history().await;
     assert_eq!(history.raw_items(), history_before.raw_items());
@@ -2368,7 +2638,9 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        format!("This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.")
+        format!(
+            "This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
+        )
     );
 }
 
@@ -2415,9 +2687,12 @@ async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounti
         collector.record_response_result(
             call.ordinal,
             codex_tools::ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Success),
-            Some(crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
-                crate::tools::context::successful_command_evidence(id.as_bytes(), None)
-            ))),
+            Some(crate::tools::context::semantic_evidence_sampling_signal(
+                serde_json::json!(crate::tools::context::successful_command_evidence(
+                    id.as_bytes(),
+                    None
+                )),
+            )),
             &codex_protocol::models::ResponseInputItem::FunctionCallOutput {
                 call_id: id.clone(),
                 output: codex_protocol::models::FunctionCallOutputPayload::from_text(id),
@@ -2426,21 +2701,41 @@ async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounti
         );
         collector.record_child_runtime(100);
         control.observe_progress(
-            &baselines, &collector,
-            &SamplingRequestSettledState { mutation_revision: 0, attributed_mutation_revision: 0, tool_exposure_revision: 0 },
+            &baselines,
+            &collector,
+            &SamplingRequestSettledState {
+                mutation_revision: 0,
+                attributed_mutation_revision: 0,
+                tool_exposure_revision: 0,
+            },
         );
     }
     let before = session.clone_history().await;
-    record_soft_convergence_directive(&session, &turn_context, &mut control, false).await.unwrap();
-    assert_eq!(session.clone_history().await.raw_items(), before.raw_items());
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true).await.unwrap();
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true).await.unwrap();
+    record_soft_convergence_directive(&session, &turn_context, &mut control, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        before.raw_items()
+    );
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
+        .await
+        .unwrap();
     let after = session.clone_history().await;
     assert_eq!(after.raw_items().len(), before.raw_items().len() + 1);
-    assert!(matches!(after.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
+    assert!(
+        matches!(after.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
         if role == "developer" && content.iter().any(|item| matches!(item,
-            ContentItem::InputText { text } if text.contains("Execution-efficiency advisory:") && text.contains("expires when that task ends")))));
-    let counters = turn_context.turn_timing_state.complete_snapshot().protocol_timing().counters;
+            ContentItem::InputText { text } if text.contains("Execution-efficiency advisory:") && text.contains("expires when that task ends"))))
+    );
+    let counters = turn_context
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing()
+        .counters;
     assert_eq!(counters.logical_generation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 0);
     assert_eq!(counters.proven_loop_activation_count, 0);
@@ -2547,16 +2842,27 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
         proven_loop_activated: false,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, &mut control, Some(&mut repeated_advisory))
-        .await
-        .unwrap();
+    record_convergence_decision(
+        &session,
+        &turn_context,
+        &mut control,
+        Some(&mut repeated_advisory),
+    )
+    .await
+    .unwrap();
     assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
         matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
     }).count(), 1, "separate decisions must not accumulate identical advice");
     let mut next_turn = TurnExecutionControl::new();
     repeated_advisory.directive = Some("Try a different method.".to_string());
-    record_convergence_decision(&session, &turn_context, &mut next_turn, Some(&mut repeated_advisory))
-        .await.unwrap();
+    record_convergence_decision(
+        &session,
+        &turn_context,
+        &mut next_turn,
+        Some(&mut repeated_advisory),
+    )
+    .await
+    .unwrap();
     assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
         matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
     }).count(), 2, "a later turn must receive its own warning");
@@ -2629,6 +2935,7 @@ async fn regular_follow_up_admission_reports_exhaustion_once() {
     let exhausted = LogicalGenerationBudget {
         regular_generations: MAX_REGULAR_LOGICAL_GENERATIONS,
         terminal_generation_used: true,
+        ..LogicalGenerationBudget::default()
     };
     reported = false;
     assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
@@ -2638,7 +2945,9 @@ async fn regular_follow_up_admission_reports_exhaustion_once() {
     };
     assert_eq!(
         error.message,
-        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
+        format!(
+            "This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume."
+        )
     );
     assert!(error.affects_turn_status());
     assert_eq!(turn.terminal_error.lock().await.as_ref(), Some(&error));
@@ -2661,6 +2970,7 @@ fn logical_generation_budget_preview_preserves_capacity() {
         let budget = LogicalGenerationBudget {
             regular_generations,
             terminal_generation_used,
+            ..LogicalGenerationBudget::default()
         };
         assert_eq!(budget.can_admit(false), regular_allowed);
         assert_eq!(budget.can_admit(true), terminal_allowed);
@@ -2790,8 +3100,6 @@ async fn untyped_status_affecting_error_is_recorded_as_terminal() {
         Some(&error)
     );
 }
-
-
 
 #[tokio::test]
 async fn planning_failure_records_initial_input_and_emits_status_affecting_error() {
@@ -2927,25 +3235,292 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         assert!(history.raw_items().starts_with(&before));
         assert_eq!(history.raw_items().len(), before.len() + 1);
     }
-    record_sampling_notices(&session, &turn, true, true)
-        .await
-        .unwrap();
+    record_sampling_notices(
+        &session,
+        &turn,
+        true,
+        Some(ForcedTerminalReason::GenerationBudget),
+    )
+    .await
+    .unwrap();
     let notices = session.clone_history().await.raw_items().to_vec();
-    record_sampling_notices(&session, &turn, true, true)
-        .await
-        .unwrap();
+    record_sampling_notices(
+        &session,
+        &turn,
+        true,
+        Some(ForcedTerminalReason::GenerationBudget),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         session.clone_history().await.raw_items(),
         notices.as_slice()
     );
     let rendered = serde_json::to_string(&notices).unwrap();
-    assert_eq!(rendered.matches("<exhaustive_scope_feasibility>").count(), 1);
+    assert_eq!(
+        rendered.matches("<exhaustive_scope_feasibility>").count(),
+        1
+    );
     assert!(rendered.contains("do not narrow the scope without the user's approval"));
     assert!(rendered.contains("Continue reading through compactions"));
     assert!(rendered.contains("not reasons to stop while required work remains obtainable"));
     assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
     assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
     assert!(rendered.contains("Later user input may resume work"));
+}
+
+#[tokio::test]
+async fn exhaustive_scope_notice_prices_full_reads_and_bounds_spawned_agents() {
+    use codex_protocol::protocol::SubAgentSource;
+
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let limit = turn
+        .model_info
+        .auto_compact_token_limit()
+        .or_else(|| turn.model_context_window())
+        .expect("the test model has a context limit");
+    // Three quarters of the compaction limit is read content, at 4 bytes a token.
+    let megabytes = (limit * 3 / 4 * 4) as f64 / 1_000_000.0;
+    let root = exhaustive_scope_feasibility_notice(&turn);
+    assert!(root.starts_with("Before committing to an exhaustive review or full-read request"));
+    assert!(root.contains(&format!(
+        "each ~{megabytes:.1} MB read fills a context window"
+    )));
+    assert!(root.contains("set autoResolutionMs so an unanswered question proceeds"));
+    assert!(root.contains("Continue reading through compactions"));
+
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: codex_protocol::ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let child = exhaustive_scope_feasibility_notice(&turn);
+    assert!(child.contains(&format!(
+        "each ~{megabytes:.1} MB read fills a context window"
+    )));
+    assert!(child.contains(&format!(
+        "Your context budget is {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} compactions per turn"
+    )));
+    assert!(child.contains("unread files or byte ranges"));
+    assert!(
+        !child.contains("autoResolutionMs"),
+        "a spawned agent does not ask the user"
+    );
+    assert!(!child.contains("Continue reading through compactions"));
+}
+
+#[test]
+fn spawned_agent_context_budget_forces_one_final_synthesis() {
+    use codex_protocol::protocol::SubAgentSource;
+
+    let child = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: codex_protocol::ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let mut events = 0;
+    let mut budget = LogicalGenerationBudget::default();
+    assert!(!observe_context_pressure_event(
+        &child,
+        &mut events,
+        &mut budget
+    ));
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    assert!(observe_context_pressure_event(
+        &child,
+        &mut events,
+        &mut budget
+    ));
+    assert_eq!(
+        budget.admit(false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
+
+    // A root session keeps compacting; the budget is for spawned agents only.
+    let mut root_events = 0;
+    let mut root_budget = LogicalGenerationBudget::default();
+    for _ in 0..5 {
+        assert!(!observe_context_pressure_event(
+            &SessionSource::Cli,
+            &mut root_events,
+            &mut root_budget,
+        ));
+    }
+    assert_eq!(
+        root_budget.admit(false),
+        LogicalGenerationAdmission::Regular
+    );
+}
+
+#[test]
+fn usage_limit_waits_for_an_account_switch_and_retries_the_same_request() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "usage_limit_waits_for_an_account_switch_and_retries_the_same_request",
+        || async {
+            let server = responses::start_mock_server().await;
+            let usage_limit = ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "limit reached",
+                    "plan_type": "pro"
+                }
+            }));
+            let requests = responses::mount_response_sequence(
+                &server,
+                vec![
+                    usage_limit,
+                    responses::sse_response(responses::sse(vec![
+                        responses::ev_assistant_message("answer", "after the switch"),
+                        responses::ev_completed("done"),
+                    ])),
+                ],
+            )
+            .await;
+            let home = tempfile::tempdir()?;
+            let provider = non_openai_model_provider(&server);
+            let (mut session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    CodexAuth::from_api_key("test key"),
+                    Vec::new(),
+                    home.path(),
+                    move |config| {
+                        config.model_provider = provider;
+                        // The retry must not come from the stream retry budget.
+                        config.model_provider.stream_max_retries = Some(0);
+                        config.model_provider.request_max_retries = Some(0);
+                        config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            // The account an interactive turn waits on. Its stored credentials
+            // match the cached ones, as after a normal login.
+            let auth_home = tempfile::tempdir()?;
+            let login = |api_key: &str| {
+                codex_login::login_with_api_key(
+                    auth_home.path(),
+                    api_key,
+                    codex_login::AuthCredentialsStoreMode::File,
+                    codex_login::AuthKeyringBackendKind::default(),
+                )
+            };
+            login("first-account")?;
+            let auth_manager = AuthManager::from_auth_for_testing_with_home(
+                CodexAuth::from_api_key("first-account"),
+                auth_home.path().to_path_buf(),
+            );
+            {
+                let turn = Arc::get_mut(&mut turn).expect("test turn context is uniquely owned");
+                turn.provider = codex_model_provider::create_model_provider(
+                    turn.provider.info().clone(),
+                    Some(Arc::clone(&auth_manager)),
+                );
+                turn.auth_manager = Some(Arc::clone(&auth_manager));
+                turn.session_source = SessionSource::Cli;
+            }
+            {
+                // Waiting and dispatch must observe the same account owner;
+                // swapping only turn.provider leaves the HTTP client unchanged.
+                let session = Arc::get_mut(&mut session).expect("unique test session");
+                session.services.auth_manager = Arc::clone(&auth_manager);
+                session.services.model_client = crate::client::ModelClient::new(
+                    Some(Arc::clone(&auth_manager)),
+                    codex_login::auth::AgentIdentityAuthPolicy::JwtOnly,
+                    session.thread_id,
+                    turn.provider.info().clone(),
+                    SessionSource::Cli,
+                    "test_originator".to_string(),
+                    turn.config.model_verbosity,
+                    false,
+                    false,
+                    None,
+                    false,
+                    None,
+                    turn.config.http_client_factory(),
+                );
+            }
+            let mut budget = LogicalGenerationBudget::default();
+            // Joined futures move on the stack; keep the turn future on the heap.
+            let run = Box::pin(run_turn(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                Arc::new(ExtensionData::new(turn.sub_id.clone())),
+                vec![TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "continue the task".into(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+                None,
+                &mut budget,
+                CancellationToken::new(),
+            ));
+            let switch_account = async {
+                let warning = loop {
+                    if let EventMsg::Warning(warning) = events.recv().await?.msg
+                        && warning.message.contains("for an account switch")
+                    {
+                        break warning;
+                    }
+                };
+                login("second-account")?;
+                // `reload` reports a change of auth mode only; the switch still
+                // advances the auth revision the turn waits on.
+                auth_manager.reload().await;
+                assert_eq!(
+                    auth_manager
+                        .auth_cached()
+                        .and_then(|auth| auth.api_key().map(str::to_string)),
+                    Some("second-account".to_string())
+                );
+                anyhow::Ok(warning)
+            };
+            let (result, warning) = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(run, switch_account)
+            })
+            .await
+            .expect("the account switch must end the wait long before its bound");
+            let warning = warning?;
+            assert!(
+                warning.message.contains("usage limit"),
+                "{}",
+                warning.message
+            );
+            assert!(
+                warning
+                    .message
+                    .contains("interrupt the turn to stop waiting")
+            );
+            let result = result?;
+            assert_eq!(
+                result.last_agent_message.as_deref(),
+                Some("after the switch")
+            );
+            let sent = requests.requests();
+            assert_eq!(sent.len(), 2, "one rejected request and one retry");
+            assert_eq!(
+                sent[0].header("authorization").as_deref(),
+                Some("Bearer first-account"),
+                "the rejected request uses the original account"
+            );
+            assert_eq!(
+                sent[1].header("authorization").as_deref(),
+                Some("Bearer second-account"),
+                "the retry must use the switched account, not just wake on its notification"
+            );
+            assert_eq!(
+                sent[0].body_json()["input"],
+                sent[1].body_json()["input"],
+                "the switch retries the same request"
+            );
+            Ok(())
+        },
+    )
 }
 
 #[test]
@@ -2997,7 +3572,10 @@ fn blocked_authoritative_wait_never_enters_terminal_surface() {
             )),
             ..Default::default()
         };
-        assert_eq!(authoritative_wait_terminal_surface(&blocked, None, 10_000), None);
+        assert_eq!(
+            authoritative_wait_terminal_surface(&blocked, None, 10_000),
+            None
+        );
     }
 }
 
@@ -3378,6 +3956,9 @@ async fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
     );
     // Running/waiting status, gates, targets, and capacity are deliberately absent from the
     // snapshot signature, so those fine-grained transitions cannot change the schema identity.
+    // The graph argument is the latched "ever had a live agent" flag rather than the current
+    // graph, so a tree that empties keeps its surface and the cached tool prefix stays stable;
+    // see `ever_had_live_agents_latches_across_a_drained_graph`.
 
     let (session, mut turn) = crate::session::tests::make_session_and_context().await;
     turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
@@ -3454,11 +4035,20 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
     let skill = |name: &str, contents: String| codex_core_skills::injection::SkillInjection {
-        name: name.to_string(), path: format!("/skills/{name}/SKILL.md"), contents,
+        name: name.to_string(),
+        path: format!("/skills/{name}/SKILL.md"),
+        contents,
         scope: codex_protocol::protocol::SkillScope::User,
     };
     let items = build_bounded_skill_context_items(&[
-        skill("first", format!("{} DO NOT PUBLISH {}", "x".repeat(max_bytes / 2), "y".repeat(max_bytes / 2))),
+        skill(
+            "first",
+            format!(
+                "{} DO NOT PUBLISH {}",
+                "x".repeat(max_bytes / 2),
+                "y".repeat(max_bytes / 2)
+            ),
+        ),
         skill("second", "legacy-skill-budget-second".to_string()),
     ]);
     let texts = response_input_texts(&items);
@@ -3467,7 +4057,8 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("INCOMPLETE MODEL DELIVERY") && text.contains("/skills/first/SKILL.md"))
+            .any(|text| text.contains("INCOMPLETE MODEL DELIVERY")
+                && text.contains("/skills/first/SKILL.md"))
     );
     assert!(
         texts
@@ -3495,7 +4086,11 @@ fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
     let items = build_bounded_skill_context_items([&first, &second]);
 
     assert_eq!(items.len(), 2);
-    assert!(response_input_texts(&items).iter().any(|text| text.contains("INCOMPLETE MODEL DELIVERY")));
+    assert!(
+        response_input_texts(&items)
+            .iter()
+            .any(|text| text.contains("INCOMPLETE MODEL DELIVERY"))
+    );
     assert!(
         response_input_texts(&items)
             .iter()
@@ -3741,8 +4336,10 @@ fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()>
                 "request flag is consumed once, without a compaction generation"
             );
             assert!(sent[0].body_contains_text("old-conversation-sentinel"));
-            assert!(sent[1].body_contains_text("old-conversation-sentinel"),
-                "a fresh context window must preserve the unresolved original request");
+            assert!(
+                sent[1].body_contains_text("old-conversation-sentinel"),
+                "a fresh context window must preserve the unresolved original request"
+            );
             let context = |index: usize| {
                 [
                     sent[index].message_input_texts("user"),
@@ -3817,9 +4414,16 @@ fn token_budget_compaction_keeps_history_without_recovery_tools() -> Result<()> 
                 .submit_turn_and_capture_completion("budget-request-sentinel")
                 .await?;
             assert!(completion.error.is_none(), "{completion:?}");
-            assert_eq!(completion.last_agent_message.as_deref(), Some("History kept."));
+            assert_eq!(
+                completion.last_agent_message.as_deref(),
+                Some("History kept.")
+            );
             let sent = requests.requests();
-            assert_eq!(sent.len(), 3, "compaction must generate a replacement history");
+            assert_eq!(
+                sent.len(),
+                3,
+                "compaction must generate a replacement history"
+            );
             assert!(
                 sent[1].body_contains_text("budget-request-sentinel"),
                 "the summarizer must receive the current request"
@@ -3910,7 +4514,6 @@ fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
         },
     )
 }
-
 
 #[test]
 fn first_turn_dispatch_reports_disabled_startup_prewarm() -> Result<()> {
@@ -4131,9 +4734,10 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                     .into_iter()
                     .filter(|text| text.starts_with("<workspace_evidence_invalidation>\n"))
                     .flat_map(|text| {
-                        let batch = text.lines().find_map(|line| {
-                            serde_json::from_str::<serde_json::Value>(line).ok()
-                        }).expect("structured workspace freshness notice");
+                        let batch = text
+                            .lines()
+                            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .expect("structured workspace freshness notice");
                         crate::tool_history::expand_workspace_notices(batch)
                     })
                     .filter(|notice| notice["call_id"] == id)
@@ -4146,9 +4750,11 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                 stale_notices.iter().any(|notice| {
                     notice["workspace_evidence_freshness"] == "changed"
                         && notice["valid_for_current_workspace"] == false
-                        && notice["source_scope"]["dependencies"].as_array().is_some_and(|paths| {
-                            paths.iter().any(|path| path["freshness"] == "changed")
-                        })
+                        && notice["source_scope"]["dependencies"]
+                            .as_array()
+                            .is_some_and(|paths| {
+                                paths.iter().any(|path| path["freshness"] == "changed")
+                            })
                 }),
                 "a pass for the pre-mutation source must not prove the changed checkout"
             );
@@ -4157,16 +4763,37 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             // complete compiler/build-script/runtime dependency scope. A fresh
             // run must clear the known mutation without claiming full freshness.
             let current_notices = notices_for(5, "validation-current");
-            assert!(!current_notices.is_empty(), "incomplete Cargo scope must remain explicit");
+            assert!(
+                !current_notices.is_empty(),
+                "incomplete Cargo scope must remain explicit"
+            );
             for notice in current_notices {
-                assert_eq!(notice["reason_code"], "workspace_freshness_unverified", "{notice}");
-                assert_eq!(notice["workspace_evidence_freshness"], "unknown", "{notice}");
-                assert_eq!(notice["historical_authenticity"], "authenticated", "{notice}");
+                assert_eq!(
+                    notice["reason_code"], "workspace_freshness_unverified",
+                    "{notice}"
+                );
+                assert_eq!(
+                    notice["workspace_evidence_freshness"], "unknown",
+                    "{notice}"
+                );
+                assert_eq!(
+                    notice["historical_authenticity"], "authenticated",
+                    "{notice}"
+                );
                 assert_eq!(notice["valid_for_current_workspace"], false, "{notice}");
-                assert_eq!(notice["source_scope"]["source_scope_complete"], false, "{notice}");
+                assert_eq!(
+                    notice["source_scope"]["source_scope_complete"], false,
+                    "{notice}"
+                );
                 let paths = notice["source_scope"]["dependencies"].as_array().unwrap();
-                assert!(!paths.is_empty(), "recorded dependency observations must survive");
-                assert!(paths.iter().all(|path| path["freshness"] == "current"), "{notice}");
+                assert!(
+                    !paths.is_empty(),
+                    "recorded dependency observations must survive"
+                );
+                assert!(
+                    paths.iter().all(|path| path["freshness"] == "current"),
+                    "{notice}"
+                );
             }
             assert!(
                 fs::read_to_string(test.workspace_path("src/lib.rs"))?
@@ -4331,10 +4958,16 @@ else:
         .await
         .expect("steer input is accepted by the active regular task");
     fs::write(test.codex_home_path().join("reentry.release"), "release")?;
-    let completion = core_test_support::wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::TurnComplete(event) => Some(event.clone()),
-        _ => None,
-    })
+    // The renewed allowance runs another full set of generations, so this wait
+    // gets the same budget as the first phase.
+    let completion = core_test_support::wait_for_event_match_with_timeout(
+        &test.codex,
+        |event| match event {
+            EventMsg::TurnComplete(event) => Some(event.clone()),
+            _ => None,
+        },
+        Duration::from_secs(60),
+    )
     .await;
     assert_eq!(completion.last_agent_message.as_deref(), Some("terminal"));
     assert!(
@@ -4368,8 +5001,14 @@ else:
         );
         assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
     }
-    assert_eq!(sent[2 * limit - 1].body_json()["tools"], sent[2 * limit - 2].body_json()["tools"]);
-    assert_eq!(sent[2 * limit - 1].body_json()["parallel_tool_calls"], sent[2 * limit - 2].body_json()["parallel_tool_calls"]);
+    assert_eq!(
+        sent[2 * limit - 1].body_json()["tools"],
+        sent[2 * limit - 2].body_json()["tools"]
+    );
+    assert_eq!(
+        sent[2 * limit - 1].body_json()["parallel_tool_calls"],
+        sent[2 * limit - 2].body_json()["parallel_tool_calls"]
+    );
     assert!(sent[2 * limit].body_contains_text("Later user input may resume work"));
     Ok(())
 }
@@ -4435,11 +5074,14 @@ async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Resul
     test.codex.flush_rollout().await?;
     let rollout = fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
     assert!(
-        rollout.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|line| {
-            line["type"] == "response_item"
-                && line["payload"]["type"] == "function_call_output"
-                && line["payload"]["call_id"] == "continue-work"
-        }),
+        rollout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|line| {
+                line["type"] == "response_item"
+                    && line["payload"]["type"] == "function_call_output"
+                    && line["payload"]["call_id"] == "continue-work"
+            }),
         "compaction failure must preserve the completed tool result in history"
     );
     Ok(())
@@ -4740,6 +5382,9 @@ async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl
         None,
         CompactionReason::ContextLimit,
         CompactionPhase::MidTurn,
+        ConsumedOutputRetirement::Eligible {
+            projected_pressure: None,
+        },
         &CancellationToken::new(),
     )
     .await
@@ -4752,6 +5397,180 @@ async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl
     assert!(!error.is_retryable());
     assert_eq!(error.to_codex_protocol_error(), CodexErrorInfo::Other);
     assert_eq!(requests.requests().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn projected_pressure_retirement_declines_when_the_projected_prompt_still_overflows() -> Result<()>
+{
+    run_turn_multi_thread_test_with_stack(
+        "projected_pressure_retirement_declines_when_the_projected_prompt_still_overflows",
+        projected_pressure_retirement_declines_when_the_projected_prompt_still_overflows_impl,
+    )
+}
+
+/// Seeds consumed, pin-eligible tool results that context-pressure retirement
+/// can select, mirroring the fixture in `context_manager::history_tests`.
+async fn seed_retirable_consumed_outputs(session: &Session, count: u32) {
+    let mut state = session.state.lock().await;
+    let history = &mut state.history;
+    let evidence = |index: u32| format!("result-{index} {}", "evidence ".repeat(500));
+    for index in 0..count {
+        let call_id = format!("read-{index}");
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: call_id.clone(),
+            },
+        ));
+        assert!(history.apply_tool_history_mutation(
+            &crate::tool_history::ToolHistoryMutation::RegisterCandidate {
+                candidate: crate::tool_history::ToolHistoryCandidate {
+                    call_id: call_id.clone(),
+                    tool_identity: "functions.exec".to_string(),
+                    semantic_class: "tool_output".to_string(),
+                    successful: true,
+                    source_dependencies: std::collections::BTreeSet::new(),
+                    source_dependencies_current: true,
+                    artifact_id: format!("artifact-{call_id}"),
+                    artifact_bytes: 96_000,
+                    artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+                    original_output_sha256: crate::tool_history::sha256(
+                        evidence(index).as_bytes(),
+                    ),
+                    original_tokens: 24_000,
+                    preserved_non_text_tokens: Some(0),
+                    bounded_model_output: evidence(index),
+                    complete: true,
+                    projection_eligible: true,
+                    proof_identity: None,
+                    supersession_identity: None,
+                    consumed_by_generation: None,
+                    derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+                },
+            },
+        ));
+        history.record_items(
+            [
+                &ResponseItem::FunctionCall {
+                    id: None,
+                    name: "functions.exec".to_string(),
+                    namespace: None,
+                    arguments: "{}".to_string(),
+                    call_id: call_id.clone(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                &ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: call_id.clone(),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                        evidence(index),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            TruncationPolicy::Tokens(10_000),
+        );
+        // One generation reads each result, as in a turn of single reads.
+        let sent = history.clone().prepare_for_prompt(&[]);
+        history.mark_tool_history_consumed_with_delta(
+            sent.items(),
+            crate::tool_history::ModelGenerationId {
+                turn_id: "turn".to_string(),
+                ordinal: index,
+            },
+        );
+    }
+}
+
+/// The pre-turn trigger fires on the next prompt's projection, which includes
+/// pending input that live usage does not yet contain. Retirement must judge
+/// itself against that same projection: judged on live usage alone it would
+/// report that an overflowing prompt fits, and the planning loop treats a
+/// second overflow as a hard failure rather than retrying.
+async fn projected_pressure_retirement_declines_when_the_projected_prompt_still_overflows_impl()
+-> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (session, turn_context, _) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| {
+                config.model_auto_compact_token_limit = Some(100_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+            },
+        )
+        .await;
+    seed_retirable_consumed_outputs(&session, 8).await;
+
+    // Live usage sits under the limit, so retiring these results would clear it
+    // and report that no summary is needed.
+    let live_tokens = session.get_total_token_usage().await;
+    assert!(
+        live_tokens < 100_000,
+        "fixture must leave live usage under the limit, got {live_tokens}"
+    );
+
+    // The projected prompt is far beyond anything retirement can recover, so it
+    // must decline and leave the summary to run. Judged on live usage this same
+    // call would retire and return true.
+    let projected = ProjectedPromptPressure {
+        total_tokens: 10_000_000,
+        auto_compact_scope_tokens: 10_000_000,
+    };
+    assert!(
+        !retire_consumed_tool_outputs_for_context_pressure(
+            &session,
+            &turn_context,
+            CONTEXT_PRESSURE_KEPT_GENERATIONS,
+            Some(projected),
+        )
+        .await,
+        "retirement must not claim an overflowing projected prompt fits"
+    );
+    assert!(
+        !crate::tool_history::ToolHistoryState::has_phase_checkpoint(
+            session.state.lock().await.history.raw_items()
+        ),
+        "a declined retirement must not retire any evidence"
+    );
+
+    // The same pressure within reach is retired rather than summarized. Each
+    // retirement saves only the inline output net of its pin, so overflow the
+    // limit by half of what the seeded evidence can actually recover.
+    let limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .expect("fixture configures an automatic-compaction limit");
+    let (_, retirable) = session
+        .state
+        .lock()
+        .await
+        .history
+        .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, u64::MAX);
+    let retirable = i64::try_from(retirable)?;
+    assert!(retirable > 0, "fixture must seed retirable evidence");
+    let reachable = ProjectedPromptPressure {
+        total_tokens: limit + retirable / 2,
+        auto_compact_scope_tokens: limit + retirable / 2,
+    };
+    assert!(
+        retire_consumed_tool_outputs_for_context_pressure(
+            &session,
+            &turn_context,
+            CONTEXT_PRESSURE_KEPT_GENERATIONS,
+            Some(reachable),
+        )
+        .await,
+        "retirement must clear a projected prompt its pins can bring under the limit"
+    );
+    assert!(
+        crate::tool_history::ToolHistoryState::has_phase_checkpoint(
+            session.state.lock().await.history.raw_items()
+        ),
+        "the accepted retirement records a checkpoint"
+    );
     Ok(())
 }
 
@@ -5545,10 +6364,14 @@ async fn drain_in_flight_persists_each_ordered_output_before_later_tools_finish(
         .expect("the drain task should join")
         .expect("both tool outputs should be delivered");
     let history = session.clone_history().await;
-    let outputs = history.raw_items().iter().filter_map(|item| match item {
-        ResponseItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
-        _ => None,
-    }).collect::<Vec<_>>();
+    let outputs = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(outputs, vec!["first", "second"]);
 }
 
@@ -6789,59 +7612,125 @@ fn pending_token_estimate_includes_model_visible_tool_schemas() {
 #[test]
 fn pending_token_estimate_only_forecasts_real_user_boundaries() {
     let router = ToolRouter::from_parts(
-        ToolRegistry::from_tools(std::iter::empty::<Arc<dyn crate::tools::registry::CoreToolRuntime>>()),
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
         Vec::new(),
     );
     let user = ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
-        text: "continue".to_string(), text_elements: Vec::new(),
+        text: "continue".to_string(),
+        text_elements: Vec::new(),
     }]));
     let communication = InterAgentCommunication::new(
-        AgentPath::root(), AgentPath::root().join("worker").unwrap(), Vec::new(),
-        "continue".to_string(), true,
+        AgentPath::root(),
+        AgentPath::root().join("worker").unwrap(),
+        Vec::new(),
+        "continue".to_string(),
+        true,
     );
     for (input, expected) in [
-        (TurnInput::UserInput { content: vec![UserInput::Text {
-            text: "continue".to_string(), text_elements: Vec::new(),
-        }], client_id: None }, true),
-        (TurnInput::UserInput { content: Vec::new(), client_id: None }, false),
+        (
+            TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+            true,
+        ),
+        (
+            TurnInput::UserInput {
+                content: Vec::new(),
+                client_id: None,
+            },
+            false,
+        ),
         (TurnInput::ResponseItem(user.clone()), true),
         (TurnInput::InternalResponseItem(user), false),
-        (TurnInput::ResponseItem(communication.to_model_input_item()), false),
+        (
+            TurnInput::ResponseItem(communication.to_model_input_item()),
+            false,
+        ),
         (TurnInput::InterAgentCommunication(communication), false),
     ] {
-        assert_eq!(estimate_pending_tokens(&[input], &[], &[], &router, false).has_real_user_boundary, expected);
+        assert_eq!(
+            estimate_pending_tokens(&[input], &[], &[], &router, false).has_real_user_boundary,
+            expected
+        );
     }
     let contextual = ContextualUserFragment::into(crate::context::UserInstructions {
-        directory: None, text: "startup context".to_string(),
+        directory: None,
+        text: "startup context".to_string(),
     });
-    assert!(!estimate_pending_tokens(&[TurnInput::ResponseItem(contextual)], &[], &[], &router, false).has_real_user_boundary);
+    assert!(
+        !estimate_pending_tokens(
+            &[TurnInput::ResponseItem(contextual)],
+            &[],
+            &[],
+            &router,
+            false
+        )
+        .has_real_user_boundary
+    );
 }
 
 #[tokio::test]
 async fn accountingless_completion_preserves_sampling_reasoning_pressure() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let user = |text: &str| ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
-        text: text.to_string(), text_elements: Vec::new(),
-    }]));
+    let user = |text: &str| {
+        ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
+    };
     let items = vec![
         user("task"),
         ResponseItem::Reasoning {
-            id: None, summary: Vec::new(), content: None,
+            id: None,
+            summary: Vec::new(),
+            content: None,
             encrypted_content: Some("a".repeat(4_000)),
             internal_chat_message_metadata_passthrough: None,
         },
         user("continue"),
     ];
-    session.record_conversation_items(&turn, &items).await.unwrap();
+    session
+        .record_conversation_items(&turn, &items)
+        .await
+        .unwrap();
     session.record_token_usage_info(&turn, None).await.unwrap();
-    let expected = items.iter().map(crate::context_manager::estimate_item_token_count)
-        .fold(codex_utils_output_truncation::approx_token_count(&turn.base_instructions.text) as i64, i64::saturating_add);
-    assert_eq!(session.get_estimated_token_count(&turn).await, Some(expected));
-    assert_eq!(session.token_usage_info().await.unwrap().last_token_usage.total_tokens, expected);
+    let expected = items
+        .iter()
+        .map(crate::context_manager::estimate_item_token_count)
+        .fold(
+            codex_utils_output_truncation::approx_token_count(&turn.base_instructions.text) as i64,
+            i64::saturating_add,
+        );
+    assert_eq!(
+        session.get_estimated_token_count(&turn).await,
+        Some(expected)
+    );
+    assert_eq!(
+        session
+            .token_usage_info()
+            .await
+            .unwrap()
+            .last_token_usage
+            .total_tokens,
+        expected
+    );
     let pending = PendingTokenEstimate {
-        total_tokens: 20, body_growth_tokens: 10, has_real_user_boundary: false,
+        total_tokens: 20,
+        body_growth_tokens: 10,
+        has_real_user_boundary: false,
     };
-    assert_eq!(projected_prompt_pressure(&session, &turn, pending).await.total_tokens, expected + 20);
+    assert_eq!(
+        projected_prompt_pressure(&session, &turn, pending)
+            .await
+            .total_tokens,
+        expected + 20
+    );
 }
 
 #[test]
@@ -6990,7 +7879,10 @@ async fn registered_exec_normalizes_yield_and_runs_the_command_impl() -> Result<
     let output = requests[1]
         .function_call_output_text("invalid-yield")
         .expect("model receives command completion and normalization notice");
-    assert!(output.contains("Adjusted `yield_time_ms` to 300000"), "{output}");
+    assert!(
+        output.contains("Adjusted `yield_time_ms` to 300000"),
+        "{output}"
+    );
     assert_eq!(std::fs::read_to_string(marker)?.trim(), "ran");
     Ok(())
 }
@@ -7758,7 +8650,8 @@ fn terminal_surface_preserves_typed_owner_result_without_json_message_synthesis(
         ..Default::default()
     };
 
-    let surfaced = authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
+    let surfaced =
+        authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
     assert_eq!(surfaced.adapter, "owner_adapter");
     assert_eq!(surfaced.value, value);
     assert_eq!(surfaced.canonical_message, None);
@@ -7779,7 +8672,8 @@ fn terminal_surface_preserves_owner_canonical_message_exactly() {
         ..Default::default()
     };
 
-    let surfaced = authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
+    let surfaced =
+        authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
     assert_eq!(surfaced.canonical_message.as_deref(), Some(canonical));
     let schema = serde_json::json!({
         "type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]
@@ -7823,8 +8717,12 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
     assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
     // A pessimistic recent sample stays in force until four new samples replace it.
     for (local, measured, numerator, denominator) in [
-        (200, 100, 1, 2), (50, 100, 2, 1), (200, 100, 2, 1),
-        (200, 100, 2, 1), (200, 100, 2, 1), (200, 100, 1, 2),
+        (200, 100, 1, 2),
+        (50, 100, 2, 1),
+        (200, 100, 2, 1),
+        (200, 100, 2, 1),
+        (200, 100, 2, 1),
+        (200, 100, 1, 2),
     ] {
         turn.turn_timing_state = Arc::new(crate::turn_timing::TurnTimingState::default());
         let timing = &turn.turn_timing_state;
@@ -7832,36 +8730,68 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
         drop(timing.begin_model_request_wait());
         timing.record_model_attempt_identity("measurement", "physical");
         timing.record_model_request_payload(
-            "measurement", "physical",
-            serde_json::json!({"model": turn.model_info.slug}).to_string().as_bytes(),
+            "measurement",
+            "physical",
+            serde_json::json!({"model": turn.model_info.slug})
+                .to_string()
+                .as_bytes(),
         );
         timing.record_model_request_sections(
-            "measurement", "physical",
-            serde_json::json!({"model": turn.model_info.slug}).to_string().as_bytes(),
+            "measurement",
+            "physical",
+            serde_json::json!({"model": turn.model_info.slug})
+                .to_string()
+                .as_bytes(),
         );
         timing.record_model_request_token_categories(
-            "measurement", "physical",
+            "measurement",
+            "physical",
             codex_protocol::protocol::TurnTimingRequestTokenCategories {
                 local_input_estimate: local,
                 ..Default::default()
             },
         );
-        let usage = TokenUsage { input_tokens: measured, total_tokens: measured, ..Default::default() };
+        let usage = TokenUsage {
+            input_tokens: measured,
+            total_tokens: measured,
+            ..Default::default()
+        };
         timing.record_generation_token_usage(Some(&usage));
-        assert_eq!(timing.prompt_token_calibration_sample(&turn.model_info.slug, &usage), None);
+        assert_eq!(
+            timing.prompt_token_calibration_sample(&turn.model_info.slug, &usage),
+            None
+        );
         timing.record_response_event_milestones(&ResponseEvent::Completed {
-            response_id: "response".to_string(), token_usage: Some(usage.clone()), end_turn: Some(true),
+            response_id: "response".to_string(),
+            token_usage: Some(usage.clone()),
+            end_turn: Some(true),
         });
-        assert_eq!(timing.prompt_token_calibration_sample("different-model", &usage), None);
-        session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
-        assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, (301 * numerator + denominator - 1) / denominator);
-        let local_prompt = session.get_estimated_token_count(&turn).await.unwrap()
-            + pending.total_tokens;
+        assert_eq!(
+            timing.prompt_token_calibration_sample("different-model", &usage),
+            None
+        );
+        session
+            .record_token_usage_info(&turn, Some(&usage))
+            .await
+            .unwrap();
+        assert_eq!(
+            session.calibrated_prompt_tokens(&turn, 301).await,
+            (301 * numerator + denominator - 1) / denominator
+        );
+        let local_prompt =
+            session.get_estimated_token_count(&turn).await.unwrap() + pending.total_tokens;
         let floor = session.get_total_token_usage().await + pending.body_growth_tokens;
         let expected = ((local_prompt * numerator + denominator - 1) / denominator).max(floor);
-        assert_eq!(projected_prompt_pressure(&session, &turn, pending).await.total_tokens, expected);
+        assert_eq!(
+            projected_prompt_pressure(&session, &turn, pending)
+                .await
+                .total_tokens,
+            expected
+        );
     }
-    let mut next = session.new_default_turn_with_sub_id("calibrated-next-turn".to_string()).await;
+    let mut next = session
+        .new_default_turn_with_sub_id("calibrated-next-turn".to_string())
+        .await;
     assert_eq!(session.calibrated_prompt_tokens(&next, 301).await, 151);
     let next = Arc::get_mut(&mut next).expect("unique next-turn fixture");
     next.model_info.slug = "different-model".to_string();
@@ -7874,10 +8804,22 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
     // is invented and subsequent planning falls back to the local estimator.
     session.record_token_usage_info(&turn, None).await.unwrap();
     assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
-    let usage = TokenUsage { input_tokens: 100, total_tokens: 100, ..Default::default() };
-    turn.turn_timing_state.record_model_attempt_identity("measurement", "retry");
-    assert_eq!(turn.turn_timing_state.prompt_token_calibration_sample(&turn.model_info.slug, &usage), None);
-    session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
+    let usage = TokenUsage {
+        input_tokens: 100,
+        total_tokens: 100,
+        ..Default::default()
+    };
+    turn.turn_timing_state
+        .record_model_attempt_identity("measurement", "retry");
+    assert_eq!(
+        turn.turn_timing_state
+            .prompt_token_calibration_sample(&turn.model_info.slug, &usage),
+        None
+    );
+    session
+        .record_token_usage_info(&turn, Some(&usage))
+        .await
+        .unwrap();
     assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
 }
 
@@ -8720,16 +9662,40 @@ fn completion_boundary_hook_repairs_compare_the_rejected_answer() -> Result<()> 
         core_test_support::require_network!();
         for unrelated_read in [false, true] {
             let server = responses::start_mock_server().await;
-            let answer = |id: &str, text: &str| responses::sse(vec![
-                responses::ev_assistant_message(id, text), responses::ev_completed(id),
-            ]);
+            let answer = |id: &str, text: &str| {
+                responses::sse(vec![
+                    responses::ev_assistant_message(id, text),
+                    responses::ev_completed(id),
+                ])
+            };
             let middle = if unrelated_read {
-                responses::sse(vec![responses::ev_function_call("unrelated", "read_file", r#"{"path":"unrelated.txt"}"#), responses::ev_completed("read")])
-            } else { answer("changed", "changed draft") };
-            let requests = responses::mount_sse_sequence(&server, vec![
-                answer("first", "draft"), middle,
-                answer("repeat", if unrelated_read { "draft" } else { "changed draft" }),
-            ]).await;
+                responses::sse(vec![
+                    responses::ev_function_call(
+                        "unrelated",
+                        "read_file",
+                        r#"{"path":"unrelated.txt"}"#,
+                    ),
+                    responses::ev_completed("read"),
+                ])
+            } else {
+                answer("changed", "changed draft")
+            };
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    answer("first", "draft"),
+                    middle,
+                    answer(
+                        "repeat",
+                        if unrelated_read {
+                            "draft"
+                        } else {
+                            "changed draft"
+                        },
+                    ),
+                ],
+            )
+            .await;
             let test = test_codex().with_pre_build_hook(|home| {
                 let script = home.join("block_completion.py");
                 fs::write(&script, "import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'decision':'block','reason':'same required repair'}))\n").unwrap();
@@ -8739,9 +9705,15 @@ fn completion_boundary_hook_repairs_compare_the_rejected_answer() -> Result<()> 
                 }]}]}}).to_string()).unwrap();
             }).with_config(trust_discovered_hooks).build(&server).await?;
             fs::write(test.workspace_path("unrelated.txt"), "unrelated evidence")?;
-            let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+            let completion = test
+                .submit_turn_and_capture_completion("Finish the answer")
+                .await?;
             assert!(completion.error.is_some(), "{completion:?}");
-            assert_eq!(requests.requests().len(), 3, "unrelated_read={unrelated_read}");
+            assert_eq!(
+                requests.requests().len(),
+                3,
+                "unrelated_read={unrelated_read}"
+            );
         }
         Ok(())
     })
@@ -8753,46 +9725,90 @@ fn completion_boundary_rejected_direct_answers_are_never_published() -> Result<(
         core_test_support::require_network!();
         for mode in ["repair-model", "repair-direct", "abort"] {
             let server = responses::start_mock_server().await;
-            let direct = |id: &str, text: &str| responses::sse(vec![
-                responses::ev_custom_tool_call(id, "exec", &format!("// @exec: {{\"deliver\":true}}\ntext('{text}');")),
-                responses::ev_completed(id),
-            ]);
+            let direct = |id: &str, text: &str| {
+                responses::sse(vec![
+                    responses::ev_custom_tool_call(
+                        id,
+                        "exec",
+                        &format!("// @exec: {{\"deliver\":true}}\ntext('{text}');"),
+                    ),
+                    responses::ev_completed(id),
+                ])
+            };
             let mut sequence = vec![direct("candidate-a", "rejected A")];
-            if mode == "repair-direct" { sequence.push(direct("candidate-b", "accepted B")); }
-            if mode == "repair-model" { sequence.push(responses::sse(vec![
-                responses::ev_assistant_message("candidate-b", "accepted B"), responses::ev_completed("accepted"),
-            ])); }
+            if mode == "repair-direct" {
+                sequence.push(direct("candidate-b", "accepted B"));
+            }
+            if mode == "repair-model" {
+                sequence.push(responses::sse(vec![
+                    responses::ev_assistant_message("candidate-b", "accepted B"),
+                    responses::ev_completed("accepted"),
+                ]));
+            }
             let requests = responses::mount_sse_sequence(&server, sequence).await;
-            let test = test_codex().with_pre_build_hook(move |home| {
-                if mode != "abort" { write_one_shot_stop_hook(home).unwrap(); }
-            }).with_config(move |config| {
-                if mode != "abort" { trust_discovered_hooks(config); }
-                config.features.enable(Feature::CodeMode).unwrap();
-                config.features.enable(Feature::Kd4Runtime).unwrap();
-                if mode == "abort" {
-                    config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
-                    config.notify = Some(vec![if cfg!(windows) { "python" } else { "python3" }.into(),
-                        "-c".into(), "import sys; sys.exit(1)".into()]);
-                }
-            }).build(&server).await?;
-            let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+            let test = test_codex()
+                .with_pre_build_hook(move |home| {
+                    if mode != "abort" {
+                        write_one_shot_stop_hook(home).unwrap();
+                    }
+                })
+                .with_config(move |config| {
+                    if mode != "abort" {
+                        trust_discovered_hooks(config);
+                    }
+                    config.features.enable(Feature::CodeMode).unwrap();
+                    config.features.enable(Feature::Kd4Runtime).unwrap();
+                    if mode == "abort" {
+                        config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
+                        config.notify = Some(vec![
+                            if cfg!(windows) { "python" } else { "python3" }.into(),
+                            "-c".into(),
+                            "import sys; sys.exit(1)".into(),
+                        ]);
+                    }
+                })
+                .build(&server)
+                .await?;
+            let completion = test
+                .submit_turn_and_capture_completion("Finish the answer")
+                .await?;
             assert_eq!(completion.error.is_some(), mode == "abort");
-            assert_eq!(completion.surfaced_result.is_some(), mode == "repair-direct");
-            if mode != "abort" { assert_eq!(completion.last_agent_message.as_deref(), Some("accepted B")); }
+            assert_eq!(
+                completion.surfaced_result.is_some(),
+                mode == "repair-direct"
+            );
+            if mode != "abort" {
+                assert_eq!(completion.last_agent_message.as_deref(), Some("accepted B"));
+            }
             test.codex.flush_rollout().await?;
             let (items, _, errors) = crate::rollout::recorder::RolloutRecorder::load_rollout_items(
                 &test.codex.rollout_path().unwrap(),
-            ).await?;
+            )
+            .await?;
             assert_eq!(errors, 0);
-            let answers = items.iter().filter_map(|item| match item {
-                codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                    if role == "assistant" => Some(content),
-                _ => None,
-            }).collect::<Vec<_>>();
-            if mode == "abort" { assert!(answers.is_empty()); } else {
-                assert_eq!(answers, vec![&vec![ContentItem::OutputText { text:"accepted B".into() }]]);
+            let answers = items
+                .iter()
+                .filter_map(|item| match item {
+                    codex_protocol::protocol::RolloutItem::ResponseItem(
+                        ResponseItem::Message { role, content, .. },
+                    ) if role == "assistant" => Some(content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if mode == "abort" {
+                assert!(answers.is_empty());
+            } else {
+                assert_eq!(
+                    answers,
+                    vec![&vec![ContentItem::OutputText {
+                        text: "accepted B".into()
+                    }]]
+                );
             }
-            assert_eq!(requests.requests().len(), if mode == "abort" { 1 } else { 2 });
+            assert_eq!(
+                requests.requests().len(),
+                if mode == "abort" { 1 } else { 2 }
+            );
         }
         Ok(())
     })
@@ -8803,12 +9819,18 @@ fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<
     run_turn_multi_thread_test_with_stack("audit_stop_hook_alternating_feedback", || async {
         core_test_support::require_network!();
         let server = responses::start_mock_server().await;
-        let requests = responses::mount_sse_sequence(&server, (0..3).map(|index| {
-            responses::sse(vec![
-                responses::ev_assistant_message(&format!("draft-{index}"), "draft answer"),
-                responses::ev_completed(&format!("response-{index}")),
-            ])
-        }).collect()).await;
+        let requests = responses::mount_sse_sequence(
+            &server,
+            (0..3)
+                .map(|index| {
+                    responses::sse(vec![
+                        responses::ev_assistant_message(&format!("draft-{index}"), "draft answer"),
+                        responses::ev_completed(&format!("response-{index}")),
+                    ])
+                })
+                .collect(),
+        )
+        .await;
         let test = test_codex().with_pre_build_hook(|home| {
             let script = home.join("alternate_block.py");
             fs::write(&script, "import json,sys,pathlib\njson.load(sys.stdin)\np=pathlib.Path(__file__).with_suffix('.count')\nn=int(p.read_text()) if p.exists() else 0\np.write_text(str(n+1))\nprint(json.dumps({'decision':'block','reason':['required A','required B'][n%2]}))\n").unwrap();
@@ -8817,7 +9839,9 @@ fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<
                 "commandWindows":format!("python \"{}\"", script.display())
             }]}]}}).to_string()).unwrap();
         }).with_config(trust_discovered_hooks).build(&server).await?;
-        let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Finish the answer")
+            .await?;
         assert!(completion.error.is_some(), "{completion:?}");
         assert_eq!(requests.requests().len(), 3);
         Ok(())
@@ -8833,13 +9857,33 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
         let command = serde_json::json!({
             "program": python, "args": ["-B", "-m", "unittest", "test_fixture"],
             "yield_time_ms": 300000,
-        }).to_string();
-        let requests = responses::mount_sse_sequence(&server, vec![
-            responses::sse(vec![responses::ev_function_call("validate", "exec_command", &command), responses::ev_completed("validated")]),
-            responses::sse(vec![responses::ev_assistant_message("answer", "The check passed."), responses::ev_completed("done")]),
-            responses::sse(vec![responses::ev_function_call("revalidate", "exec_command", &command), responses::ev_completed("revalidated")]),
-            responses::sse(vec![responses::ev_assistant_message("limitation", "The final-state validation failed; the final workspace is not verified."), responses::ev_completed("final")]),
-        ]).await;
+        })
+        .to_string();
+        let requests = responses::mount_sse_sequence(
+            &server,
+            vec![
+                responses::sse(vec![
+                    responses::ev_function_call("validate", "exec_command", &command),
+                    responses::ev_completed("validated"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message("answer", "The check passed."),
+                    responses::ev_completed("done"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_function_call("revalidate", "exec_command", &command),
+                    responses::ev_completed("revalidated"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message(
+                        "limitation",
+                        "The final-state validation failed; the final workspace is not verified.",
+                    ),
+                    responses::ev_completed("final"),
+                ]),
+            ],
+        )
+        .await;
         let test = test_codex().with_config(move |config| {
             config.features.enable(Feature::Kd4Runtime).unwrap();
             config.features.enable(Feature::UnifiedExec).unwrap();
@@ -8851,21 +9895,30 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
             ]);
         }).build(&server).await?;
         fs::write(test.workspace_path("source.txt"), "original")?;
-        fs::write(test.workspace_path("test_fixture.py"), "import pathlib,unittest\nclass Check(unittest.TestCase):\n def test_source(self):\n  self.assertEqual(pathlib.Path('source.txt').read_text(), 'original')\n")?;
+        fs::write(
+            test.workspace_path("test_fixture.py"),
+            "import pathlib,unittest\nclass Check(unittest.TestCase):\n def test_source(self):\n  self.assertEqual(pathlib.Path('source.txt').read_text(), 'original')\n",
+        )?;
         // Uncertain commands require a repository baseline to prove that
         // validation did not mutate the finalizer's workspace.
         let initialized = tokio::process::Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(test.workspace_path("."))
-            .status().await?;
+            .status()
+            .await?;
         assert!(initialized.success());
-        test.codex.submit(Op::UserInput {
-            items: vec![UserInput::Text { text: "Run the check and finish.".into(), text_elements: Vec::new() }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        }).await?;
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "Run the check and finish.".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
         let mut boundary_reported = false;
         let mut observed_events = Vec::new();
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -8893,12 +9946,28 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
             }
         }).await.unwrap_or_else(|error| panic!("validation and finalizer complete: {error}; requests={}; events={observed_events:?}", requests.requests().len()));
         assert!(boundary_reported);
-        assert_eq!(fs::read_to_string(test.workspace_path("source.txt"))?, "changed");
-        assert_eq!(fs::read_to_string(test.workspace_path("source.count"))?, "1");
+        assert_eq!(
+            fs::read_to_string(test.workspace_path("source.txt"))?,
+            "changed"
+        );
+        assert_eq!(
+            fs::read_to_string(test.workspace_path("source.count"))?,
+            "1"
+        );
         let sent = requests.requests();
         assert_eq!(sent.len(), 4);
-        assert!(sent[1].function_call_output_text("validate").unwrap().contains("OK"));
-        assert!(sent[3].function_call_output_text("revalidate").unwrap().contains("FAILED"));
+        assert!(
+            sent[1]
+                .function_call_output_text("validate")
+                .unwrap()
+                .contains("OK")
+        );
+        assert!(
+            sent[3]
+                .function_call_output_text("revalidate")
+                .unwrap()
+                .contains("FAILED")
+        );
         Ok(())
     })
 }
@@ -9090,4 +10159,3 @@ mod completion_latency;
 
 #[path = "request_latency_tests.rs"]
 mod request_latency;
-

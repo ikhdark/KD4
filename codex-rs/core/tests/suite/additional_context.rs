@@ -166,15 +166,10 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
     .await;
 
     let request = request.single_request();
-    assert_eq!(
-        request.message_input_texts("user"),
-        vec!["<external_api>"]
-    );
+    assert_eq!(request.message_input_texts("user"), vec!["<external_api>"]);
 
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_deduplicated_between_turns_while_retained() -> Result<()> {
@@ -577,7 +572,10 @@ async fn production_capture_matches_effective_settings() -> Result<()> {
             .arg("suite::additional_context::production_capture_matches_effective_settings")
             .arg("--nocapture")
             .env(TRACE_CHILD, "1")
-            .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
+            .env(
+                codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV,
+                trace_root.path(),
+            )
             .kill_on_drop(true)
             .output()
             .await?;
@@ -788,13 +786,17 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
             .expect("model input array")
             .iter()
             .flat_map(|item| {
-                item["content"].as_array().into_iter().flatten().filter_map(move |content| {
-                    let role = item["role"].as_str()?;
-                    let text = content["text"].as_str()?;
-                    (text.starts_with("<application_context source=")
-                        || text.starts_with("<external_context source="))
-                    .then(|| (role.to_string(), text.to_string()))
-                })
+                item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |content| {
+                        let role = item["role"].as_str()?;
+                        let text = content["text"].as_str()?;
+                        (text.starts_with("<application_context source=")
+                            || text.starts_with("<external_context source="))
+                        .then(|| (role.to_string(), text.to_string()))
+                    })
             })
             .collect()
     }
@@ -819,13 +821,16 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
     assert!(current[0].1.len() < 1_024);
     assert!(current.len() <= 256);
     assert!(current.iter().map(|(_, text)| text.len()).sum::<usize>() <= 160_000);
-    let serialized_fragments = current.iter().map(|(role, text)| {
-        serde_json::json!({
-            "type": "message",
-            "role": role,
-            "content": [{"type": "input_text", "text": text}],
+    let serialized_fragments = current
+        .iter()
+        .map(|(role, text)| {
+            serde_json::json!({
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": text}],
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     assert!(
         serde_json::to_vec(&serialized_fragments)?.len() <= 160_000,
         "the admission budget includes JSON escaping and message envelopes, not only text bytes"

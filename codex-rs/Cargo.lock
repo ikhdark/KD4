@@ -3077,6 +3077,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-output-truncation",
  "codex-utils-pty",
+ "codex-utils-string",
  "futures",
  "pretty_assertions",
  "regex",

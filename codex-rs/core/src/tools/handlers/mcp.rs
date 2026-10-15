@@ -272,8 +272,10 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 .tool
                 .annotations
                 .as_ref()
-                .is_some_and(|annotations| annotations.read_only_hint == Some(true)
-                    && annotations.destructive_hint != Some(true))
+                .is_some_and(|annotations| {
+                    annotations.read_only_hint == Some(true)
+                        && annotations.destructive_hint != Some(true)
+                })
     }
 
     fn search_info_for_registered_spec(
@@ -301,29 +303,37 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
         let search_text = build_mcp_search_text(&self.tool_info, registered_spec);
         // Registration may override the callable contract; only share an unchanged definition.
         let unchanged = match (registered_spec, self.spec.as_ref()) {
-            (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) => left == right,
-            (ToolSpec::Function(left), codex_tools::LoadableToolSpec::Function(right)) => left == right,
+            (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) => {
+                left == right
+            }
+            (ToolSpec::Function(left), codex_tools::LoadableToolSpec::Function(right)) => {
+                left == right
+            }
             _ => false,
         };
         let mut info = if unchanged {
-            ToolSearchInfo::from_shared_spec(
-                search_text,
-                Arc::clone(&self.spec),
-                source_info,
-            )
+            ToolSearchInfo::from_shared_spec(search_text, Arc::clone(&self.spec), source_info)
         } else {
             ToolSearchInfo::from_spec(search_text, registered_spec, source_info)?
         };
         // Titles describe this operation. They must survive the retrieval /
         // activation boundary without becoming duplicated model-visible prose.
-        let unchanged_callable = unchanged || match (registered_spec, self.spec.as_ref()) {
-            (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) =>
-                left.name == right.name && left.tools == right.tools,
-            _ => false,
-        };
+        let unchanged_callable = unchanged
+            || match (registered_spec, self.spec.as_ref()) {
+                (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) => {
+                    left.name == right.name && left.tools == right.tools
+                }
+                _ => false,
+            };
         if unchanged_callable {
-            info.entry.callable_title = self.tool_info.tool.title.as_deref()
-                .map(str::trim).filter(|title| !title.is_empty()).map(str::to_owned);
+            info.entry.callable_title = self
+                .tool_info
+                .tool
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_owned);
         }
         Some(info)
     }
@@ -486,7 +496,9 @@ impl CoreToolRuntime for McpHandler {
     }
 }
 
-fn create_tool_spec(tool_info: &ToolInfo) -> Result<codex_tools::LoadableToolSpec, serde_json::Error> {
+fn create_tool_spec(
+    tool_info: &ToolInfo,
+) -> Result<codex_tools::LoadableToolSpec, serde_json::Error> {
     let tool_name = tool_info.canonical_tool_name();
     let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
     let description = tool_info
@@ -505,11 +517,13 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<codex_tools::LoadableToolSpe
         })
         .unwrap_or_default();
 
-    Ok(codex_tools::LoadableToolSpec::Namespace(ResponsesApiNamespace {
-        name: tool_info.callable_namespace.clone(),
-        description,
-        tools: vec![ResponsesApiNamespaceTool::Function(tool)],
-    }))
+    Ok(codex_tools::LoadableToolSpec::Namespace(
+        ResponsesApiNamespace {
+            name: tool_info.callable_namespace.clone(),
+            description,
+            tools: vec![ResponsesApiNamespaceTool::Function(tool)],
+        },
+    ))
 }
 
 fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
@@ -1131,9 +1145,13 @@ mod tests {
         );
 
         let mut contradictory = tool_info("other", "mcp__other", "lookup");
-        contradictory.tool.annotations = Some(
-            rmcp::model::ToolAnnotations::from_raw(None, Some(true), Some(true), None, None),
-        );
+        contradictory.tool.annotations = Some(rmcp::model::ToolAnnotations::from_raw(
+            None,
+            Some(true),
+            Some(true),
+            None,
+            None,
+        ));
         let contradictory = McpHandler::new(contradictory).unwrap();
         assert!(!contradictory.supports_parallel_tool_calls());
         assert_eq!(

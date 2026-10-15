@@ -237,8 +237,6 @@ fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<Netw
     Ok(profile.network)
 }
 
-
-
 #[derive(Default)]
 struct NetworkConfigAccumulator {
     config: NetworkProxyConfig,

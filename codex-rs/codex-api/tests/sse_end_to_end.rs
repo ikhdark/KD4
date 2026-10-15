@@ -138,13 +138,16 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
 
     for (event, expected_text) in events[..2].iter().zip(["Hello", "World"]) {
         match event {
-        ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
-            assert_eq!(role, "assistant");
-            assert_eq!(serde_json::to_value(content)?, serde_json::json!([
-                {"type": "output_text", "text": expected_text}
-            ]));
-        }
-        other => panic!("unexpected item event: {other:?}"),
+            ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
+                assert_eq!(role, "assistant");
+                assert_eq!(
+                    serde_json::to_value(content)?,
+                    serde_json::json!([
+                        {"type": "output_text", "text": expected_text}
+                    ])
+                );
+            }
+            other => panic!("unexpected item event: {other:?}"),
         }
     }
 
@@ -235,8 +238,10 @@ async fn responses_stream_rejects_missing_completion_response_end_to_end() -> Re
             errors.push(error);
         }
     }
-    assert!(matches!(errors.as_slice(), [ApiError::ProviderFailure { message, .. }]
-        if message == "response.completed event missing response"));
+    assert!(
+        matches!(errors.as_slice(), [ApiError::ProviderFailure { message, .. }]
+        if message == "response.completed event missing response")
+    );
     Ok(())
 }
 

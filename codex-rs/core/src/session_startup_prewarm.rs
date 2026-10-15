@@ -203,7 +203,10 @@ impl SessionStartupPrewarmHandle {
     }
 
     fn resolution_from_join_result(
-        result: std::result::Result<CodexResult<Option<ModelClientSession>>, tokio::task::JoinError>,
+        result: std::result::Result<
+            CodexResult<Option<ModelClientSession>>,
+            tokio::task::JoinError,
+        >,
         started_at: Instant,
     ) -> SessionStartupPrewarmResolution {
         match result {
@@ -471,15 +474,24 @@ mod tests {
             .expect("tool preparation completes without waiting for a provider")
             .expect("prewarm task must finish")
             .expect("no network request is needed");
-        assert!(prepared_session.is_none(), "disabled prewarm must not claim an empty session");
-        assert!(!auth_abort.is_finished(), "router publication must retain auth work");
+        assert!(
+            prepared_session.is_none(),
+            "disabled prewarm must not claim an empty session"
+        );
+        assert!(
+            !auth_abort.is_finished(),
+            "router publication must retain auth work"
+        );
         let resolution = SessionStartupPrewarmHandle::resolution_from_join_result(
             Ok(Ok(prepared_session)),
             Instant::now(),
         );
         assert!(matches!(
             resolution,
-            SessionStartupPrewarmResolution::Unavailable { status: "disabled", .. }
+            SessionStartupPrewarmResolution::Unavailable {
+                status: "disabled",
+                ..
+            }
         ));
         let prepared = session
             .startup_prepared_router
@@ -503,9 +515,11 @@ mod tests {
             .expect("session retains auth ownership")
             .abort()
             .await;
-        assert!(auth_abort.is_finished(), "shutdown must drain the auth owner");
+        assert!(
+            auth_abort.is_finished(),
+            "shutdown must drain the auth owner"
+        );
     }
-
 
     #[tokio::test]
     async fn prewarm_publishes_router_while_transport_is_pending() {

@@ -135,6 +135,7 @@ pub(crate) mod shell_snapshot;
 pub mod spawn;
 mod thread_rollout_truncation;
 pub use thread_rollout_truncation::truncate_rollout_after_turn_id;
+mod scoped_workspace_gate;
 mod tool_history;
 mod tools;
 pub(crate) mod turn_diff_tracker;
@@ -142,7 +143,6 @@ mod turn_metadata;
 mod turn_timing;
 mod validation;
 mod workspace_operation_gate;
-mod scoped_workspace_gate;
 pub(crate) use codex_tools::FunctionCallError;
 
 pub async fn init_state_db(config: &config::Config) -> Option<StateDbHandle> {

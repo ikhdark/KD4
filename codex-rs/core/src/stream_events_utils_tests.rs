@@ -52,7 +52,9 @@ fn tool_call_arguments_length_counts_utf8_payload_bytes() {
     assert_eq!(tool_call_arguments_length(&call), 15);
     for (arguments, bytes) in [("", 0), ("é🦀", 6)] {
         let mut call = call.clone();
-        call.payload = ToolPayload::Function { arguments: arguments.to_string() };
+        call.payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
         assert_eq!(tool_call_arguments_length(&call), bytes);
     }
 }
@@ -232,8 +234,6 @@ async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_req
     assert_eq!(text, "hello world");
 }
 
-
-
 #[tokio::test]
 async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     use crate::session::turn_execution::SamplingRequestSettledState;
@@ -286,7 +286,10 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
 
     let mut eager_prefix_open = true;
     let output = handle_output_item_done(
-        &mut ctx, item.clone(), /*previously_active_item*/ None, &mut eager_prefix_open,
+        &mut ctx,
+        item.clone(),
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
     )
     .await
     .expect("malformed tool_search call should be recorded for model recovery");
@@ -295,7 +298,12 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
     assert!(control.observe_budget_progress(&baselines, &collector, &settled));
-    assert!(control.evaluate_convergence(&baselines, &collector, &settled).directive.is_none());
+    assert!(
+        control
+            .evaluate_convergence(&baselines, &collector, &settled)
+            .directive
+            .is_none()
+    );
     ctx.response_item_recorder.flush().await.unwrap();
     let history = session.clone_history().await;
     let [
@@ -337,16 +345,26 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     );
 
     let repeated = control.collector(&baselines);
-    ctx.tool_runtime = ctx.tool_runtime.clone().with_sampling_request_signals(repeated.clone());
+    ctx.tool_runtime = ctx
+        .tool_runtime
+        .clone()
+        .with_sampling_request_signals(repeated.clone());
     let mut item = item;
     if let ResponseItem::ToolSearchCall { call_id, .. } = &mut item {
         *call_id = Some("search-malformed-again".into());
     }
-    let output = handle_output_item_done(&mut ctx, item, None, &mut true).await.unwrap();
+    let output = handle_output_item_done(&mut ctx, item, None, &mut true)
+        .await
+        .unwrap();
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
     assert!(!control.observe_budget_progress(&baselines, &repeated, &settled));
-    assert!(control.evaluate_convergence(&baselines, &repeated, &settled).directive.is_some());
+    assert!(
+        control
+            .evaluate_convergence(&baselines, &repeated, &settled)
+            .directive
+            .is_some()
+    );
     ctx.response_item_recorder.flush().await.unwrap();
 }
 
@@ -393,7 +411,10 @@ async fn unstreamed_contributed_assistant_item_replays_finalized_text_between_li
     .await
     .expect("assistant message should complete");
 
-    assert_eq!(output.last_agent_message.as_deref(), Some("contributed assistant text"));
+    assert_eq!(
+        output.last_agent_message.as_deref(),
+        Some("contributed assistant text")
+    );
     ctx.response_item_recorder.flush().await.unwrap();
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -564,23 +585,29 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
     };
     let mut eager_prefix_open = true;
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(1), handle_output_item_done(
-        &mut ctx,
-        item,
-        /*previously_active_item*/ None,
-        &mut eager_prefix_open,
-    ))
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle_output_item_done(
+            &mut ctx,
+            item,
+            /*previously_active_item*/ None,
+            &mut eager_prefix_open,
+        ),
+    )
     .await
     .expect("acceptance must not wait for auxiliary persistence")
     .expect("read-safe tool call should be accepted");
-    tokio::time::timeout(std::time::Duration::from_secs(1), output
-        .tool_future
-        .expect("accepted tool call should retain its lazy future")
-        .into_future())
-        .await
-        .expect("dispatch must not wait for auxiliary persistence")
-        .result
-        .expect("auxiliary persistence must not delay tool dispatch");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        output
+            .tool_future
+            .expect("accepted tool call should retain its lazy future")
+            .into_future(),
+    )
+    .await
+    .expect("dispatch must not wait for auxiliary persistence")
+    .result
+    .expect("auxiliary persistence must not delay tool dispatch");
 
     assert!(started.load(Ordering::SeqCst));
     let mut flush = Box::pin(recorder_for_flush.flush());
@@ -592,7 +619,9 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
         .send(())
         .expect("auxiliary persistence blocker should still be active");
     tokio::time::timeout(std::time::Duration::from_secs(1), flush)
-        .await.expect("released persistence must finish").unwrap();
+        .await
+        .expect("released persistence must finish")
+        .unwrap();
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
         panic!("completed tool call must be model-visible before relaying results")
@@ -762,15 +791,33 @@ async fn finalized_turn_item_defers_mailbox_for_contributed_visible_text() {
     session.services.extensions = Arc::new(builder.build());
     let turn_store = ExtensionData::new(turn_context.sub_id.clone());
     for (text, phase, plan_mode, defers) in [
-        ("<proposed_plan>\n- hidden only\n</proposed_plan>", None, true, true),
-        ("still working", Some(MessagePhase::Commentary), false, false),
+        (
+            "<proposed_plan>\n- hidden only\n</proposed_plan>",
+            None,
+            true,
+            true,
+        ),
+        (
+            "still working",
+            Some(MessagePhase::Commentary),
+            false,
+            false,
+        ),
         ("finished", Some(MessagePhase::FinalAnswer), false, true),
     ] {
         let item = assistant_output_text_with_phase(text, phase);
         let finalized = finalize_non_tool_response_item(
-            &session, TurnItemContributorPolicy::Run(&turn_store), &item, plan_mode,
-        ).await.expect("assistant message should parse");
-        assert_eq!(finalized.facts.last_agent_message.as_deref(), Some("contributed assistant text"));
+            &session,
+            TurnItemContributorPolicy::Run(&turn_store),
+            &item,
+            plan_mode,
+        )
+        .await
+        .expect("assistant message should parse");
+        assert_eq!(
+            finalized.facts.last_agent_message.as_deref(),
+            Some("contributed assistant text")
+        );
         assert_eq!(finalized.facts.defers_mailbox_delivery_to_next_turn, defers);
     }
 }
@@ -780,25 +827,41 @@ fn last_assistant_message_from_item_strips_only_plan_blocks() {
     let mixed = "before<oai-mem-citation>doc1</oai-mem-citation>\n<proposed_plan>\n- x\n</proposed_plan>\nafter";
     let hidden = "<proposed_plan>\n- x\n</proposed_plan>";
     for (text, plan_mode, expected) in [
-        (mixed, true, Some("before<oai-mem-citation>doc1</oai-mem-citation>\nafter")),
+        (
+            mixed,
+            true,
+            Some("before<oai-mem-citation>doc1</oai-mem-citation>\nafter"),
+        ),
         (mixed, false, Some(mixed)),
         (hidden, true, None),
         (hidden, false, Some(hidden)),
         ("", false, None),
         ("  \n", false, None),
     ] {
-        assert_eq!(last_assistant_message_from_item(&assistant_output_text(text), plan_mode).as_deref(), expected);
+        assert_eq!(
+            last_assistant_message_from_item(&assistant_output_text(text), plan_mode).as_deref(),
+            expected
+        );
     }
 }
 
 #[test]
 fn completed_item_defers_mailbox_only_for_visible_final_text() {
-    for phase in [None, Some(MessagePhase::Commentary), Some(MessagePhase::FinalAnswer)] {
+    for phase in [
+        None,
+        Some(MessagePhase::Commentary),
+        Some(MessagePhase::FinalAnswer),
+    ] {
         let item = assistant_output_text_with_phase("final answer", phase.clone());
-        assert_eq!(completed_item_defers_mailbox_delivery_to_next_turn(&item, false),
-            phase != Some(MessagePhase::Commentary));
-        let hidden = assistant_output_text_with_phase("<proposed_plan>\n- x\n</proposed_plan>", phase);
-        assert!(!completed_item_defers_mailbox_delivery_to_next_turn(&hidden, true));
+        assert_eq!(
+            completed_item_defers_mailbox_delivery_to_next_turn(&item, false),
+            phase != Some(MessagePhase::Commentary)
+        );
+        let hidden =
+            assistant_output_text_with_phase("<proposed_plan>\n- x\n</proposed_plan>", phase);
+        assert!(!completed_item_defers_mailbox_delivery_to_next_turn(
+            &hidden, true
+        ));
     }
 }
 
@@ -844,5 +907,11 @@ async fn audit_reports_17_19_terminal_generation_rejects_tools_before_acceptance
     let result = handle_output_item_done(&mut ctx, item, None, &mut true).await;
     assert!(matches!(result, Err(CodexErr::Fatal(message)) if message.contains("terminal-only")));
     assert!(ctx.sess.clone_history().await.raw_items().is_empty());
-    assert_eq!(turn_context.turn_timing_state.tool_closure_snapshot().accepted_count, 0);
+    assert_eq!(
+        turn_context
+            .turn_timing_state
+            .tool_closure_snapshot()
+            .accepted_count,
+        0
+    );
 }

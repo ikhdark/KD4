@@ -372,11 +372,7 @@ mod tests {
             expected: expected.clone(),
             calls: AtomicUsize::new(0),
         });
-        let client = ImagesClient::new(
-            transport.clone(),
-            provider(),
-            auth.clone(),
-        );
+        let client = ImagesClient::new(transport.clone(), provider(), auth.clone());
         assert_eq!(
             client.edit(&request, HeaderMap::new()).await.unwrap(),
             expected_response()

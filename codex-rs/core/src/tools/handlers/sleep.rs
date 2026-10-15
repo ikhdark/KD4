@@ -147,12 +147,10 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 "Sleep completed."
             };
             let wall_time_seconds = started.elapsed().as_secs_f64();
-            Ok(boxed_tool_output(
-                FunctionToolOutput::from_text(
-                    format!("Wall time: {wall_time_seconds:.4} seconds\n{message}"),
-                    /*success*/ Some(true),
-                ),
-            ))
+            Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                format!("Wall time: {wall_time_seconds:.4} seconds\n{message}"),
+                /*success*/ Some(true),
+            )))
         })
     }
 }
@@ -177,12 +175,27 @@ mod tests {
         let session = Arc::new(session);
         let step_context = StepContext::for_test(Arc::new(turn));
         for (arguments, expected_error) in [
-            (json!({"duration_ms": 0}), "duration_ms must be between 1 and 43200000"),
-            (json!({"duration_ms": 43_200_001}), "duration_ms must be between 1 and 43200000"),
-            (json!({"duration_ms": -1}), "failed to parse function arguments:"),
-            (json!({"duration_ms": 1.5}), "failed to parse function arguments:"),
+            (
+                json!({"duration_ms": 0}),
+                "duration_ms must be between 1 and 43200000",
+            ),
+            (
+                json!({"duration_ms": 43_200_001}),
+                "duration_ms must be between 1 and 43200000",
+            ),
+            (
+                json!({"duration_ms": -1}),
+                "failed to parse function arguments:",
+            ),
+            (
+                json!({"duration_ms": 1.5}),
+                "failed to parse function arguments:",
+            ),
             (json!({}), "failed to parse function arguments:"),
-            (json!({"duration_ms": 1, "typo": true}), "failed to parse function arguments:"),
+            (
+                json!({"duration_ms": 1, "typo": true}),
+                "failed to parse function arguments:",
+            ),
         ] {
             let invocation = ToolInvocation {
                 session: Arc::clone(&session),
@@ -198,13 +211,17 @@ mod tests {
             };
             // A broken upper-bound guard must fail rather than wait twelve hours.
             // Dropping the handler also drops the provider's cancellable wait.
-            let result = tokio::time::timeout(Duration::from_secs(1), SleepHandler.handle(invocation))
-                .await
-                .expect("invalid sleep arguments must not leave a long-running wait");
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), SleepHandler.handle(invocation))
+                    .await
+                    .expect("invalid sleep arguments must not leave a long-running wait");
             let Err(FunctionCallError::RespondToModel(message)) = result else {
                 panic!("expected argument rejection for {arguments}");
             };
-            assert!(message.starts_with(expected_error), "{arguments}: {message}");
+            assert!(
+                message.starts_with(expected_error),
+                "{arguments}: {message}"
+            );
         }
     }
 

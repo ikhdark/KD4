@@ -272,7 +272,11 @@ mod tests {
         for (server, connector, title) in [
             ("codex_apps", Some("calendar"), Some("delete_event")),
             ("another_server", Some("calendar"), Some("create_event")),
-            ("codex_apps", Some("another_connector"), Some("create_event")),
+            (
+                "codex_apps",
+                Some("another_connector"),
+                Some("create_event"),
+            ),
             ("codex_apps", None, Some("create_event")),
             ("codex_apps", Some("calendar"), None),
             ("codex_apps", Some("calendar"), Some(" ")),

@@ -110,7 +110,10 @@ async fn test_config() -> (TempDir, Config) {
 #[tokio::test]
 async fn child_exec_policy_sharing_depends_only_on_policy_inputs() {
     let (_home, parent_config) = test_config().await;
-    assert!(child_uses_parent_exec_policy(&parent_config, &parent_config.clone()));
+    assert!(child_uses_parent_exec_policy(
+        &parent_config,
+        &parent_config.clone()
+    ));
 
     // Different rule folders must not inherit the parent's live policy manager.
     let parent_rules = tempdir().expect("parent rules folder");
@@ -121,7 +124,10 @@ async fn child_exec_policy_sharing_depends_only_on_policy_inputs() {
     let mut child_with_rules = parent_with_rules.clone();
     child_with_rules.config_layer_stack =
         config_stack_for_dot_codex_folder(child_rules.path()).into();
-    assert!(!child_uses_parent_exec_policy(&parent_with_rules, &child_with_rules));
+    assert!(!child_uses_parent_exec_policy(
+        &parent_with_rules,
+        &child_with_rules
+    ));
 
     let mut child_config = parent_config.clone();
     let mut layers: Vec<_> = child_config
@@ -244,8 +250,6 @@ async fn rules_path_file_returns_read_dir_error() {
         "expected malformed rules path to surface as ReadDir, got {err:?}"
     );
 }
-
-
 
 #[tokio::test]
 async fn format_exec_policy_error_with_source_renders_range() {
@@ -787,11 +791,20 @@ async fn evaluates_heredoc_script_against_prefix_rules() {
 async fn heredoc_fallback_omits_automatic_and_requested_amendments() {
     for (script, prefix_rule) in [
         ("python3 <<'PY'\nprint('hello')\nPY", None),
-        ("python3 <<'PY'\nprint('hello')\nPY", Some(vec_str(&["python3", "-m", "pip"]))),
-        ("python3 <<'PY'\nprint('hello')\nPY", Some(vec_str(&["python3"]))),
+        (
+            "python3 <<'PY'\nprint('hello')\nPY",
+            Some(vec_str(&["python3", "-m", "pip"])),
+        ),
+        (
+            "python3 <<'PY'\nprint('hello')\nPY",
+            Some(vec_str(&["python3"])),
+        ),
         // Unlike a bare interpreter prefix, this would be eligible without
         // the complex-parser guard, so it independently verifies that guard.
-        ("python3 script.py <<'PY'\nprint('hello')\nPY", Some(vec_str(&["python3", "script.py"]))),
+        (
+            "python3 script.py <<'PY'\nprint('hello')\nPY",
+            Some(vec_str(&["python3", "script.py"])),
+        ),
     ] {
         assert_exec_approval_requirement_for_command(
             ExecApprovalRequirementScenario {
@@ -806,7 +819,8 @@ async fn heredoc_fallback_omits_automatic_and_requested_amendments() {
                 reason: None,
                 proposed_execpolicy_amendment: None,
             },
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -1328,34 +1342,43 @@ async fn mixed_rule_and_sandbox_prompts_prioritize_rule_approval() {
     ];
 
     for (sandbox_approval, rules) in [(true, true), (false, true), (true, false), (false, false)] {
-    let requirement = manager
-        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-            command: &command,
-            command_for_safety: None,
-            approval_policy: AskForApproval::Granular(GranularApprovalConfig {
-                sandbox_approval,
-                rules,
-                skill_approval: true,
-                request_permissions: true,
-                mcp_elicitations: true,
-            }),
-            permission_profile: PermissionProfile::read_only(),
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            sandbox_permissions: SandboxPermissions::RequireEscalated,
-            prefix_rule: None,
-        })
-        .await;
+        let requirement = manager
+            .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                command: &command,
+                command_for_safety: None,
+                approval_policy: AskForApproval::Granular(GranularApprovalConfig {
+                    sandbox_approval,
+                    rules,
+                    skill_approval: true,
+                    request_permissions: true,
+                    mcp_elicitations: true,
+                }),
+                permission_profile: PermissionProfile::read_only(),
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                sandbox_permissions: SandboxPermissions::RequireEscalated,
+                prefix_rule: None,
+            })
+            .await;
 
-    if rules {
-        assert_eq!(requirement, ExecApprovalRequirement::NeedsApproval {
-            reason: Some("`bash -lc 'git status && madeup-cmd'` requires approval by policy".to_string()),
-            proposed_execpolicy_amendment: None,
-        });
-    } else {
-        assert_eq!(requirement, ExecApprovalRequirement::Forbidden {
-            reason: REJECT_RULES_APPROVAL_REASON.to_string(),
-        });
-    }
+        if rules {
+            assert_eq!(
+                requirement,
+                ExecApprovalRequirement::NeedsApproval {
+                    reason: Some(
+                        "`bash -lc 'git status && madeup-cmd'` requires approval by policy"
+                            .to_string()
+                    ),
+                    proposed_execpolicy_amendment: None,
+                }
+            );
+        } else {
+            assert_eq!(
+                requirement,
+                ExecApprovalRequirement::Forbidden {
+                    reason: REJECT_RULES_APPROVAL_REASON.to_string(),
+                }
+            );
+        }
     }
 }
 
@@ -1405,8 +1428,6 @@ async fn encoded_command_policy_reason_uses_plain_safety_command() {
     assert!(!reason.contains("EncodedCommand"));
     assert!(!reason.contains("ZwBpAHQ"));
 }
-
-
 
 #[tokio::test]
 async fn exec_approval_requirement_falls_back_to_heuristics() {
@@ -1625,9 +1646,19 @@ async fn append_execpolicy_amendment_updates_policy_and_file() {
         }
     ));
 
-    assert!(evaluation.is_match(), "the in-memory prefix rule must match");
-    let reloaded = load_exec_policy(&config_stack_for_dot_codex_folder(codex_home.path())).await.expect("reload persisted amendment");
-    assert_eq!(reloaded.check(&vec_str(&["echo", "hello", "world"]), &|_| Decision::Forbidden), evaluation);
+    assert!(
+        evaluation.is_match(),
+        "the in-memory prefix rule must match"
+    );
+    let reloaded = load_exec_policy(&config_stack_for_dot_codex_folder(codex_home.path()))
+        .await
+        .expect("reload persisted amendment");
+    assert_eq!(
+        reloaded.check(&vec_str(&["echo", "hello", "world"]), &|_| {
+            Decision::Forbidden
+        }),
+        evaluation
+    );
 
     let contents = fs::read_to_string(default_policy_path(codex_home.path()))
         .expect("policy file should have been created");

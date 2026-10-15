@@ -53,7 +53,10 @@ fn thread_spawn_depth_increments_and_enforces_limit() {
         child_depth,
         /*max_depth*/ 1
     ));
-    for source in [SessionSource::Cli, SessionSource::SubAgent(SubAgentSource::Review)] {
+    for source in [
+        SessionSource::Cli,
+        SessionSource::SubAgent(SubAgentSource::Review),
+    ] {
         assert_eq!(session_depth(&source), 0);
         assert_eq!(next_thread_spawn_depth(&source), 1);
     }
@@ -374,6 +377,76 @@ fn committed_agent_path_is_indexed_until_release() {
         registry.agent_id_for_path(&agent_path("/root/researcher")),
         None
     );
+}
+
+/// The agent tool surface is derived from `ever_had_live_agents`, so a sub-agent
+/// finishing must not retract tool schemas that sit in the cached prompt prefix.
+/// Real sessions spawned and drained repeatedly, and deriving the surface from the
+/// current graph toggled `send_message`/`list_agents` in and out of the prefix.
+#[test]
+fn ever_had_live_agents_latches_across_a_drained_graph() {
+    let registry = Arc::new(AgentRegistry::default());
+    let root_thread_id = ThreadId::new();
+    registry.register_root_thread(root_thread_id);
+
+    // A root-only tree has no agent surface to preserve yet.
+    assert!(!registry.has_live_agents());
+    assert!(
+        !registry.ever_had_live_agents(),
+        "the root thread alone must not latch the agent surface"
+    );
+
+    let child_thread_id = ThreadId::new();
+    let mut reservation = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    reservation
+        .reserve_agent_path(&agent_path("/root/researcher"))
+        .expect("reserve path");
+    reservation
+        .commit(AgentMetadata {
+            agent_id: Some(child_thread_id),
+            agent_path: Some(agent_path("/root/researcher")),
+            ..Default::default()
+        })
+        .expect("commit reservation");
+
+    assert!(registry.has_live_agents());
+    assert!(registry.ever_had_live_agents());
+
+    // The child finishes and leaves the graph: the live view empties, but the
+    // latched view must hold so the tool prefix stays byte-stable.
+    registry.release_spawned_thread(child_thread_id);
+    assert!(
+        !registry.has_live_agents(),
+        "a drained graph should report no live agents"
+    );
+    assert!(
+        registry.ever_had_live_agents(),
+        "a drained graph must keep the agent tool surface to preserve the cached prefix"
+    );
+}
+
+#[test]
+fn ever_had_live_agents_latches_for_a_graph_registered_without_a_reservation() {
+    let registry = Arc::new(AgentRegistry::default());
+    registry.register_root_thread(ThreadId::new());
+    assert!(!registry.ever_had_live_agents());
+
+    // A resumed tree can surface children without going through a reservation,
+    // so the lazy latch has to notice them as well.
+    registry
+        .register_spawned_thread(
+            AgentMetadata {
+                agent_id: Some(ThreadId::new()),
+                agent_path: Some(agent_path("/root/resumed")),
+                ..Default::default()
+            },
+            /*parent_thread_id*/ None,
+        )
+        .expect("register resumed child");
+
+    assert!(registry.ever_had_live_agents());
 }
 
 #[test]

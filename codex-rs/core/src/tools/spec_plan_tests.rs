@@ -61,11 +61,16 @@ const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 fn conflicting_namespace_descriptions_are_quarantined_in_either_order() {
     let specs = ["first instructions", "different instructions"].map(|description| {
         ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-            name: "conflict".into(), description: description.into(), tools: Vec::new(),
+            name: "conflict".into(),
+            description: description.into(),
+            tools: Vec::new(),
         })
     });
     for specs in [specs.to_vec(), specs.into_iter().rev().collect()] {
-        assert_eq!(super::conflicting_namespace_metadata(specs.iter()), std::collections::BTreeSet::from(["conflict".into()]));
+        assert_eq!(
+            super::conflicting_namespace_metadata(specs.iter()),
+            std::collections::BTreeSet::from(["conflict".into()])
+        );
         assert!(merge_into_namespaces(specs).is_empty());
     }
 }
@@ -347,8 +352,16 @@ async fn removed_workspace_workers_are_not_exposed_or_registered() {
     let plan = probe(|turn| set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec])).await;
     plan.assert_visible_contains(&["exec_command"]);
     plan.assert_registered_contains(&["exec_command"]);
-    plan.assert_visible_lacks(&["semantic_context", "workspace_validation", "context_checkpoint"]);
-    plan.assert_registered_lacks(&["semantic_context", "workspace_validation", "context_checkpoint"]);
+    plan.assert_visible_lacks(&[
+        "semantic_context",
+        "workspace_validation",
+        "context_checkpoint",
+    ]);
+    plan.assert_registered_lacks(&[
+        "semantic_context",
+        "workspace_validation",
+        "context_checkpoint",
+    ]);
 }
 
 #[tokio::test]
@@ -422,7 +435,10 @@ async fn planning_tools_keep_their_schemas_in_plan_mode() {
     plan_mode.assert_visible_contains(&["update_plan"]);
     plan_mode.assert_registered_contains(&["update_plan"]);
     plan_mode.assert_registered_lacks(&["context_checkpoint"]);
-    assert_eq!(default_mode.visible_spec("update_plan"), plan_mode.visible_spec("update_plan"));
+    assert_eq!(
+        default_mode.visible_spec("update_plan"),
+        plan_mode.visible_spec("update_plan")
+    );
 }
 
 #[tokio::test]
@@ -900,7 +916,42 @@ async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
 }
 
 #[tokio::test]
-#[expect(clippy::print_stderr, reason = "the contract projection test reports full and eager token counts for auditing")]
+async fn code_mode_eager_plan_contract_exposes_requirement_resolution() {
+    let plan = probe(|turn| {
+        set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+    })
+    .await;
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    // Completing renamed descendants requires explicit resolution even when the
+    // status update succeeds; the eager contract must explain that first call.
+    assert!(exec.description.contains("resolve?:"));
+    assert!(exec.description.contains("Original requirement IDs"));
+    assert!(exec.description.contains("completing renamed/split/merged descendants"));
+    assert!(exec.description.contains("every mapped descendant must be completed"));
+    assert!(!exec.description.contains("a rejected revision names the field"));
+    assert!(exec.description.contains("before retiring scope or linking"));
+    // Keep unrelated administrative contracts lazy, not removed from the owner.
+    let ToolSpec::Function(full) =
+        crate::tools::handlers::plan_spec::create_update_plan_tool()
+    else {
+        panic!("expected plan tool");
+    };
+    let properties = full.parameters.properties.as_ref().unwrap();
+    for field in ["resolve", "superseded", "scope_change_instructions", "workflow"] {
+        assert!(properties.contains_key(field));
+        if field != "resolve" {
+            assert!(!exec.description.contains(&format!("{field}?:")));
+        }
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the contract projection test reports full and eager token counts for auditing"
+)]
 async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvable() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         turn.model_info.supports_search_tool = true;
@@ -946,14 +997,30 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         assert!(!description.is_empty());
         assert!(!mixed_exec.description.contains(description.trim()));
         if name == "read_file" {
-            assert!(nested_exec.description.contains("Nested calls read current contents"));
-            let ToolSpec::Function(read) = spec else { panic!("read schema"); };
-            assert!(read.parameters.properties.as_ref().unwrap().contains_key("force_fresh"));
+            assert!(
+                nested_exec
+                    .description
+                    .contains("Nested calls read current contents")
+            );
+            let ToolSpec::Function(read) = spec else {
+                panic!("read schema");
+            };
+            assert!(
+                read.parameters
+                    .properties
+                    .as_ref()
+                    .unwrap()
+                    .contains_key("force_fresh")
+            );
         } else {
             assert!(nested_exec.description.contains(description.trim()));
         }
     }
-    assert!(mixed_exec.description.contains("exec_command(args: unknown"));
+    assert!(
+        mixed_exec
+            .description
+            .contains("exec_command(args: unknown")
+    );
     assert!(mixed_exec.description.contains("read_file(args: unknown"));
     assert!(!nested_exec.description.contains("read_file(args: unknown"));
     assert!(nested_exec.description.contains("selectors?:"));
@@ -969,30 +1036,36 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         "the authoritative direct argument contract must remain available"
     );
     assert!(mixed_exec.description.contains("apply_patch(input: string"));
-    let lazy_line = nested_exec.description.lines()
+    let lazy_line = nested_exec
+        .description
+        .lines()
         .find(|line| line.starts_with("Other built-in nested tools (lazy contracts;"))
         .expect("code-mode-only sessions name lazily resolved built-ins");
     assert!(lazy_line.contains("list_files"), "{lazy_line}");
-    assert!(!lazy_line.contains("read_file") && !nested_exec.description.contains("list_files(args:"));
-    assert!(!mixed_exec.description.contains("Other built-in nested tools"));
+    assert!(
+        !lazy_line.contains("read_file") && !nested_exec.description.contains("list_files(args:")
+    );
+    assert!(
+        !mixed_exec
+            .description
+            .contains("Other built-in nested tools")
+    );
     for exec in [mixed_exec, nested_exec] {
         assert_eq!(exec.description.matches("declare const tools").count(), 1);
         assert!(!exec.description.contains("canonical_sha256"));
-        assert!(!exec.description.contains("raw_output_artifact_retention_limit_reason: unknown"));
-        for contract_field in [
-            "max_output_tokens",
-            "session_id",
-            "timeout_ms",
-        ] {
+        assert!(
+            !exec
+                .description
+                .contains("raw_output_artifact_retention_limit_reason: unknown")
+        );
+        for contract_field in ["max_output_tokens", "session_id", "timeout_ms"] {
             assert!(
                 exec.description.contains(contract_field),
                 "missing {contract_field}"
             );
         }
-        let clock = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
-            "clock",
-            "curr_time",
-        ));
+        let clock =
+            codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced("clock", "curr_time"));
         assert!(!exec.description.contains(&format!("{clock}(args:")));
         assert!(!exec.description.contains("Return the current time in UTC."));
         assert!(exec.description.contains("read_file(args:"));
@@ -1001,15 +1074,25 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         assert!(exec.description.contains("update_plan(args:"));
         assert!(exec.description.contains("apply_patch(input: string"));
         assert!(exec.description.contains("Nested apply_patch is available"));
-        assert!(exec.description.contains("Result fields: path, total_lines"));
+        assert!(
+            exec.description
+                .contains("Result fields: path, total_lines")
+        );
         assert!(exec.description.contains("Promise<unknown>"));
         assert!(!exec.description.contains("wall_time_seconds?:"));
         assert!(!exec.description.contains("raw_output_artifact_bytes?:"));
-        assert!(exec.description.contains("retains the full contract when required"));
+        assert!(
+            exec.description
+                .contains("retains the full contract when required")
+        );
     }
     for name in ["exec_command", "write_stdin"] {
-        let definition = codex_tools::code_mode_tool_definition_for_spec(mixed.visible_spec(name)).unwrap();
-        assert!(definition.output_schema.is_some(), "{name}: discovery must retain the result schema");
+        let definition =
+            codex_tools::code_mode_tool_definition_for_spec(mixed.visible_spec(name)).unwrap();
+        assert!(
+            definition.output_schema.is_some(),
+            "{name}: discovery must retain the result schema"
+        );
         let full = codex_code_mode::augment_tool_definition(definition.clone()).description;
         assert!(full.contains("raw_output_artifact_bytes"));
         let mut projected = definition.clone();
@@ -1017,7 +1100,11 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         let projected = codex_code_mode::augment_tool_definition(projected).description;
         let count = |text: &str| codex_utils_output_truncation::model_token_count(text);
         assert!(count(&projected) < count(&full));
-        eprintln!("context-audit {name} full_contract_tokens={} eager_contract_tokens={}", count(&full), count(&projected));
+        eprintln!(
+            "context-audit {name} full_contract_tokens={} eager_contract_tokens={}",
+            count(&full),
+            count(&projected)
+        );
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
     let clock = ToolName::namespaced("clock", "curr_time").to_string();
@@ -1040,7 +1127,11 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         let after_tokens = codex_utils_output_truncation::model_token_count(&after);
         assert!(after_tokens < before_tokens, "{name} arguments duplicated");
         if name == "exec_command" {
-            assert!(mixed_exec.description.contains("exec_command(args: unknown"));
+            assert!(
+                mixed_exec
+                    .description
+                    .contains("exec_command(args: unknown")
+            );
         } else {
             mixed.assert_registered_contains(&[name]);
             nested_only.assert_registered_contains(&[name]);
@@ -1203,10 +1294,8 @@ async fn code_mode_keeps_direct_mcp_contracts_lazy() {
         panic!("expected code mode exec tool");
     };
     // Nested declarations use the code-mode identifier, not the display name.
-    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
-        "mcp__direct",
-        "lookup",
-    ));
+    let nested_name =
+        codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced("mcp__direct", "lookup"));
     assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
@@ -1278,7 +1367,9 @@ async fn shell_family_advertises_configured_background_wait_limit() {
             "Bounded empty polls default to {expected_default} ms and cap at {configured} ms"
         )));
         let validator = jsonschema::validator_for(&schema).unwrap();
-        assert!(validator.is_valid(&json!({"session_id": 1, "incarnation": "creation-1", "yield_time_ms": expected_max})));
+        assert!(validator.is_valid(
+            &json!({"session_id": 1, "incarnation": "creation-1", "yield_time_ms": expected_max})
+        ));
         assert!(!validator.is_valid(&json!({"session_id": 1, "incarnation": "creation-1", "yield_time_ms": expected_max + 1})));
     }
 }
@@ -1388,7 +1479,10 @@ async fn request_permissions_registration_respects_approval_policy() {
 async fn never_approval_omits_all_command_permission_overrides() {
     for (name, unified) in [("exec_command", true), ("shell_command", false)] {
         let plan = probe(|turn| {
-            set_features(turn, &[Feature::ShellTool, Feature::ExecPermissionApprovals]);
+            set_features(
+                turn,
+                &[Feature::ShellTool, Feature::ExecPermissionApprovals],
+            );
             set_feature(turn, Feature::UnifiedExec, unified);
             turn.model_info.shell_type = if unified {
                 ConfigShellToolType::UnifiedExec
@@ -1396,10 +1490,19 @@ async fn never_approval_omits_all_command_permission_overrides() {
                 ConfigShellToolType::ShellCommand
             };
             turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
-        }).await;
+        })
+        .await;
         let spec = plan.visible_spec(name);
-        for field in ["sandbox_permissions", "additional_permissions", "justification", "prefix_rule"] {
-            assert!(!has_parameter(spec, field), "{name} advertises {field} under never");
+        for field in [
+            "sandbox_permissions",
+            "additional_permissions",
+            "justification",
+            "prefix_rule",
+        ] {
+            assert!(
+                !has_parameter(spec, field),
+                "{name} advertises {field} under never"
+            );
         }
     }
 }
@@ -2124,8 +2227,16 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected first tool_search spec");
     };
-    assert!(first_plan.tool_search_sources.contains("- first [source:mcp__first]: Tools from first."));
-    assert!(!first_plan.tool_search_sources.contains("source:mcp__second"));
+    assert!(
+        first_plan
+            .tool_search_sources
+            .contains("- first [source:mcp__first]: Tools from first.")
+    );
+    assert!(
+        !first_plan
+            .tool_search_sources
+            .contains("source:mcp__second")
+    );
 
     let ToolSpec::ToolSearch {
         description: second_description,
@@ -2134,8 +2245,16 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected second tool_search spec");
     };
-    assert!(second_plan.tool_search_sources.contains("- second [source:mcp__second]: Tools from second."));
-    assert!(!second_plan.tool_search_sources.contains("source:mcp__first"));
+    assert!(
+        second_plan
+            .tool_search_sources
+            .contains("- second [source:mcp__second]: Tools from second.")
+    );
+    assert!(
+        !second_plan
+            .tool_search_sources
+            .contains("source:mcp__first")
+    );
     assert_eq!(first_description, second_description);
 
     let ToolSpec::ToolSearch {
@@ -2145,8 +2264,16 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected third tool_search spec");
     };
-    assert!(third_plan.tool_search_sources.contains("- first [source:mcp__first]: Tools from first."));
-    assert!(!third_plan.tool_search_sources.contains("source:mcp__second"));
+    assert!(
+        third_plan
+            .tool_search_sources
+            .contains("- first [source:mcp__first]: Tools from first.")
+    );
+    assert!(
+        !third_plan
+            .tool_search_sources
+            .contains("source:mcp__second")
+    );
     assert_eq!(first_description, third_description);
 }
 
@@ -2183,26 +2310,41 @@ async fn rejected_dynamic_and_deferred_mcp_contracts_are_bounded_and_not_callabl
         tool.input_schema = json!({"type":"object", "not":{}});
         spec
     };
-    let plan = probe_with(|_| {}, ToolPlanInputs {
-        deferred_mcp_tools: Some(vec![invalid_mcp_tool("broken", "mcp__broken", "lookup")]),
-        dynamic_tools: vec![invalid(None), invalid(Some("dynamic"))],
-        ..ToolPlanInputs::default()
-    }).await;
-    plan.assert_registered_lacks(&["rejected",
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            deferred_mcp_tools: Some(vec![invalid_mcp_tool("broken", "mcp__broken", "lookup")]),
+            dynamic_tools: vec![invalid(None), invalid(Some("dynamic"))],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plan.assert_registered_lacks(&[
+        "rejected",
         &ToolName::namespaced("dynamic", "rejected").to_string(),
-        &ToolName::namespaced("mcp__broken", "lookup").to_string()]);
+        &ToolName::namespaced("mcp__broken", "lookup").to_string(),
+    ]);
     assert_eq!(plan.warnings.len(), 3);
     for warning in &plan.warnings {
         assert!(warning.contains("not callable"));
         assert!(plan.tool_search_sources.contains(warning));
     }
-    assert!(plan.tool_search_sources.contains("unsupported tool input schema assertion: not"));
+    assert!(
+        plan.tool_search_sources
+            .contains("unsupported tool input schema assertion: not")
+    );
     let mut planned = super::PlannedTools::default();
     for _ in 0..40 {
         planned.reject_tool(&ToolName::plain("界".repeat(500)), &"é".repeat(1_000));
     }
     assert_eq!(planned.warnings.len(), 17);
-    assert!(planned.warnings.last().unwrap().contains("additional rejected tools omitted"));
+    assert!(
+        planned
+            .warnings
+            .last()
+            .unwrap()
+            .contains("additional rejected tools omitted")
+    );
     assert!(planned.warnings.iter().all(|warning| warning.len() < 850));
     assert!(planned.runtimes.is_empty());
 }
@@ -2288,26 +2430,43 @@ async fn plugin_install_tools_are_searchable_but_not_eager_with_tool_search() {
     for candidates in [
         None,
         Some(plugin_candidates(ToolSuggestPresentation::ListTool)),
-        Some(plugin_candidates(ToolSuggestPresentation::RecommendationContext)),
+        Some(plugin_candidates(
+            ToolSuggestPresentation::RecommendationContext,
+        )),
     ] {
-        let has_list = candidates.as_ref().is_none_or(|candidates|
-            candidates.presentation == ToolSuggestPresentation::ListTool);
+        let has_list = candidates
+            .as_ref()
+            .is_none_or(|candidates| candidates.presentation == ToolSuggestPresentation::ListTool);
         let plan = probe_with(
             |turn| {
                 turn.model_info.supports_search_tool = true;
-                set_features(turn, &[Feature::ToolSuggest, Feature::Apps, Feature::Plugins]);
+                set_features(
+                    turn,
+                    &[Feature::ToolSuggest, Feature::Apps, Feature::Plugins],
+                );
             },
-            ToolPlanInputs { tool_suggest_candidates: candidates, ..Default::default() },
-        ).await;
+            ToolPlanInputs {
+                tool_suggest_candidates: candidates,
+                ..Default::default()
+            },
+        )
+        .await;
         plan.assert_visible_contains(&["tool_search"]);
-        for name in ["request_plugin_install", "list_available_plugins_to_install"] {
+        for name in [
+            "request_plugin_install",
+            "list_available_plugins_to_install",
+        ] {
             if name == "list_available_plugins_to_install" && !has_list {
                 continue;
             }
             plan.assert_visible_lacks(&[name]);
             plan.assert_registered_contains(&[name]);
             assert_eq!(plan.exposure(name), ToolExposure::Deferred);
-            assert!(plan.tool_search_texts.iter().any(|text| text.contains(name)));
+            assert!(
+                plan.tool_search_texts
+                    .iter()
+                    .any(|text| text.contains(name))
+            );
         }
     }
 }
@@ -2444,10 +2603,8 @@ async fn code_mode_only_exposes_configured_dynamic_namespace_directly() {
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
-        "direct_only",
-        "lookup",
-    ));
+    let nested_name =
+        codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced("direct_only", "lookup"));
     assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
@@ -2477,10 +2634,8 @@ async fn deferred_tools_enable_nested_tool_guidance_without_prompt_inventory() {
         exec.description
             .contains("Some deferred nested tools may be omitted")
     );
-    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
-        "deferred",
-        "lookup",
-    ));
+    let nested_name =
+        codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced("deferred", "lookup"));
     assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
@@ -2891,11 +3046,19 @@ async fn code_mode_initial_agent_catalog_retains_lifecycle_without_typed_adminis
     ] {
         let plan = probe_with(
             |turn| {
-                set_features(turn, &[Feature::MultiAgentV2, Feature::CodeMode, Feature::CodeModeOnly]);
+                set_features(
+                    turn,
+                    &[
+                        Feature::MultiAgentV2,
+                        Feature::CodeMode,
+                        Feature::CodeModeOnly,
+                    ],
+                );
                 turn.model_info.supports_search_tool = true;
                 if excluded {
                     update_config(turn, |config| {
-                        config.code_mode.excluded_tool_namespaces = vec![MULTI_AGENT_V2_NAMESPACE.into()];
+                        config.code_mode.excluded_tool_namespaces =
+                            vec![MULTI_AGENT_V2_NAMESPACE.into()];
                     });
                 }
             },
@@ -2906,8 +3069,15 @@ async fn code_mode_initial_agent_catalog_retains_lifecycle_without_typed_adminis
                 },
                 ..ToolPlanInputs::default()
             },
-        ).await;
-        for tool in ["wait_agent", "list_agents", "send_message", "followup_task", "interrupt_agent"] {
+        )
+        .await;
+        for tool in [
+            "wait_agent",
+            "list_agents",
+            "send_message",
+            "followup_task",
+            "interrupt_agent",
+        ] {
             let name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool).to_string();
             if expected {
                 plan.assert_registered_contains(&[&name]);
@@ -2915,7 +3085,11 @@ async fn code_mode_initial_agent_catalog_retains_lifecycle_without_typed_adminis
                 plan.assert_registered_lacks(&[&name]);
             }
         }
-        plan.assert_registered_lacks(&[&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "amend_agent_task").to_string()]);
+        plan.assert_registered_lacks(&[&ToolName::namespaced(
+            MULTI_AGENT_V2_NAMESPACE,
+            "amend_agent_task",
+        )
+        .to_string()]);
         plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
     }
 }
@@ -3008,7 +3182,9 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
         panic!("expected visible tool_search spec");
     };
     assert!(description.contains("<tool_search_sources>"));
-    assert!(plan.tool_search_sources.contains(&format!("- Multi-agent tools [source:{MULTI_AGENT_V1_NAMESPACE}]: Spawn and manage sub-agents.")));
+    assert!(plan.tool_search_sources.contains(&format!(
+        "- Multi-agent tools [source:{MULTI_AGENT_V1_NAMESPACE}]: Spawn and manage sub-agents."
+    )));
 }
 
 #[tokio::test]

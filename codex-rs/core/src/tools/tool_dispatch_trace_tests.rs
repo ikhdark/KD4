@@ -126,24 +126,52 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
 fn live_gate_phases_clear_only_after_the_last_owner_resumes_or_cancels() {
     use codex_protocol::protocol::{EventMsg, HarnessPhase};
     for (start, end, phase) in [
-        (ToolLifecycleBoundary::ResourceResolutionStart, ToolLifecycleBoundary::ResourceResolutionEnd, HarnessPhase::ResourceResolution),
-        (ToolLifecycleBoundary::DiffTrackerWaitStart, ToolLifecycleBoundary::DiffTrackerWaitEnd, HarnessPhase::DiffTracker),
-        (ToolLifecycleBoundary::WorkspaceGateWaitStart, ToolLifecycleBoundary::WorkspaceGateWaitEnd, HarnessPhase::WorkspaceGate),
-        (ToolLifecycleBoundary::EvidenceTrackerWaitStart, ToolLifecycleBoundary::EvidenceTrackerWaitEnd, HarnessPhase::EvidenceTracker),
+        (
+            ToolLifecycleBoundary::ResourceResolutionStart,
+            ToolLifecycleBoundary::ResourceResolutionEnd,
+            HarnessPhase::ResourceResolution,
+        ),
+        (
+            ToolLifecycleBoundary::DiffTrackerWaitStart,
+            ToolLifecycleBoundary::DiffTrackerWaitEnd,
+            HarnessPhase::DiffTracker,
+        ),
+        (
+            ToolLifecycleBoundary::WorkspaceGateWaitStart,
+            ToolLifecycleBoundary::WorkspaceGateWaitEnd,
+            HarnessPhase::WorkspaceGate,
+        ),
+        (
+            ToolLifecycleBoundary::EvidenceTrackerWaitStart,
+            ToolLifecycleBoundary::EvidenceTrackerWaitEnd,
+            HarnessPhase::EvidenceTracker,
+        ),
     ] {
         let turn = Arc::new(TurnTimingState::default());
         let (tx, rx) = async_channel::unbounded();
         turn.bind_live_phase_events("turn".into(), tx);
-        let first = ToolDispatchTiming::new_with_turn_clock(Arc::clone(&turn), tokio::time::Instant::now(), false);
-        let second = ToolDispatchTiming::new_with_turn_clock(Arc::clone(&turn), tokio::time::Instant::now(), false);
+        let first = ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&turn),
+            tokio::time::Instant::now(),
+            false,
+        );
+        let second = ToolDispatchTiming::new_with_turn_clock(
+            Arc::clone(&turn),
+            tokio::time::Instant::now(),
+            false,
+        );
         first.record_boundary(start);
         second.record_boundary(start);
-        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else { panic!("phase"); };
+        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else {
+            panic!("phase");
+        };
         assert_eq!(event.phases, vec![phase]);
         first.record_boundary(end);
         assert!(rx.try_recv().is_err(), "another owner remains blocked");
         second.record_outcome("cancelled");
-        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else { panic!("phase"); };
+        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else {
+            panic!("phase");
+        };
         assert!(event.phases.is_empty());
         drop(second);
         drop(first);
@@ -584,15 +612,24 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     );
 
     for (call_id, expected) in [
-        ("direct-call", serde_json::json!({
-            "type": "direct_response",
-            "response_item": {
-                "type": "function_call_output", "call_id": "direct-call", "output": "ok"
-            }
-        })),
-        ("code-mode-call", serde_json::json!({"type": "code_mode_response", "value": "ok"})),
+        (
+            "direct-call",
+            serde_json::json!({
+                "type": "direct_response",
+                "response_item": {
+                    "type": "function_call_output", "call_id": "direct-call", "output": "ok"
+                }
+            }),
+        ),
+        (
+            "code-mode-call",
+            serde_json::json!({"type": "code_mode_response", "value": "ok"}),
+        ),
     ] {
-        let payload_id = replayed.tool_calls[call_id].raw_result_payload_id.as_ref().unwrap();
+        let payload_id = replayed.tool_calls[call_id]
+            .raw_result_payload_id
+            .as_ref()
+            .unwrap();
         let payload = &replayed.raw_payloads[payload_id];
         let captured: serde_json::Value =
             serde_json::from_slice(&std::fs::read(bundle.join(&payload.path))?)?;
@@ -816,29 +853,50 @@ async fn disabled_dispatch_trace_has_no_tracking_state_or_pending_terminal() {
 }
 
 #[tokio::test]
-async fn terminal_trace_handoff_does_not_wait_for_start_and_survives_cancellation() -> anyhow::Result<()> {
+async fn terminal_trace_handoff_does_not_wait_for_start_and_survives_cancellation()
+-> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let (mut session, turn) = make_session_and_context().await;
     attach_test_trace(&mut session, &turn, temp.path())?;
-    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "delayed",
-        "test_tool", ToolCallSource::Direct, "{}");
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "delayed",
+        "test_tool",
+        ToolCallSource::Direct,
+        "{}",
+    );
     let started = super::ToolDispatchTrace::start(&invocation);
     let context = started.started_context().await.unwrap();
     let tasks = invocation.session.terminal_tasks.clone();
     let (sender, receiver) = tokio::sync::watch::channel(None);
-    let delayed = super::ToolDispatchTrace { state: Some(Arc::new(super::EnabledToolDispatchTrace {
-        context: receiver, terminal_tasks: tasks.clone(),
-        terminal_recording: Arc::new(std::sync::Once::new()),
-    })) };
+    let delayed = super::ToolDispatchTrace {
+        state: Some(Arc::new(super::EnabledToolDispatchTrace {
+            context: receiver,
+            terminal_tasks: tasks.clone(),
+            terminal_recording: Arc::new(std::sync::Once::new()),
+        })),
+    };
     // Dropping the returned future cannot abandon an already accepted terminal.
     drop(delayed.record_failed(&FunctionCallError::RespondToModel("first terminal".into())));
-    tokio::time::timeout(std::time::Duration::from_millis(100), delayed.record_cancelled()).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        delayed.record_cancelled(),
+    )
+    .await?;
     tasks.close();
-    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), tasks.wait()).await.is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), tasks.wait())
+            .await
+            .is_err()
+    );
     sender.send_replace(Some(context));
     tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait()).await?;
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
-    assert_eq!(replayed.tool_calls["delayed"].execution.status, ExecutionStatus::Failed);
+    assert_eq!(
+        replayed.tool_calls["delayed"].execution.status,
+        ExecutionStatus::Failed
+    );
     assert_eq!(replayed.tool_calls.len(), 1);
     Ok(())
 }

@@ -230,13 +230,45 @@ async fn pending_approvals_are_deduped_only_for_identical_host_keys() {
     assert!(first_is_owner);
     for (candidate, same) in [
         (key.clone(), true),
-        (HostApprovalKey { port: 8443, ..key.clone() }, false),
-        (HostApprovalKey { environment_id: "remote".into(), ..key.clone() }, false),
-        (HostApprovalKey { approval_scope_id: "replacement".into(), ..key.clone() }, false),
-        (HostApprovalKey { host: "other.example.com".into(), ..key.clone() }, false),
-        (HostApprovalKey { protocol: "http", ..key.clone() }, false),
+        (
+            HostApprovalKey {
+                port: 8443,
+                ..key.clone()
+            },
+            false,
+        ),
+        (
+            HostApprovalKey {
+                environment_id: "remote".into(),
+                ..key.clone()
+            },
+            false,
+        ),
+        (
+            HostApprovalKey {
+                approval_scope_id: "replacement".into(),
+                ..key.clone()
+            },
+            false,
+        ),
+        (
+            HostApprovalKey {
+                host: "other.example.com".into(),
+                ..key.clone()
+            },
+            false,
+        ),
+        (
+            HostApprovalKey {
+                protocol: "http",
+                ..key.clone()
+            },
+            false,
+        ),
     ] {
-        let (pending, is_owner) = service.get_or_create_pending_approval(candidate.clone()).await;
+        let (pending, is_owner) = service
+            .get_or_create_pending_approval(candidate.clone())
+            .await;
         assert_eq!(is_owner, !same, "{candidate:?}");
         assert_eq!(Arc::ptr_eq(&first, &pending), same, "{candidate:?}");
     }
@@ -247,42 +279,61 @@ async fn session_approved_hosts_are_scoped_by_environment_and_incarnation() {
     let (session, _) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
     let service = &session.services.network_approval;
-    service.session_approved_hosts.lock().await.insert(HostApprovalKey {
-        environment_id: "remote".into(),
-        approval_scope_id: "remote-scope-1".into(),
-        host: "example.com".into(),
-        protocol: "https",
-        port: 443,
-    });
+    service
+        .session_approved_hosts
+        .lock()
+        .await
+        .insert(HostApprovalKey {
+            environment_id: "remote".into(),
+            approval_scope_id: "remote-scope-1".into(),
+            host: "example.com".into(),
+            protocol: "https",
+            port: 443,
+        });
 
     for (environment, scope, expected) in [
         ("remote", "remote-scope-1", NetworkDecision::Allow),
-        ("other", "remote-scope-1", NetworkDecision::deny("not_allowed")),
-        ("remote", "remote-scope-2", NetworkDecision::deny("not_allowed")),
+        (
+            "other",
+            "remote-scope-1",
+            NetworkDecision::deny("not_allowed"),
+        ),
+        (
+            "remote",
+            "remote-scope-2",
+            NetworkDecision::deny("not_allowed"),
+        ),
     ] {
-        service.register_call(
-            "registration".into(),
-            test_path_buf("/tmp").abs().into(),
-            "curl https://example.com".into(),
-            environment.into(),
-            scope.into(),
-            CancellationToken::new(),
-        ).await;
-        let decision = service.handle_inline_policy_request(
-            Arc::clone(&session),
-            NetworkPolicyRequest {
-                protocol: NetworkProtocol::HttpsConnect,
-                host: "EXAMPLE.COM".into(),
-                port: 443,
-                environment_id: Some(environment.into()),
-                client_addr: None,
-                method: None,
-                command: None,
-                exec_policy_hint: None,
-                execution_id: Some("registration".into()),
-            },
-        ).await;
-        assert_eq!(decision, expected, "environment={environment}, scope={scope}");
+        service
+            .register_call(
+                "registration".into(),
+                test_path_buf("/tmp").abs().into(),
+                "curl https://example.com".into(),
+                environment.into(),
+                scope.into(),
+                CancellationToken::new(),
+            )
+            .await;
+        let decision = service
+            .handle_inline_policy_request(
+                Arc::clone(&session),
+                NetworkPolicyRequest {
+                    protocol: NetworkProtocol::HttpsConnect,
+                    host: "EXAMPLE.COM".into(),
+                    port: 443,
+                    environment_id: Some(environment.into()),
+                    client_addr: None,
+                    method: None,
+                    command: None,
+                    exec_policy_hint: None,
+                    execution_id: Some("registration".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            decision, expected,
+            "environment={environment}, scope={scope}"
+        );
         service.unregister_call("registration").await;
     }
 }

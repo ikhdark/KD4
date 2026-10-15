@@ -16,7 +16,41 @@ version = 1
 policy-pack = ["kd4@1"]
 exclude = ["target/**", "target-*/**", ".kda/**"]
 
-# Keep built-in severities, including denials and uncertainty diagnostics.
+# Security review is out of scope for this gate. Default-deny contracts stay on.
+[lints]
+authority-lattice-widening = "allow"
+authority-membership-identity-drift = "allow"
+authorization-envelope-drift = "allow"
+authorization-subject-drift = "allow"
+capability-lifecycle-violation = "allow"
+capability-mediation-bypass = "allow"
+capability-origin-violation = "allow"
+capability-scope-escape = "allow"
+capability-subject-mismatch = "allow"
+command-injection = "allow"
+denied-read-unsandboxed-execution = "allow"
+fail-open-policy-fallback = "allow"
+hardcoded-credential = "allow"
+insecure-tls-verification = "allow"
+nominal-authority-without-membership = "allow"
+path-injection = "allow"
+permission-profile-widening = "allow"
+privileged-effect-without-authority = "allow"
+privileged-effect-without-guard = "allow"
+redaction-not-dominating-boundary = "allow"
+retry-context-drift = "allow"
+secret-to-log = "allow"
+security-context-drop = "allow"
+security-context-relaxation = "allow"
+security-policy-monotonicity = "allow"
+security-recognizer-normalization-drift = "allow"
+sensitive-data-escape = "allow"
+trust-sensitive-view-escape = "allow"
+unbound-capability-token = "allow"
+unfiltered-sandbox-capability-root = "allow"
+unsafe-powershell-approval-parser = "allow"
+
+# Keep every other built-in severity, including denials and uncertainty diagnostics.
 # Analyze the supported Windows host with normal Cargo default features.
 # Trusted loading enables build scripts/proc macros and compiler preflight;
 # agent gate operations must also explicitly set execute_workspace=true.

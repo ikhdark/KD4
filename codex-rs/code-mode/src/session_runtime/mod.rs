@@ -555,7 +555,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                     .keys()
                     .cloned()
                     .collect::<Vec<_>>();
-                active.sort_by_key(|cell_id| cell_id.as_str().parse::<u64>().unwrap_or(u64::MAX));
+                active.sort_by_key(|cell_id| cell_id_sequence(cell_id.as_str()).unwrap_or(u64::MAX));
                 return Err(Error::ActiveCellLimit(active));
             }
         };

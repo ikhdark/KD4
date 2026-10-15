@@ -237,6 +237,10 @@ struct ModelRequestMeasurements {
     request_setting_digests: Option<RequestSettingDigests>,
     /// Settings whose dispatched value differs from the preceding request's.
     changed_request_settings: Vec<&'static str>,
+    /// Whether the leading fixed input items differ from the preceding
+    /// request's, as compared by exact per-item digest. `None` before any
+    /// comparison, so a first request reports no cause rather than a false one.
+    fixed_prefix_items_changed: Option<bool>,
     /// Filled by comparison against the preceding request; absent on the first.
     history_divergence: Option<HistoryPrefixDivergence>,
     /// Representation selected at dispatch, not inferred from the manifest.
@@ -300,6 +304,23 @@ const REQUEST_SETTING_FIELDS: [&str; 6] = [
 
 type RequestSettingDigests = [Option<[u8; 32]>; REQUEST_SETTING_FIELDS.len()];
 
+/// Request sections rendered ahead of every input item, in wire order.
+///
+/// These are the only categories whose whole-request hash can invalidate the
+/// provider's cached prefix on its own. Everything else reaches the model as
+/// input items and is compared by per-item digest over the leading fixed run,
+/// so it must not be blamed for a break. Reuse eligibility and the telemetry
+/// that explains it share this list so they cannot diverge.
+const ORDERED_FIXED_PREFIX_SECTIONS: [PromptContextCategory; 2] = [
+    PromptContextCategory::BaseSystem,
+    PromptContextCategory::ToolSchemas,
+];
+
+/// Reported when the leading fixed input items changed. The individual
+/// categories inside that run are not separable by whole-request hash, so the
+/// run is named as one cause rather than guessing a category.
+const FIXED_PREFIX_ITEMS_CATEGORY: &str = "fixed_prefix_items";
+
 /// Digests each request setting exactly as dispatched; an omitted setting has
 /// no digest.
 fn request_setting_digests(
@@ -351,6 +372,12 @@ impl ModelRequestMeasurements {
             .iter()
             .find(|measurement| measurement.category == category.as_str())
             .map_or(0, |measurement| measurement.estimated_tokens)
+    }
+
+    /// Whether the leading fixed input items broke the prefix. False before
+    /// any baseline comparison.
+    fn fixed_prefix_items_diverged(&self) -> bool {
+        self.fixed_prefix_items_changed.unwrap_or(false)
     }
 
     fn logical_prompt_tokens(&self) -> u64 {
@@ -407,9 +434,15 @@ impl ModelRequestMeasurements {
             .fold(0_u64, |total, measurement| {
                 total.saturating_add(measurement.estimated_tokens)
             });
+        // Report the same basis that decided reuse. Only the ordered request
+        // sections ahead of every input item, the leading fixed input run, and
+        // dispatched settings can break the provider's cached prefix; a
+        // category appended after history cannot. Attributing a break to every
+        // changed fixed-prefix category would name sections that sit behind
+        // the divergence and were never the cause.
         let fixed_prefix_changed_categories =
             if self.prompt_context_baseline_compared && !self.fixed_prefix_reuse_eligible {
-                PromptContextCategory::FIXED_PREFIX
+                ORDERED_FIXED_PREFIX_SECTIONS
                     .into_iter()
                     .filter(|category| {
                         self.prompt_context_categories.iter().any(|measurement| {
@@ -418,6 +451,10 @@ impl ModelRequestMeasurements {
                         })
                     })
                     .map(|category| category.as_str().to_string())
+                    .chain(
+                        self.fixed_prefix_items_diverged()
+                            .then(|| FIXED_PREFIX_ITEMS_CATEGORY.to_string()),
+                    )
                     .chain(
                         self.changed_request_settings
                             .iter()
@@ -717,6 +754,7 @@ impl ModelRequestMeasurements {
             fixed_prefix_item_count: context.fixed_prefix_item_count,
             request_setting_digests: None,
             changed_request_settings: Vec::new(),
+            fixed_prefix_items_changed: None,
             history_divergence: None,
             selected_representation: None,
         })
@@ -786,10 +824,7 @@ impl ModelRequestMeasurements {
         // digest over the leading fixed run, so whole-request category hashes
         // must not decide reuse: context appended after history (such as a
         // developer notice) would otherwise make an intact prefix look changed.
-        let ordered_fixed_hashes = [
-            PromptContextCategory::BaseSystem,
-            PromptContextCategory::ToolSchemas,
-        ]
+        let ordered_fixed_hashes = ORDERED_FIXED_PREFIX_SECTIONS
             .into_iter()
             .filter_map(|category| {
                 category_hashes
@@ -798,15 +833,20 @@ impl ModelRequestMeasurements {
                     .map(|hash| (category.as_str(), hash))
             })
             .collect::<Vec<_>>();
+        // Compared once, so eligibility and the telemetry explaining it read
+        // the same result instead of recomputing it from different inputs.
+        self.fixed_prefix_items_changed = baseline.as_ref().map(|previous| {
+            previous.fixed_prefix_item_count != self.fixed_prefix_item_count
+                || previous
+                    .input_item_digests
+                    .get(..previous.fixed_prefix_item_count)
+                    != self.input_item_digests.get(..self.fixed_prefix_item_count)
+        });
         self.fixed_prefix_reuse_eligible = baseline.as_ref().is_some_and(|previous| {
             previous.prompt_cache_key.as_deref() == prompt_cache_key
                 && self.changed_request_settings.is_empty()
                 && previous.ordered_fixed_hashes == ordered_fixed_hashes
-                && previous.fixed_prefix_item_count == self.fixed_prefix_item_count
-                && previous
-                    .input_item_digests
-                    .get(..previous.fixed_prefix_item_count)
-                    == self.input_item_digests.get(..self.fixed_prefix_item_count)
+                && self.fixed_prefix_items_changed == Some(false)
         });
         self.reusable_prompt_estimated_tokens = baseline
             .as_ref()
@@ -1533,9 +1573,19 @@ impl ModelAttemptGuard {
                 "matched-task prompt cache coverage fell below baseline"
             );
         }
+        let local_prompt_context_categories = compact_prompt_context_categories(
+            &self.measurements.prompt_context_categories,
+            self.measurements.prompt_context_baseline_compared,
+        );
         // The OTEL-only event is deliberately excluded from local SQLite logs.
         // Keep a compact, content-free completion record locally as well, so
         // cache investigations do not depend on offloaded timing snapshots.
+        //
+        // The per-category byte/token breakdown is included here rather than
+        // only in the OTEL attempt event: without it, a local investigation can
+        // see that the cached prefix moved but not which context category paid
+        // for it. These measurements are counts and domain-separated hashes, so
+        // the record stays content-free.
         tracing::info!(
             event.name = "codex.model_cache",
             turn_id = self.turn_id.as_deref(),
@@ -1545,6 +1595,13 @@ impl ModelAttemptGuard {
             outcome = ?outcome,
             input_representation = self.measurements.selected_representation.map(SelectedInputRepresentation::as_str),
             diagnostics_available = !self.measurements.prompt_context_categories.is_empty(),
+            prompt_context_categories = %local_prompt_context_categories,
+            full_prompt_estimated_tokens = self.measurements.full_prompt_estimated_tokens,
+            fixed_prefix_reuse_eligible = self.measurements.fixed_prefix_reuse_eligible,
+            fixed_prefix_item_count = self.measurements.fixed_prefix_item_count,
+            tool_schemas_bytes = self.measurements.tool_schemas_bytes,
+            local_reused_bytes = self.measurements.local_reused_bytes,
+            local_constructed_bytes = self.measurements.local_constructed_bytes,
             baseline_compared = self.measurements.prompt_context_baseline_compared,
             provider_baseline = ?self.measurements.provider_baseline,
             previous_response_id_present = self.measurements.previous_response_id_present,
@@ -1709,6 +1766,37 @@ fn finish_queue_span(offsets: &mut ModelAttemptOffsets, now_us: u64) {
             .queue_us
             .saturating_add(now_us.saturating_sub(started_us));
     }
+}
+
+/// Renders the per-category breakdown for the local cache-diagnostics event.
+///
+/// Only categories that contributed bytes are listed, so an ordinary request
+/// does not carry fourteen zeroed entries. `changed` reports the comparison
+/// against the preceding request, which is what identifies the category that
+/// invalidated a cached prefix; it is omitted when no baseline existed. Values
+/// are counts and the category's domain-separated hash, never prompt text.
+fn compact_prompt_context_categories(
+    measurements: &[PromptContextMeasurement],
+    baseline_compared: bool,
+) -> String {
+    let entries = measurements
+        .iter()
+        .filter(|measurement| measurement.serialized_bytes > 0)
+        .map(|measurement| {
+            serde_json::json!({
+                "category": measurement.category,
+                "bytes": measurement.serialized_bytes,
+                "tokens": measurement.estimated_tokens,
+                "sha256": measurement.sha256,
+                // Absent rather than `true` on the first request of a session:
+                // with no predecessor every category is trivially "changed",
+                // which would otherwise read as cache churn.
+                "changed": baseline_compared
+                    .then(|| !measurement.unchanged_from_previous_request),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn model_attempt_phase_durations(offsets: &ModelAttemptOffsets) -> (u64, u64, Option<u64>) {
@@ -2325,11 +2413,54 @@ const STREAM_THROUGHPUT_COLLAPSE_STREAK: u8 = 2;
 /// Responses to observe on a replacement connection before replacing it again.
 /// A provider-wide slowdown fills the window meanwhile and becomes the baseline.
 const STREAM_THROUGHPUT_ROTATION_COOLDOWN: u8 = 4;
+/// Rotating discards the provider's inherited prefix, so the next request
+/// replays the whole conversation uncached. Measured sessions re-bill
+/// 180k-328k input tokens per rotation at a large context while the escaped
+/// slowdown costs far less, so a collapse only warrants rotation when the
+/// expected output-time saving outweighs replaying that prefix.
+///
+/// Prefill of replayed input is much cheaper per token than generating output,
+/// so the replay is charged at a conservative fraction of the observed output
+/// rate rather than token-for-token.
+const STREAM_REPLAY_PREFILL_SPEEDUP: f64 = 10.0;
+/// Output a replacement connection is expected to serve before the turn ends.
+/// Rotation only pays off across the responses that follow it, so the saving is
+/// credited over this horizon instead of the single collapsed response.
+const STREAM_ROTATION_PAYOFF_OUTPUT_TOKENS: f64 = 4096.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StreamThroughputCollapse {
     observed_tokens_per_second: f64,
     baseline_tokens_per_second: f64,
+    /// Input tokens the collapsed response billed, including the cached
+    /// prefix. Rotation would resend this prefix uncached.
+    inherited_input_tokens: i64,
+}
+
+impl StreamThroughputCollapse {
+    /// Whether replacing the connection is expected to recover more time than
+    /// replaying the inherited prefix uncached costs.
+    ///
+    /// Both sides are expressed in seconds of the current connection's own
+    /// observed rate, so a provider-wide slowdown cancels out instead of
+    /// making rotation look cheaper.
+    fn rotation_saves_more_than_replay(&self) -> bool {
+        if self.observed_tokens_per_second <= 0.0 || self.inherited_input_tokens <= 0 {
+            // Without a usable rate or context measurement, keep the existing
+            // escape behavior rather than pinning the turn to a bad backend.
+            return true;
+        }
+        let recovered_tokens_per_second =
+            self.baseline_tokens_per_second - self.observed_tokens_per_second;
+        if recovered_tokens_per_second <= 0.0 {
+            return false;
+        }
+        let saved_seconds = STREAM_ROTATION_PAYOFF_OUTPUT_TOKENS / self.observed_tokens_per_second
+            - STREAM_ROTATION_PAYOFF_OUTPUT_TOKENS / self.baseline_tokens_per_second;
+        let replay_seconds = self.inherited_input_tokens as f64
+            / (self.observed_tokens_per_second * STREAM_REPLAY_PREFILL_SPEEDUP);
+        saved_seconds > replay_seconds
+    }
 }
 
 /// Output rates of completed websocket responses, judged against their recent median.
@@ -2342,7 +2473,7 @@ struct WebsocketStreamThroughput {
 }
 
 impl WebsocketStreamThroughput {
-    fn record(&mut self, output_tokens: i64, elapsed: Duration) {
+    fn record(&mut self, output_tokens: i64, elapsed: Duration, input_tokens: i64) {
         if output_tokens < STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS || elapsed.is_zero() {
             return;
         }
@@ -2353,6 +2484,7 @@ impl WebsocketStreamThroughput {
             .map(|baseline_tokens_per_second| StreamThroughputCollapse {
                 observed_tokens_per_second: tokens_per_second,
                 baseline_tokens_per_second,
+                inherited_input_tokens: input_tokens,
             });
         self.collapsed_streak = if self.latest_collapse.is_some() {
             self.collapsed_streak.saturating_add(1)
@@ -2382,11 +2514,23 @@ impl WebsocketStreamThroughput {
     }
 
     /// Returns the collapse that warrants replacing the connection, at most once per cooldown.
+    ///
+    /// A collapse whose rotation would cost more in replayed input than it
+    /// recovers in output time is not returned, and leaves the cooldown and
+    /// streak untouched: the slowdown is real but escaping it is not worth
+    /// resending the inherited prefix uncached. A later collapse at a smaller
+    /// context, or a worse one at the same context, can still rotate.
     fn take_collapse(&mut self) -> Option<StreamThroughputCollapse> {
         if self.collapsed_streak < STREAM_THROUGHPUT_COLLAPSE_STREAK
             || self
                 .responses_since_rotation
                 .is_some_and(|responses| responses < STREAM_THROUGHPUT_ROTATION_COOLDOWN)
+        {
+            return None;
+        }
+        if self
+            .latest_collapse
+            .is_some_and(|collapse| !collapse.rotation_saves_more_than_replay())
         {
             return None;
         }
@@ -3090,7 +3234,11 @@ impl ModelClient {
                 "auto"
             }
             .to_string(),
-            parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+            // Responses Lite changes tool placement, reasoning context and a
+            // transport header; it does not restrict tool-call arity. The
+            // per-model capability is the only source of truth here, so a
+            // Lite model that advertises parallel tool calls still gets them.
+            parallel_tool_calls: prompt.parallel_tool_calls,
             reasoning,
             store: provider.is_azure_responses_endpoint(),
             stream: true,
@@ -3435,6 +3583,18 @@ impl ModelClientSession {
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
+    }
+
+    /// Replaces a websocket the provider closed mid-response with a code that
+    /// invites another connection, so the next attempt of the same request
+    /// reconnects instead of abandoning WebSockets for the session.
+    ///
+    /// The sticky turn-state token is dropped for the same reason as a
+    /// throughput collapse: the backend that closed is the one the token would
+    /// route back to.
+    pub(crate) fn replace_websocket_after_reconnectable_close(&mut self) {
+        self.reset_websocket_session();
+        self.turn_state = Arc::new(OnceLock::new());
     }
 
     /// Replaces a websocket whose responses stopped streaming at this client's
@@ -4071,9 +4231,9 @@ impl ModelClientSession {
                     self.client.force_http_fallback(session_telemetry);
                     return Ok(());
                 }
-                Err(ApiError::Transport(
-                    unauthorized_transport @ TransportError::Http { status, .. },
-                )) if status == StatusCode::UNAUTHORIZED => {
+                Err(ApiError::Transport(unauthorized_transport))
+                    if is_recoverable_authentication_failure(&unauthorized_transport) =>
+                {
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -4305,12 +4465,12 @@ impl ModelClientSession {
                     None::<(&ResponsesApiRequest, &str)>,
                 )
                 .await;
-            let client = ApiResponsesClient::new(
-                transport,
-                client_setup.api_provider,
-                client_setup.api_auth,
-            )
-            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let mut api_provider = client_setup.api_provider;
+            if let Some(timeout) = prompt.stream_progress_timeout {
+                api_provider.stream_idle_timeout = timeout;
+            }
+            let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
                 .turn_timing
@@ -4493,9 +4653,9 @@ impl ModelClientSession {
                     );
                     return Ok(stream);
                 }
-                Err(ApiError::Transport(
-                    unauthorized_transport @ TransportError::Http { status, .. },
-                )) if status == StatusCode::UNAUTHORIZED => {
+                Err(ApiError::Transport(unauthorized_transport))
+                    if is_recoverable_authentication_failure(&unauthorized_transport) =>
+                {
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
                     inference_trace_attempt
@@ -4705,9 +4865,9 @@ impl ModelClientSession {
                 {
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
-                Err(ApiError::Transport(
-                    unauthorized_transport @ TransportError::Http { status, .. },
-                )) if status == StatusCode::UNAUTHORIZED => {
+                Err(ApiError::Transport(unauthorized_transport))
+                    if is_recoverable_authentication_failure(&unauthorized_transport) =>
+                {
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -4918,10 +5078,11 @@ impl ModelClientSession {
             let dispatched_request_for_callback = Arc::clone(&dispatched_request);
             let dispatched_identity = attempt_identity.clone();
             let stream_result = websocket_connection
-                .stream_request_with_dispatch_ready(
+                .stream_request_with_response_idle_timeout(
                     &ws_request,
                     connection_reused,
                     Some(Arc::clone(&self.turn_state)),
+                    prompt.stream_progress_timeout,
                     move || {
                         if let Some(clock) = queue_clock {
                             clock.mark_queue_started();
@@ -5802,7 +5963,11 @@ where
                             throughput.collapsed_streak = 0;
                             throughput.latest_collapse = None;
                         } else if let Some(usage) = token_usage.as_ref() {
-                            throughput.record(usage.output_tokens, dispatched_at.elapsed());
+                            throughput.record(
+                                usage.output_tokens,
+                                dispatched_at.elapsed(),
+                                usage.input_tokens,
+                            );
                         }
                     }
                     feedback_tags!(last_model_response_id = &response_id);
@@ -6037,6 +6202,41 @@ fn build_routing_hint_header(
         hint.push_str(service_tier);
     }
     HeaderValue::from_str(&hint).ok()
+}
+
+/// True when a transport error is a missing/expired credential that the
+/// one-shot token refresh in [`handle_unauthorized`] can fix.
+///
+/// Covers 401 and the backend's 400 spelling of the same condition. A bearer
+/// that is absent or expired is sometimes reported as HTTP 400 "Missing bearer
+/// or basic authentication in header", which `map_api_error` turns into a
+/// non-retryable `InvalidRequest`; the turn then died with no refresh ever
+/// attempted. The 400 case is gated on an explicit authorization signal — the
+/// `x-openai-authorization-error` header, or that exact body sentence — so an
+/// ordinary malformed request still fails fast instead of burning a refresh.
+fn is_recoverable_authentication_failure(transport: &TransportError) -> bool {
+    let TransportError::Http {
+        status,
+        headers,
+        body,
+        ..
+    } = transport
+    else {
+        return false;
+    };
+    if *status == StatusCode::UNAUTHORIZED {
+        return true;
+    }
+    if *status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let has_auth_error_header = headers
+        .as_ref()
+        .is_some_and(|headers| headers.contains_key("x-openai-authorization-error"));
+    has_auth_error_header
+        || body
+            .as_deref()
+            .is_some_and(|body| body.contains("Missing bearer or basic authentication in header"))
 }
 
 async fn handle_unauthorized(

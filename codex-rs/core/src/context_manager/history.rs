@@ -121,8 +121,6 @@ impl PreparedPromptItems {
         }))
     }
 
-
-
     fn shared(&self) -> Arc<[ResponseItem]> {
         Arc::clone(self.flattened())
     }
@@ -164,8 +162,6 @@ impl PreparedPromptItems {
         }
         chunks.extend(reversed.into_iter().rev());
     }
-
-
 
     fn as_slice(&self) -> &[ResponseItem] {
         self.flattened().as_ref()
@@ -680,12 +676,12 @@ impl ContextManager {
             // retirement runs first, it deletes the original prefix item even
             // when the new value is unchanged. Retain the first item (including
             // its identity and turn metadata); changed values still retire below.
-            normalized_items = crate::stable_context::filter_unchanged_stable_context_items(
-                &[], normalized_items,
-            );
+            normalized_items =
+                crate::stable_context::filter_unchanged_stable_context_items(&[], normalized_items);
             // Retire superseded trusted slots only through the latest real
             // request. Never hoist surviving fragments or rewrite active-tail
-            // injections on each continuation.
+            // injections on each continuation. Sent task-state snapshots stay
+            // until compaction.
             if let Some(boundary) = normalized_items.iter().rposition(|item| {
                 matches!(item, ResponseItem::Message { role, .. } if role == "user")
                     && is_user_turn_boundary(item)
@@ -693,7 +689,7 @@ impl ContextManager {
                     && !crate::stable_context::is_trusted_stable_context_item(item)
             }) {
                 let tail = normalized_items.split_off(boundary + 1);
-                normalized_items = crate::stable_context::project_compaction_context(
+                normalized_items = crate::stable_context::project_sampling_history_context(
                     normalized_items.into(),
                 );
                 normalized_items.extend(tail);
@@ -793,10 +789,15 @@ impl ContextManager {
         git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> Arc<[ResponseItem]> {
         let tool_history = Arc::clone(&self.tool_history);
-        let prepared = self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
-        tool_history.project_workspace_freshness_with_cache(
-            prepared.shared_items(), workspace_identity, git_workspace,
-        ).items
+        let prepared =
+            self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
+        tool_history
+            .project_workspace_freshness_with_cache(
+                prepared.shared_items(),
+                workspace_identity,
+                git_workspace,
+            )
+            .items
     }
 
     fn prepare_for_prompt_with_completed_tool_projection_target(
@@ -883,12 +884,8 @@ impl ContextManager {
         } else {
             project(fallback_items)
         };
-        let prepared = apply_tool_history_projection(
-            prepared,
-            projection.clone(),
-            fallback_projection,
-            None,
-        );
+        let prepared =
+            apply_tool_history_projection(prepared, projection.clone(), fallback_projection, None);
         if let Some(anchor_slot) = anchor_slot
             && shares_input
         {
@@ -937,7 +934,8 @@ impl ContextManager {
         environment_id: Option<&str>,
         query: &crate::tool_history::ReadStatusQuery,
     ) -> serde_json::Value {
-        self.tool_history.read_status_page(paths, environment_id, self.raw_items(), query)
+        self.tool_history
+            .read_status_page(paths, environment_id, self.raw_items(), query)
     }
 
     pub(crate) fn rehydrate_read_replays(
@@ -1039,24 +1037,46 @@ impl ContextManager {
             .sampling_projection_anchor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(anchor) = anchor
+        // A checkpoint after the anchor makes sampling re-project (see
+        // project_continuation_with_workspace_cache); estimate that prompt,
+        // or the pins that relieve pressure would not count against it.
+        if let Some(anchor) = anchor
             .as_ref()
             .map(|entry| &entry.anchor)
             .filter(|anchor| items.starts_with(&anchor.prepared_items))
-        else {
-            return items;
-        };
-        let tail = &items[anchor.prepared_items.len()..];
-        if tail.is_empty() {
-            return Arc::clone(&anchor.projection.items);
+            .filter(|anchor| {
+                !ToolHistoryState::has_phase_checkpoint(&items[anchor.prepared_items.len()..])
+            })
+        {
+            let tail = &items[anchor.prepared_items.len()..];
+            if tail.is_empty() {
+                return Arc::clone(&anchor.projection.items);
+            }
+            return anchor
+                .projection
+                .items
+                .iter()
+                .chain(tail)
+                .cloned()
+                .collect();
         }
-        anchor
-            .projection
-            .items
-            .iter()
-            .chain(tail)
-            .cloned()
-            .collect()
+        if ToolHistoryState::has_phase_checkpoint(&items) {
+            return self.tool_history.apply_checkpoint_pins(&items);
+        }
+        items
+    }
+
+    /// See [`ToolHistoryState::pressure_retirement_selection`].
+    pub(crate) fn pressure_retirement_selection(
+        &self,
+        keep_generations: usize,
+        target_tokens: u64,
+    ) -> (Vec<String>, u64) {
+        self.tool_history.pressure_retirement_selection(
+            self.items.as_slice(),
+            keep_generations,
+            target_tokens,
+        )
     }
 
     /// Sums the projected prompt from the per-position cache of its source
@@ -1466,10 +1486,16 @@ impl ContextManager {
             )
             && self.items.iter().rev().any(|prior| match prior {
                 ResponseItem::FunctionCall {
-                    call_id: id, name, namespace: None, ..
+                    call_id: id,
+                    name,
+                    namespace: None,
+                    ..
                 }
                 | ResponseItem::CustomToolCall {
-                    call_id: id, name, namespace: None, ..
+                    call_id: id,
+                    name,
+                    namespace: None,
+                    ..
                 } => id == call_id && matches!(name.as_str(), "exec" | "wait"),
                 _ => false,
             })
@@ -1571,27 +1597,41 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
         .iter()
         .enumerate()
         .filter_map(|(index, item)| match item {
-            ResponseItem::FunctionCall { name, namespace: None, call_id, .. } if name == "update_plan" => {
-                Some((index, call_id.clone()))
-            }
+            ResponseItem::FunctionCall {
+                name,
+                namespace: None,
+                call_id,
+                ..
+            } if name == "update_plan" => Some((index, call_id.clone())),
             _ => None,
         })
         .collect::<Vec<_>>();
     // Rejections/cancellation after an accepted update remain verbatim. They
     // must not resurrect every obsolete checklist in compaction input.
     let latest = update_calls.iter().rev().find_map(|(call_index, call_id)| {
-        items.iter().enumerate().rev().find_map(|(output_index, item)| {
-            let ResponseItem::FunctionCallOutput { call_id: output_id, output, .. } = item else {
-                return None;
-            };
-            if output_id != call_id || output.success == Some(false) {
-                return None;
-            }
-            let FunctionCallOutputBody::Text(text) = &output.body else { return None };
-            let value: serde_json::Value = serde_json::from_str(text).ok()?;
-            value.get("current_plan").filter(|plan| plan.is_object())?;
-            Some((*call_index, output_index, value))
-        })
+        items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(output_index, item)| {
+                let ResponseItem::FunctionCallOutput {
+                    call_id: output_id,
+                    output,
+                    ..
+                } = item
+                else {
+                    return None;
+                };
+                if output_id != call_id || output.success == Some(false) {
+                    return None;
+                }
+                let FunctionCallOutputBody::Text(text) = &output.body else {
+                    return None;
+                };
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                value.get("current_plan").filter(|plan| plan.is_object())?;
+                Some((*call_index, output_index, value))
+            })
     });
     let Some((latest_call_index, latest_output_index, mut authoritative_output)) = latest else {
         return;
@@ -1602,7 +1642,12 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
     output_object.remove("normalized_plan");
     output_object.insert(
         "superseded_updates".to_string(),
-        serde_json::json!(update_calls.iter().filter(|(index, _)| *index < latest_call_index).count()),
+        serde_json::json!(
+            update_calls
+                .iter()
+                .filter(|(index, _)| *index < latest_call_index)
+                .count()
+        ),
     );
 
     let mut projected_call = items[latest_call_index].clone();
@@ -1621,16 +1666,25 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
 
     let update_call_ids = update_calls
         .iter()
-        .filter(|(index, call_id)| *index <= latest_call_index && items.iter().any(|item| {
-            let ResponseItem::FunctionCallOutput { call_id: output_id, output, .. } = item else {
-                return false;
-            };
-            output_id == call_id && output.success != Some(false)
-                && output.body.to_text().is_some_and(|text| {
-                    serde_json::from_str::<serde_json::Value>(&text)
-                        .is_ok_and(|value| value["current_plan"].is_object())
+        .filter(|(index, call_id)| {
+            *index <= latest_call_index
+                && items.iter().any(|item| {
+                    let ResponseItem::FunctionCallOutput {
+                        call_id: output_id,
+                        output,
+                        ..
+                    } = item
+                    else {
+                        return false;
+                    };
+                    output_id == call_id
+                        && output.success != Some(false)
+                        && output.body.to_text().is_some_and(|text| {
+                            serde_json::from_str::<serde_json::Value>(&text)
+                                .is_ok_and(|value| value["current_plan"].is_object())
+                        })
                 })
-        }))
+        })
         .map(|(_, call_id)| call_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut index = 0;
@@ -1674,8 +1728,12 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
                                 | codex_protocol::models::ContentItem::OutputText { .. }
                         )
                     }) => {}
-            ResponseItem::FunctionCall { name, namespace, call_id, .. }
-                if namespace.is_some() || name != "update_plan" => {
+            ResponseItem::FunctionCall {
+                name,
+                namespace,
+                call_id,
+                ..
+            } if namespace.is_some() || name != "update_plan" => {
                 if !calls.insert((false, call_id.as_str())) {
                     return false;
                 }
@@ -2010,7 +2068,9 @@ fn apply_tool_history_projection(
     let metadata = continuation
         .filter(|entry| entry.metadata_matches(&prepared))
         .and_then(|entry| {
-            let tail = prepared.items().get(entry.anchor.projection.items.len()..)?;
+            let tail = prepared
+                .items()
+                .get(entry.anchor.projection.items.len()..)?;
             // A new user turn reclassifies current-input attribution in the
             // prefix, even when its serialized bytes happen to be unchanged.
             if tail.iter().any(|item| {
@@ -2023,10 +2083,9 @@ fn apply_tool_history_projection(
             let provenance = if tail.is_empty() {
                 entry.prompt_provenance.clone()
             } else {
-                entry.prompt_provenance.with_appended_items(
-                    tail,
-                    &prepared.stable_context_manifest,
-                )
+                entry
+                    .prompt_provenance
+                    .with_appended_items(tail, &prepared.stable_context_manifest)
             };
             Some((provenance, fingerprint))
         });
@@ -2448,15 +2507,20 @@ pub(crate) fn is_turn_local_advice(item: &ResponseItem) -> bool {
 }
 
 pub(crate) fn retire_expired_turn_advice(items: &mut Vec<ResponseItem>) {
-    let current_turn = items.iter().rev().find(|item| is_user_turn_boundary(item))
-        .and_then(ResponseItem::turn_id).map(str::to_string);
+    let current_turn = items
+        .iter()
+        .rev()
+        .find(|item| is_user_turn_boundary(item))
+        .and_then(ResponseItem::turn_id)
+        .map(str::to_string);
     let completed = completed_turn_boundary(items);
     let mut index = 0;
     items.retain(|item| {
-        let expired = is_turn_local_advice(item) && (
-            completed.is_some_and(|boundary| index < boundary)
-                || current_turn.as_deref().is_some_and(|turn| item.turn_id().is_some_and(|owner| owner != turn))
-        );
+        let expired = is_turn_local_advice(item)
+            && (completed.is_some_and(|boundary| index < boundary)
+                || current_turn
+                    .as_deref()
+                    .is_some_and(|turn| item.turn_id().is_some_and(|owner| owner != turn)));
         index += 1;
         !expired
     });

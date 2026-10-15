@@ -387,7 +387,7 @@ impl AgentTaskCoordinator {
     pub(crate) fn record_task_usage_for_source(
         &self,
         session_source: &SessionSource,
-        tokens: u64,
+        tokens: crate::agent::task_metrics::TokenClassTotals,
         calls: u64,
     ) -> bool {
         let Some(binding) = self.binding_for_source(session_source) else {

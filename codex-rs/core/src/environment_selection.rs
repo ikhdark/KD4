@@ -45,6 +45,8 @@ struct SelectedTurnEnvironment {
     selection: TurnEnvironmentSelection,
     resolution: TurnEnvironmentResolution,
     lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
+    owns_resolution: bool,
+    snapshot_cleanup_tasks: Option<tokio_util::task::TaskTracker>,
 }
 
 #[derive(Clone)]
@@ -59,6 +61,7 @@ pub(crate) struct StartingTurnEnvironment {
     pub(crate) selection_index: usize,
     resolution: TurnEnvironmentResolution,
     _lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
+    snapshot_cleanup_tasks: Option<tokio_util::task::TaskTracker>,
 }
 
 impl fmt::Debug for StartingTurnEnvironment {
@@ -87,7 +90,7 @@ pub(crate) struct ThreadEnvironments {
     shell_snapshot: ShellSnapshot,
     non_blocking_snapshots: bool,
     environments: ArcSwap<SelectedTurnEnvironmentState>,
-    lifecycles: Mutex<Vec<Weak<TurnEnvironmentLifecycle>>>,
+    owned_lifecycles: Mutex<Vec<Weak<TurnEnvironmentLifecycle>>>,
     snapshot_tasks: Vec<tokio_util::task::TaskTracker>,
 }
 
@@ -102,14 +105,20 @@ impl ThreadEnvironments {
         // Preserve the selected order and shared startup ownership when inheriting.
         let selections = current.to_selections();
         let generation = current.generation;
-        // Retain inherited trackers even if their selections are later replaced:
-        // an already-released remote snapshot can still be awaiting deletion.
-        let snapshot_tasks = std::iter::once(shell_snapshot.tasks())
+        // Retain cleanup-only trackers even if selections are later replaced.
+        // Inherited builders belong to their parent and must not delay this session.
+        let snapshot_tasks = std::iter::once(shell_snapshot.cleanup_tasks())
             .chain(
                 current
                     .turn_environments
                     .iter()
                     .filter_map(|environment| environment.shell_snapshot_tasks.clone()),
+            )
+            .chain(
+                current
+                    .starting
+                    .iter()
+                    .filter_map(|environment| environment.snapshot_cleanup_tasks.clone()),
             )
             .collect();
         let mut environments: Vec<SelectedTurnEnvironment> = current
@@ -118,27 +127,35 @@ impl ThreadEnvironments {
             .map(|environment| {
                 let selection = environment.selection();
                 let lifecycle = environment.lifecycle();
+                let snapshot_cleanup_tasks = environment.shell_snapshot_tasks.clone();
                 let resolution: TurnEnvironmentResolution =
                     futures::future::ready(Ok(environment)).boxed().shared();
                 SelectedTurnEnvironment {
                     selection,
                     resolution,
                     lifecycle,
+                    owns_resolution: false,
+                    snapshot_cleanup_tasks,
                 }
             })
-            .chain(current.starting.into_iter().map(|environment| SelectedTurnEnvironment {
-                selection: environment.selection,
-                resolution: environment.resolution,
-                lifecycle: environment._lifecycle,
-            }))
+            .chain(
+                current
+                    .starting
+                    .into_iter()
+                    .map(|environment| SelectedTurnEnvironment {
+                        selection: environment.selection,
+                        resolution: environment.resolution,
+                        lifecycle: environment._lifecycle,
+                        owns_resolution: false,
+                        snapshot_cleanup_tasks: environment.snapshot_cleanup_tasks,
+                    }),
+            )
             .collect();
         environments.sort_by_key(|environment| {
-            selections.iter().position(|selection| selection == &environment.selection)
+            selections
+                .iter()
+                .position(|selection| selection == &environment.selection)
         });
-        let lifecycles = environments
-            .iter()
-            .filter_map(|environment| environment.lifecycle.as_ref().map(Arc::downgrade))
-            .collect();
         Self {
             environment_manager,
             local_shell,
@@ -148,7 +165,7 @@ impl ThreadEnvironments {
                 generation,
                 environments,
             }),
-            lifecycles: Mutex::new(lifecycles),
+            owned_lifecycles: Mutex::new(Vec::new()),
             snapshot_tasks,
         }
     }
@@ -178,7 +195,7 @@ impl ThreadEnvironments {
                 continue;
             };
             let lifecycle = Arc::new(TurnEnvironmentLifecycle::new());
-            self.lifecycles
+            self.owned_lifecycles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(Arc::downgrade(&lifecycle));
@@ -199,6 +216,8 @@ impl ThreadEnvironments {
                 selection: selected_environment.clone(),
                 resolution,
                 lifecycle: Some(lifecycle),
+                owns_resolution: true,
+                snapshot_cleanup_tasks: Some(self.shell_snapshot.cleanup_tasks()),
             });
         }
         let selections_changed = previous.environments.len() != next.len()
@@ -259,8 +278,8 @@ impl ThreadEnvironments {
                 TurnEnvironment::new(selection.environment_id, environment, selection.cwd, shell);
             turn_environment.operating_system = operating_system;
             turn_environment.attach_lifecycle(lifecycle);
-            let snapshot_tasks = shell_snapshot.tasks();
-            turn_environment.shell_snapshot_tasks = Some(snapshot_tasks.clone());
+            let builder_tasks = shell_snapshot.builder_tasks();
+            turn_environment.shell_snapshot_tasks = Some(shell_snapshot.cleanup_tasks());
             let mut snapshot_environment = turn_environment.clone();
             snapshot_environment.detach_lifecycle();
             let snapshot_cancellation = cancellation.clone();
@@ -272,7 +291,7 @@ impl ThreadEnvironments {
             }
             .boxed()
             .shared();
-            drop(snapshot_tasks.spawn(task.clone()));
+            drop(builder_tasks.spawn(task.clone()));
             turn_environment.shell_snapshot = task;
             Ok(turn_environment)
         }
@@ -307,6 +326,7 @@ impl ThreadEnvironments {
                     selection_index,
                     resolution: environment.resolution.clone(),
                     _lifecycle: environment.lifecycle.clone(),
+                    snapshot_cleanup_tasks: environment.snapshot_cleanup_tasks.clone(),
                 }),
             }
         }
@@ -323,7 +343,7 @@ impl ThreadEnvironments {
 
     pub(crate) fn shutdown(&self) {
         let mut lifecycles = self
-            .lifecycles
+            .owned_lifecycles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lifecycles.retain(|lifecycle| {
@@ -342,6 +362,9 @@ impl ThreadEnvironments {
     pub(crate) async fn finish_shutdown(&self) {
         let current = self.environments.load_full();
         for environment in &current.environments {
+            if !environment.owns_resolution {
+                continue;
+            }
             if let Ok(environment) = environment.resolution.clone().await {
                 // Cancellation must retire a pending builder before its tracker is
                 // checked, including a file published just before validation.
@@ -354,6 +377,11 @@ impl ThreadEnvironments {
                 environments: Vec::new(),
             }));
         drop(current);
+        // Owned builders include accepted remote writes, which retain cleanup
+        // ownership until the write is acknowledged even after cancellation.
+        let builders = self.shell_snapshot.builder_tasks();
+        builders.close();
+        builders.wait().await;
         for tasks in &self.snapshot_tasks {
             tasks.close();
             tasks.wait().await;
@@ -394,7 +422,11 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn primary(&self) -> Option<&TurnEnvironment> {
-        if self.starting.iter().any(|environment| environment.selection_index == 0) {
+        if self
+            .starting
+            .iter()
+            .any(|environment| environment.selection_index == 0)
+        {
             return None;
         }
         self.turn_environments.first()
@@ -407,7 +439,8 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn to_selections(&self) -> Vec<TurnEnvironmentSelection> {
-        let mut selections: Vec<_> = self.turn_environments
+        let mut selections: Vec<_> = self
+            .turn_environments
             .iter()
             .map(TurnEnvironment::selection)
             .collect();
@@ -850,22 +883,28 @@ url = "ws://127.0.0.1:8765"
                 .collect::<Vec<_>>(),
             vec![remote.clone()]
         );
-        assert_eq!(starting.to_selections(), vec![remote.clone(), local.clone()]);
+        assert_eq!(
+            starting.to_selections(),
+            vec![remote.clone(), local.clone()]
+        );
         assert!(starting.primary().is_none());
         assert!(starting.single_local_environment().is_none());
 
         let cancellation = CancellationToken::new();
-        let pending_dispatch = crate::tools::handlers::wait_for_tool_environment(
-            &starting, None, &cancellation,
-        );
+        let pending_dispatch =
+            crate::tools::handlers::wait_for_tool_environment(&starting, None, &cancellation);
         tokio::pin!(pending_dispatch);
-        assert!(timeout(Duration::from_millis(20), &mut pending_dispatch).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), &mut pending_dispatch)
+                .await
+                .is_err()
+        );
         let server = tokio::spawn(serve_environment_info(listener));
         let selected = timeout(Duration::from_secs(5), pending_dispatch)
-        .await
-        .expect("environment resolution should finish")
-        .expect("environment resolution should succeed")
-        .expect("selected primary");
+            .await
+            .expect("environment resolution should finish")
+            .expect("environment resolution should succeed")
+            .expect("selected primary");
         assert_eq!(selected.environment_id, remote.environment_id);
         let attached = turn_environments.snapshot().await;
 
@@ -979,6 +1018,15 @@ url = "ws://127.0.0.1:8765"
         turn_environments.shutdown();
 
         assert!(cancellation.is_cancelled());
+        assert!(
+            timeout(Duration::from_secs(5), snapshot.starting[0].wait_until_ready())
+                .await
+                .expect("owner cancellation releases its stalled resolver")
+                .is_err()
+        );
+        timeout(Duration::from_secs(5), turn_environments.finish_shutdown())
+            .await
+            .expect("owner shutdown does not wait for the stalled dependency");
         drop(snapshot);
         drop(listener);
     }
@@ -1109,6 +1157,74 @@ url = "ws://127.0.0.1:8765"
             .expect("changed environment");
         assert!(initial.resolution.ptr_eq(&reused.resolution));
         assert!(!reused.resolution.ptr_eq(&changed.resolution));
+    }
+
+    #[tokio::test]
+    async fn child_shutdown_preserves_stalled_parent_environment() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let manager = Arc::new(
+            EnvironmentManager::create_for_tests(
+                Some(format!(
+                    "ws://{}",
+                    listener.local_addr().expect("listener address")
+                )),
+                Some(test_runtime_paths()),
+            )
+            .await,
+        );
+        let selection = TurnEnvironmentSelection {
+            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+            cwd: PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")),
+        };
+        let parent = ThreadEnvironments::new(
+            Arc::clone(&manager),
+            crate::shell::default_user_shell(),
+            ShellSnapshot::disabled(),
+            TurnEnvironmentSnapshot::default(),
+            /*non_blocking_snapshots*/ true,
+        );
+        parent.update_selections(std::slice::from_ref(&selection));
+        let inherited = parent.snapshot().await;
+        assert_eq!(inherited.starting.len(), 1);
+        let pending = inherited.starting[0].clone();
+        let cancellation = pending
+            ._lifecycle
+            .as_ref()
+            .expect("parent resolution lifecycle")
+            .cancellation_token();
+        let child = ThreadEnvironments::new(
+            manager,
+            crate::shell::default_user_shell(),
+            ShellSnapshot::disabled(),
+            inherited,
+            /*non_blocking_snapshots*/ true,
+        );
+        child.update_selections(std::slice::from_ref(&selection));
+
+        child.shutdown();
+        assert!(
+            !cancellation.is_cancelled(),
+            "child shutdown must not cancel the parent's stalled resolver"
+        );
+        timeout(Duration::from_secs(5), child.finish_shutdown())
+            .await
+            .expect("child shutdown must not await the stalled parent dependency");
+        assert!(pending.resolution.clone().now_or_never().is_none());
+
+        let server = tokio::spawn(serve_environment_info(listener));
+        let resolved = timeout(Duration::from_secs(5), pending.wait_until_ready())
+            .await
+            .expect("parent resolver finishes after dependency is released")
+            .expect("parent resolver was not cancelled by child shutdown");
+        assert_eq!(resolved.environment_id, selection.environment_id);
+        server.await.expect("server task");
+        parent.shutdown();
+        timeout(Duration::from_secs(5), parent.finish_shutdown())
+            .await
+            .expect("parent shutdown finishes");
+        assert!(cancellation.is_cancelled(), "the owner still cancels its lifecycle");
     }
 
     #[tokio::test]

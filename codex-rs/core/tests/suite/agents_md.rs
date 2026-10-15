@@ -43,8 +43,7 @@ const NEW_PROJECT_INSTRUCTIONS: &str = "new project instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const PROJECT_INSTRUCTIONS: &str = "project instructions";
 const PROJECT_SEPARATOR: &str = "--- project-doc ---";
-const FRESH_PROVENANCE: &str =
-    "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.";
+const FRESH_PROVENANCE: &str = "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.";
 const SPAWN_CALL_ID: &str = "spawn-global-instructions-child";
 const SPAWN_CHILD_PROMPT: &str = "inspect inherited global instructions";
 const SPAWN_FRESH_PARENT_PROMPT: &str = "spawn a child with fresh context";
@@ -117,15 +116,11 @@ fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
 
 fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> String {
     let cwd = PathUri::from_abs_path(cwd).inferred_native_path_string();
-    format!(
-        "# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
-    )
+    format!("# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
 fn expected_provider_only_instruction_fragment(contents: &str) -> String {
-    format!(
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
-    )
+    format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
 fn expected_provider_only_replacement_fragment(contents: &str) -> String {
@@ -515,8 +510,6 @@ async fn symlinked_cwd_uses_logical_parent_for_agents_discovery() -> Result<()> 
     Ok(())
 }
 
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
     let server = start_mock_server().await;
@@ -838,7 +831,13 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     ] {
         let user_texts = request.message_input_texts("user");
         for expected in ["persist instructions", latest_prompt] {
-            assert_eq!(user_texts.iter().filter(|text| text.as_str() == expected).count(), 1);
+            assert_eq!(
+                user_texts
+                    .iter()
+                    .filter(|text| text.as_str() == expected)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -938,7 +937,13 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
     ] {
         let user_texts = request.message_input_texts("user");
         for expected in ["persist instructions", latest_prompt] {
-            assert_eq!(user_texts.iter().filter(|text| text.as_str() == expected).count(), 1);
+            assert_eq!(
+                user_texts
+                    .iter()
+                    .filter(|text| text.as_str() == expected)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -1022,7 +1027,11 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         })
         .with_config(|config| {
             // Keep this fork-history fixture independent of default child-model changes.
-            config.model_catalog.as_mut().expect("test catalog").models
+            config
+                .model_catalog
+                .as_mut()
+                .expect("test catalog")
+                .models
                 .retain(|model| model.slug == "gpt-5.5");
             let _ = config.features.enable(Feature::Collab);
             let _ = config.features.disable(Feature::MultiAgentV2);
@@ -1066,12 +1075,18 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     assert_ne!(source, new_source);
     let mut created_threads = test.thread_manager.subscribe_thread_created();
     test.submit_turn(parent_prompt).await?;
-    let spawn_outputs = server.received_requests().await.unwrap_or_default()
-        .iter().filter_map(|request| function_call_output(request, SPAWN_CALL_ID))
+    let spawn_outputs = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|request| function_call_output(request, SPAWN_CALL_ID))
         .collect::<Vec<_>>();
     let child_thread_id = tokio::time::timeout(Duration::from_secs(10), created_threads.recv())
         .await
-        .map_err(|_| anyhow!("timed out waiting for the subagent thread; spawn outputs: {spawn_outputs:?}"))??;
+        .map_err(|_| {
+            anyhow!("timed out waiting for the subagent thread; spawn outputs: {spawn_outputs:?}")
+        })??;
     let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
     let spawn_request = spawn_mock.single_request();
     let child_request = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1122,13 +1137,19 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     assert_single_fresh_instruction_fragment_contains(&spawn_request, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_fresh_instruction_fragment_contains(&child_request, OLD_GLOBAL_INSTRUCTIONS);
     for request in [&seed_request, &spawn_request, &child_request] {
-        assert!(instruction_fragments(request).iter().all(|text| {
-            !text.contains(NEW_GLOBAL_INSTRUCTIONS)
-        }), "a child must not reload changed global instructions independently of its parent");
+        assert!(
+            instruction_fragments(request)
+                .iter()
+                .all(|text| { !text.contains(NEW_GLOBAL_INSTRUCTIONS) }),
+            "a child must not reload changed global instructions independently of its parent"
+        );
     }
     let child_user_texts = child_request.message_input_texts("user");
     assert_eq!(
-        child_user_texts.iter().filter(|text| text.as_str() == SPAWN_CHILD_PROMPT).count(),
+        child_user_texts
+            .iter()
+            .filter(|text| text.as_str() == SPAWN_CHILD_PROMPT)
+            .count(),
         1,
         "both forked and fresh children must receive their own prompt exactly once"
     );
@@ -1142,7 +1163,10 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         .filter_map(|span| span["text"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
     assert_eq!(
-        child_assistant_texts.iter().filter(|text| text.as_str() == "seeded").count(),
+        child_assistant_texts
+            .iter()
+            .filter(|text| text.as_str() == "seeded")
+            .count(),
         usize::from(fork_context),
         "forking preserves parent assistant history; fresh children must not inherit it"
     );

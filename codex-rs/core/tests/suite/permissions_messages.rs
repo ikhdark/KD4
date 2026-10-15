@@ -166,7 +166,6 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_added_on_override_change() -> Result<()> {
     require_network!();
@@ -231,7 +230,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     assert_eq!(permissions_1.len(), 1);
     assert_eq!(permissions_2.len(), 1);
     assert_ne!(permissions_2[0], permissions_1[0]);
-    assert!(permissions_2[0].contains("Approval policy is `never`."));
+    assert!(permissions_2[0].contains("Approval policy is `never`"));
 
     Ok(())
 }
@@ -456,7 +455,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     let permissions = permissions_texts(&req3.single_request());
     assert_eq!(permissions.len(), 1);
-    assert!(permissions[0].contains("Approval policy is `never`."));
+    assert!(permissions[0].contains("Approval policy is `never`"));
 
     Ok(())
 }
@@ -539,7 +538,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     let permissions_base = permissions_texts(&req2.single_request());
     assert_eq!(permissions_base.len(), 1);
-    assert!(permissions_base[0].contains("Approval policy is `never`."));
+    assert!(permissions_base[0].contains("Approval policy is `never`"));
     initial.codex.flush_rollout().await?;
 
     builder = builder.with_config(|config| {

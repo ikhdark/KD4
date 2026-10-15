@@ -173,7 +173,12 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
         .send(crate::session::QueuedSubmission {
             submission: submission.clone(),
             mailbox_admission: Some(admission_tx),
-            preparation_permit: Some(Arc::clone(&codex.session.submission_preparation_slots).acquire_owned().await.unwrap()),
+            preparation_permit: Some(
+                Arc::clone(&codex.session.submission_preparation_slots)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            ),
         })
         .await
         .expect("submit to proxy");
@@ -184,8 +189,16 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
     assert_eq!(forwarded.submission.id, submission.id);
     assert_eq!(forwarded.submission.op, submission.op);
     assert_eq!(forwarded.submission.trace, submission.trace);
-    let preparation_permit = forwarded.preparation_permit.expect("original admission permit");
-    assert_eq!(codex.session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY - 1);
+    let preparation_permit = forwarded
+        .preparation_permit
+        .expect("original admission permit");
+    assert_eq!(
+        codex
+            .session
+            .submission_preparation_slots
+            .available_permits(),
+        SUBMISSION_CHANNEL_CAPACITY - 1
+    );
     forwarded
         .mailbox_admission
         .expect("original acknowledgement")
@@ -202,7 +215,13 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
         matches!(error, CodexErr::InvalidRequest(message) if message == "session mailbox is full")
     );
     drop(preparation_permit);
-    assert_eq!(codex.session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY);
+    assert_eq!(
+        codex
+            .session
+            .submission_preparation_slots
+            .available_permits(),
+        SUBMISSION_CHANNEL_CAPACITY
+    );
     drop(tx_ops);
     timeout(Duration::from_secs(5), forward)
         .await
@@ -281,7 +300,12 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     let (admission_tx, admission_rx) = oneshot::channel();
     let mut blocked = queued("blocked-forward");
     blocked.mailbox_admission = Some(admission_tx);
-    blocked.preparation_permit = Some(Arc::clone(&session.submission_preparation_slots).acquire_owned().await.unwrap());
+    blocked.preparation_permit = Some(
+        Arc::clone(&session.submission_preparation_slots)
+            .acquire_owned()
+            .await
+            .unwrap(),
+    );
     tx_ops.send(blocked).await.unwrap();
     let cancel = CancellationToken::new();
     let forward = tokio::spawn(forward_ops(
@@ -297,9 +321,17 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     .await
     .expect("forwarder takes queued submission");
     let mut buffered = queued("buffered-proxy");
-    buffered.preparation_permit = Some(Arc::clone(&session.submission_preparation_slots).acquire_owned().await.unwrap());
+    buffered.preparation_permit = Some(
+        Arc::clone(&session.submission_preparation_slots)
+            .acquire_owned()
+            .await
+            .unwrap(),
+    );
     tx_ops.send(buffered).await.unwrap();
-    assert_eq!(session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY - 2);
+    assert_eq!(
+        session.submission_preparation_slots.available_permits(),
+        SUBMISSION_CHANNEL_CAPACITY - 2
+    );
     cancel.cancel();
     timeout(Duration::from_secs(1), forward)
         .await
@@ -311,7 +343,10 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     );
     assert!(rx_ops.is_closed());
     assert!(rx_ops.is_empty());
-    assert_eq!(session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY);
+    assert_eq!(
+        session.submission_preparation_slots.available_permits(),
+        SUBMISSION_CHANNEL_CAPACITY
+    );
     let start_gate = session.task_start_gate.acquire().await.unwrap();
     timeout(Duration::from_secs(1), shutdown_delegate(&codex))
         .await

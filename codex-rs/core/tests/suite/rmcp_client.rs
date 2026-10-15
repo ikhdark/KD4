@@ -152,7 +152,9 @@ fn user_turn_with_permission_profile(
 async fn wait_for_successful_turn(fixture: &TestCodex) {
     let EventMsg::TurnComplete(completed) = wait_for_event(&fixture.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
-    }).await else {
+    })
+    .await
+    else {
         unreachable!("completion predicate");
     };
     assert!(completed.error.is_none(), "{completed:?}");
@@ -364,7 +366,10 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
     .await;
     fixture
         .codex
-        .submit(read_only_user_turn(&fixture, "refresh the client capabilities"))
+        .submit(read_only_user_turn(
+            &fixture,
+            "refresh the client capabilities",
+        ))
         .await?;
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut ready = false;
@@ -372,7 +377,11 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
         while !ready || !completed {
             match fixture.codex.next_event().await?.msg {
                 EventMsg::McpStartupComplete(summary) => {
-                    anyhow::ensure!(summary.failed.is_empty(), "MCP refresh failed: {:?}", summary.failed);
+                    anyhow::ensure!(
+                        summary.failed.is_empty(),
+                        "MCP refresh failed: {:?}",
+                        summary.failed
+                    );
                     anyhow::ensure!(summary.cancelled.is_empty(), "MCP refresh was cancelled");
                     ready = summary.ready.iter().any(|name| name == server_name);
                 }

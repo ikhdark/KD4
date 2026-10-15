@@ -121,6 +121,13 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// manager throughout the codebase; that is a larger refactor than this change.
     fn auth_manager(&self) -> Option<Arc<AuthManager>>;
 
+    /// Returns whether this provider requires first-party credentials that are
+    /// not currently cached, as during a logout or account switch. A request
+    /// dispatched now would carry no credentials.
+    fn missing_required_credentials(&self) -> bool {
+        false
+    }
+
     /// Returns the current provider-scoped auth value, if one is configured.
     fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>;
 
@@ -414,6 +421,15 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
+    }
+
+    fn missing_required_credentials(&self) -> bool {
+        // External auth resolves its source on every request, so an empty cache
+        // does not mean the request will go out unauthenticated.
+        provider_uses_first_party_auth_path(&self.info)
+            && self.auth_manager.as_ref().is_some_and(|auth_manager| {
+                !auth_manager.has_external_auth() && auth_manager.auth_cached().is_none()
+            })
     }
 
     fn supports_attestation(&self) -> bool {

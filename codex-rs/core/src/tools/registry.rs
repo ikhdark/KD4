@@ -550,7 +550,11 @@ impl AnyToolResult {
         }
         // Admission/dispatch owns these dependencies, including repaired commands.
         // Text equality without provenance cannot establish cross-tool equivalence.
-        let Some(dependencies) = self.source_dependencies.as_ref().filter(|set| !set.is_empty()) else {
+        let Some(dependencies) = self
+            .source_dependencies
+            .as_ref()
+            .filter(|set| !set.is_empty())
+        else {
             // Unknown provenance prevents cross-action reuse, not progress.
             // The collector binds unscoped evidence to its action identity.
             return Some(signal);
@@ -594,7 +598,11 @@ impl AnyToolResult {
     /// alone does not imply unread evidence; the cell compares delivered coverage.
     pub(crate) fn canonical_delivery_artifact(&self) -> Option<(String, String, u64)> {
         let candidate = self.model_projection.as_ref()?.candidate.as_ref()?;
-        Some((candidate.artifact_id.clone(), candidate.artifact_sha256.clone(), candidate.artifact_bytes))
+        Some((
+            candidate.artifact_id.clone(),
+            candidate.artifact_sha256.clone(),
+            candidate.artifact_bytes,
+        ))
     }
 
     pub(crate) fn projected_source_dependencies(
@@ -709,7 +717,8 @@ impl AnyToolResult {
     }
 
     pub(crate) fn code_mode_result_with_budget(self, budget: usize) -> serde_json::Value {
-        self.result.code_mode_result_with_budget(&self.payload, budget)
+        self.result
+            .code_mode_result_with_budget(&self.payload, budget)
     }
 
     pub(crate) fn code_mode_failure_is_error(&self) -> bool {
@@ -958,7 +967,8 @@ fn apply_post_tool_use_outcome(
         return Vec::new();
     }
     if let Some(feedback_message) = outcome.feedback_message {
-        let mut model_visible = FunctionToolOutput::from_text(feedback_message, /*success*/ None);
+        let mut model_visible =
+            FunctionToolOutput::from_text(feedback_message, /*success*/ None);
         result.code_mode_feedback.extend(model_visible.body.clone());
         // Preserve earlier runtime warnings for direct callers as well as
         // code mode; a later hook must not hide a failed durable effect commit.
@@ -1056,21 +1066,31 @@ const MODEL_DELIVERY_UNAVAILABLE_PREFIX: &str = "<tool_result_delivery_unavailab
 /// Written beside the result in the existing ordered completion batch.
 pub(crate) fn model_delivery_unavailable_receipt(call_id: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: None, role: "developer".into(), phase: None,
+        id: None,
+        role: "developer".into(),
+        phase: None,
         internal_chat_message_metadata_passthrough: None,
         content: vec![codex_protocol::models::ContentItem::InputText {
-            text: format!("{MODEL_DELIVERY_UNAVAILABLE_PREFIX}{}",
-                serde_json::json!({"version": 1, "call_id": call_id})),
+            text: format!(
+                "{MODEL_DELIVERY_UNAVAILABLE_PREFIX}{}",
+                serde_json::json!({"version": 1, "call_id": call_id})
+            ),
         }],
     }
 }
 
 pub(crate) fn is_model_delivery_unavailable_receipt(item: &ResponseItem, call_id: &str) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else { return false };
-    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else { return false };
-    role == "developer" && text.strip_prefix(MODEL_DELIVERY_UNAVAILABLE_PREFIX)
-        .and_then(|json| serde_json::from_str::<Value>(json).ok())
-        .is_some_and(|value| value["version"] == 1 && value["call_id"] == call_id)
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
+        return false;
+    };
+    role == "developer"
+        && text
+            .strip_prefix(MODEL_DELIVERY_UNAVAILABLE_PREFIX)
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .is_some_and(|value| value["version"] == 1 && value["call_id"] == call_id)
 }
 
 impl ToolOutput for UnavailableModelProjectionOutput {
@@ -1444,26 +1464,35 @@ impl ToolRegistry {
 
     pub(crate) fn semantic_capabilities(&self, name: &ToolName) -> ToolSemanticCapabilities {
         let Some(tool) = self.tools.get(name) else {
-            return ToolSemanticCapabilities { mutation: true, ..Default::default() };
+            return ToolSemanticCapabilities {
+                mutation: true,
+                ..Default::default()
+            };
         };
         ToolSemanticCapabilities {
             mutation: tool.authorization_class() == TypedToolClass::StructuredEdit
                 || (tool.authorization_class() == TypedToolClass::DynamicExternal
                     && tool.external_mutation_intent()
                         == crate::agent::task_capabilities::ExternalMutationIntent::MayMutate),
-            coordination: matches!(tool.authorization_class(),
-                TypedToolClass::AgentCommunication | TypedToolClass::RootTaskControl),
+            coordination: matches!(
+                tool.authorization_class(),
+                TypedToolClass::AgentCommunication | TypedToolClass::RootTaskControl
+            ),
             command: tool.runtime().command_argument_format(),
         }
     }
 
     pub(crate) fn terminal_failure_reuse(&self, name: &ToolName) -> TerminalFailureReuse {
-        self.tools.get(name)
-            .map_or(TerminalFailureReuse::Never, |tool| tool.runtime().terminal_failure_reuse())
+        self.tools
+            .get(name)
+            .map_or(TerminalFailureReuse::Never, |tool| {
+                tool.runtime().terminal_failure_reuse()
+            })
     }
 
     pub(crate) fn prepares_during_workspace_baseline(&self, name: &ToolName) -> bool {
-        self.tool(name).is_some_and(|tool| tool.prepares_during_workspace_baseline())
+        self.tool(name)
+            .is_some_and(|tool| tool.prepares_during_workspace_baseline())
     }
 
     pub(crate) fn terminal_result_adapter(&self, name: &ToolName) -> Option<&'static str> {
@@ -1479,21 +1508,32 @@ impl ToolRegistry {
             .is_some_and(|tool| tool.permits_shared_workspace_observation(payload))
     }
 
-    pub(crate) fn delegates_workspace_admission(&self, name: &ToolName, payload: &ToolPayload) -> bool {
-        self.tool(name)
-            .is_some_and(|tool| tool.delegates_workspace_admission() || tool.controls_process(payload))
+    pub(crate) fn delegates_workspace_admission(
+        &self,
+        name: &ToolName,
+        payload: &ToolPayload,
+    ) -> bool {
+        self.tool(name).is_some_and(|tool| {
+            tool.delegates_workspace_admission() || tool.controls_process(payload)
+        })
     }
 
     pub(crate) fn native_addition_paths(
-        &self, name: &ToolName, payload: &ToolPayload,
+        &self,
+        name: &ToolName,
+        payload: &ToolPayload,
     ) -> Option<Vec<std::path::PathBuf>> {
         self.tool(name)?.native_addition_paths(payload)
     }
 
     pub(crate) fn cancellation_cleanup_deadline(&self, name: &ToolName) -> std::time::Duration {
-        self.tool(name).map(|tool| tool.cancellation_cleanup_deadline())
+        self.tool(name)
+            .map(|tool| tool.cancellation_cleanup_deadline())
             .unwrap_or(crate::tools::parallel::TOOL_RUNTIME_CLEANUP_DEADLINE)
-            .clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(120))
+            .clamp(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(120),
+            )
     }
 
     pub(crate) fn cancellation_recovery(
@@ -1655,31 +1695,32 @@ impl ToolRegistry {
         }
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
         dispatch_state.attach_trace(dispatch_trace.clone());
-        let (tool, tool_spec, code_mode_argument_preflight, external_tool) = match self.tools.get(&tool_name) {
-            Some(registered) => (
-                Arc::clone(registered.runtime()),
-                registered.spec(),
-                Arc::clone(&registered.code_mode_argument_preflight),
-                registered.authorization_class() == TypedToolClass::DynamicExternal,
-            ),
-            None => {
-                let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
-                let log_payload = invocation.payload.log_payload();
-                otel.tool_result_with_tags(
-                    tool_name_flat.as_ref(),
-                    &call_id_owned,
-                    log_payload.as_ref(),
-                    Duration::ZERO,
-                    /*success*/ false,
-                    &message,
-                    &base_tool_result_tags,
-                    /*extra_trace_fields*/ &[],
-                );
-                let err = FunctionCallError::RespondToModel(message);
-                dispatch_trace.record_failed(&err).await;
-                return Err(err);
-            }
-        };
+        let (tool, tool_spec, code_mode_argument_preflight, external_tool) =
+            match self.tools.get(&tool_name) {
+                Some(registered) => (
+                    Arc::clone(registered.runtime()),
+                    registered.spec(),
+                    Arc::clone(&registered.code_mode_argument_preflight),
+                    registered.authorization_class() == TypedToolClass::DynamicExternal,
+                ),
+                None => {
+                    let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
+                    let log_payload = invocation.payload.log_payload();
+                    otel.tool_result_with_tags(
+                        tool_name_flat.as_ref(),
+                        &call_id_owned,
+                        log_payload.as_ref(),
+                        Duration::ZERO,
+                        /*success*/ false,
+                        &message,
+                        &base_tool_result_tags,
+                        /*extra_trace_fields*/ &[],
+                    );
+                    let err = FunctionCallError::RespondToModel(message);
+                    dispatch_trace.record_failed(&err).await;
+                    return Err(err);
+                }
+            };
 
         let telemetry_tags = tool.telemetry_tags(&invocation).await;
         let mut tool_result_tags =
@@ -1722,8 +1763,8 @@ impl ToolRegistry {
             return Err(err);
         }
 
-        let validate_arguments = external_tool
-            || matches!(invocation.source, ToolCallSource::CodeMode { .. });
+        let validate_arguments =
+            external_tool || matches!(invocation.source, ToolCallSource::CodeMode { .. });
         if validate_arguments
             && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
@@ -2120,8 +2161,7 @@ impl ToolRegistry {
                     notify_tool_finish(&invocation, lifecycle_outcome).await;
                     record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Err(err)
-                } else if dispatch_state.is_aborted()
-                {
+                } else if dispatch_state.is_aborted() {
                     // The cancellation owner retains every handler's recovery information
                     // and owns the single aborted lifecycle notification.
                     Err(err)
@@ -2394,7 +2434,9 @@ async fn prepare_model_projection(
         .get("nested_commands")
         .and_then(Value::as_array)
         .is_some_and(|states| {
-            states.iter().any(crate::tools::code_mode::command_owns_work)
+            states
+                .iter()
+                .any(crate::tools::code_mode::command_owns_work)
         });
     if admit_code_mode_output
         && (metadata.outcome == ToolOutputOutcome::Yielded || has_running_nested_command)
@@ -2445,8 +2487,7 @@ async fn prepare_model_projection(
         approx_token_count(&spillable_text)
     }
     .saturating_add(non_text_tokens);
-    let projection_truncated =
-        exceeds_limit || model_output_tokens > limits.applied_limit;
+    let projection_truncated = exceeds_limit || model_output_tokens > limits.applied_limit;
     // Preset selectors describe how to recover omitted evidence; they do not
     // establish that anything was omitted. Projecting a fitting result solely
     // for these hints needlessly reads its artifact and, in code mode, merges
@@ -2589,7 +2630,9 @@ async fn prepare_model_projection(
         model_output_tokens as u64
     };
     let invocation_sha256 = authorized_tool_invocation_sha256(
-        &invocation.step_context.turn, &invocation.payload, parsed_function_arguments,
+        &invocation.step_context.turn,
+        &invocation.payload,
+        parsed_function_arguments,
     );
     Some(ModelProjectionInput {
         fragments: metadata.fragments,
@@ -2735,8 +2778,13 @@ pub(crate) fn authorized_tool_invocation_sha256(
 ) -> Option<String> {
     let invocation_hash = canonical_tool_invocation_sha256(payload, parsed_function_arguments)?;
     serde_json::to_vec(&(
-        invocation_hash, turn.cwd(), turn.permission_profile(), turn.approval_policy.get(),
-    )).ok().map(|bytes| crate::tool_history::sha256(&bytes))
+        invocation_hash,
+        turn.cwd(),
+        turn.permission_profile(),
+        turn.approval_policy.get(),
+    ))
+    .ok()
+    .map(|bytes| crate::tool_history::sha256(&bytes))
 }
 
 fn canonical_tool_invocation_sha256(
@@ -3035,17 +3083,32 @@ fn select_typed_projection_fragments(
                 fragment.text.clone()
             } else if let Some(source) = &fragment.shell_output {
                 crate::tools::shell_output_summary::summarize_shell_output_for_model_with_streams(
-                    &fragment.text, source.exit_code, false,
+                    &fragment.text,
+                    source.exit_code,
+                    false,
                     crate::tools::shell_output_summary::ShellOutputSummaryOptions {
-                        enabled: true, applied_token_limit: Some(remaining_budget),
+                        enabled: true,
+                        applied_token_limit: Some(remaining_budget),
                         command_text: source.command_text.as_deref(),
                     },
-                    source.streams.as_ref().map(|(stdout, stderr)| (stdout.as_str(), stderr.as_str())),
-                ).unwrap_or_else(|| codex_utils_output_truncation::truncate_text_with_line_markers(
-                    &fragment.text, remaining_budget))
+                    source
+                        .streams
+                        .as_ref()
+                        .map(|(stdout, stderr)| (stdout.as_str(), stderr.as_str())),
+                )
+                .unwrap_or_else(|| {
+                    codex_utils_output_truncation::truncate_text_with_line_markers(
+                        &fragment.text,
+                        remaining_budget,
+                    )
+                })
             } else if fragment.id.as_deref() == Some("output")
-                && fragment.kind == ToolOutputProjectionFragmentKind::ContextualSpillableText {
-                codex_utils_output_truncation::truncate_text_with_line_markers(&fragment.text, remaining_budget)
+                && fragment.kind == ToolOutputProjectionFragmentKind::ContextualSpillableText
+            {
+                codex_utils_output_truncation::truncate_text_with_line_markers(
+                    &fragment.text,
+                    remaining_budget,
+                )
             } else {
                 bounded_fragment_text(&fragment.text, remaining_budget)
             };
@@ -3076,7 +3139,8 @@ fn select_typed_projection_fragments(
     let selected_tokens = approx_token_count(&selected_text);
     if selected_tokens > token_limit && token_limit > 0 {
         return select_typed_projection_fragments(
-            fragments, token_limit.saturating_sub(selected_tokens - token_limit),
+            fragments,
+            token_limit.saturating_sub(selected_tokens - token_limit),
         );
     }
     let selected_id_set = selected_ids.iter().collect::<HashSet<_>>();
@@ -3185,23 +3249,27 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                     .await
             } else {
                 crate::tools::command_output_artifact::create_tool_history_output_artifact(
-                    &codex_home, &thread_id, &canonical,
-                ).await
+                    &codex_home,
+                    &thread_id,
+                    &canonical,
+                )
+                .await
             };
             let artifact_id = artifact.artifact_id();
             if let Some(artifact_id) = artifact_id
                 && artifact.complete
                 && artifact.retained_bytes == canonical.exact_bytes
                 && artifact.unavailable_ranges.is_empty()
-                && (artifact_created || crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-                    &codex_home,
-                    &thread_id,
-                    &artifact_id,
-                    canonical.exact_bytes,
-                    &canonical.sha256,
-                )
-                .await
-                .is_ok())
+                && (artifact_created
+                    || crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                        &codex_home,
+                        &thread_id,
+                        &artifact_id,
+                        canonical.exact_bytes,
+                        &canonical.sha256,
+                    )
+                    .await
+                    .is_ok())
             {
                 Some((artifact, artifact_id, artifact_created))
             } else {
@@ -3298,7 +3366,8 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         == Some(&Value::Bool(true));
     let admission_only_fallback = || {
         let text = original_output_text.replace(
-            "artifact_id={cell_output_artifact_id}", "saved output unavailable",
+            "artifact_id={cell_output_artifact_id}",
+            "saved output unavailable",
         );
         let response = if text != original_output_text {
             projected_response_item(original_response.clone(), text.clone(), true)
@@ -3306,8 +3375,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             original_response.clone()
         };
         let bounded = BoundedModelProjection::Fallback {
-            value: serde_json::from_str(&text)
-                .unwrap_or_else(|_| Value::String(text.clone())),
+            value: serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone())),
             rendered: text.clone(),
         };
         ModelToolProjection {
@@ -3316,8 +3384,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             passthrough_response: true,
             preserve_non_text_content: true,
             candidate: None,
-            projected_tokens: approx_token_count(&text)
-                .saturating_add(non_text_tokens) as u64,
+            projected_tokens: approx_token_count(&text).saturating_add(non_text_tokens) as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
             model_bytes: text.len().saturating_add(non_text_bytes) as u64,
@@ -3335,19 +3402,26 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         return (materialization == ProjectionMaterialization::AdmissionOnly)
             .then(admission_only_fallback);
     };
-    let supersession_identity = invocation_sha256
-        .map(|invocation_sha256| format!("authorized-v1:{tool_name}:{invocation_sha256}:{}", canonical.sha256));
+    let supersession_identity = invocation_sha256.map(|invocation_sha256| {
+        format!(
+            "authorized-v1:{tool_name}:{invocation_sha256}:{}",
+            canonical.sha256
+        )
+    });
     if materialization == ProjectionMaterialization::AdmissionOnly {
         // Code mode bounds its own packet before admission. When that packet
         // dropped output, name the durable canonical artifact so the omitted
         // range is recoverable without rerunning the producer.
         let (original_response, original_output_text) = if visible_output_truncated {
             let missing_selector = essential_inline.get("cell_output_recovery_selector");
-            let selector = missing_selector.cloned().unwrap_or_else(|| serde_json::json!({
-                "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
-            }));
+            let selector = missing_selector.cloned().unwrap_or_else(|| {
+                serde_json::json!({
+                    "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
+                })
+            });
             let qualified = original_output_text.replace(
-                "artifact_id={cell_output_artifact_id}", &format!("artifact_id={artifact_id}"),
+                "artifact_id={cell_output_artifact_id}",
+                &format!("artifact_id={artifact_id}"),
             );
             let text = format!(
                 "{qualified}\n{}",
@@ -3458,7 +3532,8 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         omitted_sections,
         result: result_value,
     };
-    let fitted = serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?;
+    let fitted =
+        serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?;
     envelope = fitted.envelope()?.clone();
     let (predetermined_ranges, predetermined_json_pointers) =
         validated_omitted_predetermined_selectors(
@@ -3499,8 +3574,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         !drained_content_survived(envelope, preserved_content_start, &drained_content)
     }) {
         deterministic_continuation_receipt = None;
-        bounded =
-            serialize_projection_fragments(base_envelope, &projected_text, &fragments, applied_token_limit)?;
+        bounded = serialize_projection_fragments(
+            base_envelope,
+            &projected_text,
+            &fragments,
+            applied_token_limit,
+        )?;
     }
     let final_envelope = bounded.envelope()?;
     let omitted_section_count = final_envelope.omitted_sections.len() as u64;
@@ -3827,11 +3906,18 @@ async fn drain_predetermined_artifact_selectors(
         && canonical.unavailable_ranges.is_empty()
     {
         crate::tools::command_output_artifact::select_producer_snapshot(
-            canonical, artifact_id, selectors.clone(), token_ceiling,
+            canonical,
+            artifact_id,
+            selectors.clone(),
+            token_ceiling,
         )
     } else {
         read_tool_output_selectors_with_ceiling_and_reuse(
-            codex_home, thread_id, artifact_id, selectors.clone(), token_ceiling,
+            codex_home,
+            thread_id,
+            artifact_id,
+            selectors.clone(),
+            token_ceiling,
         )
         .await
         .map(|(result, _)| result)
@@ -4046,7 +4132,11 @@ fn serialize_projection_fragments(
     // The recovery directory can grow when fitting marks sections omitted.
     // Reserve it up front, so payload selection never truncates an earlier cut.
     let mut header = envelope.clone();
-    header.omitted_sections = header.sections.iter().map(|section| section.id.clone()).collect();
+    header.omitted_sections = header
+        .sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect();
     let header_tokens = approx_token_count(&render_projection_with_exact_metrics(&mut header)?);
     let mut output_limit = effective_limit.saturating_sub(header_tokens.saturating_add(1));
     loop {
@@ -4056,7 +4146,8 @@ fn serialize_projection_fragments(
             let (text, selection) = select_typed_projection_fragments(fragments, output_limit);
             for section in &mut envelope.sections {
                 section.inclusion = if selection.selected_ids.contains(&section.id)
-                    && !selection.partial_ids.contains(&section.id) {
+                    && !selection.partial_ids.contains(&section.id)
+                {
                     ToolProjectionInclusion::Included
                 } else {
                     ToolProjectionInclusion::Omitted
@@ -4085,7 +4176,9 @@ fn serialize_projection_fragments(
                 .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
                 .map(|section| section.id.clone())
                 .collect();
-            if fragments.is_empty() && let Some(selection) = envelope.result.get_mut("selection") {
+            if fragments.is_empty()
+                && let Some(selection) = envelope.result.get_mut("selection")
+            {
                 let selected = selection["selected_ids"].clone();
                 selection["partial_ids"] = selected.clone();
                 if retained.is_empty() {
@@ -4101,9 +4194,12 @@ fn serialize_projection_fragments(
                 }
             }
         }
-        envelope.omitted_sections = envelope.sections.iter()
+        envelope.omitted_sections = envelope
+            .sections
+            .iter()
             .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
-            .map(|section| section.id.clone()).collect();
+            .map(|section| section.id.clone())
+            .collect();
         envelope.result["selected_text"] = Value::String(retained);
         let rendered = render_projection_with_exact_metrics(&mut envelope)?;
         let rendered_tokens = approx_token_count(&rendered);
@@ -4162,9 +4258,15 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
         fields.remove(key);
     }
     fields.retain(|_, value| !value.is_null());
-    let outcome_visible = fields.get("outcome").and_then(Value::as_str) == Some(envelope.outcome.as_str())
-        || (envelope.outcome == "success" && fields.get("exit_code").and_then(Value::as_i64) == Some(0))
-        || (envelope.outcome == "failure" && fields.get("exit_code").and_then(Value::as_i64).is_some_and(|code| code != 0));
+    let outcome_visible = fields.get("outcome").and_then(Value::as_str)
+        == Some(envelope.outcome.as_str())
+        || (envelope.outcome == "success"
+            && fields.get("exit_code").and_then(Value::as_i64) == Some(0))
+        || (envelope.outcome == "failure"
+            && fields
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0));
     if !outcome_visible {
         fields.insert("outcome".into(), envelope.outcome.clone().into());
     }
@@ -4184,7 +4286,10 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
             Value::String(artifact_id.clone()),
         );
         if !envelope.omitted_sections.is_empty() {
-            fields.insert("omitted_sections".to_string(), serde_json::json!(envelope.omitted_sections));
+            fields.insert(
+                "omitted_sections".to_string(),
+                serde_json::json!(envelope.omitted_sections),
+            );
         }
     }
     let mut parts = Vec::new();
@@ -4269,10 +4374,24 @@ fn function_hook_tool_name_for(tool_name: &ToolName) -> HookToolName {
     HookToolName::new(flat_tool_name(tool_name).into_owned())
 }
 
+/// A compiled argument validator plus the schema it was compiled from.
+///
+/// The schema is retained deliberately. A bare `jsonschema` message names what
+/// was wrong ("Additional properties are not allowed ('kind' was unexpected)",
+/// "is not valid under any of the schemas listed in the 'oneOf' keyword")
+/// without naming what would be right, so a rejected call gives the model
+/// nothing to correct towards and the next attempt can repeat the same mistake.
+/// Keeping the schema lets the rejection state the accepted shape, which is
+/// already known here, instead of spending another turn on a guess.
+struct CompiledArgumentValidator {
+    validator: jsonschema::Validator,
+    schema: Value,
+}
+
 fn compile_code_mode_argument_validator(
     tool_name: &ToolName,
     spec: &ToolSpec,
-) -> Result<Option<jsonschema::Validator>, String> {
+) -> Result<Option<CompiledArgumentValidator>, String> {
     let parameters = match spec {
         ToolSpec::Function(tool) => Some(&tool.parameters),
         ToolSpec::Namespace(namespace) => namespace.tools.iter().find_map(|nested| match nested {
@@ -4293,12 +4412,115 @@ fn compile_code_mode_argument_validator(
     let validator = jsonschema::validator_for(&schema).map_err(|err| {
         format!("tool `{tool_name}` argument schema could not be compiled: {err}")
     })?;
-    Ok(Some(validator))
+    Ok(Some(CompiledArgumentValidator { validator, schema }))
+}
+
+/// Property names an object schema accepts.
+///
+/// Order follows the serialized schema map, which is sorted rather than
+/// declaration-ordered. That is deliberate here: a stable, reproducible list is
+/// what makes two rejections of the same call comparable.
+fn schema_property_names(schema: &Value) -> Vec<&str> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Resolve a JSON pointer against the schema, following `oneOf`/`anyOf` only
+/// where the pointer itself selects a branch. Returns `None` when the pointer
+/// does not address a schema node, so no guidance is invented.
+fn schema_at<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
+    let mut node = schema;
+    for segment in pointer.split('/').filter(|segment| !segment.is_empty()) {
+        // Instance pointers address data, so an array index maps to the
+        // schema's `items`, not to a sibling of the same ordinal.
+        let next = if segment.chars().all(|c| c.is_ascii_digit()) {
+            node.get("items")
+        } else {
+            node.get("properties").and_then(|props| props.get(segment))
+        };
+        node = next?;
+    }
+    Some(node)
+}
+
+/// Describe the accepted shape at one rejected pointer.
+///
+/// Only facts already present in the tool's own schema are reported: the
+/// accepted property names, or the named `oneOf`/`anyOf` branches with the
+/// required keys of each. Nothing is inferred about intent.
+fn accepted_shape(schema: &Value, pointer: &str) -> Option<String> {
+    let node = schema_at(schema, pointer)?;
+
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(branches) = node.get(keyword).and_then(Value::as_array) {
+            let described = branches
+                .iter()
+                .filter_map(|branch| {
+                    // A `const`/`enum` discriminator is the branch's name when
+                    // the schema supplies one; otherwise fall back to its keys.
+                    let tag = branch
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .and_then(|properties| {
+                            properties.iter().find_map(|(key, value)| {
+                                value
+                                    .get("const")
+                                    .and_then(Value::as_str)
+                                    .map(|constant| format!("{key}={constant}"))
+                            })
+                        });
+                    let keys = schema_property_names(branch);
+                    if tag.is_none() && keys.is_empty() {
+                        return None;
+                    }
+                    let keys = if keys.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{{{}}}", keys.join(", "))
+                    };
+                    // Join only when both parts exist, so an undiscriminated
+                    // branch does not render with a leading space.
+                    Some(match tag {
+                        Some(tag) if keys.is_empty() => tag,
+                        Some(tag) => format!("{tag} {keys}"),
+                        None => keys,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !described.is_empty() {
+                return Some(format!("accepted forms: {}", described.join(" | ")));
+            }
+        }
+    }
+
+    let properties = schema_property_names(node);
+    if properties.is_empty() {
+        return None;
+    }
+    let required = node
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|required| !required.is_empty());
+    let mut description = format!("accepted properties: {}", properties.join(", "));
+    if let Some(required) = required {
+        description.push_str(&format!("; required: {required}"));
+    }
+    Some(description)
 }
 
 #[derive(Default)]
 struct CodeModeArgumentPreflight {
-    validator: OnceLock<Result<Option<jsonschema::Validator>, String>>,
+    validator: OnceLock<Result<Option<CompiledArgumentValidator>, String>>,
     #[cfg(test)]
     compile_count: AtomicUsize,
     #[cfg(test)]
@@ -4317,14 +4539,16 @@ impl CodeModeArgumentPreflight {
         let ToolPayload::Function { arguments } = payload else {
             return Ok(());
         };
-        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "exec_command" {
+        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "exec_command"
+        {
             return crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
                 |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
             );
         }
         if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file" {
-            return crate::tools::handlers::validate_read_file_arguments(arguments)
-                .map_err(|message| format!("tool `{tool_name}` argument preflight failed: {message}"));
+            return crate::tools::handlers::validate_read_file_arguments(arguments).map_err(
+                |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
+            );
         }
         let value = parsed_function_arguments
             .and_then(|parsed| parsed.value().ok())
@@ -4347,12 +4571,12 @@ impl CodeModeArgumentPreflight {
             compile_code_mode_argument_validator(tool_name, spec)
         });
         let validator = validator.as_ref().map_err(Clone::clone)?;
-        let Some(validator) = validator else {
+        let Some(compiled) = validator else {
             return Ok(());
         };
         #[cfg(test)]
         self.validation_count.fetch_add(1, Ordering::Relaxed);
-        let mut errors = validator.iter_errors(&value);
+        let mut errors = compiled.validator.iter_errors(&value);
         let messages = errors
             .by_ref()
             .take(4)
@@ -4363,7 +4587,13 @@ impl CodeModeArgumentPreflight {
                 } else {
                     format!("${pointer}")
                 };
-                format!("{path}: {error}")
+                // Append the accepted shape from the tool's own schema. Without
+                // it the model only learns which key was wrong, not which keys
+                // exist, and a retry can repeat the same rejected call.
+                match accepted_shape(&compiled.schema, pointer) {
+                    Some(shape) => format!("{path}: {error} ({shape})"),
+                    None => format!("{path}: {error}"),
+                }
             })
             .collect::<Vec<_>>();
         if messages.is_empty() {

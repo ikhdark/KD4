@@ -31,7 +31,9 @@ const BEHAVIORAL_VALIDATOR: &str = "import sys,time; from pathlib import Path; f
 #[test_case::test_case("validation_overlap")]
 #[test_case::test_case("validation-progress")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scenario: &str) -> Result<()> {
+async fn explicit_delivery_preserves_answer_and_removes_final_model_request(
+    scenario: &str,
+) -> Result<()> {
     require_network!();
     for candidate in [false, true] {
         eprintln!("direct-delivery scenario={scenario} candidate={candidate}");
@@ -45,29 +47,52 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         let answer = "Verified answer: α → β.\nPreserve this exact text.\n";
         fs::write(test.cwd.path().join("answer.txt"), answer)?;
         if scenario == "validation-helper" {
-            fs::write(test.cwd.path().join("changed_fixture.py"), "def transform(value):\n    return value + 1\n")?;
+            fs::write(
+                test.cwd.path().join("changed_fixture.py"),
+                "def transform(value):\n    return value + 1\n",
+            )?;
         }
-        fs::write(test.cwd.path().join("first.txt"), "Verified answer: α → β.\n")?;
-        fs::write(test.cwd.path().join("second.txt"), "Preserve this exact text.\n")?;
-        fs::write(test.cwd.path().join("ranges.txt"), "Verified answer: α → β.\nnot requested\nPreserve this exact text.\n")?;
-        let mut inventory = (0..128).map(|index| serde_json::json!({
-            "path":format!("unrelated/{index}.txt"), "selected":false,
-        })).collect::<Vec<_>>();
+        fs::write(
+            test.cwd.path().join("first.txt"),
+            "Verified answer: α → β.\n",
+        )?;
+        fs::write(
+            test.cwd.path().join("second.txt"),
+            "Preserve this exact text.\n",
+        )?;
+        fs::write(
+            test.cwd.path().join("ranges.txt"),
+            "Verified answer: α → β.\nnot requested\nPreserve this exact text.\n",
+        )?;
+        let mut inventory = (0..128)
+            .map(|index| {
+                serde_json::json!({
+                    "path":format!("unrelated/{index}.txt"), "selected":false,
+                })
+            })
+            .collect::<Vec<_>>();
         inventory.extend([
             serde_json::json!({"path":"first.txt","selected":true}),
             serde_json::json!({"path":"second.txt","selected":true}),
         ]);
-        fs::write(test.cwd.path().join("inventory.json"), serde_json::to_vec(&inventory)?)?;
+        fs::write(
+            test.cwd.path().join("inventory.json"),
+            serde_json::to_vec(&inventory)?,
+        )?;
         let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(match scenario {
             "recipe-recovery" => 160_000, "large-recovery" => 10_000, _ => 900,
-        })}).to_string();
+        })})
+        .to_string();
         fs::write(test.cwd.path().join("bulk.json"), &bulk)?;
         // Larger than a model display page, but comfortably within the exact
         // script payload limit. A short computed answer must not force paging.
-        let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(10_000)}).to_string();
+        let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(10_000)})
+            .to_string();
         fs::write(test.cwd.path().join("large.json"), &large)?;
         if scenario == "full-recovery-helper" {
-            let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(100_000)}).to_string();
+            let large =
+                serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(100_000)})
+                    .to_string();
             fs::write(test.cwd.path().join("recovery.json"), large)?;
         }
         let read_answer = "const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw new Error('incomplete source'); text(r.results[0].text);";
@@ -286,11 +311,15 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             } else {
                 "text('prepared');"
             };
-            responses::mount_sse_once(&server, sse(vec![
-                ev_response_created("prepare"),
-                ev_custom_tool_call("prepare", "exec", &format!("{prepare}\n{extra}")),
-                ev_completed("prepare"),
-            ])).await;
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_response_created("prepare"),
+                    ev_custom_tool_call("prepare", "exec", &format!("{prepare}\n{extra}")),
+                    ev_completed("prepare"),
+                ]),
+            )
+            .await;
         }
         let prefix = if candidate {
             "// @exec: {\"deliver\": true,\"max_output_tokens\":64}\n"
@@ -299,7 +328,17 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         };
         // Discovery and independent reads already have same-cell APIs. Recovery
         // and polling also need their owners not to manufacture a model boundary.
-        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "recipe-recovery" | "poll" | "retained" | "retained-batch" | "bounded-inventory") {
+        let inline_prepare = if candidate
+            && matches!(
+                scenario,
+                "recovery"
+                    | "large-recovery"
+                    | "recipe-recovery"
+                    | "poll"
+                    | "retained"
+                    | "retained-batch"
+                    | "bounded-inventory"
+            ) {
             prepare.as_deref().unwrap_or_default()
         } else {
             ""
@@ -330,7 +369,9 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         test.codex
             .submit(Op::UserInput {
                 items: vec![UserInput::Text {
-                    text: format!("Complete the {scenario} task and return the exact verified answer."),
+                    text: format!(
+                        "Complete the {scenario} task and return the exact verified answer."
+                    ),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
@@ -372,7 +413,11 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         };
         assert!(completed.error.is_none(), "{:?}", completed.error);
         assert_eq!(completed.last_agent_message.as_deref(), Some(answer));
-        assert_eq!(messages.len(), 1, "one visible answer before turn completion");
+        assert_eq!(
+            messages.len(),
+            1,
+            "one visible answer before turn completion"
+        );
         assert_eq!(started, vec![messages[0].id.clone()]);
         assert!(matches!(
             messages[0].content.as_slice(),
@@ -398,9 +443,16 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(persisted.len(), 1, "the visible answer must survive reopening");
         assert_eq!(
-            persisted[0].0.as_ref().map(codex_protocol::ResponseItemId::as_str),
+            persisted.len(),
+            1,
+            "the visible answer must survive reopening"
+        );
+        assert_eq!(
+            persisted[0]
+                .0
+                .as_ref()
+                .map(codex_protocol::ResponseItemId::as_str),
             Some(messages[0].id.as_str())
         );
         assert_eq!(
@@ -429,21 +481,50 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             .iter()
             .filter(|r| r.url.path().contains("responses"))
             .count();
-        assert_eq!(model_requests, if candidate { 1 } else { 2 + usize::from(prepare.is_some()) }, "{scenario}");
+        assert_eq!(
+            model_requests,
+            if candidate {
+                1
+            } else {
+                2 + usize::from(prepare.is_some())
+            },
+            "{scenario}"
+        );
         let timing = completed.timing.as_ref().expect("turn timing");
-        assert_eq!(timing.counters.logical_generation_count as usize, model_requests);
+        assert_eq!(
+            timing.counters.logical_generation_count as usize,
+            model_requests
+        );
         assert_eq!(timing.counters.model_request_count as usize, model_requests);
         let timing_json = serde_json::to_value(timing)?;
-        let reads = timing_json["toolCalls"].as_array().expect("tool timing").iter()
-            .filter(|call| call["toolName"] == "read_file").count();
-        if matches!(scenario, "retained" | "full-file" | "multi-range" | "search-inspect") {
-            assert_eq!(reads, if candidate { 1 } else { 2 }, "no repeat read without drift");
+        let reads = timing_json["toolCalls"]
+            .as_array()
+            .expect("tool timing")
+            .iter()
+            .filter(|call| call["toolName"] == "read_file")
+            .count();
+        if matches!(
+            scenario,
+            "retained" | "full-file" | "multi-range" | "search-inspect"
+        ) {
+            assert_eq!(
+                reads,
+                if candidate { 1 } else { 2 },
+                "no repeat read without drift"
+            );
         }
         if scenario == "retained-batch" {
-            assert_eq!(reads, if candidate { 2 } else { 3 }, "unprinted siblings must survive the phase boundary");
+            assert_eq!(
+                reads,
+                if candidate { 2 } else { 3 },
+                "unprinted siblings must survive the phase boundary"
+            );
         }
         if scenario == "bounded-inventory" {
-            assert_eq!(reads, 3, "same complete inventory and selected-source coverage");
+            assert_eq!(
+                reads, 3,
+                "same complete inventory and selected-source coverage"
+            );
         }
         let calls = timing_json["toolCalls"].as_array().expect("tool timing");
         if scenario == "read-helper" {
@@ -451,32 +532,69 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         }
         if scenario == "full-recovery-helper" {
             assert_eq!(reads, 1, "recovery never reopens the mutable source");
-            assert!(calls.iter().any(|call| call["toolName"] == "read_tool_output"));
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call["toolName"] == "read_tool_output")
+            );
         }
         if scenario == "leaf-glob" {
-            let commands = calls.iter().filter(|call| call["toolName"] == "exec_command").count();
-            assert_eq!(commands, if candidate { 1 } else { 2 }, "no discovery-only command or retry");
+            let commands = calls
+                .iter()
+                .filter(|call| call["toolName"] == "exec_command")
+                .count();
+            assert_eq!(
+                commands,
+                if candidate { 1 } else { 2 },
+                "no discovery-only command or retry"
+            );
         }
         if matches!(scenario, "large-recovery" | "recipe-recovery") {
-            let recoveries = calls.iter().filter(|call| call["toolName"] == "read_tool_output").count();
-            if candidate { assert_eq!(recoveries, 1); } else { assert!(recoveries > 1); }
+            let recoveries = calls
+                .iter()
+                .filter(|call| call["toolName"] == "read_tool_output")
+                .count();
+            if candidate {
+                assert_eq!(recoveries, 1);
+            } else {
+                assert!(recoveries > 1);
+            }
         }
-        let outer_calls = calls.iter().filter(|call| call["toolName"] == "exec").count();
-        assert_eq!(outer_calls, if candidate { 1 } else { 1 + usize::from(prepare.is_some()) }, "{scenario}: outer tool dispatches");
-        assert!(calls.iter().all(|call| call["outcome"] == "success"
-            || (call["outcome"] == "yielded"
-                && matches!(call["toolName"].as_str(), Some("exec_command" | "write_stdin")))),
-            "{scenario}: completion hid a failed child: {calls:?}");
-        eprintln!("LATENCY_COMPARISON {}", serde_json::json!({
-            "scenario":scenario, "candidate":candidate,
-            "wall_ms":started_at.elapsed().as_millis(),
-            "model_requests":model_requests, "native_reads":reads,
-            "native_recoveries":calls.iter().filter(|call| call["toolName"] == "read_tool_output").count(),
-            "outer_tool_calls":outer_calls,
-            "projected_tool_output_bytes":timing_json["counters"]["toolOutputModelByteCount"],
-            "exact_answer_and_persistence_verified":true,
-            "provider":"scripted",
-        }));
+        let outer_calls = calls
+            .iter()
+            .filter(|call| call["toolName"] == "exec")
+            .count();
+        assert_eq!(
+            outer_calls,
+            if candidate {
+                1
+            } else {
+                1 + usize::from(prepare.is_some())
+            },
+            "{scenario}: outer tool dispatches"
+        );
+        assert!(
+            calls.iter().all(|call| call["outcome"] == "success"
+                || (call["outcome"] == "yielded"
+                    && matches!(
+                        call["toolName"].as_str(),
+                        Some("exec_command" | "write_stdin")
+                    ))),
+            "{scenario}: completion hid a failed child: {calls:?}"
+        );
+        eprintln!(
+            "LATENCY_COMPARISON {}",
+            serde_json::json!({
+                "scenario":scenario, "candidate":candidate,
+                "wall_ms":started_at.elapsed().as_millis(),
+                "model_requests":model_requests, "native_reads":reads,
+                "native_recoveries":calls.iter().filter(|call| call["toolName"] == "read_tool_output").count(),
+                "outer_tool_calls":outer_calls,
+                "projected_tool_output_bytes":timing_json["counters"]["toolOutputModelByteCount"],
+                "exact_answer_and_persistence_verified":true,
+                "provider":"scripted",
+            })
+        );
     }
     Ok(())
 }
@@ -485,10 +603,18 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
 async fn explicit_delivery_accepts_schema_valid_json_and_supported_media() -> Result<()> {
     require_network!();
     for (code, expected, schema) in [
-        ("text({answer: 42});", "{\"answer\":42}",
-         Some(serde_json::json!({"type":"object","properties":{"answer":{"const":42}},"required":["answer"],"additionalProperties":false}))),
-        ("image('DATA:image/png;base64,AAAA');",
-         "![image](<DATA:image/png;base64,AAAA>)", None),
+        (
+            "text({answer: 42});",
+            "{\"answer\":42}",
+            Some(
+                serde_json::json!({"type":"object","properties":{"answer":{"const":42}},"required":["answer"],"additionalProperties":false}),
+            ),
+        ),
+        (
+            "image('DATA:image/png;base64,AAAA');",
+            "![image](<DATA:image/png;base64,AAAA>)",
+            None,
+        ),
     ] {
         let server = responses::start_mock_server().await;
         let mut builder = test_codex().with_config(|config| {
@@ -496,35 +622,64 @@ async fn explicit_delivery_accepts_schema_valid_json_and_supported_media() -> Re
             let _ = config.features.enable(Feature::Kd4Runtime);
         });
         let test = builder.build(&server).await?;
-        responses::mount_sse_once(&server, sse(vec![
-            ev_response_created("initial"),
-            ev_custom_tool_call("delivery", "exec", &format!("// @exec: {{\"deliver\":true}}\n{code}")),
-            ev_completed("initial"),
-        ])).await;
-        responses::mount_sse_once(&server, sse(vec![
-            ev_assistant_message("fallback", "unexpected model handoff"),
-            ev_completed("fallback"),
-        ])).await;
-        test.codex.submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "Return the completed result.".into(), text_elements: Vec::new(),
-            }],
-            final_output_json_schema: schema,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(), thread_settings: Default::default(),
-        }).await?;
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("initial"),
+                ev_custom_tool_call(
+                    "delivery",
+                    "exec",
+                    &format!("// @exec: {{\"deliver\":true}}\n{code}"),
+                ),
+                ev_completed("initial"),
+            ]),
+        )
+        .await;
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message("fallback", "unexpected model handoff"),
+                ev_completed("fallback"),
+            ]),
+        )
+        .await;
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "Return the completed result.".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: schema,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
         let EventMsg::TurnComplete(completed) = core_test_support::wait_for_event_with_timeout(
             &test.codex,
             |event| matches!(event, EventMsg::TurnComplete(_)),
             Duration::from_secs(30),
-        ).await else {
+        )
+        .await
+        else {
             unreachable!()
         };
         assert!(completed.error.is_none(), "{:?}", completed.error);
         assert_eq!(completed.last_agent_message.as_deref(), Some(expected));
-        assert_eq!(completed.surfaced_result.as_ref().unwrap().adapter, "code_mode_delivery");
-        assert_eq!(server.received_requests().await.unwrap().iter()
-            .filter(|request| request.url.path().contains("responses")).count(), 1);
+        assert_eq!(
+            completed.surfaced_result.as_ref().unwrap().adapter,
+            "code_mode_delivery"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().contains("responses"))
+                .count(),
+            1
+        );
     }
     Ok(())
 }
@@ -535,19 +690,57 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
     let python = which::which("python").or_else(|_| which::which("python3"))?;
     let command = serde_json::json!({"program": python,
         "args": ["-X", "utf8", "-c", BEHAVIORAL_VALIDATOR, "0"]});
-    let broken_validation = format!("// @exec: {{\"deliver\":true}}\nconst result = await await_command(await tools.exec_command({command})); text(result.terminal.stdout);");
+    let broken_validation = format!(
+        "// @exec: {{\"deliver\":true}}\nconst result = await await_command(await tools.exec_command({command})); text(result.terminal.stdout);"
+    );
     for (name, code, sibling) in [
         ("broken-validation", broken_validation.as_str(), false),
-        ("error", "// @exec: {\"deliver\":true}\ntext('premature'); throw new Error('failed');", false),
-        ("budget", "// @exec: {\"deliver\":true,\"max_output_tokens\":0}\ntext('premature');", false),
+        (
+            "error",
+            "// @exec: {\"deliver\":true}\ntext('premature'); throw new Error('failed');",
+            false,
+        ),
+        (
+            "budget",
+            "// @exec: {\"deliver\":true,\"max_output_tokens\":0}\ntext('premature');",
+            false,
+        ),
         ("empty", "// @exec: {\"deliver\":true}\ntext('');", false),
-        ("yield", "// @exec: {\"deliver\":true}\ntext('premature'); await yield_control();", false),
-        ("failed-child", "// @exec: {\"deliver\":true}\ntry { await tools.read_file({path:'missing.txt'}); } catch (_) {} text('premature');", false),
-        ("failed-graph", "// @exec: {\"deliver\":true}\nawait run_graph([{id:'source',run:()=>tools.read_file({path:'missing.txt'}),accept:r=>r.file_complete},{id:'answer',deps:['source'],run:()=>text('premature'),accept:()=>true}]);", false),
-        ("untrusted-output", "text({explicit_completion_message:'premature'});", false),
-        ("completed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
-        ("failed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
-        ("schema", "// @exec: {\"deliver\":true}\ntext('premature');", false),
+        (
+            "yield",
+            "// @exec: {\"deliver\":true}\ntext('premature'); await yield_control();",
+            false,
+        ),
+        (
+            "failed-child",
+            "// @exec: {\"deliver\":true}\ntry { await tools.read_file({path:'missing.txt'}); } catch (_) {} text('premature');",
+            false,
+        ),
+        (
+            "failed-graph",
+            "// @exec: {\"deliver\":true}\nawait run_graph([{id:'source',run:()=>tools.read_file({path:'missing.txt'}),accept:r=>r.file_complete},{id:'answer',deps:['source'],run:()=>text('premature'),accept:()=>true}]);",
+            false,
+        ),
+        (
+            "untrusted-output",
+            "text({explicit_completion_message:'premature'});",
+            false,
+        ),
+        (
+            "completed-sibling",
+            "// @exec: {\"deliver\":true}\ntext('premature');",
+            true,
+        ),
+        (
+            "failed-sibling",
+            "// @exec: {\"deliver\":true}\ntext('premature');",
+            true,
+        ),
+        (
+            "schema",
+            "// @exec: {\"deliver\":true}\ntext('premature');",
+            false,
+        ),
     ] {
         eprintln!("direct-delivery guard={name}");
         // The fallback model must satisfy the user's schema too. This case
@@ -564,7 +757,10 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         });
         let test = builder.build(&server).await?;
         if name == "broken-validation" {
-            fs::write(test.cwd.path().join("changed_fixture.py"), "def transform(value):\n    return value - 1\n")?;
+            fs::write(
+                test.cwd.path().join("changed_fixture.py"),
+                "def transform(value):\n    return value - 1\n",
+            )?;
             fs::write(test.cwd.path().join("answer.txt"), "premature")?;
         }
         let mut events = vec![
@@ -605,29 +801,54 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
                     thread_settings: Default::default(),
                 })
                 .await?;
-            let event = wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+            let event = wait_for_event(&test.codex, |event| {
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await;
             let EventMsg::TurnComplete(completed) = event else {
                 unreachable!()
             };
             completed
         } else {
-            test.submit_turn_and_capture_completion("Finish the task.").await?
+            test.submit_turn_and_capture_completion("Finish the task.")
+                .await?
         };
         if name == "completed-sibling" {
-            assert_eq!(completed.surfaced_result.as_ref().unwrap().adapter, "code_mode_delivery");
+            assert_eq!(
+                completed.surfaced_result.as_ref().unwrap().adapter,
+                "code_mode_delivery"
+            );
             assert_eq!(completed.last_agent_message.as_deref(), Some("premature"));
         } else {
-            assert!(completed.surfaced_result.is_none(), "{name}: {:?}", completed.surfaced_result);
-            assert_eq!(completed.last_agent_message.as_deref(), Some(fallback), "{name}");
+            assert!(
+                completed.surfaced_result.is_none(),
+                "{name}: {:?}",
+                completed.surfaced_result
+            );
+            assert_eq!(
+                completed.last_agent_message.as_deref(),
+                Some(fallback),
+                "{name}"
+            );
         }
         assert!(completed.error.is_none(), "{name}: {:?}", completed.error);
         if name == "broken-validation" {
-            let (output, _) = custom_tool_output_body_and_success(&final_response.single_request(), "delivery");
-            assert!(output.contains("AssertionError"), "must detect the fixture defect, not fail in setup: {output}");
+            let (output, _) =
+                custom_tool_output_body_and_success(&final_response.single_request(), "delivery");
+            assert!(
+                output.contains("AssertionError"),
+                "must detect the fixture defect, not fail in setup: {output}"
+            );
         }
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.iter().filter(|r| r.url.path().contains("responses")).count(),
-            if name == "completed-sibling" { 1 } else { 2 }, "{name}");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path().contains("responses"))
+                .count(),
+            if name == "completed-sibling" { 1 } else { 2 },
+            "{name}"
+        );
     }
     Ok(())
 }
@@ -647,18 +868,27 @@ async fn completion_audit_plan_closure_uses_existing_evidence(close_plan: bool) 
     fs::write(test.cwd.path().join("evidence.txt"), "verified result")?;
     let close = if close_plan {
         "const advanced = await tools.update_plan({expected_revision:p.revision,set:[{step_id:p.step_ids[0],status:'completed'}]}); const closed = await tools.update_plan({expected_revision:advanced.revision,set:advanced.step_ids.map(step_id=>({step_id,status:'completed'}))}); if(closed.obligations.unresolved.length || closed.obligations.completed !== 2) throw Error('unresolved obligations');"
-    } else { "" };
-    let code = format!(r#"// @exec: {{"deliver":true}}
+    } else {
+        ""
+    };
+    let code = format!(
+        r#"// @exec: {{"deliver":true}}
 const p = await tools.update_plan({{plan:[{{step:'Inspect source',status:'in_progress'}},{{step:'Verify result',status:'pending'}}]}});
 const source = await tools.read_file({{path:'evidence.txt'}});
 if (!source.file_complete || !source.complete || !source.source_sha256) throw Error('incomplete evidence');
 store('completionEvidence', source); store('completionPlan', p);
 {close}
-text(source.results[0].text);"#);
-    responses::mount_sse_once(&server, sse(vec![
-        ev_response_created("compute"), ev_custom_tool_call("compute", "exec", &code),
-        ev_completed("compute"),
-    ])).await;
+text(source.results[0].text);"#
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("compute"),
+            ev_custom_tool_call("compute", "exec", &code),
+            ev_completed("compute"),
+        ]),
+    )
+    .await;
     responses::mount_sse_once(&server, sse(vec![
         ev_response_created("fallback"),
         ev_custom_tool_call("finish-required-work", "exec", r#"// @exec: {"deliver":true}
@@ -669,18 +899,35 @@ const closed = await tools.update_plan({expected_revision:p.revision,set:p.step_
 if (closed.obligations.unresolved.length) throw Error('work remains');
 text('Required work completed.');"#), ev_completed("fallback"),
     ])).await;
-    let completed = test.submit_turn_and_capture_completion("Inspect and verify the source.").await?;
+    let completed = test
+        .submit_turn_and_capture_completion("Inspect and verify the source.")
+        .await?;
     assert!(completed.error.is_none(), "{completed:?}");
     assert!(completed.surfaced_result.is_some());
-    assert_eq!(completed.last_agent_message.as_deref(),
-        Some("verified result"));
-    let assessment = completed.timing.as_ref().unwrap().completion_assessment.as_ref().unwrap();
+    assert_eq!(
+        completed.last_agent_message.as_deref(),
+        Some("verified result")
+    );
+    let assessment = completed
+        .timing
+        .as_ref()
+        .unwrap()
+        .completion_assessment
+        .as_ref()
+        .unwrap();
     assert!(assessment.failed_checks.is_empty());
     assert!(assessment.verification_gaps.is_empty());
     assert_eq!(assessment.advisories.is_empty(), close_plan);
-    assert_eq!(server.received_requests().await.unwrap().iter()
-        .filter(|request| request.url.path().contains("responses")).count(),
-        1);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("responses"))
+            .count(),
+        1
+    );
     Ok(())
 }
 #[test_case::test_case(0)]
@@ -689,7 +936,11 @@ text('Required work completed.');"#), ev_completed("fallback"),
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn namespace_alias_avoids_repair_request(pair: usize) -> Result<()> {
     require_network!();
-    for candidate in if pair.is_multiple_of(2) { [false, true] } else { [true, false] } {
+    for candidate in if pair.is_multiple_of(2) {
+        [false, true]
+    } else {
+        [true, false]
+    } {
         let server = responses::start_mock_server().await;
         let mut builder = test_codex().with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
@@ -705,58 +956,114 @@ async fn namespace_alias_avoids_repair_request(pair: usize) -> Result<()> {
                     defer_loading: false,
                 })],
             })]);
-        let thread = test.thread_manager.start_thread_with_options(options).await?;
+        let thread = test
+            .thread_manager
+            .start_thread_with_options(options)
+            .await?;
         test.codex.replace_thread(thread.thread);
         test.session_configured = thread.session_configured;
         let answer = "Verified namespace answer: λ\n";
         // Reproduce the old catalog shape without reverting production source:
         // hashed canonical functions existed, but their namespace object did not.
         // Both sides use direct delivery, isolating the alias-repair request.
-        let remove_alias = if candidate { "" } else { "delete tools.fixture;" };
-        let initial = format!(r#"// @exec: {{"deliver":true}}
+        let remove_alias = if candidate {
+            ""
+        } else {
+            "delete tools.fixture;"
+        };
+        let initial = format!(
+            r#"// @exec: {{"deliver":true}}
 {remove_alias}
-text(await tools.fixture.result({{value:42}}));"#);
-        responses::mount_sse_once(&server, sse(vec![
-            ev_custom_tool_call("namespace-call", "exec", &initial), ev_completed("initial"),
-        ])).await;
-        let repair = responses::mount_sse_once(&server, sse(vec![
-            ev_custom_tool_call("namespace-repair", "exec", r#"// @exec: {"deliver":true}
-text(await resolve_tool('fixture.result')({value:42}));"#), ev_completed("repair"),
-        ])).await;
-        responses::mount_sse_once(&server, sse(vec![
-            ev_assistant_message("unexpected", "unexpected final model request"), ev_completed("fallback"),
-        ])).await;
+text(await tools.fixture.result({{value:42}}));"#
+        );
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_custom_tool_call("namespace-call", "exec", &initial),
+                ev_completed("initial"),
+            ]),
+        )
+        .await;
+        let repair = responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_custom_tool_call(
+                    "namespace-repair",
+                    "exec",
+                    r#"// @exec: {"deliver":true}
+text(await resolve_tool('fixture.result')({value:42}));"#,
+                ),
+                ev_completed("repair"),
+            ]),
+        )
+        .await;
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message("unexpected", "unexpected final model request"),
+                ev_completed("fallback"),
+            ]),
+        )
+        .await;
         let started_at = std::time::Instant::now();
-        test.codex.submit(Op::UserInput {
-            items: vec![UserInput::Text { text: "Return the exact fixture result for value 42.".into(), text_elements: Vec::new() }],
-            final_output_json_schema: None, responsesapi_client_metadata: None,
-            additional_context: Default::default(), thread_settings: Default::default(),
-        }).await?;
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "Return the exact fixture result for value 42.".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
         let request = wait_for_event_match(&test.codex, |event| match event {
-            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()), _ => None,
-        }).await;
+            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
+            _ => None,
+        })
+        .await;
         assert_eq!(request.namespace.as_deref(), Some("fixture"));
         assert_eq!(request.tool, "result");
         assert_eq!(request.arguments, serde_json::json!({"value":42}));
-        test.codex.submit(Op::DynamicToolResponse {
-            turn_id: request.turn_id, id: request.call_id,
-            response: DynamicToolResponse {
-                content_items: vec![DynamicToolCallOutputContentItem::InputText { text: answer.into() }],
-                success: true,
-            },
-        }).await?;
+        test.codex
+            .submit(Op::DynamicToolResponse {
+                turn_id: request.turn_id,
+                id: request.call_id,
+                response: DynamicToolResponse {
+                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                        text: answer.into(),
+                    }],
+                    success: true,
+                },
+            })
+            .await?;
         let completed = wait_for_event_match(&test.codex, |event| match event {
-            EventMsg::TurnComplete(event) => Some(event.clone()), _ => None,
-        }).await;
+            EventMsg::TurnComplete(event) => Some(event.clone()),
+            _ => None,
+        })
+        .await;
         assert!(completed.error.is_none(), "{:?}", completed.error);
         assert_eq!(completed.last_agent_message.as_deref(), Some(answer));
-        assert!(completed.surfaced_result.is_some(), "must deliver the tool result, not a model rewrite");
+        assert!(
+            completed.surfaced_result.is_some(),
+            "must deliver the tool result, not a model rewrite"
+        );
         if !candidate {
-            let (output, _) = custom_tool_output_body_and_success(&repair.single_request(), "namespace-call");
-            assert!(output.contains("TypeError") && output.contains("result"), "expected alias miss: {output}");
+            let (output, _) =
+                custom_tool_output_body_and_success(&repair.single_request(), "namespace-call");
+            assert!(
+                output.contains("TypeError") && output.contains("result"),
+                "expected alias miss: {output}"
+            );
         }
-        let requests = server.received_requests().await.unwrap().iter()
-            .filter(|request| request.url.path().contains("responses")).count();
+        let requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("responses"))
+            .count();
         assert_eq!(requests, if candidate { 1 } else { 2 });
         let timing = completed.timing.as_ref().expect("turn timing");
         assert_eq!(timing.counters.model_request_count as usize, requests);
@@ -764,19 +1071,35 @@ text(await resolve_tool('fixture.result')({value:42}));"#), ev_completed("repair
         test.codex.flush_rollout().await?;
         let (items, _, errors) = codex_core::RolloutRecorder::load_rollout_items(
             &test.codex.rollout_path().expect("rollout"),
-        ).await?;
+        )
+        .await?;
         assert_eq!(errors, 0);
-        let answers = items.iter().filter_map(|item| match item {
-            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) if role == "assistant" => Some(content),
-            _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(answers, vec![&vec![ContentItem::OutputText { text: answer.into() }]]);
-        eprintln!("LATENCY_COMPARISON {}", serde_json::json!({
-            "scenario":"namespace-alias", "pair":pair, "candidate":candidate,
-            "wall_ms":started_at.elapsed().as_secs_f64() * 1000.0,
-            "model_requests":requests, "exact_answer_and_persistence_verified":true,
-            "provider":"scripted", "baseline":"old namespace absence injected; same current native runtime",
-        }));
+        let answers = items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                    if role == "assistant" =>
+                {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            answers,
+            vec![&vec![ContentItem::OutputText {
+                text: answer.into()
+            }]]
+        );
+        eprintln!(
+            "LATENCY_COMPARISON {}",
+            serde_json::json!({
+                "scenario":"namespace-alias", "pair":pair, "candidate":candidate,
+                "wall_ms":started_at.elapsed().as_secs_f64() * 1000.0,
+                "model_requests":requests, "exact_answer_and_persistence_verified":true,
+                "provider":"scripted", "baseline":"old namespace absence injected; same current native runtime",
+            })
+        );
     }
     Ok(())
 }

@@ -30,8 +30,11 @@ pub fn create_update_plan_tool() -> ToolSpec {
             Some("IDs (step_ids of the last result, or unresolved orphan requirement IDs) of removed or reworded steps whose remaining work this step carries.".to_string()),
         ),
     );
-    let revision_item =
-        JsonSchema::object(revision_item_properties, item_required(), Some(false.into()));
+    let revision_item = JsonSchema::object(
+        revision_item_properties,
+        item_required(),
+        Some(false.into()),
+    );
     let superseded = JsonSchema::array(
         JsonSchema::object(
             BTreeMap::from([

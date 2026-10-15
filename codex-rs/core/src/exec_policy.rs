@@ -690,8 +690,14 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
     let mut policy_paths = Vec::new();
     for layer in config_stack.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
+        /*include_disabled*/ true,
     ) {
+        // A user layer is disabled only by `--ignore-user-config`, which ignores
+        // config.toml contents, not rules; those have their own `--ignore-rules`
+        // control below.
+        if layer.is_disabled() && !matches!(layer.name, ConfigLayerSource::User { .. }) {
+            continue;
+        }
         if config_stack.ignore_user_and_project_exec_policy_rules()
             && matches!(
                 layer.name,

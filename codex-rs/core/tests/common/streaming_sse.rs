@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -22,6 +23,7 @@ pub struct StreamingSseServer {
     uri: String,
     requests: Arc<TokioMutex<Vec<Vec<u8>>>>,
     request_notify: Arc<Notify>,
+    chunk_bodies: Arc<TokioMutex<HashMap<(usize, usize), String>>>,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -29,6 +31,17 @@ pub struct StreamingSseServer {
 impl StreamingSseServer {
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Replaces the body of chunk `chunk_index` in response `response_index`
+    /// (both in queue order) before it is written. A gated chunk reads its
+    /// replacement after the gate opens, so a test can send content that
+    /// depends on output observed while that response was held.
+    pub async fn replace_chunk_body(&self, response_index: usize, chunk_index: usize, body: String) {
+        self.chunk_bodies
+            .lock()
+            .await
+            .insert((response_index, chunk_index), body);
     }
 
     pub async fn requests(&self) -> Vec<Vec<u8>> {
@@ -76,11 +89,14 @@ pub async fn start_streaming_sse_server(
     let state = Arc::new(TokioMutex::new(StreamingSseState {
         responses: VecDeque::from(responses),
         completions: VecDeque::from(completion_senders),
+        next_response_index: 0,
     }));
     let requests = Arc::new(TokioMutex::new(Vec::new()));
     let request_notify = Arc::new(Notify::new());
+    let chunk_bodies = Arc::new(TokioMutex::new(HashMap::new()));
     let requests_for_task = Arc::clone(&requests);
     let request_notify_for_task = Arc::clone(&request_notify);
+    let chunk_bodies_for_task = Arc::clone(&chunk_bodies);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
@@ -94,6 +110,7 @@ pub async fn start_streaming_sse_server(
                     let state = Arc::clone(&state);
                     let requests = Arc::clone(&requests_for_task);
                     let request_notify = Arc::clone(&request_notify_for_task);
+                    let chunk_bodies = Arc::clone(&chunk_bodies_for_task);
                     connections.spawn(async move {
                         let (request, body_prefix) = read_http_request(&mut stream).await;
                         let Some((method, path)) = parse_request_line(&request) else {
@@ -130,7 +147,7 @@ pub async fn start_streaming_sse_server(
                             };
                             requests.lock().await.push(body);
                             request_notify.notify_one();
-                            let Some((chunks, completion)) = take_next_stream(&state).await else {
+                            let Some((response_index, chunks, completion)) = take_next_stream(&state).await else {
                                 let _ = write_http_response(&mut stream, /*status*/ 500, "no responses queued", "text/plain").await;
                                 return;
                             };
@@ -139,12 +156,17 @@ pub async fn start_streaming_sse_server(
                                 return;
                             }
 
-                            for chunk in chunks {
+                            for (chunk_index, chunk) in chunks.into_iter().enumerate() {
                                 if let Some(gate) = chunk.gate
                                     && gate.await.is_err() {
                                         return;
                                     }
-                                if stream.write_all(chunk.body.as_bytes()).await.is_err() {
+                                let body = chunk_bodies
+                                    .lock()
+                                    .await
+                                    .remove(&(response_index, chunk_index))
+                                    .unwrap_or(chunk.body);
+                                if stream.write_all(body.as_bytes()).await.is_err() {
                                     return;
                                 }
                                 let _ = stream.flush().await;
@@ -168,6 +190,7 @@ pub async fn start_streaming_sse_server(
             uri,
             requests,
             request_notify,
+            chunk_bodies,
             shutdown: shutdown_tx,
             task,
         },
@@ -178,15 +201,18 @@ pub async fn start_streaming_sse_server(
 struct StreamingSseState {
     responses: VecDeque<Vec<StreamingSseChunk>>,
     completions: VecDeque<oneshot::Sender<i64>>,
+    next_response_index: usize,
 }
 
 async fn take_next_stream(
     state: &TokioMutex<StreamingSseState>,
-) -> Option<(Vec<StreamingSseChunk>, oneshot::Sender<i64>)> {
+) -> Option<(usize, Vec<StreamingSseChunk>, oneshot::Sender<i64>)> {
     let mut guard = state.lock().await;
     let chunks = guard.responses.pop_front()?;
     let completion = guard.completions.pop_front()?;
-    Some((chunks, completion))
+    let response_index = guard.next_response_index;
+    guard.next_response_index += 1;
+    Some((response_index, chunks, completion))
 }
 
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
@@ -701,16 +727,19 @@ data: {"type":"response.completed","response":{"id":"resp-1"}}
                 }],
             ]),
             completions: VecDeque::from(vec![first_tx, second_tx]),
+            next_response_index: 0,
         });
 
-        let (first_chunks, first_completion) =
+        let (first_index, first_chunks, first_completion) =
             take_next_stream(&state).await.expect("first stream");
+        assert_eq!(first_index, 0);
         assert_eq!(first_chunks[0].body, "first");
         let _ = first_completion.send(11);
         assert_eq!(first_rx.await.expect("first completion"), 11);
 
-        let (second_chunks, second_completion) =
+        let (second_index, second_chunks, second_completion) =
             take_next_stream(&state).await.expect("second stream");
+        assert_eq!(second_index, 1);
         assert_eq!(second_chunks[0].body, "second");
         let _ = second_completion.send(22);
         assert_eq!(second_rx.await.expect("second completion"), 22);

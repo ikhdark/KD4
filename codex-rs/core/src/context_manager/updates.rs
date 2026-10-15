@@ -339,8 +339,6 @@ mod tests {
         }
     }
 
-
-
     #[tokio::test]
     async fn model_switch_reinjects_template_less_personality_and_honors_feature_gate() {
         let (_session, mut next) = make_session_and_context().await;
@@ -351,9 +349,15 @@ mod tests {
         ] {
             next.personality = Some(personality);
             let mut previous = next.to_turn_context_item();
-            assert_eq!(build_personality_update_item(Some(&previous), &next, true), None);
+            assert_eq!(
+                build_personality_update_item(Some(&previous), &next, true),
+                None
+            );
             previous.model = "previous-model".into();
-            assert_eq!(build_personality_update_item(Some(&previous), &next, false), None);
+            assert_eq!(
+                build_personality_update_item(Some(&previous), &next, false),
+                None
+            );
             let update = build_personality_update_item(Some(&previous), &next, true).unwrap();
             assert!(update.starts_with("<personality_spec>"));
             assert!(update.contains(expected));
@@ -361,11 +365,15 @@ mod tests {
         next.personality = Some(Personality::None);
         let mut previous = next.to_turn_context_item();
         previous.model = "previous-model".into();
-        assert_eq!(super::personality_message_for(&next.model_info, Personality::None), None);
-        assert_eq!(build_personality_update_item(Some(&previous), &next, true), None);
+        assert_eq!(
+            super::personality_message_for(&next.model_info, Personality::None),
+            None
+        );
+        assert_eq!(
+            build_personality_update_item(Some(&previous), &next, true),
+            None
+        );
     }
-
-
 
     #[tokio::test]
     async fn blank_collaboration_instructions_emit_reset_and_preserve_nonblank_formatting() {
@@ -374,7 +382,10 @@ mod tests {
             Some("active instructions".to_string());
         let mut previous = next.to_turn_context_item();
         previous.collaboration_mode.as_mut().unwrap().settings.model = "previous-model".into();
-        assert_eq!(build_collaboration_mode_update_item(Some(&previous), &next), None);
+        assert_eq!(
+            build_collaboration_mode_update_item(Some(&previous), &next),
+            None
+        );
         for instructions in [None, Some(""), Some("\n\t \u{2003}")] {
             next.collaboration_mode.settings.developer_instructions =
                 instructions.map(str::to_string);

@@ -16,6 +16,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_list_agents_tool()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        // A read-only agent/task snapshot must not take the global exclusive
+        // workspace gate: that serializes independent siblings and stalls the
+        // shared polls write_stdin issues in the same batch. Mirrors wait.rs.
+        true
+    }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(invocation))
     }

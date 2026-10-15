@@ -279,10 +279,15 @@ async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -
     assert_eq!(requests.len(), 2, "expected two model requests");
 
     assert_eq!(requests[0].body_json()["model"], "gpt-5.4");
-    assert!(requests[0].message_input_texts("developer").iter().any(|text| {
-        text.contains("<personality_spec>")
-            && text.contains("Be concise, direct, and engineering-focused.")
-    }));
+    assert!(
+        requests[0]
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| {
+                text.contains("<personality_spec>")
+                    && text.contains("Be concise, direct, and engineering-focused.")
+            })
+    );
     let second_request = requests.last().expect("expected second request");
     let body = second_request.body_json();
     assert_eq!(body["model"], next_model);
@@ -463,7 +468,15 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
         description: "Fast processing.".to_string(),
     }];
     model.default_service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    let resp_mock = mount_sse_sequence(&server, vec![sse_completed("resp-1"), sse_completed("resp-2"), sse_completed("resp-3")]).await;
+    let resp_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse_completed("resp-1"),
+            sse_completed("resp-2"),
+            sse_completed("resp-3"),
+        ],
+    )
+    .await;
 
     let mut builder = test_codex()
         .with_model(model_slug)
@@ -477,8 +490,13 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
     test.submit_turn_with_service_tier("default turn", Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE))
         .await?;
 
-    test.submit_turn_with_service_tier("restore fast tier", Some(ServiceTier::Fast.request_value())).await?;
-    test.submit_turn_with_service_tier("standard turn", None).await?;
+    test.submit_turn_with_service_tier(
+        "restore fast tier",
+        Some(ServiceTier::Fast.request_value()),
+    )
+    .await?;
+    test.submit_turn_with_service_tier("standard turn", None)
+        .await?;
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].body_json().get("service_tier"), None);
@@ -487,8 +505,6 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
 
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<()> {
@@ -574,7 +590,10 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     let first_request = requests.first().expect("expected first request");
     assert_eq!(first_request.body_json()["model"], image_model_slug);
-    assert_eq!(first_request.message_input_image_urls("user"), vec![image_url]);
+    assert_eq!(
+        first_request.message_input_image_urls("user"),
+        vec![image_url]
+    );
 
     let second_request = requests.last().expect("expected second request");
     assert!(
@@ -584,7 +603,13 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
     assert_eq!(second_request.body_json()["model"], text_model_slug);
     let second_user_texts = second_request.message_input_texts("user");
     for prompt in ["first turn", "second turn"] {
-        assert_eq!(second_user_texts.iter().filter(|text| text.as_str() == prompt).count(), 1);
+        assert_eq!(
+            second_user_texts
+                .iter()
+                .filter(|text| text.as_str() == prompt)
+                .count(),
+            1
+        );
     }
     assert!(
         second_user_texts
@@ -887,8 +912,11 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
     let second_request = requests.last().expect("expected second request");
     assert_eq!(
-        second_request.message_input_texts("user").iter()
-            .filter(|text| text.as_str() == "after rollback").count(),
+        second_request
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.as_str() == "after rollback")
+            .count(),
         1,
         "rollback must not discard the new user turn"
     );

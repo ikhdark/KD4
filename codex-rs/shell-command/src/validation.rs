@@ -1240,6 +1240,7 @@ pub fn is_standalone_cargo_fmt_check(program: &str, args: &[String]) -> bool {
     })
 }
 
+
 /// Build and inventory commands may compile, but do not establish a test pass.
 pub fn is_build_or_discovery(program: &str, args: &[String]) -> bool {
     let program = normalized_program_name(program);
@@ -1330,6 +1331,7 @@ mod tests {
         let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
         classify_argv_with_runners(program, &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>(), &runners)
     }
+
 
     #[test]
     fn repository_bytecode_flag_preserves_trusted_validation() {
@@ -1692,6 +1694,7 @@ mod tests {
                 "positional arguments do not change shell options");
         }
     }
+
 
     #[test]
     fn python_interpreter_help_and_version_do_not_run_modules() {

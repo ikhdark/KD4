@@ -595,10 +595,11 @@ def analyze(
                     retry_overhead_us += elapsed_us
 
         if reason is None:
-            input_tokens = _number(record.get("input_token_count"))
-            cached_tokens = _number(record.get("cached_input_token_count"))
-            uncached_tokens = _number(record.get("uncached_input_token_count"))
-            if input_tokens is None or cached_tokens is None or uncached_tokens is None:
+            input_tokens = record.get("input_token_count")
+            cached_tokens = record.get("cached_input_token_count")
+            uncached_tokens = record.get("uncached_input_token_count")
+            if not all(type(value) is int and _number(value) is not None
+                       for value in (input_tokens, cached_tokens, uncached_tokens)):
                 reason = "invalid_token_accounting"
             elif cached_tokens + uncached_tokens != input_tokens:
                 reason = "inconsistent_token_accounting"

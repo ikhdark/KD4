@@ -23,7 +23,11 @@ async fn connector_selection_merges_deduplicates_and_clears() {
     assert_eq!(state.get_connector_selection(), merged);
     assert_eq!(
         state.merge_connector_selection(["calendar".to_string(), "mail".to_string()]),
-        HashSet::from(["calendar".to_string(), "drive".to_string(), "mail".to_string()])
+        HashSet::from([
+            "calendar".to_string(),
+            "drive".to_string(),
+            "mail".to_string()
+        ])
     );
 
     state.clear_connector_selection();
@@ -67,8 +71,15 @@ async fn replace_history_clears_auto_compact_window_prefill() {
     let mut state = SessionState::new(session_configuration);
 
     state.set_auto_compact_window_estimated_prefill(/*tokens*/ 100);
-    state.prompt_token_calibration.observe("provider", "model", Some((100, 200)));
-    assert_eq!(state.prompt_token_calibration.estimate("provider", "model", 100), 200);
+    state
+        .prompt_token_calibration
+        .observe("provider", "model", Some((100, 200)));
+    assert_eq!(
+        state
+            .prompt_token_calibration
+            .estimate("provider", "model", 100),
+        200
+    );
     state.replace_history(Vec::new(), /*reference_context_item*/ None);
 
     assert_eq!(
@@ -77,7 +88,12 @@ async fn replace_history_clears_auto_compact_window_prefill() {
             prefill_input_tokens: None,
         }
     );
-    assert_eq!(state.prompt_token_calibration.estimate("provider", "model", 100), 100);
+    assert_eq!(
+        state
+            .prompt_token_calibration
+            .estimate("provider", "model", 100),
+        100
+    );
 }
 
 #[tokio::test]
@@ -87,10 +103,13 @@ async fn replace_history_reconciles_additional_context_delivery() {
     use indexmap::IndexMap;
 
     let mut state = SessionState::new(make_session_configuration_for_tests().await);
-    let values = IndexMap::from([("constraint".to_string(), AdditionalContextEntry {
-        value: "Do not publish this project.".to_string(),
-        kind: AdditionalContextKind::Application,
-    })]);
+    let values = IndexMap::from([(
+        "constraint".to_string(),
+        AdditionalContextEntry {
+            value: "Do not publish this project.".to_string(),
+            kind: AdditionalContextKind::Application,
+        },
+    )]);
     let first = state.additional_context.merge(values.clone());
     let retained = first.iter().cloned().map(ResponseItem::from).collect();
     state.replace_history(retained, None);

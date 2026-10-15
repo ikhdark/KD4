@@ -2,12 +2,18 @@ use std::path::PathBuf;
 
 #[test]
 fn successful_shell_sampling_signal_identifies_command_evidence() {
-    let signal = super::shell_sampling_signal(None, "Get-Content source.txt", Some(0), Some(b"source\n"))
-        .expect("successful command evidence");
+    let signal =
+        super::shell_sampling_signal(None, "Get-Content source.txt", Some(0), Some(b"source\n"))
+            .expect("successful command evidence");
     assert_eq!(signal["command_evidence"], true);
     assert_eq!(signal["empty_output"], false);
-    assert_eq!(signal["semantic_evidence"], serde_json::json!(
-        crate::tools::context::successful_command_evidence(b"source\n", Some("Get-Content source.txt"))));
+    assert_eq!(
+        signal["semantic_evidence"],
+        serde_json::json!(crate::tools::context::successful_command_evidence(
+            b"source\n",
+            Some("Get-Content source.txt")
+        ))
+    );
     let empty = super::shell_sampling_signal(None, "Get-Content source.txt", Some(0), Some(b""))
         .expect("empty command evidence");
     assert_eq!(empty["empty_output"], true);
@@ -21,7 +27,10 @@ fn shell_validation_timing_is_stable_without_normalizing_source_reads() {
         let signal = |bytes: &[u8]| {
             super::shell_sampling_signal(None, command, Some(0), Some(bytes)).unwrap()
         };
-        assert_eq!(signal(first)["semantic_evidence"] == signal(second)["semantic_evidence"], same);
+        assert_eq!(
+            signal(first)["semantic_evidence"] == signal(second)["semantic_evidence"],
+            same
+        );
     }
 }
 use std::sync::Arc;
@@ -71,7 +80,10 @@ use super::shell_sampling_signal;
 fn orchestration_correctness_stall_timeout_defaults_and_overrides() {
     assert_eq!(effective_stall_timeout_ms(None, None), None);
     assert_eq!(effective_stall_timeout_ms(Some(60_001), None), Some(60_000));
-    assert_eq!(effective_stall_timeout_ms(Some(300_000), None), Some(60_000));
+    assert_eq!(
+        effective_stall_timeout_ms(Some(300_000), None),
+        Some(60_000)
+    );
     assert_eq!(
         effective_stall_timeout_ms(Some(300_000), Some(25_000)),
         Some(25_000)
@@ -213,7 +225,10 @@ mod pure {
         assert!(first.is_some());
         assert_eq!(first, repeated);
         let changed = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"modified\n"));
-        assert_ne!(first, changed, "different canonical bytes must change the evidence");
+        assert_ne!(
+            first, changed,
+            "different canonical bytes must change the evidence"
+        );
     }
 
     #[test]
@@ -399,8 +414,9 @@ fn retained_validation_attempt_preserves_output_after_retry_refusal() {
         Some("sandbox denied diagnostic"),
     );
 
-    let restored = super::restore_retained_validation_attempt(user_declined, Some(&retained_attempt))
-        .expect("retained attempt becomes the terminal output");
+    let restored =
+        super::restore_retained_validation_attempt(user_declined, Some(&retained_attempt))
+            .expect("retained attempt becomes the terminal output");
     assert_eq!(restored.exit_code, 126);
     assert_eq!(restored.aggregated_output.text, "sandbox denied diagnostic");
 }
@@ -507,11 +523,15 @@ fn independent_review_powershell_safety_args_disable_profiles() {
     assert!(is_known_safe_command(&safety_command));
     let args: crate::tools::handlers::unified_exec::ExecCommandArgs = serde_json::from_value(
         serde_json::json!({"script_body":"Get-Content -LiteralPath Cargo.toml"}),
-    ).unwrap();
+    )
+    .unwrap();
     let unified = crate::tools::handlers::unified_exec::get_command(
-        &args, Arc::new(shell),
-        ShellCommandHandler::effective_allow_login_shell(&reviewer, true), false,
-    ).unwrap();
+        &args,
+        Arc::new(shell),
+        ShellCommandHandler::effective_allow_login_shell(&reviewer, true),
+        false,
+    )
+    .unwrap();
     assert_eq!(unified.safety_command, safety_command);
     assert!(unified.command.iter().any(|arg| arg == "-NoProfile"));
 }

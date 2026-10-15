@@ -42,8 +42,12 @@ impl ContextualUserFragment for InterAgentCompletionMessage {
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!(
             "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\n{}Payload:\n{}",
-            self.task_name, self.sender,
-            self.receipt.as_ref().map(|receipt| format!("{receipt}\n")).unwrap_or_default(),
+            self.task_name,
+            self.sender,
+            self.receipt
+                .as_ref()
+                .map(|receipt| format!("{receipt}\n"))
+                .unwrap_or_default(),
             self.payload,
         ))
     }

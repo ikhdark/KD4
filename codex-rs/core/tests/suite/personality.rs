@@ -142,14 +142,17 @@ async fn base_instructions_override_disables_personality_template() {
         .enable(Feature::Personality)
         .expect("test config should allow feature update");
     config.personality = Some(Personality::Friendly);
-    let templated = codex_core::test_support::construct_model_info_offline(
-        "exp-codex-personality",
-        &config,
+    let templated =
+        codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
+    assert!(
+        templated
+            .get_model_instructions(config.personality)
+            .contains(LOCAL_FRIENDLY_TEMPLATE)
     );
-    assert!(templated.get_model_instructions(config.personality).contains(LOCAL_FRIENDLY_TEMPLATE));
     config.base_instructions = Some("override instructions".to_string());
 
-    let model_info = codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
+    let model_info =
+        codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
 
     assert_eq!(model_info.base_instructions, "override instructions");
     assert_eq!(
@@ -157,7 +160,6 @@ async fn base_instructions_override_disables_personality_template() {
         "override instructions"
     );
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Result<()> {
@@ -205,9 +207,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         instructions_text.as_str(),
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
-    assert!(
-        instructions_text.contains("Add tests only to prevent concrete behavioral failures")
-    );
+    assert!(instructions_text.contains("Add tests only to prevent concrete behavioral failures"));
     assert!(!instructions_text.contains("{{ personality }}"));
 
     assert!(
@@ -329,7 +329,6 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow::Result<()> {
     require_network!();
@@ -409,7 +408,9 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
         .find(|text| text.contains("<personality_spec>"))
         .expect("friendly personality was active before reset");
     assert!(prior_personality.contains(LOCAL_FRIENDLY_TEMPLATE));
-    assert!(prior_personality.contains("Use the following communication style for future messages:"));
+    assert!(
+        prior_personality.contains("Use the following communication style for future messages:")
+    );
     let developer_texts = requests
         .last()
         .expect("expected personality reset request")
@@ -428,10 +429,7 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
         friendly_updates, 0,
         "the reset supersedes the historical personality slot"
     );
-    assert_eq!(
-        reset_updates, 1,
-        "the reset must be emitted exactly once"
-    );
+    assert_eq!(reset_updates, 1, "the reset must be emitted exactly once");
     assert!(
         developer_texts
             .iter()
@@ -445,7 +443,8 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_same_value_preserves_single_active_instruction() -> anyhow::Result<()> {
+async fn user_turn_personality_same_value_preserves_single_active_instruction() -> anyhow::Result<()>
+{
     require_network!();
 
     let server = start_mock_server().await;
@@ -498,7 +497,8 @@ async fn user_turn_personality_same_value_preserves_single_active_instruction() 
 
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2, "expected two requests");
-    let initial_personality = requests[0].message_input_texts("developer")
+    let initial_personality = requests[0]
+        .message_input_texts("developer")
         .into_iter()
         .filter(|text| text.contains("<personality_spec>"))
         .collect::<Vec<_>>();
@@ -509,7 +509,8 @@ async fn user_turn_personality_same_value_preserves_single_active_instruction() 
         .expect("expected second request after personality override");
 
     let developer_texts = request.message_input_texts("developer");
-    let personality_texts = developer_texts.iter()
+    let personality_texts = developer_texts
+        .iter()
         .filter(|text| text.contains("<personality_spec>"))
         .cloned()
         .collect::<Vec<_>>();
@@ -533,17 +534,19 @@ async fn instructions_uses_base_if_feature_disabled() -> anyhow::Result<()> {
         .expect("test config should allow feature update");
     config.personality = Some(Personality::Friendly);
 
-    let templated = codex_core::test_support::construct_model_info_offline(
-        "exp-codex-personality",
-        &config,
+    let templated =
+        codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
+    assert!(
+        templated
+            .get_model_instructions(config.personality)
+            .contains(LOCAL_FRIENDLY_TEMPLATE)
     );
-    assert!(templated.get_model_instructions(config.personality).contains(LOCAL_FRIENDLY_TEMPLATE));
-    config.features.disable(Feature::Personality)
+    config
+        .features
+        .disable(Feature::Personality)
         .expect("test config should allow feature update");
-    let model_info = codex_core::test_support::construct_model_info_offline(
-        "exp-codex-personality",
-        &config,
-    );
+    let model_info =
+        codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
     assert_eq!(
         model_info.get_model_instructions(config.personality),
         model_info.base_instructions
@@ -884,8 +887,13 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         .last()
         .expect("expected personality update request");
     let developer_texts = request.message_input_texts("developer");
-    assert_eq!(developer_texts.iter()
-        .filter(|text| text.contains("<personality_spec>")).count(), 1);
+    assert_eq!(
+        developer_texts
+            .iter()
+            .filter(|text| text.contains("<personality_spec>"))
+            .count(),
+        1
+    );
     assert!(!developer_texts.iter().any(|text| {
         text.contains("<personality_spec>") && text.contains(remote_pragmatic_message)
     }));

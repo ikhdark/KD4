@@ -305,13 +305,14 @@ async fn system_time_source_adds_current_time_reminder() -> Result<()> {
         r"^It is \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC\.$",
         &reminders[0],
     );
-    let timestamp = chrono::NaiveDateTime::parse_from_str(
-        &reminders[0],
-        "It is %Y-%m-%d %H:%M:%S UTC.",
-    )?
-    .and_utc()
-    .timestamp();
-    assert!((before..=after).contains(&timestamp), "system reminder must use the current clock");
+    let timestamp =
+        chrono::NaiveDateTime::parse_from_str(&reminders[0], "It is %Y-%m-%d %H:%M:%S UTC.")?
+            .and_utc()
+            .timestamp();
+    assert!(
+        (before..=after).contains(&timestamp),
+        "system reminder must use the current clock"
+    );
 
     Ok(())
 }
@@ -362,18 +363,26 @@ async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
     let EventMsg::TurnComplete(compacted) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
-    .await else {
+    .await
+    else {
         unreachable!();
     };
-    assert_eq!(compacted.error, None, "compaction must succeed before the refresh assertion");
+    assert_eq!(
+        compacted.error, None,
+        "compaction must succeed before the refresh assertion"
+    );
     test.submit_turn("after compact").await?;
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
-    assert!(requests[2].message_input_texts("user").iter().any(|text| {
-        text.starts_with(codex_core::compact::SUMMARY_PREFIX) && text.contains("compact summary")
-    }), "the next request must use the successfully installed compacted history");
+    assert!(
+        requests[2].message_input_texts("user").iter().any(|text| {
+            text.starts_with(codex_core::compact::SUMMARY_PREFIX)
+                && text.contains("compact summary")
+        }),
+        "the next request must use the successfully installed compacted history"
+    );
     assert_eq!(
         current_time_reminders(&requests[2]),
         vec![SECOND_REMINDER],
@@ -431,7 +440,8 @@ async fn time_provider_failure_stops_before_inference() -> Result<()> {
     let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
-    .await else {
+    .await
+    else {
         unreachable!();
     };
     assert_eq!(completed.error, Some(error));
@@ -501,7 +511,11 @@ async fn current_time_tool_returns_json_through_code_mode() -> Result<()> {
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_custom_tool_call(CALL_ID, "exec", "text(await resolve_tool('clock.curr_time')({}));"),
+                ev_custom_tool_call(
+                    CALL_ID,
+                    "exec",
+                    "text(await resolve_tool('clock.curr_time')({}));",
+                ),
                 ev_completed("resp-1"),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
@@ -529,7 +543,11 @@ async fn current_time_tool_returns_json_through_code_mode() -> Result<()> {
     let (output, success) = requests[1]
         .custom_tool_call_output_content_and_success(CALL_ID)
         .expect("cell output");
-    assert_ne!(success, Some(false), "the clock cell must not report failure");
+    assert_ne!(
+        success,
+        Some(false),
+        "the clock cell must not report failure"
+    );
     let output = output.expect("cell text");
     let values = output
         .lines()

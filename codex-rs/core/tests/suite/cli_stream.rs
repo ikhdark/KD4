@@ -336,7 +336,10 @@ async fn exec_cli_applies_model_instructions_file() {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert_eq!(instructions, marker, "custom instructions replace the built-in text");
+    assert_eq!(
+        instructions, marker,
+        "custom instructions replace the built-in text"
+    );
 }
 
 /// Verify that `codex exec --profile ...` preserves the active user config
@@ -404,10 +407,11 @@ async fn exec_cli_profile_applies_model_instructions_file() {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert_eq!(instructions, marker, "profile instructions replace the built-in text");
+    assert_eq!(
+        instructions, marker,
+        "profile instructions replace the built-in text"
+    );
 }
-
-
 
 /// End-to-end: create a session (writes rollout), verify the file, then resume and confirm append.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -520,7 +524,9 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     let session_id = payload["id"].as_str().expect("SessionMeta id is a string");
     Uuid::parse_str(session_id).expect("SessionMeta id is a UUID");
     chrono::DateTime::parse_from_rfc3339(
-        payload["timestamp"].as_str().expect("SessionMeta timestamp is a string"),
+        payload["timestamp"]
+            .as_str()
+            .expect("SessionMeta timestamp is a string"),
     )
     .expect("SessionMeta timestamp is RFC3339");
 
@@ -536,7 +542,8 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
             && payload.get("type").and_then(|t| t.as_str()) == Some("message")
             && payload.get("role").and_then(|t| t.as_str()) == Some("user")
             && let Some(c) = payload.get("content").and_then(|c| c.as_array())
-            && c.iter().any(|part| part["type"] == "input_text" && part["text"] == prompt)
+            && c.iter()
+                .any(|part| part["type"] == "input_text" && part["text"] == prompt)
         {
             matching_messages += 1;
         }
@@ -579,18 +586,29 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     let resumed_user_texts = requests[1].message_input_texts("user");
     for expected in [&prompt, &prompt2] {
         assert_eq!(
-            resumed_user_texts.iter().filter(|text| *text == expected).count(),
+            resumed_user_texts
+                .iter()
+                .filter(|text| *text == expected)
+                .count(),
             1,
             "resumed request must contain each user prompt exactly once"
         );
     }
     let resumed_input = requests[1].input();
-    assert_eq!(resumed_input.iter().filter(|item| {
-        item["type"] == "message" && item["role"] == "assistant"
-            && item["content"].as_array().is_some_and(|parts| {
-                parts.iter().any(|part| part["text"] == "fixture hello")
+    assert_eq!(
+        resumed_input
+            .iter()
+            .filter(|item| {
+                item["type"] == "message"
+                    && item["role"] == "assistant"
+                    && item["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| part["text"] == "fixture hello")
+                    })
             })
-    }).count(), 1, "resume must replay the first assistant response");
+            .count(),
+        1,
+        "resume must replay the first assistant response"
+    );
 
     // Find the new session file containing the resumed marker.
     let marker2_clone = marker2.clone();
@@ -612,11 +630,20 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     );
 
     let resumed_content = std::fs::read_to_string(&resumed_path)?;
-    assert!(resumed_content.starts_with(&content), "resume must append without rewriting prior records");
+    assert!(
+        resumed_content.starts_with(&content),
+        "resume must append without rewriting prior records"
+    );
     let (_, resumed_id, parse_errors) =
         codex_rollout::RolloutRecorder::load_rollout_items(&resumed_path).await?;
-    assert_eq!(parse_errors, 0, "all persisted records must decode through the real loader");
-    assert_eq!(resumed_id.expect("resumed thread id").to_string(), session_id);
+    assert_eq!(
+        parse_errors, 0,
+        "all persisted records must decode through the real loader"
+    );
+    assert_eq!(
+        resumed_id.expect("resumed thread id").to_string(),
+        session_id
+    );
     assert!(
         resumed_content.contains(&marker),
         "resumed file missing original marker"

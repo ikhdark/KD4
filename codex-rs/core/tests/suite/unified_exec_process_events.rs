@@ -633,20 +633,25 @@ async fn exec_command_consumes_pushed_remote_process_events(
             "yield_time_ms": 30_000,
         }),
     };
-    let responses = vec![sse(vec![
-        ev_response_created("resp-1"),
-        ev_function_call(CALL_ID, tool_name, &tool_arguments.to_string()),
-        ev_completed("resp-1"),
-    ]), sse(vec![
-        ev_response_created("resp-2"),
-        ev_assistant_message("msg-2", "done"),
-        ev_completed("resp-2"),
-    ])];
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(CALL_ID, tool_name, &tool_arguments.to_string()),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ]),
+    ];
     let response_mock = mount_sse_sequence(&server, responses).await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
     let (replay_barrier_tx, replay_barrier_rx) = tokio::sync::oneshot::channel();
     let exec_server = AbortOnDropHandle::new(tokio::spawn(serve_exec_with_pushed_events(
-        listener, scenario, replay_barrier_rx,
+        listener,
+        scenario,
+        replay_barrier_rx,
     )));
     let mut builder = test_codex()
         .with_model_info_override("gpt-5.5", |model_info| {
@@ -689,23 +694,32 @@ async fn exec_command_consumes_pushed_remote_process_events(
     // Its wake receiver observes application of notifications, not merely socket
     // receipt, so the fake server can bound each target-output batch precisely.
     let _replay_barrier_process = if matches!(scenario, PushedExecScenario::ReplayGap) {
-        let environment = test.thread_manager.environment_manager()
+        let environment = test
+            .thread_manager
+            .environment_manager()
             .get_environment(REMOTE_ENVIRONMENT_ID)
             .context("remote replay environment should exist")?;
-        let started = environment.get_exec_backend().start(codex_exec_server::ExecParams {
-            process_id: REPLAY_BARRIER_PROCESS_ID.into(),
-            argv: vec!["replay-barrier".into()],
-            cwd: PathUri::parse("file:///C:/workspace")?,
-            env_policy: None,
-            env: Default::default(),
-            tty: false,
-            pipe_stdin: false,
-            arg0: None,
-            sandbox: None,
-            enforce_managed_network: false,
-            managed_network: None,
-        }).await?;
-        assert!(replay_barrier_tx.send(started.process.subscribe_wake()).is_ok());
+        let started = environment
+            .get_exec_backend()
+            .start(codex_exec_server::ExecParams {
+                process_id: REPLAY_BARRIER_PROCESS_ID.into(),
+                argv: vec!["replay-barrier".into()],
+                cwd: PathUri::parse("file:///C:/workspace")?,
+                env_policy: None,
+                env: Default::default(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+            })
+            .await?;
+        assert!(
+            replay_barrier_tx
+                .send(started.process.subscribe_wake())
+                .is_ok()
+        );
         Some(started.process)
     } else {
         None
@@ -813,8 +827,11 @@ async fn exec_command_consumes_pushed_remote_process_events(
         // Sandbox denial closes the process, not the model turn. Its observed
         // exit must reach the model without manufacturing a live poll handle.
         assert_eq!(response_mock.requests().len(), 2);
-        let output = response_mock.last_request().expect("denial continuation")
-            .function_call_output_text(CALL_ID).expect("denied command output");
+        let output = response_mock
+            .last_request()
+            .expect("denial continuation")
+            .function_call_output_text(CALL_ID)
+            .expect("denied command output");
         let output: Value = serde_json::from_str(&output)?;
         assert_eq!(output["exit_code"], 1);
         assert!(output.get("session_id").is_none(), "{output}");
@@ -874,7 +891,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
                 "x".repeat((REPLAY_RETAINED_OUTPUT_SEQ - 2) as usize),
                 "x".repeat((REPLAY_OUTPUT_EVENT_COUNT - REPLAY_RETAINED_OUTPUT_SEQ) as usize),
             );
-            assert!(output.contains(&expected_output), "replay output must be complete and ordered: {output}");
+            assert!(
+                output.contains(&expected_output),
+                "replay output must be complete and ordered: {output}"
+            );
             assert_eq!(process_read_requests, 1, "expected replay recovery read");
         }
     }

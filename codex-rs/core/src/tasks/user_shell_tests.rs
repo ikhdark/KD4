@@ -83,31 +83,51 @@ async fn remote_user_shell_read_failure_terminates_process() {
 async fn remote_user_shell_output_gap_is_visible_without_forging_process_failure() {
     for with_tail in [false, true] {
         let response = |chunks, output_gap| ReadResponse {
-            chunks, output_gap, next_seq: 5, exited: true, exit_code: Some(0),
-            closed: true, failure: None, sandbox_denied: false,
+            chunks,
+            output_gap,
+            next_seq: 5,
+            exited: true,
+            exit_code: Some(0),
+            closed: true,
+            failure: None,
+            sandbox_denied: false,
         };
         let chunks = if with_tail {
             vec![codex_exec_server::ProcessOutputChunk {
-                seq: 4, stream: ServerExecOutputStream::Stdout, chunk: b"tail".to_vec().into(),
+                seq: 4,
+                stream: ServerExecOutputStream::Stdout,
+                chunk: b"tail".to_vec().into(),
             }]
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let process = Arc::new(TerminationTrackingProcess {
             process_id: "gapped-output".into(),
             terminated: AtomicBool::new(false),
             reads: tokio::sync::Mutex::new(std::collections::VecDeque::from([
-                response(chunks, Some(codex_exec_server::ProcessOutputGap { through_seq: 3, exit_seq: Some(5) })),
+                response(
+                    chunks,
+                    Some(codex_exec_server::ProcessOutputGap {
+                        through_seq: 3,
+                        exit_seq: Some(5),
+                    }),
+                ),
                 response(Vec::new(), None),
             ])),
         });
         let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let output = collect_remote_user_shell_output(&session, &turn, process, "gapped").await.unwrap();
+        let output = collect_remote_user_shell_output(&session, &turn, process, "gapped")
+            .await
+            .unwrap();
         assert_eq!(output.exit_code, 0);
         assert!(!output.timed_out);
         for stream in [&output.stdout, &output.stderr, &output.aggregated_output] {
             assert!(stream.text.contains("remote executor output was lost"));
             assert!(stream.truncated);
         }
-        if with_tail { assert!(output.stdout.text.starts_with("tail")); }
+        if with_tail {
+            assert!(output.stdout.text.starts_with("tail"));
+        }
     }
 }
 
@@ -116,28 +136,49 @@ async fn remote_user_shell_output_gap_is_visible_without_forging_process_failure
 async fn remote_user_shell_collector_drains_real_closed_process_pages() -> anyhow::Result<()> {
     let environment = codex_exec_server::Environment::create_for_tests(None)?;
     let directory = tempfile::tempdir()?;
-    let process = environment.get_exec_backend().start(ExecParams {
-        process_id: "paged-user-shell".into(),
-        argv: vec!["powershell.exe".to_string(), "-NoLogo".to_string(), "-NoProfile".to_string(),
-            "-NonInteractive".to_string(), "-Command".to_string(),
-            "[Console]::Out.Write(('x' * 150000) + 'TAIL')".to_string()],
-        cwd: codex_utils_path_uri::PathUri::from_host_native_path(directory.path())?,
-        // Windows PowerShell requires its host environment to initialize.
-        env_policy: None, env: std::env::vars().collect(), tty: false, pipe_stdin: false,
-        arg0: None, sandbox: None, enforce_managed_network: false, managed_network: None,
-    }).await?.process;
+    let process = environment
+        .get_exec_backend()
+        .start(ExecParams {
+            process_id: "paged-user-shell".into(),
+            argv: vec![
+                "powershell.exe".to_string(),
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.Write(('x' * 150000) + 'TAIL')".to_string(),
+            ],
+            cwd: codex_utils_path_uri::PathUri::from_host_native_path(directory.path())?,
+            // Windows PowerShell requires its host environment to initialize.
+            env_policy: None,
+            env: std::env::vars().collect(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+        })
+        .await?
+        .process;
     // Reads are replayable. Wait for real EOF before exercising the bounded
     // collector so every page, including the first, reports closed=true.
     timeout(Duration::from_secs(20), async {
         loop {
-            if process.read(None, None, Some(100)).await.unwrap().closed { break; }
+            if process.read(None, None, Some(100)).await.unwrap().closed {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await?;
+    })
+    .await?;
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let output = timeout(Duration::from_secs(5), collect_remote_user_shell_output(
-        &session, &turn, process.clone(), "paged",
-    )).await?.unwrap();
+    let output = timeout(
+        Duration::from_secs(5),
+        collect_remote_user_shell_output(&session, &turn, process.clone(), "paged"),
+    )
+    .await?
+    .unwrap();
     process.terminate().await?;
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout.text, format!("{}TAIL", "x".repeat(150000)));

@@ -120,14 +120,16 @@ async fn immutable_catalog_references_preserve_revision_revocation() {
     state.disconnect().await;
 }
 
-fn session_capacity_error() -> String {
+/// Cell IDs are session-qualified, so the expected list is the IDs the runtime
+/// actually issued, in admission order.
+fn session_capacity_error(active_cells: &[&str]) -> String {
     serde_json::json!({
         "kind": "code_mode_admission_failure",
         "version": 1,
         "reason": "active_cell_limit",
         "message": "code mode has reached its active cell limit; wait for a known dependency or explicitly terminate an unwanted cell before starting another exec",
         "started": false,
-        "active_cells": (1..=8).map(|id| serde_json::json!({
+        "active_cells": active_cells.iter().map(|id| serde_json::json!({
             "cell_id": id.to_string(),
             "state": "registered",
             "readiness": "unknown",
@@ -469,7 +471,9 @@ async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down(
             Some(HostToClient::Response {
                 id: request_id(10),
                 result: WireResult::Err {
-                    message: session_capacity_error(),
+                    message: session_capacity_error(
+                        &cells.iter().map(|cell| cell.as_str()).collect::<Vec<_>>()
+                    ),
                 },
             })
         );
@@ -954,10 +958,11 @@ async fn saturated_session_admission_releases_host_permit() {
         let id = session_id("saturated");
         state.open_session(id.clone()).expect("open");
         let session = state.session(&id).expect("session");
+        let mut cells = Vec::new();
         for _ in 0..8 {
             let mut request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
             request.yield_time_ms = Some(1);
-            session
+            let started = session
                 .execute(
                     request
                         .try_into()
@@ -965,6 +970,7 @@ async fn saturated_session_admission_releases_host_permit() {
                 )
                 .await
                 .expect("occupying cell");
+            cells.push(started.cell_id);
         }
         state.handle_request(
             request_id(1),
@@ -979,7 +985,9 @@ async fn saturated_session_admission_releases_host_permit() {
             HostToClient::Response {
                 id: request_id(1),
                 result: WireResult::Err {
-                    message: session_capacity_error()
+                    message: session_capacity_error(
+                        &cells.iter().map(|cell| cell.as_str()).collect::<Vec<_>>()
+                    )
                 },
             }
         );

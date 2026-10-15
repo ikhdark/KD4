@@ -209,10 +209,16 @@ pub(crate) fn project_exec_output_text_with_budget(
 
 fn complete_exec_output_streams(output: &ExecToolCallOutput) -> Option<(&str, &str)> {
     let streams = [&output.stdout, &output.stderr, &output.aggregated_output];
-    (streams.iter().all(|stream| !stream.truncated && stream.truncated_after_lines.is_none())
-        && output.stdout.text.len().checked_add(output.stderr.text.len())
+    (streams
+        .iter()
+        .all(|stream| !stream.truncated && stream.truncated_after_lines.is_none())
+        && output
+            .stdout
+            .text
+            .len()
+            .checked_add(output.stderr.text.len())
             == Some(output.aggregated_output.text.len()))
-        .then_some((output.stdout.text.as_str(), output.stderr.text.as_str()))
+    .then_some((output.stdout.text.as_str(), output.stderr.text.as_str()))
 }
 
 fn resolve_exec_output_limits(

@@ -201,7 +201,6 @@ pub fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> 
     canonical_relative_identity(&canonical_root, &normalized)
 }
 
-
 fn normalize_lexically(path: &str) -> StoreResult<String> {
     if path.trim().is_empty() {
         return Err(StoreError::InvalidScope(
@@ -383,4 +382,5 @@ mod audit_tests {
         let right_identity = filesystem_identity_bytes(&right);
         assert_ne!(left_identity, right_identity);
     }
+
 }

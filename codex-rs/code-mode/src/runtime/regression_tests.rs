@@ -54,6 +54,66 @@ async fn storage_inventory_reports_admission_bytes_without_loading_values() {
     closed(&mut rx).await;
 }
 
+/// An oversized `limit` clamps to the ceiling instead of throwing. Rejecting it
+/// aborted the whole cell, discarding the unrelated work the model had batched
+/// after the call; the recorded rollouts show that costing a wasted round trip
+/// and generation in eleven sessions. A page size no value satisfies is still a
+/// type error.
+#[tokio::test]
+async fn oversized_list_keys_limit_clamps_instead_of_failing_the_cell() {
+    let (_tx, _termination, mut rx) = start(
+        r#"
+        for (let i = 0; i < 70; i++) store('k' + String(i).padStart(3, '0'), i);
+        text(listKeys({limit: 100}));
+        text(listKeys());
+        for (const bad of [0, 1.5, -1, 'all']) {
+            let threw = false;
+            try { listKeys({limit: bad}); } catch (error) {
+                threw = true;
+                if (!error.message.includes('capped at 64')) throw error;
+            }
+            if (!threw) throw Error('listKeys accepted limit ' + bad);
+        }
+        text('rejected every unsatisfiable limit');
+    "#,
+    )
+    .await;
+    let clamped: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    // Clamped to the ceiling, and still reaching every key through `next_after`.
+    assert_eq!(clamped["keys"].as_array().unwrap().len(), 64);
+    assert_eq!(clamped["next_after"], "k063");
+    assert_eq!(clamped["usage"]["entries"], 70);
+    let defaulted: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    assert_eq!(defaulted["keys"].as_array().unwrap().len(), 32);
+    assert_eq!(
+        text(next(&mut rx).await),
+        "rejected every unsatisfiable limit"
+    );
+    let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else {
+        panic!("result");
+    };
+    assert_eq!(
+        error_text, None,
+        "an oversized page must not fail the cell around it"
+    );
+    closed(&mut rx).await;
+}
+
+/// The contract must state the ceiling it enforces. The model passed `limit:100`
+/// because the published description named no range at all.
+#[test]
+fn the_published_contract_states_the_enforced_list_keys_ceiling() {
+    let description = codex_code_mode_protocol::build_exec_tool_description(true, false, &[]);
+    assert!(
+        description.contains(&format!("`limit` 1-{MAX_LIST_KEYS_LIMIT}")),
+        "the exec contract must publish the enforced listKeys ceiling"
+    );
+    assert!(
+        description.contains(&format!("default {DEFAULT_LIST_KEYS_LIMIT}")),
+        "the exec contract must publish the default listKeys page size"
+    );
+}
+
 #[tokio::test]
 #[ignore = "narrow storage-recovery wall-clock benchmark"]
 async fn storage_inventory_wall_clock_benchmark() {

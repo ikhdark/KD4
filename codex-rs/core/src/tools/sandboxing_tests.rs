@@ -137,25 +137,29 @@ async fn cached_approval_requires_every_key_and_never_caches_empty_requests() {
     assert_eq!(
         with_cached_approval(&session.services, "apply_patch", vec!["a", "b"], || async {
             ReviewDecision::ApprovedForSession
-        }).await,
+        })
+        .await,
         ReviewDecision::ApprovedForSession
     );
     assert_eq!(
         with_cached_approval(&session.services, "apply_patch", vec!["b"], || async {
             panic!("a subset of approved file keys must reuse the session grant")
-        }).await,
+        })
+        .await,
         ReviewDecision::ApprovedForSession
     );
     assert_eq!(
         with_cached_approval(&session.services, "apply_patch", vec!["b", "c"], || async {
             ReviewDecision::Denied
-        }).await,
+        })
+        .await,
         ReviewDecision::Denied
     );
     assert_eq!(
         with_cached_approval(&session.services, "apply_patch", vec!["c"], || async {
             ReviewDecision::Approved
-        }).await,
+        })
+        .await,
         ReviewDecision::Approved
     );
     for keys in [vec!["c"], vec![], vec![]] {
@@ -164,11 +168,14 @@ async fn cached_approval_requires_every_key_and_never_caches_empty_requests() {
             with_cached_approval(&session.services, "apply_patch", keys, || async {
                 fetched.store(true, std::sync::atomic::Ordering::Relaxed);
                 ReviewDecision::ApprovedForSession
-            }).await,
+            })
+            .await,
             ReviewDecision::ApprovedForSession
         );
-        assert!(fetched.load(std::sync::atomic::Ordering::Relaxed),
-            "one-shot approvals and empty key sets must not bypass the approval fetch");
+        assert!(
+            fetched.load(std::sync::atomic::Ordering::Relaxed),
+            "one-shot approvals and empty key sets must not bypass the approval fetch"
+        );
     }
 }
 

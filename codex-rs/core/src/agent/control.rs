@@ -12,9 +12,9 @@ use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::emit_subagent_session_started;
-use crate::session_prefix::inter_agent_completion_communication;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
+use crate::session_prefix::inter_agent_completion_communication;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
@@ -96,6 +96,80 @@ pub(crate) struct LiveAgent {
     pub(crate) thread_id: ThreadId,
     pub(crate) metadata: AgentMetadata,
     pub(crate) status: AgentStatus,
+}
+
+/// Model usage for one thread, separated by token class.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct ThreadUsageTotals {
+    pub(crate) input_tokens: u64,
+    pub(crate) cached_input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) reasoning_output_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
+impl ThreadUsageTotals {
+    fn accumulate(&mut self, usage: &codex_protocol::protocol::TokenUsage) {
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(usage.input_tokens.max(0) as u64);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens.max(0) as u64);
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(usage.output_tokens.max(0) as u64);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(usage.reasoning_output_tokens.max(0) as u64);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(usage.total_tokens.max(0) as u64);
+    }
+
+    fn checked_sum(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_add(other.cached_input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_add(other.reasoning_output_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+        }
+    }
+}
+
+/// Aggregate readable usage for an agent and the subtree it spawned.
+///
+/// Root and descendant totals stay separate so delegation overhead is attributable:
+/// a parent whose own usage is small but whose subtree is large has pushed cost into
+/// children rather than removed it.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct SubtreeUsage {
+    pub(crate) root: ThreadUsageTotals,
+    pub(crate) descendants: ThreadUsageTotals,
+    pub(crate) descendant_threads: u32,
+    /// Subtree members whose usage could not be read. Nonzero means `combined()` is a
+    /// lower bound rather than a complete total.
+    pub(crate) threads_missing_usage: u32,
+    /// False unless membership includes every spawn mode, not just durable edges.
+    /// Ephemeral descendants can disappear from both retained and live graphs.
+    pub(crate) membership_complete: bool,
+}
+
+impl SubtreeUsage {
+    /// Total parent-plus-child usage.
+    pub(crate) fn combined(&self) -> ThreadUsageTotals {
+        self.root.checked_sum(self.descendants)
+    }
+
+    /// Whether every subtree member reported usage.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.membership_complete && self.threads_missing_usage == 0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -231,8 +305,14 @@ impl AgentControl {
         &self.task_coordinator
     }
 
-    pub(crate) fn has_live_agents(&self) -> bool {
-        self.state.has_live_agents()
+    /// Whether this tree has ever had a live sub-agent.
+    ///
+    /// The tool surface uses this rather than the registry's live-graph view, so
+    /// a graph that empties when children finish cannot retract tool schemas
+    /// that sit in the cached prompt prefix. See
+    /// [`AgentRegistry::ever_had_live_agents`].
+    pub(crate) fn ever_had_live_agents(&self) -> bool {
+        self.state.ever_had_live_agents()
     }
 
     /// Heartbeats a bound typed agent for as long as this loaded runtime lives. A finished turn
@@ -603,6 +683,62 @@ impl AgentControl {
         Ok(thread_ids)
     }
 
+    /// Sums readable model usage across `agent_id` and its known descendants.
+    ///
+    /// Per-thread accounting alone makes delegated work look free: a parent that spawns
+    /// five children reports only its own tokens. This aggregates the subtree so parent
+    /// and child cost can be compared against doing the same work locally.
+    ///
+    /// Retained spawn edges keep unloaded children in the membership count. Their
+    /// unavailable session usage makes the totals a lower bound. Even with a
+    /// retained graph, ephemeral children are not persisted, so complete membership
+    /// cannot currently be certified.
+    pub(crate) async fn aggregate_live_subtree_usage(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<SubtreeUsage> {
+        let state = self.upgrade()?;
+        let mut usage = SubtreeUsage::default();
+        let mut thread_ids = HashSet::from([agent_id]);
+        if let Some(agent_graph_store) = state.agent_graph_store() {
+            thread_ids.extend(
+                agent_graph_store
+                    .list_thread_spawn_descendants(agent_id, /*status_filter*/ None)
+                    .await
+                    .map_err(|err| {
+                        CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
+                    })?,
+            );
+            // Persisted edges deliberately exclude ephemeral children. Keep
+            // completeness false: an unloaded ephemeral member is unknowable
+            // from either this graph or the currently loaded thread registry.
+        }
+        thread_ids.extend(self.list_live_agent_subtree_thread_ids(agent_id).await?);
+        for thread_id in thread_ids {
+            // Membership is structural; a member without readable usage is still
+            // a descendant and is reported separately as missing usage.
+            if thread_id != agent_id {
+                usage.descendant_threads = usage.descendant_threads.saturating_add(1);
+            }
+            let Ok(thread) = state.get_thread(thread_id).await else {
+                usage.threads_missing_usage = usage.threads_missing_usage.saturating_add(1);
+                continue;
+            };
+            let Some(info) = thread.token_usage_info().await else {
+                usage.threads_missing_usage = usage.threads_missing_usage.saturating_add(1);
+                continue;
+            };
+            let total = &info.total_token_usage;
+            let target = if thread_id == agent_id {
+                &mut usage.root
+            } else {
+                &mut usage.descendants
+            };
+            target.accumulate(total);
+        }
+        Ok(usage)
+    }
+
     pub(crate) async fn get_agent_config_snapshot(
         &self,
         agent_id: ThreadId,
@@ -794,6 +930,24 @@ impl AgentControl {
                 Some(state) => state.get_thread(child_thread_id).await.ok(),
                 None => None,
             };
+            // Record aggregate cost for this delegation while its subtree is still
+            // readable. Per-thread accounting alone would report the child's tokens
+            // without the descendants it spawned, making deep delegation look cheap.
+            if let Some(child_thread) = child_thread.as_ref() {
+                match control.aggregate_live_subtree_usage(child_thread_id).await {
+                    Ok(usage) => {
+                        crate::agent::task_metrics::emit_subtree_usage(
+                            &child_thread.session_telemetry(),
+                            &usage,
+                        );
+                    }
+                    Err(error) => warn!(
+                        child_thread_id = %child_thread_id,
+                        %error,
+                        "failed to aggregate delegation subtree usage"
+                    ),
+                }
+            }
             if let (Some(child_agent_path), Some(binding)) =
                 (child_agent_path.as_ref(), watched_binding.as_ref())
             {

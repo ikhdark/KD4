@@ -32,8 +32,12 @@ pub(crate) use subagents::SubagentsState;
 pub(crate) use task_state::TaskState;
 
 trait ErasedWorldStateSection: Send + Sync {
-    fn retains_rendered_fragment(&self) -> bool { false }
-    fn retained_rendering(&self) -> Option<Value> { None }
+    fn retains_rendered_fragment(&self) -> bool {
+        false
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        None
+    }
     fn snapshot(&self) -> Option<Value>;
 
     fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool;
@@ -203,8 +207,12 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
 struct PreservedWorldStateSection(Value, Option<Value>);
 
 impl ErasedWorldStateSection for PreservedWorldStateSection {
-    fn retains_rendered_fragment(&self) -> bool { true }
-    fn retained_rendering(&self) -> Option<Value> { self.1.clone() }
+    fn retains_rendered_fragment(&self) -> bool {
+        true
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        self.1.clone()
+    }
     fn snapshot(&self) -> Option<Value> {
         Some(self.0.clone())
     }
@@ -437,7 +445,12 @@ impl WorldState {
             .insert(id, std::sync::Arc::new(ExtensionWorldStateSection(section)));
     }
 
-    pub(crate) fn add_preserved_extension_section(&mut self, id: &'static str, snapshot: Value, rendering: Option<Value>) {
+    pub(crate) fn add_preserved_extension_section(
+        &mut self,
+        id: &'static str,
+        snapshot: Value,
+        rendering: Option<Value>,
+    ) {
         assert!(
             !self.sections.contains_key(id),
             "duplicate world-state section ID: {id}"
@@ -555,8 +568,11 @@ impl WorldState {
                 PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
             };
             let fragment = section.render_diff(previous);
-            let mut accepted_rendering = section.retained_rendering().or_else(||
-                previous_snapshot.and_then(|snapshot| snapshot.rendered_extension(id)).cloned());
+            let mut accepted_rendering = section.retained_rendering().or_else(|| {
+                previous_snapshot
+                    .and_then(|snapshot| snapshot.rendered_extension(id))
+                    .cloned()
+            });
             let mut delivered_digest = None;
             let snapshot_advanced = match fragment {
                 Some(fragment) if !matches!(fragment.role(), "developer" | "user") => {
@@ -583,7 +599,8 @@ impl WorldState {
                         }
                         let role = fragment.role();
                         if section.retains_rendered_fragment() {
-                            accepted_rendering = Some(serde_json::json!({"role": role, "text": rendered}));
+                            accepted_rendering =
+                                Some(serde_json::json!({"role": role, "text": rendered}));
                         }
                         fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
                             as Box<dyn ContextualUserFragment>);
@@ -612,14 +629,19 @@ impl WorldState {
                     }
                 }
                 sections.insert((*id).to_string(), snapshot);
-                if section.retains_rendered_fragment() && let Some(rendering) = accepted_rendering {
+                if section.retains_rendered_fragment()
+                    && let Some(rendering) = accepted_rendering
+                {
                     extension_renderings.insert((*id).to_string(), rendering);
                 }
             }
         }
 
         if !extension_renderings.is_empty() {
-            sections.insert("_codex_extension_delivery".to_string(), Value::Object(extension_renderings));
+            sections.insert(
+                "_codex_extension_delivery".to_string(),
+                Value::Object(extension_renderings),
+            );
         }
 
         (fragments, WorldStateSnapshot { sections })

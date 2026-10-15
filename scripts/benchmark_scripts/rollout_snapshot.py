@@ -22,7 +22,7 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Sequence
 
 from scripts.common.atomic_json import write_stream_atomic
 
@@ -387,7 +387,9 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
     )
 
 
-def iter_rollout_records(path: Path) -> Iterator[tuple[dict[str, Any], int]]:
+def iter_rollout_records(path: Path, *, recover: bool = False,
+                         on_gap: Callable[[dict[str, Any]], None] | None = None
+                         ) -> Iterator[tuple[dict[str, Any], int]]:
     """Yield records and their JSONL byte lengths from one fixed snapshot.
 
     A live writer can leave an unterminated, unparseable final record. Keep the
@@ -396,33 +398,54 @@ def iter_rollout_records(path: Path) -> Iterator[tuple[dict[str, Any], int]]:
 
     Exhaust the iterator before publishing results. Consumers that can stop
     early must close it (for example, with contextlib.closing).
+
+    Diagnostic recovery requires a gap consumer; it never silently skips damage.
+    Gap byte ranges are zero-based, half-open offsets in decoded JSONL (not zstd).
     """
+    if recover and on_gap is None:
+        raise ValueError("diagnostic recovery requires on_gap")
     snapshot = read_rollout_snapshot(path)
     with snapshot, snapshot.open_lines() as lines:
+        offset = 0
         for number, line in enumerate(lines, 1):
+            start, offset = offset, offset + len(line)
+            record = None
+            category = "invalid_record"
             try:
                 record = json.loads(line.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                if not line.endswith(b"\n"):
+                if not isinstance(record, dict):
+                    raise ValueError(f"rollout record {snapshot.path}:{number} is not an object")
+                category = "payload_unavailable"
+                hydrated = hydrate_rollout_record(record, snapshot.path)
+            except (ValueError, OSError) as error:
+                if recover:
+                    reference = record.get("payload") if isinstance(record, dict) else None
+                    on_gap({"path": str(snapshot.path), "snapshot": snapshot.sha256,
+                            "line": number, "byteStart": start, "byteEnd": offset,
+                            "coordinateSpace": "decoded_jsonl", "category": category,
+                            "payload": reference if category == "payload_unavailable" else None,
+                            "error": str(error)})
+                    continue
+                if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) and category == "invalid_record" and not line.endswith(b"\n"):
                     print(
                         f"warning: {snapshot.path}:{number}: ignoring unparseable "
                         "unterminated final record; report covers the complete prefix only",
                         file=sys.stderr,
                     )
                     break
+                if category == "payload_unavailable":
+                    raise
                 raise ValueError(
                     f"invalid rollout record {snapshot.path}:{number}: {error}"
                 ) from error
-            if not isinstance(record, dict):
-                raise ValueError(
-                    f"rollout record {snapshot.path}:{number} is not an object"
-                )
-            yield hydrate_rollout_record(record, snapshot.path), len(line)
+            yield hydrated, len(line)
 
 
-def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
+def read_rollout_records(path: Path, *, recover: bool = False,
+                         on_gap: Callable[[dict[str, Any]], None] | None = None
+                         ) -> list[tuple[dict[str, Any], int]]:
     """Return all verified records, closing the snapshot before returning."""
-    return list(iter_rollout_records(path))
+    return list(iter_rollout_records(path, recover=recover, on_gap=on_gap))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -433,6 +456,8 @@ def _parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("path", type=Path, help="Rollout JSONL or JSONL.zst path")
+    parser.add_argument("--diagnostic", action="store_true",
+                        help="Stream valid hydrated records and explicit gap events as JSONL; not a complete analysis")
     parser.add_argument(
         "--output",
         type=Path,
@@ -443,6 +468,24 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.diagnostic:
+        if args.output is not None:
+            raise ValueError("--diagnostic cannot be combined with portable --output")
+        gaps = 0
+        records = 0
+
+        def gap(value):
+            nonlocal gaps
+            gaps += 1
+            print(json.dumps({"event": "gap", **value}, sort_keys=True))
+
+        with contextlib.closing(iter_rollout_records(args.path, recover=True, on_gap=gap)) as rows:
+            for record, size in rows:
+                records += 1
+                print(json.dumps({"event": "record", "record": record, "wireBytes": size}, sort_keys=True))
+        print(json.dumps({"event": "coverage", "partial": bool(gaps),
+                          "records": records, "gaps": gaps, "traversalComplete": True}, sort_keys=True))
+        return 0
     with read_rollout_snapshot(args.path) as snapshot:
         metadata = snapshot.metadata()
         if args.output is not None:

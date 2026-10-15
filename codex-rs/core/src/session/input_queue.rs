@@ -132,16 +132,25 @@ impl InputQueue {
         &self,
         turn_state: Option<&Mutex<TurnState>>,
         has_internal_completion: bool,
-    ) -> (watch::Receiver<InputQueueActivity>, Option<InputQueueActivity>) {
+    ) -> (
+        watch::Receiver<InputQueueActivity>,
+        Option<InputQueueActivity>,
+    ) {
         let (receiver, pending) = self.subscribe_agent_activity(turn_state).await;
-        (receiver, pending.or(has_internal_completion.then_some(InputQueueActivity::InternalCompletion)))
+        (
+            receiver,
+            pending.or(has_internal_completion.then_some(InputQueueActivity::InternalCompletion)),
+        )
     }
 
     /// Agent waits retain their original policy: any mailbox message wakes them.
     pub(crate) async fn subscribe_agent_activity(
         &self,
         turn_state: Option<&Mutex<TurnState>>,
-    ) -> (watch::Receiver<InputQueueActivity>, Option<InputQueueActivity>) {
+    ) -> (
+        watch::Receiver<InputQueueActivity>,
+        Option<InputQueueActivity>,
+    ) {
         let receiver = self.agent_activity_tx.subscribe();
         let mut pending = self.pending_activity(turn_state, false).await;
         if pending != Some(InputQueueActivity::Steer) && self.has_pending_mailbox_items().await {
@@ -224,7 +233,8 @@ impl InputQueue {
         mailbox.bytes += bytes;
         mailbox.pending_mails.push_back((communication, bytes));
         drop(mailbox);
-        self.agent_activity_tx.send_replace(InputQueueActivity::Mailbox);
+        self.agent_activity_tx
+            .send_replace(InputQueueActivity::Mailbox);
         if trigger_turn {
             self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         }
@@ -268,6 +278,31 @@ impl InputQueue {
             .iter()
             .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
             || !self.mailbox.lock().await.pending_mails.is_empty()
+    }
+
+    /// Authors of queued mail, recovered input first, without consuming it.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
+    )]
+    pub(crate) async fn pending_mailbox_authors(&self) -> Vec<codex_protocol::AgentPath> {
+        let recovered = self.startup_recovery_items.lock().await;
+        let mut authors = recovered
+            .iter()
+            .filter_map(|item| match item {
+                TurnInput::InterAgentCommunication(mail) => Some(mail.author.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        authors.extend(
+            self.mailbox
+                .lock()
+                .await
+                .pending_mails
+                .iter()
+                .map(|(mail, _)| mail.author.clone()),
+        );
+        authors
     }
 
     #[expect(
@@ -326,16 +361,17 @@ impl InputQueue {
         *recovered = restored;
         let activity = if recovered.iter().any(TurnInput::is_steering_input) {
             Some(InputQueueActivity::Steer)
-        } else if recovered
-            .iter()
-            .any(|item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn))
-        {
+        } else if recovered.iter().any(
+            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+        ) {
             Some(InputQueueActivity::Mailbox)
         } else {
             None
         };
         let agent_activity = activity.or_else(|| {
-            recovered.iter().any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
+            recovered
+                .iter()
+                .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
                 .then_some(InputQueueActivity::Mailbox)
         });
         drop(recovered);
@@ -443,7 +479,8 @@ impl InputQueue {
             turn_state.accept_mailbox_delivery_for_current_turn();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
-        self.agent_activity_tx.send_replace(InputQueueActivity::Steer);
+        self.agent_activity_tx
+            .send_replace(InputQueueActivity::Steer);
         Ok(())
     }
 
@@ -482,7 +519,8 @@ impl InputQueue {
             .await?;
         if !input.is_empty() {
             self.activity_tx.send_replace(InputQueueActivity::Steer);
-            self.agent_activity_tx.send_replace(InputQueueActivity::Steer);
+            self.agent_activity_tx
+                .send_replace(InputQueueActivity::Steer);
         }
         Ok(())
     }
@@ -983,7 +1021,10 @@ mod tests {
         assert!(!activity_rx.has_changed().unwrap());
         assert!(agent_rx.has_changed().unwrap());
         assert_eq!(*agent_rx.borrow_and_update(), InputQueueActivity::Mailbox);
-        assert_eq!(input_queue.subscribe_agent_activity(None).await.1, Some(InputQueueActivity::Mailbox));
+        assert_eq!(
+            input_queue.subscribe_agent_activity(None).await.1,
+            Some(InputQueueActivity::Mailbox)
+        );
         assert_eq!(input_queue.pending_activity(None, false).await, None);
         input_queue
             .enqueue_mailbox_communication(make_mail(
@@ -1116,7 +1157,10 @@ mod tests {
             ))
             .await
             .expect("mailbox admission");
-        activity_rx.changed().await.expect("mail wakes the parked subscriber");
+        activity_rx
+            .changed()
+            .await
+            .expect("mail wakes the parked subscriber");
         assert_eq!(
             *activity_rx.borrow_and_update(),
             InputQueueActivity::Mailbox
@@ -1420,7 +1464,8 @@ mod tests {
                     .await
                     .expect("mailbox admission");
             }
-            let (mut activity_rx, pending) = input_queue.subscribe_code_mode_activity(None, false).await;
+            let (mut activity_rx, pending) =
+                input_queue.subscribe_code_mode_activity(None, false).await;
             assert_eq!(pending, None);
             if !queued_before_subscription {
                 input_queue
@@ -1443,7 +1488,10 @@ mod tests {
                 .await
                 .expect("mailbox admission");
             assert!(activity_rx.has_changed().unwrap());
-            assert_eq!(*activity_rx.borrow_and_update(), InputQueueActivity::Mailbox);
+            assert_eq!(
+                *activity_rx.borrow_and_update(),
+                InputQueueActivity::Mailbox
+            );
             assert_eq!(
                 input_queue.pending_activity(None, false).await,
                 Some(InputQueueActivity::Mailbox)
@@ -1529,39 +1577,87 @@ mod tests {
     async fn repeated_error_completions_are_dropped_before_wake_and_history() {
         let queue = InputQueue::with_mailbox_limits(1, 4);
         let sender = codex_protocol::ThreadId::new();
-        let make = |receipt| crate::session_prefix::inter_agent_completion_communication(
-            AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), sender,
-            &codex_protocol::protocol::AgentStatus::Errored("same failure".into()), receipt,
-        ).unwrap();
+        let make = |receipt| {
+            crate::session_prefix::inter_agent_completion_communication(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").unwrap(),
+                sender,
+                &codex_protocol::protocol::AgentStatus::Errored("same failure".into()),
+                receipt,
+            )
+            .unwrap()
+        };
         let first = make(Some("attempt-1"));
         let mut activity = queue.subscribe_agent_activity(None).await.0;
         let (one, two) = tokio::join!(
             queue.enqueue_mailbox_communication(first.clone()),
             queue.enqueue_mailbox_communication(make(Some("attempt-1"))),
         );
-        assert_ne!(one.unwrap(), two.unwrap(), "concurrent producers admit one error");
+        assert_ne!(
+            one.unwrap(),
+            two.unwrap(),
+            "concurrent producers admit one error"
+        );
         activity.borrow_and_update();
         for _ in 0..100 {
-            assert!(!queue.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
+            assert!(
+                !queue
+                    .enqueue_mailbox_communication(make(Some("attempt-1")))
+                    .await
+                    .unwrap()
+            );
         }
-        assert!(!activity.has_changed().unwrap(), "duplicates must not wake the parent");
+        assert!(
+            !activity.has_changed().unwrap(),
+            "duplicates must not wake the parent"
+        );
         // A full mailbox rejects a genuinely new attempt without poisoning its retry.
-        assert!(queue.enqueue_mailbox_communication(make(Some("attempt-2"))).await.is_err());
-        assert_eq!(queue.get_pending_input(&Mutex::new(None)).await,
-            vec![TurnInput::InterAgentCommunication(first.clone())]);
-        assert!(!queue.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
-        assert!(queue.enqueue_mailbox_communication(make(Some("attempt-2"))).await.unwrap());
+        assert!(
+            queue
+                .enqueue_mailbox_communication(make(Some("attempt-2")))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            queue.get_pending_input(&Mutex::new(None)).await,
+            vec![TurnInput::InterAgentCommunication(first.clone())]
+        );
+        assert!(
+            !queue
+                .enqueue_mailbox_communication(make(Some("attempt-1")))
+                .await
+                .unwrap()
+        );
+        assert!(
+            queue
+                .enqueue_mailbox_communication(make(Some("attempt-2")))
+                .await
+                .unwrap()
+        );
 
         // Resume seeds from the startup reducer, so its extraction is what must keep the id.
         let restored = InputQueue::new();
-        let history = codex_protocol::protocol::InitialHistory::Forked(vec![
-            RolloutItem::ResponseItem(first.to_model_input_item()),
-        ]);
-        restored.seed_seen_mailbox_communication_ids_from_ids(
-            crate::session::StartupRolloutFacts::reduce(&history).mailbox_communication_ids,
-        ).await;
-        assert!(!restored.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
-        assert!(restored.get_pending_input(&Mutex::new(None)).await.is_empty());
+        let history =
+            codex_protocol::protocol::InitialHistory::Forked(vec![RolloutItem::ResponseItem(
+                first.to_model_input_item(),
+            )]);
+        restored
+            .seed_seen_mailbox_communication_ids_from_ids(
+                crate::session::StartupRolloutFacts::reduce(&history).mailbox_communication_ids,
+            )
+            .await;
+        assert!(
+            !restored
+                .enqueue_mailbox_communication(make(Some("attempt-1")))
+                .await
+                .unwrap()
+        );
+        assert!(
+            restored
+                .get_pending_input(&Mutex::new(None))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1705,16 +1801,38 @@ mod tests {
         for trigger_turn in [false, true] {
             for recovered in [false, true] {
                 let queue = InputQueue::new();
-                let mail = make_mail(AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), "done", trigger_turn);
+                let mail = make_mail(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").unwrap(),
+                    "done",
+                    trigger_turn,
+                );
                 if recovered {
-                    queue.restore_transferred_startup_input(vec![TurnInput::InterAgentCommunication(mail)]).await;
+                    queue
+                        .restore_transferred_startup_input(vec![
+                            TurnInput::InterAgentCommunication(mail),
+                        ])
+                        .await;
                 } else {
                     queue.enqueue_mailbox_communication(mail).await.unwrap();
                 }
-                assert_eq!(queue.has_pending_input(&Mutex::new(None)).await, trigger_turn);
+                assert_eq!(
+                    queue.has_pending_input(&Mutex::new(None)).await,
+                    trigger_turn
+                );
                 assert_eq!(queue.has_pending_turn_start_work().await, trigger_turn);
-                assert_eq!(queue.subscribe_code_mode_activity(None, false).await.1.is_some(), trigger_turn);
-                assert_eq!(queue.subscribe_activity(None, false).await.1, Some(InputQueueActivity::Mailbox));
+                assert_eq!(
+                    queue
+                        .subscribe_code_mode_activity(None, false)
+                        .await
+                        .1
+                        .is_some(),
+                    trigger_turn
+                );
+                assert_eq!(
+                    queue.subscribe_activity(None, false).await.1,
+                    Some(InputQueueActivity::Mailbox)
+                );
             }
         }
     }

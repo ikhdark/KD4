@@ -593,7 +593,10 @@ pub(super) async fn store_process_for_test(
 ) {
     let cwd = turn.cwd().clone().into();
     let mut store = manager.process_store.lock().await;
-    store.used_process_ids.insert(process_id, Some(process.session_capabilities(true).incarnation));
+    store.used_process_ids.insert(
+        process_id,
+        Some(process.session_capabilities(true).incarnation),
+    );
     store.processes.insert(
         process_id,
         ProcessEntry {
@@ -637,17 +640,28 @@ async fn process_incarnation_rejects_legacy_and_reused_numeric_handles() {
     manager.process_store.lock().await.remove(1003);
     let replacement = remote_process(WriteStatus::Accepted, None).await;
     store_process_for_test(manager, &session, &turn, 1003, Arc::clone(&replacement)).await;
-    assert_ne!(old.session_capabilities(true).incarnation, replacement.session_capabilities(true).incarnation);
+    assert_ne!(
+        old.session_capabilities(true).incarnation,
+        replacement.session_capabilities(true).incarnation
+    );
     for legacy in [false, true] {
         for (chars, terminate) in [("", false), ("unsafe", false), ("", true)] {
             let mut invocation = original.clone();
-            let ToolPayload::Function { arguments } = &mut invocation.payload else { unreachable!() };
+            let ToolPayload::Function { arguments } = &mut invocation.payload else {
+                unreachable!()
+            };
             let mut args: serde_json::Value = serde_json::from_str(arguments).unwrap();
             args["chars"] = chars.into();
             args["terminate"] = terminate.into();
-            if legacy { args.as_object_mut().unwrap().remove("incarnation"); }
+            if legacy {
+                args.as_object_mut().unwrap().remove("incarnation");
+            }
             *arguments = args.to_string();
-            let error = WriteStdinHandler::default().handle(invocation).await.err().expect("old handle must fail");
+            let error = WriteStdinHandler::default()
+                .handle(invocation)
+                .await
+                .err()
+                .expect("old handle must fail");
             assert!(error.to_string().contains("creation identity"), "{error}");
             assert!(!replacement.termination_was_requested());
         }
@@ -663,8 +677,16 @@ fn write_stdin_invocation_with_chars(
     chars: &str,
 ) -> ToolInvocation {
     let incarnation = {
-        let store = session.services.unified_exec_manager.process_store.try_lock().unwrap();
-        store.processes.get(&process_id).map(|entry| entry.process.session_capabilities(entry.tty).incarnation)
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .try_lock()
+            .unwrap();
+        store
+            .processes
+            .get(&process_id)
+            .map(|entry| entry.process.session_capabilities(entry.tty).incarnation)
             .or_else(|| store.used_process_ids.get(&process_id).copied().flatten())
     };
     ToolInvocation {
@@ -721,7 +743,9 @@ async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
             process: Arc::new(DelayedInputExecProcess {
                 inner: MockExecProcess {
                     process_id: "queued-input".to_string().into(),
-                    write_response: WriteResponse { status: WriteStatus::Accepted },
+                    write_response: WriteResponse {
+                        status: WriteStatus::Accepted,
+                    },
                     read_responses: Mutex::new(VecDeque::new()),
                     terminate_error: None,
                     termination_control: None,
@@ -741,16 +765,35 @@ async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
     let interaction = process.interaction_lock().lock_owned().await;
     let artifact = process.raw_output_artifact_owner_for_test().unwrap();
     let artifact_lock = artifact.lock().await;
-    let response = tokio::time::timeout(Duration::from_secs(1), manager.write_stdin(super::WriteStdinRequest {
-        process_id: 1234, input: "once\n", yield_time_ms: 250,
-        max_output_tokens: None, truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
-        nested_deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
-    })).await.expect("queue timeout must hand back inside the outer deadline").unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.write_stdin(super::WriteStdinRequest {
+            process_id: 1234,
+            input: "once\n",
+            yield_time_ms: 250,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
+        }),
+    )
+    .await
+    .expect("queue timeout must hand back inside the outer deadline")
+    .unwrap();
     assert_eq!(response.process_id, Some(1234));
     assert!(!response.process_exited);
     assert!(response.raw_output_artifact.is_none());
-    assert!(response.repair_notice.unwrap().to_ascii_lowercase().contains("input was not delivered"));
-    assert_eq!(writes.load(Ordering::Acquire), 0, "queued input must not reach the executor");
+    assert!(
+        response
+            .repair_notice
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("input was not delivered")
+    );
+    assert_eq!(
+        writes.load(Ordering::Acquire),
+        0,
+        "queued input must not reach the executor"
+    );
     assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
     drop(artifact_lock);
     drop(interaction);
@@ -1076,15 +1119,23 @@ async fn stall_timeout_resets_on_stdout_and_stderr_then_yields_without_terminati
     notified.as_mut().enable();
     process.start_stall_watchdog(Some(100));
     tokio::task::yield_now().await;
-    for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr, ExecOutputStream::Stdout] {
+    for stream in [
+        ExecOutputStream::Stdout,
+        ExecOutputStream::Stderr,
+        ExecOutputStream::Stdout,
+    ] {
         tokio::time::advance(Duration::from_millis(60)).await;
-        process.publish_stream_output_for_test(stream, b"progress".to_vec()).await;
+        process
+            .publish_stream_output_for_test(stream, b"progress".to_vec())
+            .await;
         tokio::task::yield_now().await;
         assert!(!process.has_exited());
         assert_eq!(process.failure_message(), None);
     }
     tokio::time::advance(Duration::from_millis(101)).await;
-    tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), notified)
+        .await
+        .unwrap();
     assert!(!process.has_exited());
     assert!(!process.termination_was_requested());
     assert_eq!(process.failure_message(), None);
@@ -1094,24 +1145,39 @@ async fn stall_timeout_resets_on_stdout_and_stderr_then_yields_without_terminati
     assert!(output.contains("process exit not observed, termination not requested"));
     let observation = process.session_capabilities(false).observation.unwrap();
     assert_eq!(observation.silent_for_ms, 100);
-    assert_eq!(observation.reason, crate::tools::context::ExecObservationReason::NoOutputObserved);
+    assert_eq!(
+        observation.reason,
+        crate::tools::context::ExecObservationReason::NoOutputObserved
+    );
     assert!(!observation.process_exited);
     assert!(!observation.termination_requested);
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
-    assert_eq!(String::from_utf8(process.snapshot_output().await).unwrap(), output);
+    assert_eq!(
+        String::from_utf8(process.snapshot_output().await).unwrap(),
+        output
+    );
     for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr] {
         let notified = process.interaction_requested().notified_owned();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        process.publish_stream_output_for_test(stream, b"resumed".to_vec()).await;
+        process
+            .publish_stream_output_for_test(stream, b"resumed".to_vec())
+            .await;
         tokio::task::yield_now().await;
         assert!(process.session_capabilities(false).observation.is_none());
         tokio::time::advance(Duration::from_millis(101)).await;
-        tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .unwrap();
     }
     let output = String::from_utf8(process.snapshot_output().await).unwrap();
-    assert_eq!(output.matches("no output observed for 100 milliseconds").count(), 3);
+    assert_eq!(
+        output
+            .matches("no output observed for 100 milliseconds")
+            .count(),
+        3
+    );
     assert!(!process.has_exited());
     process.terminate_confirmed().await.unwrap();
 }
@@ -1128,7 +1194,10 @@ async fn stall_timeout_disabled_and_exited_processes_are_not_terminated() {
         assert!(!process.has_exited());
         assert!(!process.termination_was_requested());
         assert!(process.session_capabilities(false).observation.is_none());
-        assert!(process.snapshot_output().await.is_empty(), "disabled observation emits no notice");
+        assert!(
+            process.snapshot_output().await.is_empty(),
+            "disabled observation emits no notice"
+        );
         process.terminate_confirmed().await.unwrap();
     }
     let process = remote_process(WriteStatus::Accepted, None).await;
@@ -1140,7 +1209,10 @@ async fn stall_timeout_disabled_and_exited_processes_are_not_terminated() {
     assert_eq!(process.failure_message(), None);
     assert_eq!(process.exit_code(), Some(0));
     assert!(process.session_capabilities(false).observation.is_none());
-    assert!(process.snapshot_output().await.is_empty(), "exited processes emit no stall notice");
+    assert!(
+        process.snapshot_output().await.is_empty(),
+        "exited processes emit no stall notice"
+    );
 }
 
 #[tokio::test]
@@ -1254,7 +1326,10 @@ async fn unsandboxed_local_process_constructor_does_not_wait_for_early_exit() {
         .await
         .expect("immediately registered process remains owned and cancellable");
     pending_spawns.clear().await;
-    assert!(ready, "unsandboxed registration must not wait for the grace period");
+    assert!(
+        ready,
+        "unsandboxed registration must not wait for the grace period"
+    );
 }
 
 #[cfg(windows)]
@@ -2272,7 +2347,9 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
             process_id: "stopped-reader".to_string().into(),
-            write_response: WriteResponse { status: WriteStatus::Accepted },
+            write_response: WriteResponse {
+                status: WriteStatus::Accepted,
+            },
             read_responses: Mutex::new(VecDeque::new()),
             terminate_error: None,
             termination_control: None,
@@ -2286,13 +2363,23 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     // end this task; neither an exit nor an authoritative Closed was received.
     output_shutdown.cancel();
     let output_task = UnifiedExecProcess::spawn_exec_server_output_task(
-        started, output_handles, output_tx, state_tx, Some(Arc::clone(&artifact)),
-        CancellationToken::new(), output_shutdown,
+        started,
+        output_handles,
+        output_tx,
+        state_tx,
+        Some(Arc::clone(&artifact)),
+        CancellationToken::new(),
+        output_shutdown,
     );
     tokio::time::timeout(Duration::from_secs(5), output_task)
-        .await.expect("reader shutdown must finish").expect("output task");
+        .await
+        .expect("reader shutdown must finish")
+        .expect("output task");
     assert!(output_closed.load(Ordering::Acquire));
-    assert!(!state_rx.borrow().has_exited, "reader shutdown is not process exit proof");
+    assert!(
+        !state_rx.borrow().has_exited,
+        "reader shutdown is not process exit proof"
+    );
     let (path, id) = {
         let artifact = artifact.lock().await;
         let RawOutputArtifact::Stored { path, .. } = &*artifact else {
@@ -2303,21 +2390,38 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     let bytes = tokio::fs::read(path).await.expect("read retained prefix");
     assert!(bytes.starts_with(PREFIX));
     let recovered = read_tool_output_selectors(
-        temp.path(), "remote-reader-shutdown", &id,
+        temp.path(),
+        "remote-reader-shutdown",
+        &id,
         vec![ToolOutputSelector::Search {
-            query: "MutexGuard".into(), case_insensitive: false,
-            start_byte: 0, max_results: 20, context_lines: 0, enclosing: false,
+            query: "MutexGuard".into(),
+            case_insensitive: false,
+            start_byte: 0,
+            max_results: 20,
+            context_lines: 0,
+            enclosing: false,
         }],
-    ).await.expect("recover retained diagnostic prefix");
-    assert!(recovered.complete, "retained search page itself was delivered");
+    )
+    .await
+    .expect("recover retained diagnostic prefix");
+    assert!(
+        recovered.complete,
+        "retained search page itself was delivered"
+    );
     let search = recovered.results[0].value.as_ref().expect("search result");
     assert_eq!(search["total_matches"], 0);
-    assert!(!recovered.capture_complete,
-        "reader shutdown before authoritative closure cannot certify producer capture");
-    assert_eq!(search["coverage_complete"], false,
-        "negative retained search is not absence proof for the interrupted producer");
-    assert!(!String::from_utf8_lossy(&bytes).contains("evicted"),
-        "reader interruption does not establish retention eviction");
+    assert!(
+        !recovered.capture_complete,
+        "reader shutdown before authoritative closure cannot certify producer capture"
+    );
+    assert_eq!(
+        search["coverage_complete"], false,
+        "negative retained search is not absence proof for the interrupted producer"
+    );
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("evicted"),
+        "reader interruption does not establish retention eviction"
+    );
 }
 
 #[cfg(windows)]
@@ -2332,20 +2436,25 @@ async fn exec_server_authoritative_close_preserves_complete_artifact() {
         create_raw_output_artifact(temp.path(), "normal-close", b"").await,
     ));
     let environment = codex_exec_server::Environment::default_for_tests();
-    let started = environment.get_exec_backend().start(codex_exec_server::ExecParams {
-        process_id: ProcessId::from("capture-normal-close"),
-        argv: ["cmd.exe", "/D", "/S", "/C", "echo compiler-output"]
-            .map(str::to_owned).to_vec(),
-        cwd: codex_utils_path_uri::PathUri::from_host_native_path(temp.path()).unwrap(),
-        env_policy: None,
-        env: std::env::vars().collect(),
-        tty: false,
-        pipe_stdin: false,
-        arg0: None,
-        sandbox: None,
-        enforce_managed_network: false,
-        managed_network: None,
-    }).await.expect("start real native process");
+    let started = environment
+        .get_exec_backend()
+        .start(codex_exec_server::ExecParams {
+            process_id: ProcessId::from("capture-normal-close"),
+            argv: ["cmd.exe", "/D", "/S", "/C", "echo compiler-output"]
+                .map(str::to_owned)
+                .to_vec(),
+            cwd: codex_utils_path_uri::PathUri::from_host_native_path(temp.path()).unwrap(),
+            env_policy: None,
+            env: std::env::vars().collect(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+        })
+        .await
+        .expect("start real native process");
     let process = Arc::clone(&started.process);
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_handles = OutputHandles {
@@ -2361,8 +2470,13 @@ async fn exec_server_authoritative_close_preserves_complete_artifact() {
     let (output_tx, _) = tokio::sync::broadcast::channel(8);
     let (state_tx, state_rx) = watch::channel(super::process_state::ProcessState::default());
     let mut output_task = UnifiedExecProcess::spawn_exec_server_output_task(
-        started, output_handles, output_tx, state_tx, Some(Arc::clone(&artifact)),
-        CancellationToken::new(), CancellationToken::new(),
+        started,
+        output_handles,
+        output_tx,
+        state_tx,
+        Some(Arc::clone(&artifact)),
+        CancellationToken::new(),
+        CancellationToken::new(),
     );
     match tokio::time::timeout(Duration::from_secs(10), &mut output_task).await {
         Ok(result) => result.expect("output task"),
@@ -2379,21 +2493,36 @@ async fn exec_server_authoritative_close_preserves_complete_artifact() {
     assert!(state_rx.borrow().failure_message.is_none());
     let (path, id) = {
         let artifact = artifact.lock().await;
-        let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else {
+        let RawOutputArtifact::Stored {
+            path, truncated, ..
+        } = &*artifact
+        else {
             panic!("native output must remain recoverable");
         };
         assert!(!truncated);
         (path.clone(), artifact.artifact_id().unwrap().to_string())
     };
     assert_eq!(tokio::fs::read(path).await.unwrap(), b"compiler-output\r\n");
-    let recovered = read_tool_output_selectors(temp.path(), "normal-close", &id,
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "normal-close",
+        &id,
         vec![ToolOutputSelector::Search {
-            query: "absent".into(), case_insensitive: false,
-            start_byte: 0, max_results: 20, context_lines: 0, enclosing: false,
+            query: "absent".into(),
+            case_insensitive: false,
+            start_byte: 0,
+            max_results: 20,
+            context_lines: 0,
+            enclosing: false,
         }],
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     assert!(recovered.capture_complete);
-    assert_eq!(recovered.results[0].value.as_ref().unwrap()["coverage_complete"], true);
+    assert_eq!(
+        recovered.results[0].value.as_ref().unwrap()["coverage_complete"],
+        true
+    );
 }
 
 #[tokio::test]
@@ -2649,7 +2778,9 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
             Ok(output) => {
                 completions += 1;
                 let value = output.code_mode_result(&invocation.payload);
-                if let Some(previous) = &terminal { assert_eq!(&value, previous); }
+                if let Some(previous) = &terminal {
+                    assert_eq!(&value, previous);
+                }
                 terminal = Some(value);
                 assert_eq!(
                     output.code_mode_result(&invocation.payload)["session_id"],
@@ -2668,17 +2799,24 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
 
     assert_eq!(completions, 2);
     assert_eq!(post_hooks, 1);
-    let invocation = write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-again", 1003);
+    let invocation =
+        write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-again", 1003);
     let output = handler.handle(invocation.clone()).await.unwrap();
     let replay = output.code_mode_result(&invocation.payload);
     assert_eq!(Some(&replay), terminal.as_ref());
     assert_eq!(replay["process_exited"], true);
     assert_eq!(replay["output_complete"], true);
-    assert!(handler.post_tool_use_payload(&invocation, output.as_ref()).is_none());
+    assert!(
+        handler
+            .post_tool_use_payload(&invocation, output.as_ref())
+            .is_none()
+    );
     {
         let mut store = manager.process_store.lock().await;
         let sample = store.finished.front().unwrap().1.clone();
-        for id in 2000..2040 { store.remember_finished(id, &sample); }
+        for id in 2000..2040 {
+            store.remember_finished(id, &sample);
+        }
         assert_eq!(store.finished.len(), 32);
         assert_eq!(store.finished.front().unwrap().0, 2008);
         assert!(store.used_process_ids.contains_key(&1003));
@@ -2687,6 +2825,14 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
         store.remember_finished(1003, &sample);
     }
     let write = write_stdin_invocation_with_chars(session, turn, "late-input", 1003, "unsafe");
-    let error = handler.handle(write).await.err().expect("input must be rejected");
-    assert!(error.to_string().contains("has exited; input was not delivered"));
+    let error = handler
+        .handle(write)
+        .await
+        .err()
+        .expect("input must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("has exited; input was not delivered")
+    );
 }

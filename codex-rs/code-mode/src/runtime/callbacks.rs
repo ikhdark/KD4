@@ -1,7 +1,9 @@
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
 
+use super::DEFAULT_LIST_KEYS_LIMIT;
 use super::EXIT_SENTINEL;
+use super::MAX_LIST_KEYS_LIMIT;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
 use super::MAX_SESSION_STORED_VALUE_BYTES;
 use super::MAX_SESSION_STORED_VALUES;
@@ -475,9 +477,15 @@ pub(super) fn list_keys_callback(
         }
     };
     let after = options.get("after").and_then(serde_json::Value::as_str);
-    let limit = options.get("limit").map_or(Some(32), serde_json::Value::as_u64);
-    let Some(limit) = limit.filter(|limit| (1..=64).contains(limit)) else {
-        throw_type_error(scope, "listKeys limit must be an integer from 1 to 64"); return;
+    let limit = options.get("limit").map_or(Some(DEFAULT_LIST_KEYS_LIMIT), serde_json::Value::as_u64);
+    // A page larger than the ceiling is clamped, not rejected: the result
+    // carries `next_after`, so the caller still reaches every key, and the
+    // sibling `max_output_tokens` ceiling in the same contract clamps too.
+    // Rejecting instead aborted the whole cell, discarding unrelated work
+    // batched after the call. Zero and non-integers remain type errors: no page
+    // size satisfies them, so clamping would answer a different question.
+    let Some(limit) = limit.filter(|limit| *limit > 0).map(|limit| limit.min(MAX_LIST_KEYS_LIMIT)) else {
+        throw_type_error(scope, &format!("listKeys limit must be a positive integer; it is capped at {MAX_LIST_KEYS_LIMIT}")); return;
     };
     if options.get("after").is_some() && after.is_none() {
         throw_type_error(scope, "listKeys after must be a string"); return;

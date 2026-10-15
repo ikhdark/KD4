@@ -174,7 +174,10 @@ where
     let (result, timing) = if telemetry.is_some() {
         codex_http_client::capture_transport_timing(send(req)).await
     } else {
-        (send(req).await, codex_http_client::TransportTiming::default())
+        (
+            send(req).await,
+            codex_http_client::TransportTiming::default(),
+        )
     };
     let duration = start.elapsed();
     if let Some(t) = telemetry.as_ref() {
@@ -251,7 +254,9 @@ fn emit_transport_phases(
     ] {
         let (duration, provenance) = match phase {
             TransportPhase::ProxyResolution => (timing.proxy_resolution, "route_resolver_boundary"),
-            TransportPhase::ClientPoolSelection => (timing.client_pool_selection, "route_client_pool"),
+            TransportPhase::ClientPoolSelection => {
+                (timing.client_pool_selection, "route_client_pool")
+            }
             _ => (None, "reqwest_transport_boundary"),
         };
         telemetry.on_transport_phase(
@@ -353,9 +358,12 @@ mod tests {
             wiremock::Mock::given(wiremock::matchers::path(format!("/{status}")))
                 .respond_with(wiremock::ResponseTemplate::new(status).set_body_string("body"))
                 .expect(1)
-                .mount(&server).await;
+                .mount(&server)
+                .await;
             let pool = codex_http_client::RouteAwareClientPool::new(
-                codex_http_client::HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
                 codex_http_client::ClientRouteClass::Api,
             );
             let transport = codex_http_client::ReqwestTransport::from_client_pool(pool);
@@ -369,20 +377,36 @@ mod tests {
                 },
                 Request::new(Method::GET, format!("{}/{status}", server.uri())),
                 3,
-            ).await;
+            )
+            .await;
             assert_eq!(result.is_ok(), status == 200);
             let elapsed = start.elapsed();
             let observations = recorder.observations.lock().unwrap();
             assert_eq!(observations.len(), 9);
-            for phase in [TransportPhase::ProxyResolution, TransportPhase::ClientPoolSelection, TransportPhase::ResponseHeaders] {
-                let (attempt, observation) = observations.iter().find(|(_, item)| item.phase == phase).unwrap();
+            for phase in [
+                TransportPhase::ProxyResolution,
+                TransportPhase::ClientPoolSelection,
+                TransportPhase::ResponseHeaders,
+            ] {
+                let (attempt, observation) = observations
+                    .iter()
+                    .find(|(_, item)| item.phase == phase)
+                    .unwrap();
                 assert_eq!(*attempt, 3);
                 assert!(observation.duration.is_some(), "{phase:?}");
                 assert!(observation.unavailable_reason.is_none());
             }
-            let headers = observations.iter().find(|(_, item)| item.phase == TransportPhase::ResponseHeaders).unwrap().1;
+            let headers = observations
+                .iter()
+                .find(|(_, item)| item.phase == TransportPhase::ResponseHeaders)
+                .unwrap()
+                .1;
             assert!(elapsed.saturating_sub(headers.duration.unwrap()) >= Duration::from_millis(50));
-            let reuse = observations.iter().find(|(_, item)| item.phase == TransportPhase::ConnectionReuse).unwrap().1;
+            let reuse = observations
+                .iter()
+                .find(|(_, item)| item.phase == TransportPhase::ConnectionReuse)
+                .unwrap()
+                .1;
             assert!(reuse.duration.is_none());
             assert!(reuse.unavailable_reason.is_some());
         }
@@ -451,7 +475,11 @@ mod tests {
             .lock()
             .unwrap()
             .expect("request timing");
-        let callback_started = recorder.callback_started.lock().unwrap().expect("callback timing");
+        let callback_started = recorder
+            .callback_started
+            .lock()
+            .unwrap()
+            .expect("callback timing");
         let callback_duration = *recorder.callback_duration.lock().unwrap();
         assert!(callback_duration >= Duration::from_millis(50));
         // The request measurement must fit entirely before the response callback,

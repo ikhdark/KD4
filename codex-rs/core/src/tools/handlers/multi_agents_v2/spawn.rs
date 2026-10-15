@@ -178,6 +178,7 @@ async fn handle_spawn_agent(
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config = build_agent_spawn_config(turn.as_ref())?;
+    let parent_service_tier = inherit_live_service_tier(&session, &mut config).await;
     let mut spawn_environments = Some(turn.environments.to_selections());
     let mut isolated_workspace: Option<IsolatedWorkspace> = None;
     if let Some(service_tier) = args.service_tier.as_ref() {
@@ -210,7 +211,7 @@ async fn handle_spawn_agent(
         &session,
         turn.as_ref(),
         &mut config,
-        turn.config.service_tier.as_deref(),
+        parent_service_tier.as_deref(),
         args.service_tier.as_deref(),
     )
     .await?;
@@ -870,6 +871,13 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
                 Some("duplicated_primary_investigation"),
                 1,
             ),
+            // Counted as duplicated discovery too: the work was avoided because a
+            // finished result over identical read-scope bytes already answers it.
+            AdmissionRejectionReason::ReusableSealedInvestigation => (
+                "reusable_sealed_investigation",
+                Some("reusable_sealed_investigation"),
+                1,
+            ),
             AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
                 ("isolated_integrator_unavailable", None, 0)
             }
@@ -1126,9 +1134,11 @@ async fn create_isolated_worktree(
         }
         return Err(error);
     }
-    Arc::into_inner(workspace).ok_or_else(|| FunctionCallError::RespondToModel(
-        "spawn_agent: isolated snapshot copy is still in progress".to_string(),
-    ))
+    Arc::into_inner(workspace).ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "spawn_agent: isolated snapshot copy is still in progress".to_string(),
+        )
+    })
 }
 
 async fn capture_workspace_overlay(
@@ -1137,14 +1147,25 @@ async fn capture_workspace_overlay(
     terminal_tasks: &TaskTracker,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
     let mut head_command = Command::new(codex_git_utils::git_executable_async().await);
-    head_command.arg("-C").arg(repo_root).args(["rev-parse", "--verify", "HEAD"]);
-    let head = run_worktree_git(head_command, None, cancellation_token, terminal_tasks).await
-        .map_err(|error| FunctionCallError::RespondToModel(format!("spawn_agent: could not capture snapshot HEAD: {error}")))?;
+    head_command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "HEAD"]);
+    let head = run_worktree_git(head_command, None, cancellation_token, terminal_tasks)
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not capture snapshot HEAD: {error}"
+            ))
+        })?;
     if !head.status.success() {
-        return Err(FunctionCallError::RespondToModel("spawn_agent: could not resolve snapshot HEAD".into()));
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: could not resolve snapshot HEAD".into(),
+        ));
     }
-    let head = String::from_utf8(head.stdout).map_err(|error|
-        FunctionCallError::RespondToModel(format!("spawn_agent: invalid snapshot HEAD: {error}")))?;
+    let head = String::from_utf8(head.stdout).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("spawn_agent: invalid snapshot HEAD: {error}"))
+    })?;
     let head = head.trim().to_string();
     let mut diff_command = Command::new(codex_git_utils::git_executable_async().await);
     diff_command
@@ -1152,18 +1173,31 @@ async fn capture_workspace_overlay(
         .arg(repo_root)
         .args(["diff", "--binary", "--no-ext-diff", &head, "--"]);
     let mut untracked_command = Command::new(codex_git_utils::git_executable_async().await);
-    untracked_command
-        .arg("-C")
-        .arg(repo_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    untracked_command.arg("-C").arg(repo_root).args([
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]);
     let mut tracked_paths_command = Command::new(codex_git_utils::git_executable_async().await);
     tracked_paths_command.arg("-C").arg(repo_root).args([
-        "diff", "--name-only", "--no-renames", "--diff-filter=ACMRT", "-z", &head, "--",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=ACMRT",
+        "-z",
+        &head,
+        "--",
     ]);
     let (diff, untracked, tracked_paths) = tokio::join!(
         run_worktree_git(diff_command, None, cancellation_token, terminal_tasks),
         run_worktree_git(untracked_command, None, cancellation_token, terminal_tasks),
-        run_worktree_git(tracked_paths_command, None, cancellation_token, terminal_tasks),
+        run_worktree_git(
+            tracked_paths_command,
+            None,
+            cancellation_token,
+            terminal_tasks
+        ),
     );
     let diff = diff.map_err(|error| {
         FunctionCallError::RespondToModel(format!(
@@ -1203,8 +1237,16 @@ async fn capture_workspace_overlay(
     // Git patches use clean-filtered content, so applying one alone can change
     // working bytes (notably LF/CRLF). Reapply captured regular-file bytes after
     // the patch handles deletes, modes, and tracked symlinks.
-    let paths = untracked.stdout.split(|byte| *byte == 0).map(|path| (path, false))
-        .chain(tracked_paths.stdout.split(|byte| *byte == 0).map(|path| (path, true)));
+    let paths = untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .map(|path| (path, false))
+        .chain(
+            tracked_paths
+                .stdout
+                .split(|byte| *byte == 0)
+                .map(|path| (path, true)),
+        );
     for (raw_path, tracked) in paths {
         if raw_path.is_empty() {
             continue;
@@ -1708,7 +1750,11 @@ async fn construct_and_attach_task_capsule(
                         "duplicate file handle for {path:?}"
                     )));
                 }
-                normalized_handles.push(TaskCapsuleHandle::File { path, existed, content_hash: None });
+                normalized_handles.push(TaskCapsuleHandle::File {
+                    path,
+                    existed,
+                    content_hash: None,
+                });
             }
             RelevantHandle::Symbol { symbol, .. } => {
                 let symbol = symbol.trim().to_string();
@@ -1722,7 +1768,12 @@ async fn construct_and_attach_task_capsule(
                         "duplicate symbol handle for {path:?} and locator {symbol:?}"
                     )));
                 }
-                normalized_handles.push(TaskCapsuleHandle::Symbol { path, symbol, existed, content_hash: None });
+                normalized_handles.push(TaskCapsuleHandle::Symbol {
+                    path,
+                    symbol,
+                    existed,
+                    content_hash: None,
+                });
             }
         }
     }
@@ -1946,10 +1997,13 @@ mod tests {
                     }
                     args.model = model.map(str::to_string);
                     args.fork_turns = fork_turns.map(str::to_string);
-                    assert!(matches!(
-                        args.fork_mode(AgentRole::Worker, false),
-                        Ok(Some(SpawnAgentForkMode::TaskCapsule))
-                    ), "typed={typed}, model={model:?}, fork_turns={fork_turns:?}");
+                    assert!(
+                        matches!(
+                            args.fork_mode(AgentRole::Worker, false),
+                            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+                        ),
+                        "typed={typed}, model={model:?}, fork_turns={fork_turns:?}"
+                    );
                 }
             }
         }
@@ -2140,21 +2194,33 @@ mod snapshot_tests {
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
                 .arg("-c")
-                .arg(format!("core.hooksPath={}", repo.path().join("no-hooks").display()))
+                .arg(format!(
+                    "core.hooksPath={}",
+                    repo.path().join("no-hooks").display()
+                ))
                 .args(["-c", "commit.gpgsign=false"])
                 .args(args)
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "core.autocrlf", "true"]);
         std::fs::write(repo.path().join("tracked.txt"), b"before\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&[
-            "-c", "user.name=Snapshot Test", "-c", "user.email=snapshot@example.invalid",
-            "commit", "-qm", "fixture",
+            "-c",
+            "user.name=Snapshot Test",
+            "-c",
+            "user.email=snapshot@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
         ]);
         std::fs::write(repo.path().join("tracked.txt"), b"after\n").unwrap();
         std::fs::create_dir_all(repo.path().join("nested/files")).unwrap();
@@ -2167,11 +2233,18 @@ mod snapshot_tests {
         }
         let tasks = TaskTracker::new();
         let workspace = create_isolated_worktree(
-            repo.path(), home.path(), "snapshot", &CancellationToken::new(), &tasks,
+            repo.path(),
+            home.path(),
+            "snapshot",
+            &CancellationToken::new(),
+            &tasks,
         )
         .await
         .unwrap();
-        assert_eq!(std::fs::read(workspace.path.join("tracked.txt")).unwrap(), b"after\n");
+        assert_eq!(
+            std::fs::read(workspace.path.join("tracked.txt")).unwrap(),
+            b"after\n"
+        );
         for index in 0..16_u8 {
             assert_eq!(
                 std::fs::read(workspace.path.join(format!("nested/files/{index}.bin"))).unwrap(),

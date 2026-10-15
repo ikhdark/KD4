@@ -19,6 +19,31 @@ const RETRY_HEADER: &str = "*** Retry Patch: ";
 pub(crate) struct RetainedPatches {
     patches: BTreeMap<String, RetainedPatch>,
     bytes: usize,
+    /// Why a receipt left `patches`, so a later submission can be told the
+    /// actual cause instead of one message covering every possibility. Bounded
+    /// to the same receipt count; ids are small and carry no patch payload.
+    retired: BTreeMap<String, RetirementCause>,
+}
+
+#[derive(Clone, Copy)]
+enum RetirementCause {
+    /// Applied, or rotated by a hook, by an earlier call.
+    Consumed,
+    /// Dropped to stay inside the retention limits while newer receipts arrived.
+    Evicted,
+}
+
+impl RetirementCause {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Consumed => {
+                "patch_id was already used by an earlier call; receipts are single-use. Inspect the current file before submitting a new patch."
+            }
+            Self::Evicted => {
+                "patch_id was dropped to stay within the patch recovery limit after newer receipts were issued. Re-read the affected file and submit a fresh patch."
+            }
+        }
+    }
 }
 
 struct RetainedPatch {
@@ -147,32 +172,66 @@ impl RetainedPatches {
     /// Rotate the receipt atomically: the old payload must never become
     /// replayable, even if execution is cancelled before workspace admission.
     pub(super) fn replace_after_hook(
-        &mut self, id: &str, patch: &str, call_id: &str,
+        &mut self,
+        id: &str,
+        patch: &str,
+        call_id: &str,
     ) -> Result<Value, String> {
-        let saved = self.patches.remove(id).ok_or("patch_id was already consumed by another call")?;
+        let saved = self
+            .patches
+            .remove(id)
+            .ok_or_else(|| self.retirement_detail(id))?;
         self.bytes -= saved.patch.len();
-        let receipt = self.retain(patch, &saved.environment_id, &saved.cwd, &Default::default(), None);
+        let receipt = self.retain(
+            patch,
+            &saved.environment_id,
+            &saved.cwd,
+            &Default::default(),
+            None,
+        );
         let Some(receipt) = receipt else {
             self.bytes += saved.patch.len();
             self.patches.insert(id.to_string(), saved);
-            return Err("hook replacement cannot be retained within the patch recovery limit".into());
+            // Restored, so this id is live again and must not read as retired.
+            self.retired.remove(id);
+            return Err(
+                "hook replacement cannot be retained within the patch recovery limit".into(),
+            );
         };
-        #[expect(clippy::expect_used, reason = "retain constructs patch_id as a string after inserting that exact key")]
+        self.mark_retired(id, RetirementCause::Consumed);
+        #[expect(
+            clippy::expect_used,
+            reason = "retain constructs patch_id as a string after inserting that exact key"
+        )]
         let replacement_id = receipt["patch_id"].as_str().expect("retained patch id");
-        #[expect(clippy::expect_used, reason = "retain just inserted this key and exclusive access prevents intervening removal")]
-        let replacement = self.patches.get_mut(replacement_id).expect("new retained patch");
+        #[expect(
+            clippy::expect_used,
+            reason = "retain just inserted this key and exclusive access prevents intervening removal"
+        )]
+        let replacement = self
+            .patches
+            .get_mut(replacement_id)
+            .expect("new retained patch");
         replacement.hook_recovery = Some((call_id.to_string(), receipt.clone()));
         Ok(receipt)
     }
 
     pub(crate) fn recovery_for_call(&self, call_id: &str) -> Option<Value> {
-        self.patches.values().find_map(|patch| patch.hook_recovery.as_ref()
-            .filter(|(owner, _)| owner == call_id).map(|(_, receipt)| receipt.clone()))
+        self.patches.values().find_map(|patch| {
+            patch
+                .hook_recovery
+                .as_ref()
+                .filter(|(owner, _)| owner == call_id)
+                .map(|(_, receipt)| receipt.clone())
+        })
     }
 
     pub(super) fn prepare(&self, input: &str) -> Result<PreparedRetry, String> {
         let (id, amendments) = parse_retry(input)?;
-        let saved = self.patches.get(&id).ok_or("patch_id is unknown, expired or already used; inspect current files before submitting a new patch")?;
+        let saved = self
+            .patches
+            .get(&id)
+            .ok_or_else(|| self.retirement_detail(&id))?;
         let mut args = codex_apply_patch::parse_patch(&saved.patch).map_err(|e| e.to_string())?;
         for amendment in amendments {
             match amendment {
@@ -207,9 +266,37 @@ impl RetainedPatches {
         let saved = self
             .patches
             .remove(id)
-            .ok_or("patch_id was already consumed by another call")?;
+            .ok_or_else(|| self.retirement_detail(id))?;
         self.bytes -= saved.patch.len();
+        self.mark_retired(id, RetirementCause::Consumed);
         Ok(())
+    }
+
+    /// Explain a receipt that is not live, naming the cause when it is known.
+    /// An id this session never issued cannot be distinguished from one issued
+    /// before a restart, because receipts do not survive one, nor from one
+    /// retired long enough ago that the bounded cause record dropped it.
+    fn retirement_detail(&self, id: &str) -> String {
+        match self.retired.get(id) {
+            Some(cause) => cause.describe().to_string(),
+            None => {
+                "patch_id is not a live receipt in this session: it was never issued here, was issued before a restart (receipts are session-local), or was retired too long ago for its cause to be retained. Inspect the current file and submit a new patch."
+                    .to_string()
+            }
+        }
+    }
+
+    fn mark_retired(&mut self, id: &str, cause: RetirementCause) {
+        // Keep the cause map bounded alongside the receipts themselves.
+        while self.retired.len() >= MAX_RETAINED_PATCHES {
+            let Some((oldest, _)) = self.retired.pop_first() else {
+                break;
+            };
+            if oldest == id {
+                break;
+            }
+        }
+        self.retired.insert(id.to_string(), cause);
     }
 
     pub(super) fn retain(
@@ -258,8 +345,9 @@ impl RetainedPatches {
         while self.patches.len() >= MAX_RETAINED_PATCHES
             || self.bytes + patch.len() > MAX_RETAINED_BYTES
         {
-            let (_, evicted) = self.patches.pop_first()?;
+            let (evicted_id, evicted) = self.patches.pop_first()?;
             self.bytes -= evicted.patch.len();
+            self.mark_retired(&evicted_id, RetirementCause::Evicted);
         }
         let id = uuid::Uuid::now_v7().to_string();
         let hunks = remaining
@@ -482,9 +570,16 @@ mod tests {
             LOCAL_FS.as_ref(),
             None,
             &|| {
-                if !committed.exists() { return false; }
-                *reader.lock().unwrap() = Some(std::fs::OpenOptions::new().read(true)
-                    .share_mode(1).open(&committed).unwrap());
+                if !committed.exists() {
+                    return false;
+                }
+                *reader.lock().unwrap() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&committed)
+                        .unwrap(),
+                );
                 true
             },
         )
@@ -553,19 +648,51 @@ mod tests {
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let pending = dir.path().join("pending");
         std::fs::write(&pending, "old\n").unwrap();
-        let reader = std::fs::OpenOptions::new().read(true).share_mode(1).open(&pending).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&pending)
+            .unwrap();
         let patch = "*** Begin Patch\n*** Add File: first\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
-        let failure = codex_apply_patch::apply_patch(patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap_err();
+        let failure = codex_apply_patch::apply_patch(
+            patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.delta().is_empty());
         assert!(failure.delta().is_exact());
         let mut store = RetainedPatches::default();
-        let receipt = store.retain(patch, "local", &cwd, failure.delta(), None).unwrap();
+        let receipt = store
+            .retain(patch, "local", &cwd, failure.delta(), None)
+            .unwrap();
         assert_eq!(receipt["committed_hunks_excluded"], 0);
-        let retry = store.prepare(&format!("*** Begin Patch\n*** Retry Patch: {}\n*** End Patch", receipt["patch_id"].as_str().unwrap())).unwrap();
+        let retry = store
+            .prepare(&format!(
+                "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",
+                receipt["patch_id"].as_str().unwrap()
+            ))
+            .unwrap();
         assert_eq!(retry.args.hunks.len(), 2);
         drop(reader);
-        codex_apply_patch::apply_patch(&retry.args.patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap();
+        codex_apply_patch::apply_patch(
+            &retry.args.patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&pending).unwrap(), "new\n");
-        assert_eq!(std::fs::read_to_string(dir.path().join("first")).unwrap(), "first\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("first")).unwrap(),
+            "first\n"
+        );
     }
 }

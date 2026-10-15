@@ -109,13 +109,20 @@ fn render_instruction_template_expands_placeholders_and_escapes_braces() {
             "Review {path} in {area}. Also see {file path}. Use {{literal}}.",
             "Review src/lib.rs in test. Also see docs/readme.md. Use {literal}.",
         ),
-        ("Check {path} then {missing}", "Check src/lib.rs then {missing}"),
+        (
+            "Check {path} then {missing}",
+            "Check src/lib.rs then {missing}",
+        ),
         (
             "{a} {b} __CODEX_OPEN_BRACE__ {marker}",
             "{b} secret __CODEX_OPEN_BRACE__ __CODEX_CLOSE_BRACE__",
         ),
     ] {
-        assert_eq!(render_instruction_template(input, &row), expected, "{input}");
+        assert_eq!(
+            render_instruction_template(input, &row),
+            expected,
+            "{input}"
+        );
     }
 }
 
@@ -124,7 +131,10 @@ fn ensure_unique_headers_rejects_duplicates() {
     ensure_unique_headers(&["path".to_string(), "description".to_string()]).unwrap();
     for (second, message) in [
         ("path", "csv header path is duplicated"),
-        ("result_json", "csv header result_json conflicts with a generated output column"),
+        (
+            "result_json",
+            "csv header result_json conflicts with a generated output column",
+        ),
     ] {
         let headers = vec!["path".to_string(), second.to_string()];
         assert_eq!(
@@ -265,8 +275,10 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
     )
     .await
     .expect("schema-conforming correction should be accepted");
-    assert_eq!(delivered.sampling_request_signal.as_ref().unwrap()
-        ["authoritative_wait_owner_v1"]["surfaceable_message"], r#"{"score":5}"#);
+    assert_eq!(
+        delivered.sampling_request_signal.as_ref().unwrap()["authoritative_wait_owner_v1"]["surfaceable_message"],
+        r#"{"score":5}"#
+    );
     let item = db
         .get_agent_job_item(job.id.as_str(), "item-0")
         .await
@@ -303,8 +315,11 @@ async fn wait_for_status_change_blocks_after_non_final_update_is_consumed() {
     let (_capacity, mut capacity_changes) = tokio::sync::watch::channel(0);
     let cancellation = CancellationToken::new();
     let wait = wait_for_status_change(
-        &active_items, &mut job_changes, &mut capacity_changes,
-        &cancellation, Duration::from_secs(60),
+        &active_items,
+        &mut job_changes,
+        &mut capacity_changes,
+        &cancellation,
+        Duration::from_secs(60),
     );
     tokio::pin!(wait);
     assert!(futures::poll!(&mut wait).is_pending());
@@ -328,13 +343,21 @@ async fn wait_for_status_change_wakes_on_capacity_release_without_active_workers
     let active = HashMap::new();
     let start = Instant::now();
     let wait = wait_for_status_change(
-        &active, &mut jobs, &mut capacity, &cancellation, Duration::from_secs(60),
+        &active,
+        &mut jobs,
+        &mut capacity,
+        &cancellation,
+        Duration::from_secs(60),
     );
     tokio::pin!(wait);
     assert!(futures::poll!(&mut wait).is_pending());
     drop(reservation);
     wait.await;
-    assert_eq!(Instant::now(), start, "capacity release must not wait for a polling interval");
+    assert_eq!(
+        Instant::now(),
+        start,
+        "capacity release must not wait for a polling interval"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -344,7 +367,11 @@ async fn wait_for_status_change_wakes_on_job_commit_and_honors_runtime_deadline(
     let cancellation = CancellationToken::new();
     let active = HashMap::new();
     let wait = wait_for_status_change(
-        &active, &mut jobs, &mut capacity, &cancellation, Duration::from_secs(60),
+        &active,
+        &mut jobs,
+        &mut capacity,
+        &cancellation,
+        Duration::from_secs(60),
     );
     tokio::pin!(wait);
     assert!(futures::poll!(&mut wait).is_pending());
@@ -355,11 +382,22 @@ async fn wait_for_status_change_wakes_on_job_commit_and_honors_runtime_deadline(
     let (_capacity, mut capacity) = tokio::sync::watch::channel(0);
     let (_status, status_rx) = tokio::sync::watch::channel(AgentStatus::Running);
     let started_at = Instant::now();
-    let active = HashMap::from([(ThreadId::new(), ActiveJobItem {
-        item_id: "deadline".into(), started_at, status_rx: Some(status_rx),
-    })]);
-    wait_for_status_change(&active, &mut jobs, &mut capacity, &cancellation,
-        Duration::from_millis(40)).await;
+    let active = HashMap::from([(
+        ThreadId::new(),
+        ActiveJobItem {
+            item_id: "deadline".into(),
+            started_at,
+            status_rx: Some(status_rx),
+        },
+    )]);
+    wait_for_status_change(
+        &active,
+        &mut jobs,
+        &mut capacity,
+        &cancellation,
+        Duration::from_millis(40),
+    )
+    .await;
     assert_eq!(Instant::now() - started_at, Duration::from_millis(40));
 }
 
@@ -368,7 +406,10 @@ async fn wait_for_status_change_handles_maximum_persisted_runtime_deadline() {
     // The largest persisted positive timeout must not disable wakeups.
     // Instant's representable range is platform-specific, not part of this contract.
     let seconds = i64::MAX as u64;
-    assert_eq!(normalize_max_runtime_seconds(Some(seconds)).unwrap(), Some(seconds));
+    assert_eq!(
+        normalize_max_runtime_seconds(Some(seconds)).unwrap(),
+        Some(seconds)
+    );
     let runtime_timeout = Duration::from_secs(seconds);
     for wake in ["job", "cancel", "reconcile"] {
         let (jobs_tx, mut jobs) = tokio::sync::watch::channel(0);
@@ -376,24 +417,39 @@ async fn wait_for_status_change_handles_maximum_persisted_runtime_deadline() {
         let (_status_tx, status_rx) = tokio::sync::watch::channel(AgentStatus::Running);
         let cancellation = CancellationToken::new();
         let started_at = Instant::now();
-        let active = HashMap::from([(ThreadId::new(), ActiveJobItem {
-            item_id: "long-runtime".into(), started_at, status_rx: Some(status_rx),
-        })]);
+        let active = HashMap::from([(
+            ThreadId::new(),
+            ActiveJobItem {
+                item_id: "long-runtime".into(),
+                started_at,
+                status_rx: Some(status_rx),
+            },
+        )]);
         let wait = wait_for_status_change(
-            &active, &mut jobs, &mut capacity, &cancellation, runtime_timeout,
+            &active,
+            &mut jobs,
+            &mut capacity,
+            &cancellation,
+            runtime_timeout,
         );
         tokio::pin!(wait);
         assert!(futures::poll!(&mut wait).is_pending());
         match wake {
-            "job" => { jobs_tx.send_replace(1); }
+            "job" => {
+                jobs_tx.send_replace(1);
+            }
             "cancel" => cancellation.cancel(),
-            "reconcile" => {},
+            "reconcile" => {}
             _ => unreachable!(),
         }
         wait.await;
         assert_eq!(
             Instant::now() - started_at,
-            if wake == "reconcile" { Duration::from_secs(5) } else { Duration::ZERO },
+            if wake == "reconcile" {
+                Duration::from_secs(5)
+            } else {
+                Duration::ZERO
+            },
             "{wake} wakeup must not wait for the maximum persisted deadline",
         );
     }
@@ -514,23 +570,61 @@ async fn durability_regression_restart_reconciles_and_exports_partial_csv() {
     assert_eq!(
         reader.headers().expect("CSV headers"),
         &csv::StringRecord::from(vec![
-            "value", "job_id", "item_id", "row_index", "source_id", "status",
-            "attempt_count", "last_error", "result_json", "reported_at", "completed_at",
+            "value",
+            "job_id",
+            "item_id",
+            "row_index",
+            "source_id",
+            "status",
+            "attempt_count",
+            "last_error",
+            "result_json",
+            "reported_at",
+            "completed_at",
         ])
     );
-    let rows = reader.records().collect::<Result<Vec<_>, _>>().expect("CSV records");
-    assert_eq!(rows.len(), 2, "restart export must preserve both input rows");
+    let rows = reader
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("CSV records");
+    assert_eq!(
+        rows.len(),
+        2,
+        "restart export must preserve both input rows"
+    );
     assert_eq!(
         rows[0].iter().take(9).collect::<Vec<_>>(),
-        vec!["row-0", job.id.as_str(), "item-0", "0", "", "completed", "1", "", r#"{"result":"kept"}"#]
+        vec![
+            "row-0",
+            job.id.as_str(),
+            "item-0",
+            "0",
+            "",
+            "completed",
+            "1",
+            "",
+            r#"{"result":"kept"}"#
+        ]
     );
     assert_eq!(
         rows[1].iter().take(9).collect::<Vec<_>>(),
-        vec!["row-1", job.id.as_str(), "item-1", "1", "", "failed", "0",
-            codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR, ""]
+        vec![
+            "row-1",
+            job.id.as_str(),
+            "item-1",
+            "1",
+            "",
+            "failed",
+            "0",
+            codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR,
+            ""
+        ]
     );
     chrono::DateTime::parse_from_rfc3339(&rows[0][9]).expect("completed item report time");
-    assert_eq!(&rows[1][9], "", "unreported item must not acquire a report time");
+    assert_eq!(
+        &rows[1][9], "",
+        "unreported item must not acquire a report time"
+    );
     for row in &rows {
         chrono::DateTime::parse_from_rfc3339(&row[10]).expect("terminal item completion time");
     }

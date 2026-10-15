@@ -301,9 +301,19 @@ impl TurnContext {
         items: Vec<ResponseItem>,
     ) {
         let activations = {
-            let state = self.deferred_tool_activations.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            tools.iter().filter_map(|name| state.capability_revisions.get(name)
-                .map(|revision| (name.clone(), revision.clone()))).collect::<Vec<_>>()
+            let state = self
+                .deferred_tool_activations
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tools
+                .iter()
+                .filter_map(|name| {
+                    state
+                        .capability_revisions
+                        .get(name)
+                        .map(|revision| (name.clone(), revision.clone()))
+                })
+                .collect::<Vec<_>>()
         };
         let mut pending = self.pending_post_tool_contexts.lock().await;
         let context = pending.entry(call_id.into()).or_default();
@@ -312,22 +322,32 @@ impl TurnContext {
     }
 
     pub(crate) fn commit_tool_search_activations(&self, context: PendingToolContext) {
-        let mut state = self.deferred_tool_activations.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .deferred_tool_activations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut changed = false;
         for (name, revision) in context.activations {
-            if state.capability_revisions.get(&name) != Some(&revision) { continue; }
+            if state.capability_revisions.get(&name) != Some(&revision) {
+                continue;
+            }
             let activation = DeferredToolActivation {
-                root_task_epoch: self.sub_id.clone(), provenance: name.to_string(), capability_revision: revision,
+                root_task_epoch: self.sub_id.clone(),
+                provenance: name.to_string(),
+                capability_revision: revision,
             };
             changed |= state.activations.get(&name) != Some(&activation);
             state.activations.insert(name, activation);
         }
-        if changed { state.revision = state.revision.saturating_add(1); }
+        if changed {
+            state.revision = state.revision.saturating_add(1);
+        }
     }
 
     #[cfg(test)]
     pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
-        let mut context = self.pending_post_tool_contexts
+        let mut context = self
+            .pending_post_tool_contexts
             .lock()
             .await
             .remove(call_id)
@@ -746,13 +766,19 @@ impl TurnContext {
                 });
             }
             let parts = [
-                ("config_layers_v1", serde_json::to_value(turn.config.config_layer_stack.effective_config())?),
-                ("turn_settings_v1", serde_json::to_value((
-                    settings,
-                    &turn.reasoning_summary,
-                    &turn.config.service_tier,
-                    turn.config.web_search_mode.value(),
-                ))?),
+                (
+                    "config_layers_v1",
+                    serde_json::to_value(turn.config.config_layer_stack.effective_config())?,
+                ),
+                (
+                    "turn_settings_v1",
+                    serde_json::to_value((
+                        settings,
+                        &turn.reasoning_summary,
+                        &turn.config.service_tier,
+                        turn.config.web_search_mode.value(),
+                    ))?,
+                ),
                 ("selected_model_v1", serde_json::to_value(&turn.model_info)?),
             ];
             let mut identity = BTreeMap::new();
@@ -763,7 +789,8 @@ impl TurnContext {
                 identity.insert(name.to_string(), format!("{:x}", writer.0.finalize()));
             }
             Ok((identity, Some(codex_rollout::current_harness_build_info())))
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(identity)) => identity,
             _ => {
@@ -1244,9 +1271,9 @@ impl Session {
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
-        turn_context.turn_timing_state.bind_live_phase_events(
-            turn_context.sub_id.clone(), self.tx_event.clone(),
-        );
+        turn_context
+            .turn_timing_state
+            .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());
         let turn_context = Arc::new(turn_context);
         if turn_context
             .environments

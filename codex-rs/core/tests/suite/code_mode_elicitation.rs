@@ -85,7 +85,8 @@ impl CodeModeElicitationHarness {
             },
             TURN_COMPLETE_TIMEOUT,
         )
-        .await else {
+        .await
+        else {
             unreachable!("matching turn completion");
         };
         assert!(completed.error.is_none(), "{completed:?}");
@@ -191,8 +192,14 @@ await tools.exec_command({
         })
         .await?;
     harness.finish().await;
-    let output = harness.follow_up.single_request().custom_tool_call_output("call-1");
-    assert!(output.to_string().contains("code_mode_approval_marker"), "{output}");
+    let output = harness
+        .follow_up
+        .single_request()
+        .custom_tool_call_output("call-1");
+    assert!(
+        output.to_string().contains("code_mode_approval_marker"),
+        "{output}"
+    );
     Ok(())
 }
 

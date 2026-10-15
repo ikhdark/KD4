@@ -15,7 +15,11 @@ fn utf8_projection_is_independent_of_poll_boundaries_and_retry() {
             buffer.push_chunk(&input[split..]);
             buffer.collect_pending_output();
             let second = buffer.projected_pending_output(true, &[]);
-            let text = format!("{}{}", String::from_utf8_lossy(&first.0), String::from_utf8_lossy(&second.0));
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&first.0),
+                String::from_utf8_lossy(&second.0)
+            );
             assert_eq!(text, String::from_utf8_lossy(input));
             let first_ranges = first.1.unwrap();
             let second_ranges = second.1.unwrap();
@@ -51,9 +55,21 @@ fn utf8_projection_preserves_raw_bytes_and_only_defers_incomplete_suffix() {
     // Only the incomplete euro sign may be carried to the next open poll;
     // closure must flush even an incomplete suffix before the process retires.
     for (chunk, closed, expected, range, has_carry) in [
-        (b"ready:\xff\xe2".as_slice(), false, b"ready:\xff".as_slice(), 0..7, true),
+        (
+            b"ready:\xff\xe2".as_slice(),
+            false,
+            b"ready:\xff".as_slice(),
+            0..7,
+            true,
+        ),
         (b"".as_slice(), false, b"".as_slice(), 7..7, true),
-        (b"\x82\xac!".as_slice(), false, b"\xe2\x82\xac!".as_slice(), 7..11, false),
+        (
+            b"\x82\xac!".as_slice(),
+            false,
+            b"\xe2\x82\xac!".as_slice(),
+            7..11,
+            false,
+        ),
         (b"\xe2\x82".as_slice(), false, b"".as_slice(), 11..11, true),
         (b"".as_slice(), true, b"\xe2\x82".as_slice(), 11..13, false),
     ] {
@@ -75,7 +91,15 @@ fn pending_reports_keep_absolute_chunk_and_gap_coordinates() {
     let mut source = HeadTailBuffer::new(8);
     source.push_chunk(b"first\r\n");
     source.collect_pending_output();
-    assert_eq!(source.pending_output().unwrap().output_ranges().unwrap().range, 0..7);
+    assert_eq!(
+        source
+            .pending_output()
+            .unwrap()
+            .output_ranges()
+            .unwrap()
+            .range,
+        0..7
+    );
     source.acknowledge_pending_output();
     source.push_chunk(b"abcdefghijklmnop");
     source.collect_pending_output();
@@ -86,10 +110,21 @@ fn pending_reports_keep_absolute_chunk_and_gap_coordinates() {
     // bytes extend it without moving its starting coordinate or replaying reads.
     source.begin_output_report();
     source.collect_pending_output();
-    assert_eq!(source.pending_output().unwrap().output_ranges(), Some(ranges));
+    assert_eq!(
+        source.pending_output().unwrap().output_ranges(),
+        Some(ranges)
+    );
     source.push_chunk(b"tail");
     source.collect_pending_output();
-    assert_eq!(source.pending_output().unwrap().output_ranges().unwrap().range, 7..27);
+    assert_eq!(
+        source
+            .pending_output()
+            .unwrap()
+            .output_ranges()
+            .unwrap()
+            .range,
+        7..27
+    );
     source.acknowledge_pending_output();
     source.collect_pending_output();
     let empty = source.pending_output().unwrap().output_ranges().unwrap();
@@ -132,7 +167,10 @@ fn loss_notice_snapshot_preserves_wrapped_tail_and_trailing_notice() {
     let mut complete = HeadTailBuffer::new(8);
     complete.push_chunk(b"complete");
     assert_eq!(complete.to_bytes_with_loss_notice(&[]), b"complete");
-    assert_eq!(complete.to_bytes_with_loss_notice(b"<lag>"), b"complete<lag>");
+    assert_eq!(
+        complete.to_bytes_with_loss_notice(b"<lag>"),
+        b"complete<lag>"
+    );
     assert_eq!(HeadTailBuffer::new(0).to_bytes_with_loss_notice(&[]), b"");
 }
 
@@ -158,7 +196,11 @@ fn zero_head_budget_respects_zero_and_one_byte_capacity() {
         assert_eq!(buf.retained_bytes(), capacity);
         assert_eq!(buf.omitted_bytes(), 3 - capacity);
         assert_eq!(buf.to_bytes(), expected);
-        let chunks = if capacity == 0 { Vec::new() } else { vec![expected.to_vec()] };
+        let chunks = if capacity == 0 {
+            Vec::new()
+        } else {
+            vec![expected.to_vec()]
+        };
         assert_eq!(buf.snapshot_chunks(), chunks);
         assert_eq!(buf.take_unreported_omitted_bytes(), 3 - capacity);
         assert_eq!(buf.take_unreported_omitted_bytes(), 0);

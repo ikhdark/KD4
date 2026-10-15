@@ -22,11 +22,17 @@ pub(crate) fn file_selector_schema() -> JsonSchema {
     let mut schema = selector_schema(true);
     if let Some(variants) = &mut schema.one_of
         && let Some(section) = variants.iter_mut().find(|variant| {
-            variant.properties.as_ref().and_then(|properties| properties.get("kind"))
+            variant
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("kind"))
                 .and_then(|kind| kind.enum_values.as_ref())
                 .is_some_and(|values| values == &[serde_json::json!("section")])
         })
-        && let Some(id) = section.properties.as_mut().and_then(|properties| properties.get_mut("id"))
+        && let Some(id) = section
+            .properties
+            .as_mut()
+            .and_then(|properties| properties.get_mut("id"))
     {
         id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates), then a returned item ID for exact source. Imports are not listed; the first page gives their line runs as import_ranges. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
     }
@@ -355,7 +361,10 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 properties
                     .get("kind")
                     .and_then(|kind| kind.enum_values.as_ref())
-                    .is_some_and(|values| values == &vec![serde_json::json!("search")] || values == &vec![serde_json::json!("search_index")])
+                    .is_some_and(|values| {
+                        values == &vec![serde_json::json!("search")]
+                            || values == &vec![serde_json::json!("search_index")]
+                    })
             })
         });
     exact_result["properties"]["selector"] = serde_json::json!({"oneOf": exact_selectors});
@@ -467,7 +476,11 @@ mod tests {
             panic!("recovery uses a function spec");
         };
         let declaration = codex_code_mode::render_json_schema_to_typescript(
-            &spec.output_schema.as_ref().expect("recovery output schema").to_value(),
+            &spec
+                .output_schema
+                .as_ref()
+                .expect("recovery output schema")
+                .to_value(),
         );
         for field in [
             "complete: boolean",

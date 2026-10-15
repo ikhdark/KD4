@@ -30,15 +30,21 @@ pub fn create_test_sync_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "sleep_before_ms".to_string(),
-            JsonSchema { minimum: Some(0.into()), ..JsonSchema::integer(Some(
-                "Delay before any other action. Defaults to no delay.".to_string(),
-            )) },
+            JsonSchema {
+                minimum: Some(0.into()),
+                ..JsonSchema::integer(Some(
+                    "Delay before any other action. Defaults to no delay.".to_string(),
+                ))
+            },
         ),
         (
             "sleep_after_ms".to_string(),
-            JsonSchema { minimum: Some(0.into()), ..JsonSchema::integer(Some(
-                "Delay after completing the barrier. Defaults to no delay.".to_string(),
-            )) },
+            JsonSchema {
+                minimum: Some(0.into()),
+                ..JsonSchema::integer(Some(
+                    "Delay after completing the barrier. Defaults to no delay.".to_string(),
+                ))
+            },
         ),
         (
             "barrier".to_string(),

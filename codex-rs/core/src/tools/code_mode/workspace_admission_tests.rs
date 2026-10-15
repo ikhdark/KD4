@@ -11,21 +11,30 @@ impl ToolExecutor<ToolInvocation> for ProcessGateControl {
     }
 
     fn spec(&self) -> codex_tools::ToolSpec {
-        PacketTestTool { name: "process_gate_control" }.spec()
+        PacketTestTool {
+            name: "process_gate_control",
+        }
+        .spec()
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
-            let ToolPayload::Function { arguments } = invocation.payload else { panic!("function") };
+            let ToolPayload::Function { arguments } = invocation.payload else {
+                panic!("function")
+            };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
             if args["release"] == true {
-                tokio::fs::write(self.0.join("release"), b"go").await.unwrap();
+                tokio::fs::write(self.0.join("release"), b"go")
+                    .await
+                    .unwrap();
             } else {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     while !tokio::fs::try_exists(self.0.join("ready")).await.unwrap() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                }).await.expect("real process must publish its ready barrier");
+                })
+                .await
+                .expect("real process must publish its ready barrier");
             }
             Ok(crate::tools::context::boxed_tool_output(
                 FunctionToolOutput::from_text("ready".into(), Some(true)),
@@ -35,7 +44,9 @@ impl ToolExecutor<ToolInvocation> for ProcessGateControl {
 }
 
 impl crate::tools::registry::CoreToolRuntime for ProcessGateControl {
-    fn delegates_workspace_admission(&self) -> bool { true }
+    fn delegates_workspace_admission(&self) -> bool {
+        true
+    }
 }
 
 #[tokio::test]
@@ -43,11 +54,15 @@ async fn admission_grace_preserves_real_command_through_queued_read_and_command(
     let workspace = tempfile::tempdir().unwrap();
     let control = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("read.txt"), "independent read\n").unwrap();
-    let runtime = PacketRuntime::with_nested_runtimes_in_workspace(vec![
-        Arc::new(crate::tools::handlers::ExecCommandHandler::default()),
-        Arc::new(crate::tools::handlers::ReadFileHandler),
-        Arc::new(ProcessGateControl(control.path().to_path_buf())),
-    ], Some(workspace.path())).await;
+    let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
+        vec![
+            Arc::new(crate::tools::handlers::ExecCommandHandler::default()),
+            Arc::new(crate::tools::handlers::ReadFileHandler),
+            Arc::new(ProcessGateControl(control.path().to_path_buf())),
+        ],
+        Some(workspace.path()),
+    )
+    .await;
     let script = "import pathlib,sys,time\nc=pathlib.Path(sys.argv[1])\n(c/'ready').write_text('ready')\nend=time.monotonic()+15\nwhile not (c/'release').exists():\n if time.monotonic()>end: raise RuntimeError('fixture release timed out')\n time.sleep(.01)\nprint('admitted-command-survived',flush=True)\n";
     let command = serde_json::json!({
         "program":"python", "args":["-u", "-c", script, control.path()],
@@ -83,11 +98,23 @@ async fn admission_grace_preserves_real_command_through_queued_read_and_command(
         text(await tools.read_file({{path: "read.txt"}}));
     "#)).await;
     let visible = packet_output_text(output.as_ref());
-    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success, "{visible}");
+    assert_eq!(
+        output.outcome_for_logging(),
+        ToolOutputOutcome::Success,
+        "{visible}"
+    );
     assert!(visible.contains("admitted-command-survived"), "{visible}");
     assert!(visible.contains("independent read"), "{visible}");
     assert!(!visible.contains("queued-command-ran"), "{visible}");
     assert!(runtime.session.list_background_terminals().await.is_empty());
-    assert_eq!(runtime.step.turn.turn_timing_state.lifecycle_context().parallel_gate_waiter_count, 0);
+    assert_eq!(
+        runtime
+            .step
+            .turn
+            .turn_timing_state
+            .lifecycle_context()
+            .parallel_gate_waiter_count,
+        0
+    );
     runtime.finish().await;
 }

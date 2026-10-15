@@ -8,7 +8,11 @@ async fn git_freshness_test_output(cwd: &Path, args: &[&str]) -> String {
         .output()
         .await
         .expect("run fixture Git command");
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
@@ -30,16 +34,25 @@ async fn git_read_evidence_invalidates_after_external_head_or_config_change() {
         let root = repo.path();
         git_freshness_test_output(root, &["init", "-q"]).await;
         git_freshness_test_output(root, &["symbolic-ref", "HEAD", "refs/heads/before"]).await;
-        git_freshness_test_output(root, &["config", "--local", "status.showUntrackedFiles", "all"]).await;
+        git_freshness_test_output(
+            root,
+            &["config", "--local", "status.showUntrackedFiles", "all"],
+        )
+        .await;
         let source = root.join("source.txt");
         std::fs::write(&source, "unchanged source").unwrap();
         let before = git_freshness_test_output(root, &read_args).await;
-        let arguments = serde_json::json!({"cmd": format!("git {}", read_args.join(" ")), "shell": "bash"});
+        let arguments =
+            serde_json::json!({"cmd": format!("git {}", read_args.join(" ")), "shell": "bash"});
         let (classification, _) = classify_workspace_tool_call_at_admission(
             "exec_command".into(),
-            ToolPayload::Function { arguments: arguments.to_string() },
+            ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
             root.to_path_buf(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(classification.observes_workspace);
         let cache = GitWorkspaceCache::new();
         let revision = workspace_identity_at(root, "captured");
@@ -48,20 +61,39 @@ async fn git_read_evidence_invalidates_after_external_head_or_config_change() {
         let items: Arc<[ResponseItem]> = Arc::from([
             named_function_call_with_arguments("git-read", "exec_command", arguments),
             output.clone(),
-            named_function_call_with_arguments("source-read", "read_file", serde_json::json!({"path": source})),
+            named_function_call_with_arguments(
+                "source-read",
+                "read_file",
+                serde_json::json!({"path": source}),
+            ),
             source_output.clone(),
         ]);
         let mut state = ToolHistoryState::default();
         for (output, dependencies) in [
             (&output, classification.source_dependencies),
-            (&source_output, BTreeSet::from([SourceDependencyV1::new(&source, false)])),
+            (
+                &source_output,
+                BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+            ),
         ] {
-            state.register_workspace_evidence(watched(&cache, root,
-                WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), output, dependencies).unwrap(),
-            ).await);
+            state.register_workspace_evidence(
+                watched(
+                    &cache,
+                    root,
+                    WorkspaceEvidenceObservation::from_response_item(
+                        Some(revision.clone()),
+                        output,
+                        dependencies,
+                    )
+                    .unwrap(),
+                )
+                .await,
+            );
         }
-        let delivery_probe = cache.begin_source_path_change_observation(root, &root.join(changed_path), false)
-            .await.unwrap();
+        let delivery_probe = cache
+            .begin_source_path_change_observation(root, &root.join(changed_path), false)
+            .await
+            .unwrap();
         assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
 
         // This external writer bypasses host mutation accounting. Wait for an
@@ -71,11 +103,20 @@ async fn git_read_evidence_invalidates_after_external_head_or_config_change() {
             while cache.source_path_change_observation_is_current(&delivery_probe) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }).await.expect("native watcher must observe the metadata change");
-        assert_ne!(before, git_freshness_test_output(root, &read_args).await,
-            "the Git result actually depends on {changed_path}");
+        })
+        .await
+        .expect("native watcher must observe the metadata change");
+        assert_ne!(
+            before,
+            git_freshness_test_output(root, &read_args).await,
+            "the Git result actually depends on {changed_path}"
+        );
         let notices = freshness_notices(&state, &items, Some(&revision), &cache);
-        assert_eq!(notices.len(), 1, "invalidate Git evidence, not the unchanged file read: {changed_path}");
+        assert_eq!(
+            notices.len(),
+            1,
+            "invalidate Git evidence, not the unchanged file read: {changed_path}"
+        );
         assert_eq!(notices[0]["call_id"], "git-read");
         assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
@@ -86,7 +127,11 @@ async fn git_read_from_subdirectory_tracks_sibling_changes_but_exact_reads_do_no
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     git_freshness_test_output(root, &["init", "-q"]).await;
-    git_freshness_test_output(root, &["config", "--local", "status.showUntrackedFiles", "all"]).await;
+    git_freshness_test_output(
+        root,
+        &["config", "--local", "status.showUntrackedFiles", "all"],
+    )
+    .await;
     let cwd = root.join("package");
     std::fs::create_dir(&cwd).unwrap();
     let source = cwd.join("source.txt");
@@ -95,36 +140,73 @@ async fn git_read_from_subdirectory_tracks_sibling_changes_but_exact_reads_do_no
     let before = git_freshness_test_output(&cwd, &["status", "--short"]).await;
     let arguments = serde_json::json!({"cmd": "git status --short", "shell": "bash"});
     let (classification, _) = classify_workspace_tool_call_at_admission(
-        "exec_command".into(), ToolPayload::Function { arguments: arguments.to_string() }, cwd,
-    ).await.unwrap();
+        "exec_command".into(),
+        ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+        cwd,
+    )
+    .await
+    .unwrap();
     let cache = GitWorkspaceCache::new();
     let revision = workspace_identity_at(root, "captured");
     let output = text_output("git-read", before.clone());
     let source_output = text_output("source-read", "unchanged source".into());
     let items: Arc<[ResponseItem]> = Arc::from([
-        named_function_call_with_arguments("git-read", "exec_command", arguments), output.clone(),
-        named_function_call_with_arguments("source-read", "read_file", serde_json::json!({"path": source})), source_output.clone(),
+        named_function_call_with_arguments("git-read", "exec_command", arguments),
+        output.clone(),
+        named_function_call_with_arguments(
+            "source-read",
+            "read_file",
+            serde_json::json!({"path": source}),
+        ),
+        source_output.clone(),
     ]);
     let mut state = ToolHistoryState::default();
     for (output, dependencies) in [
         (&output, classification.source_dependencies),
-        (&source_output, BTreeSet::from([SourceDependencyV1::new(&source, false)])),
+        (
+            &source_output,
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        ),
     ] {
-        state.register_workspace_evidence(watched(&cache, root,
-            WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), output, dependencies).unwrap(),
-        ).await);
+        state.register_workspace_evidence(
+            watched(
+                &cache,
+                root,
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(revision.clone()),
+                    output,
+                    dependencies,
+                )
+                .unwrap(),
+            )
+            .await,
+        );
     }
-    let delivery_probe = cache.begin_source_path_change_observation(root, &sibling, false).await.unwrap();
+    let delivery_probe = cache
+        .begin_source_path_change_observation(root, &sibling, false)
+        .await
+        .unwrap();
     assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
     std::fs::write(&sibling, "new sibling").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while cache.source_path_change_observation_is_current(&delivery_probe) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.expect("native watcher must observe the sibling change");
-    assert_ne!(before, git_freshness_test_output(&root.join("package"), &["status", "--short"]).await);
+    })
+    .await
+    .expect("native watcher must observe the sibling change");
+    assert_ne!(
+        before,
+        git_freshness_test_output(&root.join("package"), &["status", "--short"]).await
+    );
     let notices = freshness_notices(&state, &items, Some(&revision), &cache);
-    assert_eq!(notices.len(), 1, "Git status spans the repository, while the exact read does not");
+    assert_eq!(
+        notices.len(),
+        1,
+        "Git status spans the repository, while the exact read does not"
+    );
     assert_eq!(notices[0]["call_id"], "git-read");
     assert_eq!(notices[0]["valid_for_current_workspace"], false);
 }
@@ -145,39 +227,80 @@ async fn rg_evidence_tracks_pattern_and_ignore_inputs_outside_search_directory()
         }
         let input = root.join(input_name);
         std::fs::write(&input, before_input).unwrap();
-        let argv = options.split_whitespace().chain(["src"]).collect::<Vec<_>>();
+        let argv = options
+            .split_whitespace()
+            .chain(["src"])
+            .collect::<Vec<_>>();
         let run = || async {
-            let output = tokio::process::Command::new("rg").args(&argv).current_dir(root)
-                .env_remove("RIPGREP_CONFIG_PATH").output().await.expect("run fixture ripgrep");
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let output = tokio::process::Command::new("rg")
+                .args(&argv)
+                .current_dir(root)
+                .env_remove("RIPGREP_CONFIG_PATH")
+                .output()
+                .await
+                .expect("run fixture ripgrep");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8(output.stdout).unwrap()
         };
         let before = run().await;
         let arguments = serde_json::json!({"cmd": format!("rg {options} src"), "shell": "bash"});
         let (classification, _) = classify_workspace_tool_call_at_admission(
-            "exec_command".into(), ToolPayload::Function { arguments: arguments.to_string() }, root.to_path_buf(),
-        ).await.unwrap();
-        assert!(classification.source_dependencies.iter().any(|dependency|
-            source_dependency_overlaps(dependency, &SourceDependencyV1::new(&input, false).path)),
-            "{input_name} affects the query or directory membership");
+            "exec_command".into(),
+            ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+            root.to_path_buf(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            classification
+                .source_dependencies
+                .iter()
+                .any(|dependency| source_dependency_overlaps(
+                    dependency,
+                    &SourceDependencyV1::new(&input, false).path
+                )),
+            "{input_name} affects the query or directory membership"
+        );
         let cache = GitWorkspaceCache::new();
         let revision = workspace_identity_at(root, "captured");
         let output = text_output("rg-read", before.clone());
         let items: Arc<[ResponseItem]> = Arc::from([
-            named_function_call_with_arguments("rg-read", "exec_command", arguments), output.clone(),
+            named_function_call_with_arguments("rg-read", "exec_command", arguments),
+            output.clone(),
         ]);
         let mut state = ToolHistoryState::default();
-        state.register_workspace_evidence(watched(&cache, root,
-            WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), &output, classification.source_dependencies).unwrap(),
-        ).await);
-        let probe = cache.begin_source_path_change_observation(root, &input, false).await.unwrap();
+        state.register_workspace_evidence(
+            watched(
+                &cache,
+                root,
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(revision.clone()),
+                    &output,
+                    classification.source_dependencies,
+                )
+                .unwrap(),
+            )
+            .await,
+        );
+        let probe = cache
+            .begin_source_path_change_observation(root, &input, false)
+            .await
+            .unwrap();
         assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
         std::fs::write(&input, after_input).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while cache.source_path_change_observation_is_current(&probe) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }).await.expect("native watcher must observe the search input change");
+        })
+        .await
+        .expect("native watcher must observe the search input change");
         assert_ne!(before, run().await, "the real search output must change");
         let notices = freshness_notices(&state, &items, Some(&revision), &cache);
         assert_eq!(notices.len(), 1, "{input_name}");
@@ -192,8 +315,12 @@ fn root_only_sampling_keeps_unscoped_unavailable_evidence_unknown() {
     let mut unavailable = workspace_identity("unavailable");
     unavailable.unavailable = true;
     let observation = WorkspaceEvidenceObservation::from_response_item_with_freshness(
-        Some(unavailable), &output, BTreeSet::new(), false,
-    ).unwrap();
+        Some(unavailable),
+        &output,
+        BTreeSet::new(),
+        false,
+    )
+    .unwrap();
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(observation.clone());
     assert!(state.can_use_root_only_workspace_identity(&items));
@@ -213,18 +340,27 @@ fn root_only_sampling_keeps_unscoped_unavailable_evidence_unknown() {
     // Unknown outer provenance cannot hide a nested digest-based requirement.
     let mut scoped = observation;
     scoped.revision = Some(current);
-    scoped.source_dependencies.insert(SourceDependencyV1::new(Path::new("source.txt"), false));
-    state.code_mode_nested_evidence.insert("poll".into(), BTreeMap::from([
-        ("nested".into(), NestedWorkspaceEvidence {
-            observation: scoped.clone(), output: "nested bytes".into(),
-        }),
-    ]));
+    scoped
+        .source_dependencies
+        .insert(SourceDependencyV1::new(Path::new("source.txt"), false));
+    state.code_mode_nested_evidence.insert(
+        "poll".into(),
+        BTreeMap::from([(
+            "nested".into(),
+            NestedWorkspaceEvidence {
+                observation: scoped.clone(),
+                output: "nested bytes".into(),
+            },
+        )]),
+    );
     assert!(!state.can_use_root_only_workspace_identity(&items));
     state.code_mode_nested_evidence.clear();
     scoped.revision.as_mut().unwrap().unavailable = true;
     state.workspace_evidence.insert("poll".into(), scoped);
-    assert!(!state.can_use_root_only_workspace_identity(&items),
-        "unavailable but scoped evidence retains the existing capture path");
+    assert!(
+        !state.can_use_root_only_workspace_identity(&items),
+        "unavailable but scoped evidence retains the existing capture path"
+    );
 }
 
 #[tokio::test]
@@ -233,18 +369,26 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
     let source = root.path().join("source.txt");
     std::fs::write(&source, "before").unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let watch = cache.begin_source_path_change_observation(root.path(), &source, false)
-        .await.unwrap();
+    let watch = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .await
+        .unwrap();
     let mut revision = workspace_identity("captured");
     revision.repository_root = Some(root.path().to_string_lossy().into_owned());
     let output = text_output("watched", "before".into());
     let items: Arc<[ResponseItem]> = Arc::from([function_call("watched"), output.clone()]);
     let observation = WorkspaceEvidenceObservation::from_response_item(
-        Some(revision.clone()), &output,
+        Some(revision.clone()),
+        &output,
         BTreeSet::from([SourceDependencyV1::new(&source, false)]),
-    ).unwrap().with_source_path_observations(vec![watch]);
+    )
+    .unwrap()
+    .with_source_path_observations(vec![watch]);
     let mut state = ToolHistoryState::default();
-    assert!(!state.can_use_root_only_workspace_identity(&items), "missing observation");
+    assert!(
+        !state.can_use_root_only_workspace_identity(&items),
+        "missing observation"
+    );
     state.register_workspace_evidence(observation.clone());
     assert!(state.can_use_root_only_workspace_identity(&items));
     let mut root_only = revision.clone();
@@ -258,9 +402,12 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
     assert!(!observation.is_current(Some(&other_root), Some(&cache)));
 
     // Restoring a ledger does not restore its original watch ownership.
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-    assert!(freshness_notices(&restored, &items, Some(&revision), &cache).is_empty(),
-        "serialization must preserve proof still owned by the live cache");
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(
+        freshness_notices(&restored, &items, Some(&revision), &cache).is_empty(),
+        "serialization must preserve proof still owned by the live cache"
+    );
     let other_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let foreign = freshness_notices(&restored, &items, Some(&root_only), &other_cache);
     assert_eq!(foreign.len(), 1);
@@ -273,18 +420,36 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
     // watches. That is unknown freshness, not evidence of a source change.
     for include_nested in [false, true] {
         let mut legacy = state.clone();
-        legacy.workspace_evidence.insert("watched".into(), unscoped.clone());
+        legacy
+            .workspace_evidence
+            .insert("watched".into(), unscoped.clone());
         if include_nested {
             let mut old_nested = unscoped.clone();
             old_nested.call_id = "legacy-nested".into();
             let mut current_nested = observation.clone();
             current_nested.call_id = "watched-nested".into();
-            legacy.code_mode_nested_evidence.insert("watched".into(), BTreeMap::from([
-                ("legacy-nested".into(), NestedWorkspaceEvidence { observation: old_nested, output: "before".into() }),
-                ("watched-nested".into(), NestedWorkspaceEvidence { observation: current_nested, output: "before".into() }),
-            ]));
+            legacy.code_mode_nested_evidence.insert(
+                "watched".into(),
+                BTreeMap::from([
+                    (
+                        "legacy-nested".into(),
+                        NestedWorkspaceEvidence {
+                            observation: old_nested,
+                            output: "before".into(),
+                        },
+                    ),
+                    (
+                        "watched-nested".into(),
+                        NestedWorkspaceEvidence {
+                            observation: current_nested,
+                            output: "before".into(),
+                        },
+                    ),
+                ]),
+            );
         }
-        let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+        let restored: ToolHistoryState =
+            serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
         let notices = freshness_notices(&restored, &items, Some(&revision), &cache);
         assert_eq!(notices.len(), 1);
         let notice = &notices[0];
@@ -298,36 +463,66 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
             let stale = notice["stale_nested_results"].as_array().unwrap();
             assert_eq!(stale.len(), 1);
             assert_eq!(stale[0]["call_id"], "legacy-nested");
-            assert_eq!(stale[0]["source_scope"]["dependencies"][0]["freshness"], "unknown");
+            assert_eq!(
+                stale[0]["source_scope"]["dependencies"][0]["freshness"],
+                "unknown"
+            );
         }
     }
-    state.code_mode_nested_evidence.insert("watched".into(), BTreeMap::from([
-        ("nested".into(), NestedWorkspaceEvidence { observation: unscoped.clone(), output: "before".into() }),
-    ]));
+    state.code_mode_nested_evidence.insert(
+        "watched".into(),
+        BTreeMap::from([(
+            "nested".into(),
+            NestedWorkspaceEvidence {
+                observation: unscoped.clone(),
+                output: "before".into(),
+            },
+        )]),
+    );
     assert!(!state.can_use_root_only_workspace_identity(&items));
     state.code_mode_nested_evidence.clear();
     state.workspace_evidence.insert("watched".into(), unscoped);
-    assert!(!state.can_use_root_only_workspace_identity(&items), "legacy digest-only evidence");
+    assert!(
+        !state.can_use_root_only_workspace_identity(&items),
+        "legacy digest-only evidence"
+    );
     let mut partial = observation.clone();
-    partial.source_dependencies.insert(SourceDependencyV1::new(&root.path().join("other.txt"), false));
+    partial.source_dependencies.insert(SourceDependencyV1::new(
+        &root.path().join("other.txt"),
+        false,
+    ));
     state.workspace_evidence.insert("watched".into(), partial);
-    assert!(!state.can_use_root_only_workspace_identity(&items), "partial watch coverage");
-    state.workspace_evidence.insert("watched".into(), observation.clone());
+    assert!(
+        !state.can_use_root_only_workspace_identity(&items),
+        "partial watch coverage"
+    );
+    state
+        .workspace_evidence
+        .insert("watched".into(), observation.clone());
 
     // Recovery must consult the retained origin even without its call in history.
-    state.artifact_call_ids.insert("artifact".into(), "watched".into());
+    state
+        .artifact_call_ids
+        .insert("artifact".into(), "watched".into());
     let recovered = [ResponseItem::FunctionCall {
-        id: None, name: "read_tool_output".into(), namespace: None,
-        arguments: r#"{"artifact_id":"artifact"}"#.into(), call_id: "recovery".into(),
+        id: None,
+        name: "read_tool_output".into(),
+        namespace: None,
+        arguments: r#"{"artifact_id":"artifact"}"#.into(),
+        call_id: "recovery".into(),
         internal_chat_message_metadata_passthrough: None,
     }];
     assert!(state.can_use_root_only_workspace_identity(&recovered));
     state.workspace_evidence.remove("watched");
     assert!(!state.can_use_root_only_workspace_identity(&recovered));
-    state.workspace_evidence.insert("watched".into(), observation);
+    state
+        .workspace_evidence
+        .insert("watched".into(), observation);
 
     // Git digests never override a changed or lost dependency watch.
-    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
+        .await;
     let changed = freshness_notices(&state, &items, Some(&root_only), &cache);
     assert_eq!(changed[0]["workspace_evidence_freshness"], "changed");
     cache.note_host_workspace_mutation();
@@ -338,11 +533,20 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
 #[test]
 fn salience_receipt_spends_space_on_all_small_diagnostic_groups() {
     for decisive in 0..9 {
-        let output = (0..9).map(|index| {
-            let label = if index == decisive { "decisive" } else { "other" };
-            format!("error: {label}{index}\n\n\n\n")
-        }).collect::<String>();
-        let record = candidate("small-groups", serde_json::json!({"output":output}).to_string());
+        let output = (0..9)
+            .map(|index| {
+                let label = if index == decisive {
+                    "decisive"
+                } else {
+                    "other"
+                };
+                format!("error: {label}{index}\n\n\n\n")
+            })
+            .collect::<String>();
+        let record = candidate(
+            "small-groups",
+            serde_json::json!({"output":output}).to_string(),
+        );
         let digest = record.receipt_digest_input();
         assert_eq!(digest.matches("error:").count(), 9, "{digest}");
         let pin = record.artifact_pin_value().unwrap();
@@ -357,7 +561,11 @@ fn epistemic_unknown_dependency_scope_never_proves_currentness() {
     let revision = workspace_identity("unchanged");
     let output = text_output("unknown", "retained exact historical bytes".into());
     let observation = WorkspaceEvidenceObservation::from_response_item(
-        Some(revision.clone()), &output, BTreeSet::new()).unwrap();
+        Some(revision.clone()),
+        &output,
+        BTreeSet::new(),
+    )
+    .unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     assert!(!observation.is_current(Some(&revision), Some(&cache)));
     let mut state = ToolHistoryState::default();
@@ -380,50 +588,80 @@ async fn epistemic_remote_receipts_require_local_claim_authentication() {
     let original = text_output("auth", receipt.clone());
     assert!(state.authenticates_receipt(&original));
     let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
-    assert!(state.authenticates_receipt(&text_output("auth", serde_json::to_string_pretty(&value).unwrap())));
+    assert!(state.authenticates_receipt(&text_output(
+        "auth",
+        serde_json::to_string_pretty(&value).unwrap()
+    )));
     for (key, value) in [
         ("successful", serde_json::json!(false)),
         ("source_dependencies_current", serde_json::json!(false)),
         ("digest", serde_json::json!("all tests verified")),
         ("evidence", serde_json::json!({"file_complete":true})),
         ("artifact_id", serde_json::json!("invented-artifact")),
-        ("verification_claim", serde_json::json!("all integration tests passed")),
+        (
+            "verification_claim",
+            serde_json::json!("all integration tests passed"),
+        ),
     ] {
         let mut altered: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         altered[key] = value;
         let altered = text_output("auth", altered.to_string());
         assert!(!state.authenticates_receipt(&altered), "{key}");
-        let (retained, _, _) = crate::compact_remote::process_compacted_history_with_retained_input(
-            &session, &turn, vec![function_call("auth"), altered], Vec::new(),
-            &crate::compact::InitialContextInjection::DoNotInject).await.unwrap();
-        assert!(!retained.iter().any(|item| textual_output_identity(item).is_some()), "{key}");
+        let (retained, _, _) =
+            crate::compact_remote::process_compacted_history_with_retained_input(
+                &session,
+                &turn,
+                vec![function_call("auth"), altered],
+                Vec::new(),
+                &crate::compact::InitialContextInjection::DoNotInject,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !retained
+                .iter()
+                .any(|item| textual_output_identity(item).is_some()),
+            "{key}"
+        );
     }
     let (retained, _, _) = crate::compact_remote::process_compacted_history_with_retained_input(
-        &session, &turn, vec![function_call("auth"), original.clone()], Vec::new(),
-        &crate::compact::InitialContextInjection::DoNotInject).await.unwrap();
+        &session,
+        &turn,
+        vec![function_call("auth"), original.clone()],
+        Vec::new(),
+        &crate::compact::InitialContextInjection::DoNotInject,
+    )
+    .await
+    .unwrap();
     assert!(retained.contains(&original));
 }
 
 #[test]
 fn evidence_salience_read_pins_keep_source_scope_and_excerpt_after_restore() {
     let mut pins = Vec::new();
-    for (call, environment, body) in [("one", "local", "AUTH_REQUIRED=1"),
-        ("two", "local", "AUTH_REQUIRED=0"), ("three", "remote", "AUTH_REQUIRED=1")]
-    {
+    for (call, environment, body) in [
+        ("one", "local", "AUTH_REQUIRED=1"),
+        ("two", "local", "AUTH_REQUIRED=0"),
+        ("three", "remote", "AUTH_REQUIRED=1"),
+    ] {
         let text = format!("{body}\n{}", "source context\n".repeat(256));
         let hash = sha256(text.as_bytes());
         let output = serde_json::json!({"path":"/repo/config.rs", "environment_id":environment,
             "source_sha256":hash, "file_complete":true, "complete":true,
             "selection_status":"complete", "results":[{"status":"ok", "complete":true,
-                "selector":{"kind":"lines", "start":1, "end":257}, "text":text}]}).to_string();
+                "selector":{"kind":"lines", "start":1, "end":257}, "text":text}]})
+        .to_string();
         let mut record = candidate(call, output.clone());
         record.tool_identity = "read_file".into();
         record.artifact_id = format!("artifact-{call}");
         let mut state = ToolHistoryState::default();
         state.register(record);
-        let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut restored: ToolHistoryState =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
         restored.refresh_derived_and_indexes();
-        let payload = restored.artifact_pin_payload_for_items(&[text_output(call, output)]).unwrap();
+        let payload = restored
+            .artifact_pin_payload_for_items(&[text_output(call, output)])
+            .unwrap();
         assert!(approx_token_count(&payload) <= COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET);
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
         let pin = payload["artifacts"][0].clone();
@@ -440,21 +678,37 @@ fn evidence_salience_read_pins_keep_source_scope_and_excerpt_after_restore() {
     assert_ne!(pins[0]["evidence"], pins[2]["evidence"]);
     let output = serde_json::json!({"complete":false, "results":[
         {"status":"ok", "text":"successful sibling"},
-        {"status":"not_found", "message":"missing selection"}]}).to_string();
+        {"status":"not_found", "message":"missing selection"}]})
+    .to_string();
     let mut record = candidate("partial", output);
     record.tool_identity = "read_file".into();
     assert!(record.receipt_digest_input().contains("missing selection"));
-    let mut search = candidate("search", serde_json::json!({"results":[{"status":"ok",
-        "value":{"hydrated_ranges":[{"text":"exact recovered fact"}]}}]}).to_string());
+    let mut search = candidate(
+        "search",
+        serde_json::json!({"results":[{"status":"ok",
+        "value":{"hydrated_ranges":[{"text":"exact recovered fact"}]}}]})
+        .to_string(),
+    );
     search.tool_identity = "read_tool_output".into();
-    assert!(search.receipt_digest_input().contains("exact recovered fact"));
+    assert!(
+        search
+            .receipt_digest_input()
+            .contains("exact recovered fact")
+    );
     let unicode = "🦀".repeat(200);
-    search.bounded_model_output = serde_json::json!({"results":[{"status":"ok", "text":unicode}]}).to_string();
+    search.bounded_model_output =
+        serde_json::json!({"results":[{"status":"ok", "text":unicode}]}).to_string();
     let digest = search.receipt_digest_input();
     let excerpt = digest.strip_prefix("Partial source excerpt:\n").unwrap();
     assert!(unicode.starts_with(excerpt));
     assert!(excerpt.len() < unicode.len());
-    assert!(approx_token_count(search.artifact_pin_value().unwrap()["digest"].as_str().unwrap()) <= RECEIPT_DIGEST_TARGET_TOKENS);
+    assert!(
+        approx_token_count(
+            search.artifact_pin_value().unwrap()["digest"]
+                .as_str()
+                .unwrap()
+        ) <= RECEIPT_DIGEST_TARGET_TOKENS
+    );
 }
 
 #[test]
@@ -462,10 +716,15 @@ fn evidence_salience_receipt_keeps_terminal_cause_after_secondary_errors() {
     for groups in [9, 12, 100] {
         let mut output = String::new();
         for index in 0..groups - 1 {
-            output.push_str(&format!("error: secondary {index}\ncontext\ncontext\ncontext\n"));
+            output.push_str(&format!(
+                "error: secondary {index}\ncontext\ncontext\ncontext\n"
+            ));
         }
         output.push_str("fatal: ROOT_CAUSE_SENTINEL\nactual: 17\nexpected: 9\n");
-        let mut record = candidate("failure", serde_json::json!({"output":output, "exit_code":1}).to_string());
+        let mut record = candidate(
+            "failure",
+            serde_json::json!({"output":output, "exit_code":1}).to_string(),
+        );
         record.successful = false;
         record.refresh_derived();
         let pin = record.artifact_pin_value().unwrap();
@@ -489,25 +748,42 @@ async fn verified10_remote_compaction_storage_failure_does_not_install_history()
         session.register_tool_history_candidate(record).await;
         items.push(text_output(&call, output));
     }
-    session.record_conversation_items(&turn, &items).await.unwrap();
+    session
+        .record_conversation_items(&turn, &items)
+        .await
+        .unwrap();
     let before = session.clone_history().await;
     let window = session.current_window_id().await;
     let reference = session.reference_context_item().await;
     let home = session.codex_home().await;
-    let blocked = home.join("tool-output").join(session.thread_id().to_string());
-    assert!(!blocked.exists(), "the fixture must own a new artifact directory");
+    let blocked = home
+        .join("tool-output")
+        .join(session.thread_id().to_string());
+    assert!(
+        !blocked.exists(),
+        "the fixture must own a new artifact directory"
+    );
     std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
     std::fs::write(&blocked, "not a directory").unwrap();
     let result = crate::compact_remote::process_compacted_history_with_retained_input(
-        &session, &turn, vec![ResponseItem::Compaction {
-            id: None, encrypted_content: "uninstalled".into(),
+        &session,
+        &turn,
+        vec![ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "uninstalled".into(),
             internal_chat_message_metadata_passthrough: None,
-        }], Vec::new(), &crate::compact::InitialContextInjection::DoNotInject,
-    ).await;
+        }],
+        Vec::new(),
+        &crate::compact::InitialContextInjection::DoNotInject,
+    )
+    .await;
     assert!(result.is_err());
     assert_eq!(session.current_window_id().await, window);
     assert_eq!(session.reference_context_item().await, reference);
-    assert_eq!(session.clone_history().await.raw_items(), before.raw_items());
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        before.raw_items()
+    );
 }
 
 #[test]
@@ -524,17 +800,28 @@ fn verified10_compaction_preserves_recency_across_sidecars() {
     let first = state.artifact_pin_payload_for_items(&items).unwrap();
     let first_value: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first_value["artifacts"][0]["call_id"], "opaque-039");
-    let second = state.artifact_pin_payload_for_items(&[text_output("sidecar", first)]).unwrap();
+    let second = state
+        .artifact_pin_payload_for_items(&[text_output("sidecar", first)])
+        .unwrap();
     let second_value: serde_json::Value = serde_json::from_str(&second).unwrap();
-    let call_ids = |value: &serde_json::Value| value["artifacts"].as_array().unwrap()
-        .iter().map(|pin| pin["call_id"].clone()).collect::<Vec<_>>();
+    let call_ids = |value: &serde_json::Value| {
+        value["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pin| pin["call_id"].clone())
+            .collect::<Vec<_>>()
+    };
     assert_eq!(call_ids(&second_value), call_ids(&first_value));
     let mut record = candidate("aaa-newest", bounded_output());
     record.artifact_id = "latest-artifact".into();
     state.register(record);
-    let third = state.artifact_pin_payload_for_items(&[
-        text_output("sidecar", second), text_output("aaa-newest", bounded_output()),
-    ]).unwrap();
+    let third = state
+        .artifact_pin_payload_for_items(&[
+            text_output("sidecar", second),
+            text_output("aaa-newest", bounded_output()),
+        ])
+        .unwrap();
     let third: serde_json::Value = serde_json::from_str(&third).unwrap();
     assert_eq!(third["artifacts"][0]["call_id"], "aaa-newest");
 }
@@ -558,24 +845,44 @@ fn verified10_read_status_recovers_all_snapshots_and_disjoint_ranges() {
     }
     let report = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(report["paths"][0]["next_snapshot_offset"], 8);
-    let query = ReadStatusQuery { snapshot_offset:8, ..Default::default() };
+    let query = ReadStatusQuery {
+        snapshot_offset: 8,
+        ..Default::default()
+    };
     let tail = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
     assert_eq!(tail["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
     let snapshot = &tail["paths"][0]["snapshots"][0];
-    assert_eq!(report["paths"][0]["snapshots"][0]["source_sha256"], "hash-8");
+    assert_eq!(
+        report["paths"][0]["snapshots"][0]["source_sha256"],
+        "hash-8"
+    );
     assert_eq!(snapshot["source_sha256"], "hash-0");
     assert_eq!(snapshot["next_range_offset"], 64);
-    let query = ReadStatusQuery { snapshot_id: snapshot["snapshot_id"].as_str().map(str::to_string),
-        range_offset:64, ..Default::default() };
-    let tail_ranges = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
+    let query = ReadStatusQuery {
+        snapshot_id: snapshot["snapshot_id"].as_str().map(str::to_string),
+        range_offset: 64,
+        ..Default::default()
+    };
+    let tail_ranges =
+        state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
     let tail_snapshot = &tail_ranges["paths"][0]["snapshots"][0];
-    assert_eq!(tail_snapshot["obtained_ranges"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        tail_snapshot["obtained_ranges"].as_array().unwrap().len(),
+        6
+    );
     assert_eq!(tail_snapshot["unread_ranges"].as_array().unwrap().len(), 6);
     assert!(tail_snapshot["next_range_offset"].is_null());
     for version in 0..9 {
-        let query = ReadStatusQuery { source_sha256:Some(format!("hash-{version}")), ..Default::default() };
-        let selected = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
-        assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
+        let query = ReadStatusQuery {
+            source_sha256: Some(format!("hash-{version}")),
+            ..Default::default()
+        };
+        let selected =
+            state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
+        assert_eq!(
+            selected["paths"][0]["snapshots"].as_array().unwrap().len(),
+            1
+        );
     }
 }
 
@@ -597,20 +904,41 @@ fn read_status_prioritizes_observation_recency_and_selects_historical_hashes() {
     let persisted = serde_json::to_value(&state).unwrap();
     let mut state: ToolHistoryState = serde_json::from_value(persisted.clone()).unwrap();
     let latest = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
-    assert_eq!(latest["paths"][0]["snapshots"][0]["source_sha256"], "hash-11");
-    assert_eq!(latest["paths"][0]["snapshots"][0]["freshness"], "invalidated");
+    assert_eq!(
+        latest["paths"][0]["snapshots"][0]["source_sha256"],
+        "hash-11"
+    );
+    assert_eq!(
+        latest["paths"][0]["snapshots"][0]["freshness"],
+        "invalidated"
+    );
     assert_eq!(latest["paths"][0]["omitted_snapshots"], 4);
-    let selected = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &ReadStatusQuery {
-        source_sha256: Some("hash-00".into()), ..Default::default()
-    });
-    assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
-    assert_eq!(selected["paths"][0]["snapshots"][0]["source_sha256"], "hash-00");
+    let selected = state.read_status_page(
+        std::slice::from_ref(&path),
+        Some("local"),
+        &[],
+        &ReadStatusQuery {
+            source_sha256: Some("hash-00".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        selected["paths"][0]["snapshots"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        selected["paths"][0]["snapshots"][0]["source_sha256"],
+        "hash-00"
+    );
     assert_eq!(serde_json::to_value(&state).unwrap(), persisted);
     let mut legacy = persisted;
     legacy.as_object_mut().unwrap().remove("observation_order");
     let legacy: ToolHistoryState = serde_json::from_value(legacy).unwrap();
     let report = legacy.read_status(&[path], Some("local"), &[]);
-    assert_eq!(report["paths"][0]["snapshots"][0]["observation_recency"], "unknown");
+    assert_eq!(
+        report["paths"][0]["snapshots"][0]["observation_recency"],
+        "unknown"
+    );
     state.retain_for_history(&[]);
     assert!(state.observation_order.is_empty());
 }
@@ -623,27 +951,53 @@ async fn dependency_notices_distinguish_changed_current_and_unverified_paths() {
     std::fs::write(&a, "a").unwrap();
     std::fs::write(&b, "b").unwrap();
     let cache = GitWorkspaceCache::new();
-    let watches = cache.begin_source_path_change_observations(root.path(), &[(a.clone(), false), (b.clone(), false)])
-        .await.unwrap();
+    let watches = cache
+        .begin_source_path_change_observations(
+            root.path(),
+            &[(a.clone(), false), (b.clone(), false)],
+        )
+        .await
+        .unwrap();
     let mut identity = workspace_identity("captured");
     identity.repository_root = Some(root.path().to_string_lossy().into_owned());
     let output = serde_json::json!({"environment_id":"local"}).to_string();
-    let observation = WorkspaceEvidenceObservation::from_response_item(Some(identity.clone()),
-        &text_output("read", output.clone()), BTreeSet::from([
-            SourceDependencyV1::new(&a, false), SourceDependencyV1::new(&b, false),
-        ])).unwrap().with_source_path_observations(watches);
-    cache.note_host_workspace_mutation_paths(root.path(), &["a.rs".into()]).await;
+    let observation = WorkspaceEvidenceObservation::from_response_item(
+        Some(identity.clone()),
+        &text_output("read", output.clone()),
+        BTreeSet::from([
+            SourceDependencyV1::new(&a, false),
+            SourceDependencyV1::new(&b, false),
+        ]),
+    )
+    .unwrap()
+    .with_source_path_observations(watches);
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["a.rs".into()])
+        .await;
     let scope = observation.dependency_notice(&output, Some(&identity), Some(&cache));
-    assert_eq!(scope["dependencies"][0]["path"], SourceDependencyV1::new(&a, false).path);
+    assert_eq!(
+        scope["dependencies"][0]["path"],
+        SourceDependencyV1::new(&a, false).path
+    );
     assert_eq!(scope["dependencies"][0]["freshness"], "changed");
     assert_eq!(scope["dependencies"][1]["freshness"], "current");
     assert_eq!(scope["dependencies"][0]["environment_id"], "local");
     let unknown = observation.dependency_notice(&output, Some(&identity), None);
-    assert!(unknown["dependencies"].as_array().unwrap().iter().all(|row| row["freshness"] == "unknown"));
+    assert!(
+        unknown["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["freshness"] == "unknown")
+    );
     let mut bounded = observation;
-    bounded.source_dependencies = (0..12).map(|index|
-        SourceDependencyV1::new(&root.path().join(format!("{index}.rs")), false)).collect();
-    assert_eq!(bounded.dependency_notice("{}", None, None)["omitted_dependencies"], 4);
+    bounded.source_dependencies = (0..12)
+        .map(|index| SourceDependencyV1::new(&root.path().join(format!("{index}.rs")), false))
+        .collect();
+    assert_eq!(
+        bounded.dependency_notice("{}", None, None)["omitted_dependencies"],
+        4
+    );
 }
 
 #[tokio::test]
@@ -654,37 +1008,83 @@ async fn verified10_segmented_history_survives_resume_fork_and_boundary_recovery
     let artifact = create_canonical_output_artifact(home.path(), "parent", &canonical).await;
     assert!(artifact.complete);
     let id = artifact.artifact_id().unwrap();
-    protect_active_tool_history_artifact(home.path(), "parent", &id, canonical.exact_bytes, &canonical.sha256).await.unwrap();
+    protect_active_tool_history_artifact(
+        home.path(),
+        "parent",
+        &id,
+        canonical.exact_bytes,
+        &canonical.sha256,
+    )
+    .await
+    .unwrap();
     let mut record = candidate("segmented", bounded_output());
     record.artifact_id = id.clone();
     record.artifact_bytes = canonical.exact_bytes;
     record.artifact_sha256 = canonical.sha256;
-    record.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+    record.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn".into(),
+        ordinal: 1,
+    });
     let mut state = ToolHistoryState::default();
     state.register(record);
-    persist_tool_history_state(home.path(), "parent", &state).await.unwrap();
+    persist_tool_history_state(home.path(), "parent", &state)
+        .await
+        .unwrap();
     let resumed = expect_loaded_tool_history(load_tool_history_state(home.path(), "parent").await);
     assert_eq!(resumed.candidates.len(), 1);
-    let (forked, dropped) = remint_tool_history_state_for_fork(home.path(), "parent", "child", resumed).await;
+    let (forked, dropped) =
+        remint_tool_history_state_for_fork(home.path(), "parent", "child", resumed).await;
     assert_eq!(dropped, 0);
-    persist_tool_history_state(home.path(), "child", &forked).await.unwrap();
+    persist_tool_history_state(home.path(), "child", &forked)
+        .await
+        .unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "child").await);
     assert_eq!(restored.candidates.len(), 1);
     let result = crate::tools::command_output_artifact::read_tool_output_selectors(
-        home.path(), "child", &id, vec![crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
-            start: boundary as u64 - 16, end: boundary as u64 + 16,
-        }],
-    ).await.unwrap();
+        home.path(),
+        "child",
+        &id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
+                start: boundary as u64 - 16,
+                end: boundary as u64 + 16,
+            },
+        ],
+    )
+    .await
+    .unwrap();
     assert!(result.complete);
-    assert_eq!(result.results[0].text.as_deref(), Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
-    let segment = home.path().join("tool-output/child").join(format!("{id}.segment-000001.log"));
+    assert_eq!(
+        result.results[0].text.as_deref(),
+        Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    );
+    let segment = home
+        .path()
+        .join("tool-output/child")
+        .join(format!("{id}.segment-000001.log"));
     // Use the actual advertised segment filename, without assuming its format.
-    let segment = std::fs::read_dir(segment.parent().unwrap()).unwrap().map(|entry| entry.unwrap().path())
-        .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(&format!("{id}.segment-"))).unwrap();
+    let segment = std::fs::read_dir(segment.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{id}.segment-"))
+        })
+        .unwrap();
     std::fs::write(segment, "corrupt").unwrap();
-    assert!(crate::tools::command_output_artifact::verify_tool_history_artifact(
-        home.path(), "child", &id, canonical.exact_bytes, &restored.candidates["segmented"].artifact_sha256,
-    ).await.is_err());
+    assert!(
+        crate::tools::command_output_artifact::verify_tool_history_artifact(
+            home.path(),
+            "child",
+            &id,
+            canonical.exact_bytes,
+            &restored.candidates["segmented"].artifact_sha256,
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[test]
@@ -699,16 +1099,31 @@ fn verified10_nested_read_coverage_survives_compaction_without_payload() {
     let pin = compact_read_evidence(&output);
     assert!(pin.to_string().len() < 1_024);
     let mut state = ToolHistoryState::default();
-    let observation = WorkspaceEvidenceObservation::from_response_item(None,
-        &text_output("nested", output.to_string()), BTreeSet::from([SourceDependencyV1::new(&path, false)])).unwrap();
+    let observation = WorkspaceEvidenceObservation::from_response_item(
+        None,
+        &text_output("nested", output.to_string()),
+        BTreeSet::from([SourceDependencyV1::new(&path, false)]),
+    )
+    .unwrap();
     ToolHistoryMutation::RegisterWorkspaceEvidence { observation }.apply(&mut state);
-    ToolHistoryMutation::RegisterArtifactOrigin { artifact_id:"source-snapshot".into(), call_id:"nested".into(),
-        bytes:8_000, sha256:"hash".into() }.apply(&mut state);
-    ToolHistoryMutation::RegisterCodeModeNestedEvidence { parent_call_id:"cell".into(), call_id:"nested".into(), output:pin.to_string() }.apply(&mut state);
+    ToolHistoryMutation::RegisterArtifactOrigin {
+        artifact_id: "source-snapshot".into(),
+        call_id: "nested".into(),
+        bytes: 8_000,
+        sha256: "hash".into(),
+    }
+    .apply(&mut state);
+    ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+        parent_call_id: "cell".into(),
+        call_id: "nested".into(),
+        output: pin.to_string(),
+    }
+    .apply(&mut state);
     let before = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(before["paths"][0]["snapshots"][0]["coverage"], "full");
     state.retain_for_history(&[text_output("compact", pin.to_string())]);
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
     assert_eq!(restored.read_status(&[path], Some("local"), &[]), before);
 }
 
@@ -725,36 +1140,60 @@ async fn adjacent_recovery_pages_coalesce_before_persistence_bound() {
     let mut state = ToolHistoryState::default();
     state.register(record);
     for page in 0..65 {
-        assert!(ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id.clone(),
-            recovery_call_id:format!("page-{page}"), selectors:vec![serde_json::json!({
-                "kind":"bytes", "start":page * 10, "end":(page + 1) * 10})] }.apply(&mut state));
+        assert!(
+            ToolHistoryMutation::RecordArtifactRecovery {
+                artifact_id: id.clone(),
+                recovery_call_id: format!("page-{page}"),
+                selectors: vec![serde_json::json!({
+                "kind":"bytes", "start":page * 10, "end":(page + 1) * 10})]
+            }
+            .apply(&mut state)
+        );
     }
     let expected = vec![serde_json::json!({"kind":"bytes", "start":0, "end":650})];
     assert_eq!(state.recovered_ranges["source"], expected);
-    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
-    let mut restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
+    persist_tool_history_state(temp.path(), "thread", &state)
+        .await
+        .unwrap();
+    let mut restored =
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
     assert_eq!(restored.recovered_ranges["source"], expected);
-    assert!(!ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id,
-        recovery_call_id:"source".into(), selectors:vec![serde_json::json!({
-            "kind":"bytes", "start":10, "end":20})] }.apply(&mut restored));
+    assert!(
+        !ToolHistoryMutation::RecordArtifactRecovery {
+            artifact_id: id,
+            recovery_call_id: "source".into(),
+            selectors: vec![serde_json::json!({
+            "kind":"bytes", "start":10, "end":20})]
+        }
+        .apply(&mut restored)
+    );
 }
 
 #[test]
 fn forgotten_recovery_coverage_is_unknown_not_unread() {
     let path = PathBuf::from("source.txt");
-    let mut record = candidate("source", serde_json::json!({"path":path, "source_sha256":"hash",
-        "canonical_bytes":200, "results":[]}).to_string());
+    let mut record = candidate(
+        "source",
+        serde_json::json!({"path":path, "source_sha256":"hash",
+        "canonical_bytes":200, "results":[]})
+        .to_string(),
+    );
     record.tool_identity = "read_file".into();
     let id = record.artifact_id.clone();
     let mut state = ToolHistoryState::default();
     state.register(record);
     for page in 0..65 {
-        ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id.clone(),
-            recovery_call_id:"page".into(), selectors:vec![serde_json::json!({
-                "kind":"bytes", "start":page * 2, "end":page * 2 + 1})] }.apply(&mut state);
+        ToolHistoryMutation::RecordArtifactRecovery {
+            artifact_id: id.clone(),
+            recovery_call_id: "page".into(),
+            selectors: vec![serde_json::json!({
+                "kind":"bytes", "start":page * 2, "end":page * 2 + 1})],
+        }
+        .apply(&mut state);
     }
     assert_eq!(state.recovered_ranges["source"].len(), 64);
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
     let report = restored.read_status(&[path], None, &[]);
     let snapshot = &report["paths"][0]["snapshots"][0];
     assert_eq!(snapshot["coverage_history_complete"], false);
@@ -773,23 +1212,40 @@ async fn stale_validation_pin_survives_compaction_and_restart_without_rerun() {
     record.artifact_id = artifact.artifact_id().unwrap();
     record.artifact_bytes = canonical.exact_bytes;
     record.artifact_sha256 = canonical.sha256;
-    record.source_dependencies.insert(SourceDependencyV1::new(&source, false));
-    record.consumed_by_generation = Some(ModelGenerationId { turn_id:"turn".into(), ordinal:1 });
+    record
+        .source_dependencies
+        .insert(SourceDependencyV1::new(&source, false));
+    record.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn".into(),
+        ordinal: 1,
+    });
     let mut state = ToolHistoryState::default();
     state.register(record);
-    assert_eq!(state.candidates["validation"].artifact_pin_value().unwrap()["source_dependencies_current"], true);
+    assert_eq!(
+        state.candidates["validation"].artifact_pin_value().unwrap()["source_dependencies_current"],
+        true
+    );
     assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([source])), None));
-    let pins = state.artifact_pin_payload_for_items(&[text_output("validation", text)]).unwrap();
+    let pins = state
+        .artifact_pin_payload_for_items(&[text_output("validation", text)])
+        .unwrap();
     let pin: serde_json::Value = serde_json::from_str(&pins).unwrap();
     assert_eq!(pin["artifacts"][0]["successful"], true);
     assert_eq!(pin["artifacts"][0]["source_dependencies_current"], false);
     state.retain_for_history(&[text_output("compacted", pins)]);
-    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
+    persist_tool_history_state(temp.path(), "thread", &state)
+        .await
+        .unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
-    let pin = restored.candidates["validation"].artifact_pin_value().unwrap();
+    let pin = restored.candidates["validation"]
+        .artifact_pin_value()
+        .unwrap();
     assert_eq!(pin["successful"], true);
     assert_eq!(pin["source_dependencies_current"], false);
-    assert_eq!(pin["artifact_id"], state.candidates["validation"].artifact_id);
+    assert_eq!(
+        pin["artifact_id"],
+        state.candidates["validation"].artifact_id
+    );
 }
 
 #[test]
@@ -801,14 +1257,25 @@ fn stale_carrier_observation_marks_dependency_free_exec_pin_not_current() {
     record.tool_identity = "exec".to_string();
     let mut state = ToolHistoryState::default();
     state.register(record);
-    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        None, &output, BTreeSet::from([SourceDependencyV1::new(&source, false)]),
-    ).unwrap());
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .unwrap(),
+    );
     let flags = |state: &ToolHistoryState| {
         let pins: serde_json::Value = serde_json::from_str(
-            &state.artifact_pin_payload_for_items(std::slice::from_ref(&output)).unwrap()).unwrap();
-        [pins["artifacts"][0]["source_dependencies_current"].clone(),
-            state.artifact_recovery_directory()[0]["source_dependencies_current"].clone()]
+            &state
+                .artifact_pin_payload_for_items(std::slice::from_ref(&output))
+                .unwrap(),
+        )
+        .unwrap();
+        [
+            pins["artifacts"][0]["source_dependencies_current"].clone(),
+            state.artifact_recovery_directory()[0]["source_dependencies_current"].clone(),
+        ]
     };
     assert_eq!(flags(&state), [true, true]);
     assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([source])), None));
@@ -826,17 +1293,38 @@ fn dependency_free_carrier_pins_name_their_observed_sources() {
     record.tool_identity = "exec".to_string();
     let mut state = ToolHistoryState::default();
     state.register(record);
-    let pin = |state: &ToolHistoryState| serde_json::from_str::<serde_json::Value>(
-        &state.artifact_pin_payload_for_items(std::slice::from_ref(&output)).unwrap()).unwrap()["artifacts"][0].clone();
-    assert!(pin(&state).get("sources").is_none(), "nothing was observed yet");
-    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        None, &output, BTreeSet::from([SourceDependencyV1::new(&source, false)]),
-    ).unwrap());
+    let pin = |state: &ToolHistoryState| {
+        serde_json::from_str::<serde_json::Value>(
+            &state
+                .artifact_pin_payload_for_items(std::slice::from_ref(&output))
+                .unwrap(),
+        )
+        .unwrap()["artifacts"][0]
+            .clone()
+    };
+    assert!(
+        pin(&state).get("sources").is_none(),
+        "nothing was observed yet"
+    );
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .unwrap(),
+    );
     let observed = pin(&state);
     assert!(observed["evidence"].is_null());
-    assert_eq!(observed["sources"], serde_json::json!({
-        "paths": [SourceDependencyV1::new(&source, false).path], "omitted": 0}));
-    assert_eq!(state.artifact_recovery_directory()[0]["sources"], observed["sources"]);
+    assert_eq!(
+        observed["sources"],
+        serde_json::json!({
+        "paths": [SourceDependencyV1::new(&source, false).path], "omitted": 0})
+    );
+    assert_eq!(
+        state.artifact_recovery_directory()[0]["sources"],
+        observed["sources"]
+    );
 }
 
 #[test]
@@ -844,19 +1332,42 @@ fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
     for position in [11, 333, 880] {
         let mut lines = vec!["compiler boilerplate"; 1000];
         lines[position] = "error: decisive counterexample: alias overwrote source A";
-        for output in [lines.join("\n"), serde_json::json!({"output":lines.join("\n"), "exit_code":1}).to_string()] {
+        for output in [
+            lines.join("\n"),
+            serde_json::json!({"output":lines.join("\n"), "exit_code":1}).to_string(),
+        ] {
             let mut record = candidate("failure", output);
             record.successful = false;
             record.refresh_derived();
-            let receipt: serde_json::Value = serde_json::from_str(record.render_receipt(false, false).unwrap().1).unwrap();
-            assert!(receipt["digest"].as_str().unwrap().contains("decisive counterexample"));
-            assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive counterexample"));
+            let receipt: serde_json::Value =
+                serde_json::from_str(record.render_receipt(false, false).unwrap().1).unwrap();
+            assert!(
+                receipt["digest"]
+                    .as_str()
+                    .unwrap()
+                    .contains("decisive counterexample")
+            );
+            assert!(
+                record.artifact_pin_value().unwrap()["digest"]
+                    .as_str()
+                    .unwrap()
+                    .contains("decisive counterexample")
+            );
         }
     }
-    let record = candidate("selection", serde_json::json!({"output":"boilerplate".repeat(4000),
+    let record = candidate(
+        "selection",
+        serde_json::json!({"output":"boilerplate".repeat(4000),
         "results":[{"selector":{"kind":"lines","start":1,"end":2},
-            "status":"not_found", "message":"decisive selection error"}]}).to_string());
-    assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive selection error"));
+            "status":"not_found", "message":"decisive selection error"}]})
+        .to_string(),
+    );
+    assert!(
+        record.artifact_pin_value().unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .contains("decisive selection error")
+    );
 }
 
 #[test]
@@ -865,8 +1376,10 @@ fn read_status_keeps_environments_and_legacy_observations_separate() {
     let path = root.path().join("source.rs");
     let mut state = ToolHistoryState::default();
     for (call, environment, start, end) in [
-        ("one", Some("env-a"), 0, 5), ("two", Some("env-b"), 5, 10),
-        ("legacy-one", None, 0, 5), ("legacy-two", None, 5, 10),
+        ("one", Some("env-a"), 0, 5),
+        ("two", Some("env-b"), 5, 10),
+        ("legacy-one", None, 0, 5),
+        ("legacy-two", None, 5, 10),
     ] {
         let value = serde_json::json!({"path":path, "source_sha256":"same", "canonical_bytes":10,
             "environment_id":environment, "canonical_uri":environment.map(|_| "file:///source.rs"),
@@ -879,12 +1392,28 @@ fn read_status_keeps_environments_and_legacy_observations_separate() {
     let report = state.read_status(std::slice::from_ref(&path), None, &[]);
     let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 4);
-    assert!(snapshots.iter().all(|row| row["coverage"] == "partial" && row["obtained_bytes"] == 5));
+    assert!(
+        snapshots
+            .iter()
+            .all(|row| row["coverage"] == "partial" && row["obtained_bytes"] == 5)
+    );
     let filtered = state.read_status(&[path], Some("env-a"), &[]);
     let snapshots = filtered["paths"][0]["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 3);
-    assert_eq!(snapshots.iter().filter(|row| row["environment_id"] == "env-a").count(), 1);
-    assert_eq!(snapshots.iter().filter(|row| row["environment_id"].is_null()).count(), 2);
+    assert_eq!(
+        snapshots
+            .iter()
+            .filter(|row| row["environment_id"] == "env-a")
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshots
+            .iter()
+            .filter(|row| row["environment_id"].is_null())
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -893,7 +1422,8 @@ fn read_status_merges_only_same_snapshot_and_retains_unknown_and_stale_states() 
     let path = root.path().join("source.rs");
     let mut state = ToolHistoryState::default();
     for (call, hash, start, end, current) in [
-        ("first", "a", 0, 4, true), ("second", "a", 4, 8, true),
+        ("first", "a", 0, 4, true),
+        ("second", "a", 4, 8, true),
         ("old", "b", 0, 2, false),
     ] {
         let value = serde_json::json!({"path":path, "source_sha256":hash, "canonical_bytes":10,
@@ -906,19 +1436,32 @@ fn read_status_merges_only_same_snapshot_and_retains_unknown_and_stale_states() 
         entry.source_dependencies_current = current;
         state.register(entry);
     }
-    state.recovered_ranges.insert("second".into(), vec![serde_json::json!({"kind":"bytes","start":8,"end":10})]);
+    state.recovered_ranges.insert(
+        "second".into(),
+        vec![serde_json::json!({"kind":"bytes","start":8,"end":10})],
+    );
     let persisted = serde_json::to_value(&state).unwrap();
     let restored: ToolHistoryState = serde_json::from_value(persisted.clone()).unwrap();
     let report = restored.read_status(&[path, root.path().join("unread.rs")], Some("local"), &[]);
     let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
-    let full = snapshots.iter().find(|row| row["source_sha256"] == "a").unwrap();
-    let partial = snapshots.iter().find(|row| row["source_sha256"] == "b").unwrap();
+    let full = snapshots
+        .iter()
+        .find(|row| row["source_sha256"] == "a")
+        .unwrap();
+    let partial = snapshots
+        .iter()
+        .find(|row| row["source_sha256"] == "b")
+        .unwrap();
     assert_eq!(full["coverage"], "full");
     assert_eq!(full["obtained_bytes"], 10);
     assert_eq!(partial["coverage"], "partial");
     assert_eq!(partial["freshness"], "invalidated");
     assert_eq!(report["paths"][1]["status"], "unknown");
-    assert_eq!(serde_json::to_value(restored).unwrap(), persisted, "read-only query");
+    assert_eq!(
+        serde_json::to_value(restored).unwrap(),
+        persisted,
+        "read-only query"
+    );
 }
 
 #[tokio::test]
@@ -928,56 +1471,96 @@ async fn journal_writer_reuses_handles_and_replays_after_another_writer() {
     let mut state = ToolHistoryState::default();
     state.register_non_workspace_code_mode_call("initial".into());
     persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(writer.lock().unwrap().checkpoint_replays, 1);
     for sequence in 1..=2 {
         let mutation = ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
             call_id: format!("local-{sequence}"),
         };
         mutation.apply(&mut state);
-        persist_tool_history_mutations_with_writer(temp.path(), "thread", "local",
-            &[(sequence, mutation)], Arc::clone(&writer)).await.unwrap();
+        persist_tool_history_mutations_with_writer(
+            temp.path(),
+            "thread",
+            "local",
+            &[(sequence, mutation)],
+            Arc::clone(&writer),
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(writer.lock().unwrap().journal_opens, 1);
     persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(writer.lock().unwrap().checkpoint_replays, 1);
-    let foreign = ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id: "foreign".into() };
+    let foreign = ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+        call_id: "foreign".into(),
+    };
     foreign.apply(&mut state);
     persist_tool_history_mutations(temp.path(), "thread", "foreign", &[(1, foreign)])
-        .await.unwrap();
+        .await
+        .unwrap();
     persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(writer.lock().unwrap().checkpoint_replays, 2);
-    let ledger: ToolHistoryLedgerFile = serde_json::from_slice(
-        &std::fs::read(ledger_path(temp.path(), "thread")).unwrap(),
-    ).unwrap();
+    let ledger: ToolHistoryLedgerFile =
+        serde_json::from_slice(&std::fs::read(ledger_path(temp.path(), "thread")).unwrap())
+            .unwrap();
     assert_eq!(ledger.journal_sequences.get("local"), Some(&2));
     assert_eq!(ledger.journal_sequences.get("foreign"), Some(&1));
-    assert!(ledger.state.non_workspace_code_mode_calls.contains("foreign"));
+    assert!(
+        ledger
+            .state
+            .non_workspace_code_mode_calls
+            .contains("foreign")
+    );
 }
 
 #[tokio::test]
 async fn admission_read_only_proof_rejects_shell_writes_and_unknown_commands() {
     for (arguments, expected) in [
-        (serde_json::json!({"program":"rg", "args":["needle", "."]}), true),
-        (serde_json::json!({"program":"unknown-command", "args":[]}), false),
-        (serde_json::json!({"cmd":"cat input > output", "shell":"bash"}), false),
-        (serde_json::json!({"cmd":"cat input; rm output", "shell":"bash"}), false),
-        (serde_json::json!({"cmd":"cat $(touch output)", "shell":"bash"}), false),
+        (
+            serde_json::json!({"program":"rg", "args":["needle", "."]}),
+            true,
+        ),
+        (
+            serde_json::json!({"program":"unknown-command", "args":[]}),
+            false,
+        ),
+        (
+            serde_json::json!({"cmd":"cat input > output", "shell":"bash"}),
+            false,
+        ),
+        (
+            serde_json::json!({"cmd":"cat input; rm output", "shell":"bash"}),
+            false,
+        ),
+        (
+            serde_json::json!({"cmd":"cat $(touch output)", "shell":"bash"}),
+            false,
+        ),
     ] {
         let (_, read_only) = classify_workspace_tool_call_at_admission(
             "exec_command".to_string(),
-            ToolPayload::Function { arguments: arguments.to_string() },
+            ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
             std::env::current_dir().unwrap(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(read_only, expected, "{arguments}");
     }
 }
 
 /// Deterministic projection/recovery workload, not a model-latency benchmark.
 #[tokio::test]
-#[expect(clippy::print_stderr, reason = "this comparison intentionally reports projection and recovery measurements")]
+#[expect(
+    clippy::print_stderr,
+    reason = "this comparison intentionally reports projection and recovery measurements"
+)]
 async fn only_checkpointed_evidence_is_pinned_after_restart_and_stays_recoverable() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
 
@@ -1027,33 +1610,53 @@ async fn only_checkpointed_evidence_is_pinned_after_restart_and_stays_recoverabl
     // Sampling after a restart: a final answer plus review-to-fix continuation
     // is not a checkpoint. The same evidence stays directly usable without
     // manufactured recovery calls.
-    persist_tool_history_state(home.path(), "pressure", &original).await.unwrap();
-    let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "pressure").await);
+    persist_tool_history_state(home.path(), "pressure", &original)
+        .await
+        .unwrap();
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state(home.path(), "pressure").await);
     let mut history = crate::context_manager::ContextManager::new();
     history.set_tool_history_state(restored);
     let message = |role: &str, text: &str, phase| ResponseItem::Message {
-        id: None, role: role.into(),
+        id: None,
+        role: role.into(),
         content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
-        phase, internal_chat_message_metadata_passthrough: None,
+        phase,
+        internal_chat_message_metadata_passthrough: None,
     };
     history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
-    history.record_items([
-        &message("assistant", "The source review is complete; the failure remains unresolved.", Some(codex_protocol::models::MessagePhase::FinalAnswer)),
-        &message("user", "Use the review to fix the failure.", None),
-    ], TruncationPolicy::Tokens(100_000));
+    history.record_items(
+        [
+            &message(
+                "assistant",
+                "The source review is complete; the failure remains unresolved.",
+                Some(codex_protocol::models::MessagePhase::FinalAnswer),
+            ),
+            &message("user", "Use the review to fix the failure.", None),
+        ],
+        TruncationPolicy::Tokens(100_000),
+    );
     let canonical = history.raw_items().to_vec();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let sampled = history.clone().prepare_for_sampling_prompt_with_completed_tool_projection(
-        &[codex_protocol::openai_models::InputModality::Text],
-        crate::stable_context::StableContextTarget::Sampling, None, &cache,
-    );
+    let sampled = history
+        .clone()
+        .prepare_for_sampling_prompt_with_completed_tool_projection(
+            &[codex_protocol::openai_models::InputModality::Text],
+            crate::stable_context::StableContextTarget::Sampling,
+            None,
+            &cache,
+        );
     assert!(sampled.items().contains(&text_output("active", active)));
     let continuation_started = std::time::Instant::now();
     let mut continuation_recovery_calls = 0;
     for index in 0..18 {
         let id = format!("completed-{index}");
-        let (_, text) = sampled.items().iter().filter_map(canonical_textual_output_identity)
-            .find(|(call_id, _)| *call_id == id).unwrap();
+        let (_, text) = sampled
+            .items()
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .find(|(call_id, _)| *call_id == id)
+            .unwrap();
         if index != 0 {
             assert_eq!(text, source, "review-to-implementation needs no recovery");
             continue;
@@ -1063,25 +1666,53 @@ async fn only_checkpointed_evidence_is_pinned_after_restart_and_stays_recoverabl
         let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(pin["kind"], "tool_history_artifact_pin");
         let artifact_id = &original.candidates[&id].artifact_id;
-        assert_eq!(read_exact_tool_output_artifact(
-            home.path(), "pressure", artifact_id,
-        ).await.unwrap(), source.as_bytes());
+        assert_eq!(
+            read_exact_tool_output_artifact(home.path(), "pressure", artifact_id,)
+                .await
+                .unwrap(),
+            source.as_bytes()
+        );
         let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
-            home.path(), "pressure", artifact_id,
-            vec![ToolOutputSelector::Lines { start: 1, end: 2 }], false,
-        ).await.unwrap();
+            home.path(),
+            "pressure",
+            artifact_id,
+            vec![ToolOutputSelector::Lines { start: 1, end: 2 }],
+            false,
+        )
+        .await
+        .unwrap();
         continuation_recovery_calls += 1;
         assert!(recovered.complete);
-        assert_eq!(recovered.results[0].text.as_deref().unwrap().lines().collect::<Vec<_>>(),
-            source.lines().take(2).collect::<Vec<_>>());
+        assert_eq!(
+            recovered.results[0]
+                .text
+                .as_deref()
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            source.lines().take(2).collect::<Vec<_>>()
+        );
     }
-    let tokens = |items: &[ResponseItem]| items.iter().filter_map(canonical_textual_output_identity)
-        .map(|(_, text)| codex_utils_output_truncation::model_token_count(&text)).sum::<usize>();
+    let tokens = |items: &[ResponseItem]| {
+        items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(_, text)| codex_utils_output_truncation::model_token_count(&text))
+            .sum::<usize>()
+    };
     assert_eq!(continuation_recovery_calls, 1);
     assert!(tokens(sampled.items()) < tokens(&canonical));
-    assert_eq!(history.raw_items(), canonical, "canonical evidence remains unchanged");
-    eprintln!("review-to-implementation continuation_ms={} actual_model_requests=0 recovery_calls={continuation_recovery_calls} input_tool_tokens_before={} after={} live_model_correctness=unmeasured",
-        continuation_started.elapsed().as_secs_f64() * 1000.0, tokens(&canonical), tokens(sampled.items()));
+    assert_eq!(
+        history.raw_items(),
+        canonical,
+        "canonical evidence remains unchanged"
+    );
+    eprintln!(
+        "review-to-implementation continuation_ms={} actual_model_requests=0 recovery_calls={continuation_recovery_calls} input_tool_tokens_before={} after={} live_model_correctness=unmeasured",
+        continuation_started.elapsed().as_secs_f64() * 1000.0,
+        tokens(&canonical),
+        tokens(sampled.items())
+    );
 }
 
 #[test]
@@ -1091,7 +1722,8 @@ fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
         let mut entry = candidate(id, bounded_output());
         entry.artifact_id = format!("artifact-{id}");
         entry.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "turn".into(), ordinal: 1,
+            turn_id: "turn".into(),
+            ordinal: 1,
         });
         if id != "ordinary" {
             entry.tool_identity = "functions.exec".into();
@@ -1103,7 +1735,9 @@ fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
             entry.consumed_by_generation = None;
         }
         if id == "source-marker" {
-            entry.bounded_model_output.push_str("\n// source containing exec tool declaration:\n");
+            entry
+                .bounded_model_output
+                .push_str("\n// source containing exec tool declaration:\n");
         }
         state.register(entry);
     }
@@ -1111,8 +1745,15 @@ fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
     assert!(state.candidates["lookup"].checkpoint_pin().is_some());
     assert!(state.candidates["source-marker"].checkpoint_pin().is_some());
     assert!(state.candidates["unread-schema"].checkpoint_pin().is_none());
-    assert_ne!(state.phase_checkpoint_receipts(&["lookup".into()]).unwrap(), serde_json::json!({}));
-    assert!(state.candidates["lookup"].bounded_model_output.contains("declare const tools"));
+    assert_ne!(
+        state.phase_checkpoint_receipts(&["lookup".into()]).unwrap(),
+        serde_json::json!({})
+    );
+    assert!(
+        state.candidates["lookup"]
+            .bounded_model_output
+            .contains("declare const tools")
+    );
 }
 
 #[test]
@@ -1130,7 +1771,6 @@ fn phase_checkpoint_leaves_tiny_results_inline() {
     }
 }
 
-
 #[test]
 fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     let mut state = ToolHistoryState::default();
@@ -1146,9 +1786,15 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     state.register_non_workspace_code_mode_call("active".into());
     assert!(state.phase_checkpoint_receipts(&["active".into()]).is_err());
     let diagnostic: serde_json::Value = serde_json::from_str(
-        &state.phase_checkpoint_receipts(&["missing".into(), "also-missing".into()]).unwrap_err(),
-    ).unwrap();
-    assert_eq!(diagnostic["unknown_call_ids"], serde_json::json!(["missing", "also-missing"]));
+        &state
+            .phase_checkpoint_receipts(&["missing".into(), "also-missing".into()])
+            .unwrap_err(),
+    )
+    .unwrap();
+    assert_eq!(
+        diagnostic["unknown_call_ids"],
+        serde_json::json!(["missing", "also-missing"])
+    );
     assert_eq!(diagnostic["eligible_call_ids"], serde_json::json!(["done"]));
     let receipts = state.phase_checkpoint_receipts(&["done".into()]).unwrap();
     assert!(receipts["done"].get("digest").is_none());
@@ -1215,6 +1861,255 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
 }
 
 #[test]
+fn pressure_retirement_pins_oldest_consumed_outputs_and_keeps_the_working_set() {
+    let mut state = ToolHistoryState::default();
+    let source = bounded_output();
+    let mut items = Vec::new();
+    for index in 0..6u32 {
+        let id = format!("read-{index}");
+        let mut entry = candidate(&id, source.clone());
+        entry.artifact_id = format!("artifact-{index}");
+        entry.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".into(),
+            ordinal: index,
+        });
+        state.register(entry);
+        state.register_non_workspace_code_mode_call(id.clone());
+        items.extend([function_call(&id), text_output(&id, source.clone())]);
+    }
+    // The model has not read this output yet; it is never retired.
+    state.register(candidate("unread", source.clone()));
+    state.register_non_workspace_code_mode_call("unread".into());
+    items.extend([
+        function_call("unread"),
+        text_output("unread", source.clone()),
+    ]);
+
+    let (retired, all_saved) = state.pressure_retirement_selection(&items, 3, u64::MAX);
+    assert_eq!(
+        retired,
+        ["read-0", "read-1", "read-2"],
+        "the newest three consumed generations stay inline"
+    );
+    let (oldest, saved) = state.pressure_retirement_selection(&items, 3, 1);
+    assert_eq!(
+        oldest,
+        ["read-0"],
+        "selection is oldest first and stops at the target"
+    );
+    assert!(saved > 0 && saved < all_saved);
+
+    let checkpoint = pressure_retirement_checkpoint(&retired);
+    let ResponseItem::Message { content, .. } = &checkpoint else {
+        unreachable!("the retirement checkpoint is a developer message");
+    };
+    let codex_protocol::models::ContentItem::InputText { text } = &content[0] else {
+        unreachable!("the retirement checkpoint is text");
+    };
+    assert!(is_pressure_retirement_checkpoint_text(text));
+    assert_eq!(phase_checkpoint_ids(&checkpoint).unwrap(), retired);
+    items.push(checkpoint);
+    let items: Arc<[ResponseItem]> = Arc::from(items);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let projection = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
+    let projected = |id: &str| {
+        projection
+            .items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .find(|(call_id, _)| *call_id == id)
+            .unwrap()
+            .1
+            .to_string()
+    };
+    for id in &retired {
+        assert!(
+            projected(id).contains("tool_history_artifact_pin"),
+            "{id} is pinned"
+        );
+    }
+    for id in ["read-3", "read-4", "read-5", "unread"] {
+        assert_eq!(projected(id), source, "{id} stays inline");
+    }
+    assert_eq!(state.apply_checkpoint_pins(&items), projection.items);
+    assert!(
+        state
+            .pressure_retirement_selection(&items, 3, u64::MAX)
+            .0
+            .is_empty(),
+        "retired outputs are not selected again"
+    );
+}
+
+/// Proactive retirement (see `retire_consumed_tool_outputs_before_limit`)
+/// retires consumed evidence once the prompt passes its steady-state ceiling
+/// rather than at the compaction limit. It reuses this selection and pinning
+/// path, so the properties that make retiring earlier safe are asserted here
+/// against real artifact bytes:
+///
+/// 1. retirement actually selects and pins evidence at a steady-state target,
+///    not only when the full excess is demanded;
+/// 2. every retired output stays recoverable through the recovery reference
+///    carried in its own pin, byte-for-byte; and
+/// 3. retirement does not repeat without a further meaningful reduction.
+#[tokio::test]
+async fn proactive_retirement_pins_are_recoverable_and_do_not_repeat() {
+    let home = tempfile::tempdir().unwrap();
+    let source = bounded_output();
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    // Distinct recoverable artifacts, so a pin cannot appear to recover by
+    // accidentally sharing another output's bytes.
+    let mut artifacts = Vec::new();
+
+    for index in 0..6u32 {
+        let id = format!("read-{index}");
+        let exact = format!("exact recoverable bytes for {id}\n").repeat(64);
+        let canonical = CanonicalToolResult::text(exact.clone());
+        let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+        assert!(artifact.complete, "{id} artifact is stored complete");
+        let artifact_id = artifact.artifact_id().unwrap();
+        protect_active_tool_history_artifact(
+            home.path(),
+            "thread",
+            &artifact_id,
+            canonical.exact_bytes,
+            &canonical.sha256,
+        )
+        .await
+        .unwrap();
+
+        let mut entry = candidate(&id, source.clone());
+        entry.artifact_id = artifact_id.clone();
+        entry.artifact_bytes = canonical.exact_bytes;
+        entry.artifact_sha256 = canonical.sha256.clone();
+        // Consumed: the model has already read this output, which is what
+        // makes retiring it non-lossy.
+        entry.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".into(),
+            ordinal: index,
+        });
+        state.register(entry);
+        state.register_non_workspace_code_mode_call(id.clone());
+        items.extend([function_call(&id), text_output(&id, source.clone())]);
+        artifacts.push((id, artifact_id, exact));
+    }
+
+    // (1) A steady-state target retires a bounded prefix, oldest first, and
+    // reports a real saving. This is the proactive trigger's selection call.
+    // Retiring an output saves its inline cost net of the pin that replaces it.
+    let net_saving = |id: &str| {
+        let candidate = &state.candidates[id];
+        let (_, pin_tokens) = candidate
+            .checkpoint_pin()
+            .expect("consumed output has a pin");
+        candidate.derived.bounded_model_output_tokens - pin_tokens as u64
+    };
+    let target = net_saving("read-0") + net_saving("read-1");
+    let (retired, saved) = state.pressure_retirement_selection(&items, 3, target);
+    assert!(
+        !retired.is_empty(),
+        "a steady-state target must retire eligible evidence before the limit"
+    );
+    assert_eq!(
+        retired,
+        ["read-0", "read-1"],
+        "selection is oldest first and stops once the target is met"
+    );
+    assert!(saved >= target, "the reported saving must meet the target");
+
+    let checkpoint = pressure_retirement_checkpoint(&retired);
+    items.push(checkpoint);
+    let items: Arc<[ResponseItem]> = Arc::from(items);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let projection = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
+    let projected = |id: &str| {
+        projection
+            .items
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .find(|(call_id, _)| *call_id == id)
+            .unwrap()
+            .1
+            .to_string()
+    };
+
+    // (2) Each retired output is pinned, and the recovery reference in that
+    // pin returns the original bytes. The pin is the only thing the model
+    // still sees, so recovery must work from the pin alone.
+    for (id, artifact_id, exact) in &artifacts {
+        let text = projected(id);
+        if !retired.contains(id) {
+            assert_eq!(&text, &source, "{id} stays inline as the working set");
+            continue;
+        }
+        assert!(text.contains("tool_history_artifact_pin"), "{id} is pinned");
+        assert!(text.len() < source.len(), "{id} pin is smaller than inline");
+
+        let pin: serde_json::Value = serde_json::from_str(&text).expect("pin is structured");
+        assert_eq!(
+            pin["artifact_id"].as_str(),
+            Some(artifact_id.as_str()),
+            "{id} pin names its own artifact"
+        );
+        assert_eq!(pin["retrieval"]["tool"], "read_tool_output");
+
+        // Recover through the artifact the pin advertises, not a test-held id.
+        let recovered_id = pin["artifact_id"].as_str().unwrap();
+        let bytes = pin["bytes"].as_u64().unwrap();
+        let result = crate::tools::command_output_artifact::read_tool_output_selectors(
+            home.path(),
+            "thread",
+            recovered_id,
+            vec![crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
+                start: 0,
+                end: bytes,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(result.complete, "{id} recovery is complete");
+        assert_eq!(
+            result.results[0].text.as_deref(),
+            Some(exact.as_str()),
+            "{id} recovers its exact original bytes from its pin"
+        );
+        assert!(
+            crate::tools::command_output_artifact::verify_tool_history_artifact(
+                home.path(),
+                "thread",
+                recovered_id,
+                bytes,
+                pin["sha256"].as_str().unwrap(),
+            )
+            .await
+            .is_ok(),
+            "{id} recovered bytes match the pinned digest"
+        );
+    }
+
+    // (3) Already-retired outputs are not selected again, so a proactive
+    // trigger that re-evaluates on the next request cannot churn. Only the
+    // unretired output outside the held-back working set remains eligible,
+    // and once it is retired there is no further meaningful reduction.
+    let (remaining, _) = state.pressure_retirement_selection(&items, 3, u64::MAX);
+    assert_eq!(
+        remaining,
+        ["read-2"],
+        "retired outputs and the working set are not selected again"
+    );
+    let mut items = items.to_vec();
+    items.push(pressure_retirement_checkpoint(&remaining));
+    assert!(
+        state
+            .pressure_retirement_selection(&items, 3, u64::MAX)
+            .0
+            .is_empty(),
+        "retirement must not repeat without new eligible evidence"
+    );
+}
+
+#[test]
 fn phase_checkpoint_resolves_only_later_current_success_for_the_same_action() {
     let mut state = ToolHistoryState::default();
     let source = bounded_output();
@@ -1222,36 +2117,56 @@ fn phase_checkpoint_resolves_only_later_current_success_for_the_same_action() {
     let mut failure = candidate("failed", source.clone());
     failure.successful = false;
     failure.supersession_identity = Some(format!("functions.exec:{action}:{}", sha256(b"failed")));
-    failure.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 0 });
+    failure.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn".into(),
+        ordinal: 0,
+    });
     state.register(failure);
     assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
     let mut success = candidate("repaired", source.clone());
     success.supersession_identity = Some(format!("functions.exec:{action}:{}", sha256(b"passed")));
-    success.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+    success.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn".into(),
+        ordinal: 1,
+    });
     state.register(success.clone());
     let receipts = state.phase_checkpoint_receipts(&["failed".into()]).unwrap();
     assert_eq!(receipts["failed"]["resolved_by"]["call_id"], "repaired");
     let checkpoint = ResponseItem::Message {
-        id: None, role: "developer".into(),
+        id: None,
+        role: "developer".into(),
         content: vec![codex_protocol::models::ContentItem::InputText {
-            text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                serde_json::json!({"receipts": receipts})),
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts": receipts})
+            ),
         }],
-        phase: None, internal_chat_message_metadata_passthrough: None,
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let items: Arc<[ResponseItem]> = Arc::from([
-        function_call("failed"), text_output("failed", source.clone()), checkpoint,
+        function_call("failed"),
+        text_output("failed", source.clone()),
+        checkpoint,
     ]);
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let projected = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
-    assert!(!projected.items.contains(&text_output("failed", source.clone())));
+    assert!(
+        !projected
+            .items
+            .contains(&text_output("failed", source.clone()))
+    );
     success.source_dependencies_current = false;
     state.register(success.clone());
     assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
     let projected = state.project_sampling_with_workspace_cache(items, None, &cache);
     assert!(projected.items.contains(&text_output("failed", source)));
     success.source_dependencies_current = true;
-    success.supersession_identity = Some(format!("functions.exec:{}:{}", sha256(b"other target"), sha256(b"passed")));
+    success.supersession_identity = Some(format!(
+        "functions.exec:{}:{}",
+        sha256(b"other target"),
+        sha256(b"passed")
+    ));
     state.register(success);
     assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
 }
@@ -1262,15 +2177,19 @@ fn checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes() {
     let mut evidence = candidate("source", bounded_output());
     state.register(evidence.clone());
     let checkpoint = ResponseItem::Message {
-        id: None, role: "developer".into(),
+        id: None,
+        role: "developer".into(),
         content: vec![codex_protocol::models::ContentItem::InputText {
-            text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
                 serde_json::json!({"receipts": {}, "answered_questions": [{
                     "question": "What is the source?", "answer": "A prior observation.",
                     "evidence_refs": ["source"],
-                }]})),
+                }]})
+            ),
         }],
-        phase: None, internal_chat_message_metadata_passthrough: None,
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let items: Arc<[ResponseItem]> = Arc::from([checkpoint.clone()]);
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
@@ -1284,7 +2203,8 @@ fn checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes() {
     let notice = serde_json::to_value(&stale.items[1]).unwrap().to_string();
     assert!(notice.contains("checkpoint_answer_evidence"));
     assert!(notice.contains("unverified"));
-    let repeated = state.project_sampling_with_workspace_cache(Arc::clone(&stale.items), None, &cache);
+    let repeated =
+        state.project_sampling_with_workspace_cache(Arc::clone(&stale.items), None, &cache);
     assert_eq!(repeated.items, stale.items);
 }
 
@@ -1299,21 +2219,43 @@ fn verified_evidence_uncertainty_only_lineage_downgrades_both_reference_sets() {
         let mut uncertainty = serde_json::json!({"claim":"open", "next_action":"inspect"});
         uncertainty[field] = serde_json::json!(["stale", "current"]);
         let checkpoint = ResponseItem::Message {
-            id: None, role: "developer".into(),
+            id: None,
+            role: "developer".into(),
             content: vec![codex_protocol::models::ContentItem::InputText {
-                text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                    serde_json::json!({"receipts":{}, "uncertainties":[uncertainty]})),
-            }], phase: None, internal_chat_message_metadata_passthrough: None,
+                text: format!(
+                    "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                    serde_json::json!({"receipts":{}, "uncertainties":[uncertainty]})
+                ),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-        let projection = state.project_sampling_with_workspace_cache(Arc::from([checkpoint.clone()]), None, &cache);
+        let projection = state.project_sampling_with_workspace_cache(
+            Arc::from([checkpoint.clone()]),
+            None,
+            &cache,
+        );
         assert_eq!(projection.items.len(), 2);
         assert_eq!(projection.items[0], checkpoint);
-        let ResponseItem::Message { content, .. } = &projection.items[1] else { panic!("notice") };
-        let codex_protocol::models::ContentItem::InputText { text } = &content[0] else { panic!("text") };
-        let notice: serde_json::Value = text.lines().find_map(|line| serde_json::from_str(line).ok()).unwrap();
-        assert_eq!(notice["notices"][0]["kind"], "checkpoint_uncertainty_evidence");
-        assert_eq!(notice["notices"][0]["evidence_refs"], serde_json::json!(["stale"]));
+        let ResponseItem::Message { content, .. } = &projection.items[1] else {
+            panic!("notice")
+        };
+        let codex_protocol::models::ContentItem::InputText { text } = &content[0] else {
+            panic!("text")
+        };
+        let notice: serde_json::Value = text
+            .lines()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .unwrap();
+        assert_eq!(
+            notice["notices"][0]["kind"],
+            "checkpoint_uncertainty_evidence"
+        );
+        assert_eq!(
+            notice["notices"][0]["evidence_refs"],
+            serde_json::json!(["stale"])
+        );
     }
 }
 
@@ -1448,17 +2390,16 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call("read-old"), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(captured),
-            &output,
-            BTreeSet::new(),
-        )
-        .unwrap(),
+        WorkspaceEvidenceObservation::from_response_item(Some(captured), &output, BTreeSet::new())
+            .unwrap(),
     );
-    let previous = state.project_sampling_with_workspace_cache(
-        Arc::clone(&canonical), Some(&changed), &cache,
+    let previous =
+        state.project_sampling_with_workspace_cache(Arc::clone(&canonical), Some(&changed), &cache);
+    assert_eq!(
+        previous.items.len(),
+        canonical.len() + 1,
+        "fixture has a freshness notice"
     );
-    assert_eq!(previous.items.len(), canonical.len() + 1, "fixture has a freshness notice");
     let anchor = SamplingProjectionAnchor {
         prepared_items: Arc::clone(&canonical),
         projection: previous.clone(),
@@ -1475,35 +2416,110 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
     for message in [mail.to_model_input_item(), legacy] {
         let mut extended = canonical.to_vec();
         extended.push(message.clone());
-        let continued = state.project_continuation_with_workspace_cache(
-            &anchor, extended.into(), Some(&changed), &cache,
-        ).expect("child messages continue the same history layout");
+        let continued = state
+            .project_continuation_with_workspace_cache(
+                &anchor,
+                extended.into(),
+                Some(&changed),
+                &cache,
+            )
+            .expect("child messages continue the same history layout");
         for (items, prior) in [
             (&continued.items, &previous.items),
             (&continued.unreplaced_items, &previous.unreplaced_items),
         ] {
             assert!(items.starts_with(prior));
-            assert_eq!(items.len(), prior.len() + 1, "notice must not move or repeat");
+            assert_eq!(
+                items.len(),
+                prior.len() + 1,
+                "notice must not move or repeat"
+            );
             assert_eq!(items.last(), Some(&message));
         }
     }
-    // Actual user input and explicit checkpoints must still rebuild.
-    for (role, text) in [
-        ("user", "next task"),
-        ("developer", "<completed_phase_checkpoint>\n{\"receipts\":{}}\n</completed_phase_checkpoint>"),
-    ] {
+    let message = |role: &str, text: &str| ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let checkpoint = message(
+        "developer",
+        "<completed_phase_checkpoint>\n{\"receipts\":{}}\n</completed_phase_checkpoint>",
+    );
+    let next_task = message("user", "next task");
+    // Explicit checkpoints retire evidence and always rebuild. In this fixture
+    // the notice is most of the prompt, so a user turn consolidates it too.
+    for appended in [&checkpoint, &next_task] {
         let mut extended = canonical.to_vec();
-        extended.push(ResponseItem::Message {
-            id: None,
-            role: role.to_string(),
-            content: vec![codex_protocol::models::ContentItem::InputText { text: text.to_string() }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        });
-        assert!(state.project_continuation_with_workspace_cache(
-            &anchor, extended.into(), Some(&changed), &cache,
-        ).is_none());
+        extended.push(appended.clone());
+        assert!(
+            state
+                .project_continuation_with_workspace_cache(
+                    &anchor,
+                    extended.into(),
+                    Some(&changed),
+                    &cache,
+                )
+                .is_none()
+        );
     }
+    // A user turn whose notices are a small share of the prompt keeps the
+    // layout the provider cached and appends the request after it.
+    let earlier_work = message("assistant", &"earlier analysis ".repeat(2_000));
+    let padded: Arc<[ResponseItem]> =
+        Arc::from([earlier_work, function_call("read-old"), output.clone()]);
+    let padded_previous =
+        state.project_sampling_with_workspace_cache(Arc::clone(&padded), Some(&changed), &cache);
+    assert_eq!(
+        padded_previous.items.len(),
+        padded.len() + 1,
+        "fixture has a freshness notice"
+    );
+    let padded_anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&padded),
+        projection: padded_previous.clone(),
+    };
+    let mut extended = padded.to_vec();
+    extended.push(next_task.clone());
+    let continued = state
+        .project_continuation_with_workspace_cache(
+            &padded_anchor,
+            extended.into(),
+            Some(&changed),
+            &cache,
+        )
+        .expect("a user turn continues the cached layout");
+    for (items, prior) in [
+        (&continued.items, &padded_previous.items),
+        (
+            &continued.unreplaced_items,
+            &padded_previous.unreplaced_items,
+        ),
+    ] {
+        assert!(items.starts_with(prior));
+        assert_eq!(
+            items.len(),
+            prior.len() + 1,
+            "notice must not move or repeat"
+        );
+        assert_eq!(items.last(), Some(&next_task));
+    }
+    let mut extended = padded.to_vec();
+    extended.extend([next_task, checkpoint]);
+    assert!(
+        state
+            .project_continuation_with_workspace_cache(
+                &padded_anchor,
+                extended.into(),
+                Some(&changed),
+                &cache,
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -1540,7 +2556,11 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap();
-    assert_eq!(text.lines().count(), 4, "one safety qualification precedes the batched evidence records");
+    assert_eq!(
+        text.lines().count(),
+        4,
+        "one safety qualification precedes the batched evidence records"
+    );
     assert!(text.contains("This is not a request to rerun tests or builds."));
     let notices = batch["notices"].as_array().unwrap();
     assert_eq!(notices.len(), 2);
@@ -1582,8 +2602,10 @@ fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_change
     next = previous.clone();
     next["valid_for_current_workspace"] = true.into();
     assert!(!same_workspace_invalidation(&previous, &next));
-    assert!(!same_workspace_invalidation(&serde_json::json!({"reason":"one"}),
-                                       &serde_json::json!({"reason":"two"})));
+    assert!(!same_workspace_invalidation(
+        &serde_json::json!({"reason":"one"}),
+        &serde_json::json!({"reason":"two"})
+    ));
 }
 
 #[test]
@@ -1988,7 +3010,10 @@ fn workspace_evidence_captured_across_unobserved_revision_change_is_stale() {
         WorkspaceEvidenceObservation::from_response_item_with_freshness(
             Some(captured.clone()),
             &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after/source.rs"), false)]),
+            BTreeSet::from([SourceDependencyV1::new(
+                Path::new("/repo-after/source.rs"),
+                false,
+            )]),
             /*source_dependencies_current*/ false,
         )
         .expect("raced workspace observation"),
@@ -2018,8 +3043,12 @@ async fn later_duplicate_registration_cannot_revive_invalidated_workspace_eviden
         watched(
             &cache,
             root.path(),
-            WorkspaceEvidenceObservation::from_response_item(Some(captured.clone()), &output, dependencies.clone())
-                .expect("initial workspace observation"),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &output,
+                dependencies.clone(),
+            )
+            .expect("initial workspace observation"),
         )
         .await,
     );
@@ -2069,7 +3098,10 @@ fn unwatched_evidence_notice_reports_how_to_treat_it() {
     // Matching digests without a dependency watch are unknown, not current.
     let unverified = freshness_notices(&state, &canonical, Some(&captured), &cache);
     assert_eq!(unverified.len(), 1);
-    assert_eq!(unverified[0]["reason_code"], "workspace_freshness_unverified");
+    assert_eq!(
+        unverified[0]["reason_code"],
+        "workspace_freshness_unverified"
+    );
 
     let stale = state.project_workspace_freshness_with_cache(
         Arc::clone(&canonical),
@@ -2108,10 +3140,14 @@ fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshot
     let output = text_output("cached", "captured evidence".into());
     let items: Arc<[ResponseItem]> = Arc::from([function_call("cached"), output.clone()]);
     let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        Some(captured.clone()), &output,
-        BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
-    ).unwrap());
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured.clone()),
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
+        )
+        .unwrap(),
+    );
     let original = state.clone();
     // Verdicts are memoized only for unwatched evidence, which a live cache
     // never reports as current; the reason code tells the verdicts apart.
@@ -2121,26 +3157,40 @@ fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshot
         assert_eq!(notices.len(), 1);
         notices[0]["reason_code"].clone()
     };
-    let hits = |state: &ToolHistoryState| {
-        state.workspace_projection_cache.lock().unwrap()["cached"].hits
-    };
+    let hits =
+        |state: &ToolHistoryState| state.workspace_projection_cache.lock().unwrap()["cached"].hits;
     assert_eq!(reason(&state, &captured), "workspace_freshness_unverified");
     assert_eq!(reason(&state, &captured), "workspace_freshness_unverified");
     assert_eq!(hits(&state), 1);
     assert_eq!(reason(&state, &changed), "workspace_identity_changed");
     assert_eq!(hits(&state), 0);
-    assert_eq!(reason(&state.clone(), &changed), "workspace_identity_changed");
+    assert_eq!(
+        reason(&state.clone(), &changed),
+        "workspace_identity_changed"
+    );
     assert_eq!(hits(&state), 1);
     assert!(state.invalidate_source_dependencies(None, Some(&captured)));
     assert_eq!(reason(&state, &captured), "source_dependencies_invalidated");
     assert_eq!(hits(&state), 0);
-    assert_eq!(reason(&original, &captured), "workspace_freshness_unverified");
+    assert_eq!(
+        reason(&original, &captured),
+        "workspace_freshness_unverified"
+    );
     assert_eq!(hits(&state), 0);
     let encoded = serde_json::to_value(&state).unwrap();
     assert!(encoded.get("workspace_projection_cache").is_none());
     let restored: ToolHistoryState = serde_json::from_value(encoded).unwrap();
-    assert!(restored.workspace_projection_cache.lock().unwrap().is_empty());
-    assert_eq!(reason(&restored, &captured), "source_dependencies_invalidated");
+    assert!(
+        restored
+            .workspace_projection_cache
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reason(&restored, &captured),
+        "source_dependencies_invalidated"
+    );
     state.project_workspace_freshness_with_cache(Arc::from([]), Some(&captured), &cache);
     assert!(state.workspace_projection_cache.lock().unwrap().is_empty());
 }
@@ -2150,12 +3200,20 @@ fn workspace_projection_cache_rechecks_output_and_read_arguments() {
     let identity = workspace_identity("captured");
     let output = text_output("read", "old evidence".into());
     let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        Some(identity.clone()), &output, BTreeSet::new(),
-    ).unwrap());
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(identity.clone()),
+            &output,
+            BTreeSet::new(),
+        )
+        .unwrap(),
+    );
     state.invalidate_source_dependencies(None, Some(&identity));
     let mut call = function_call("read");
-    if let ResponseItem::FunctionCall { name, arguments, .. } = &mut call {
+    if let ResponseItem::FunctionCall {
+        name, arguments, ..
+    } = &mut call
+    {
         *name = "read_file".into();
         *arguments = r#"{"path":"before.rs"}"#.into();
     }
@@ -2194,31 +3252,54 @@ fn sampling_freshness_notice_never_copies_tool_output() {
         if let ResponseItem::FunctionCallOutput { output, .. } = &mut output {
             output.success = Some(name == "read_tool_output");
         }
-        let canonical: Arc<[ResponseItem]> = Arc::from([
-            named_function_call("parent", name), output.clone(),
-        ]);
+        let canonical: Arc<[ResponseItem]> =
+            Arc::from([named_function_call("parent", name), output.clone()]);
         let mut state = ToolHistoryState::default();
-        state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-            Some(before.clone()), &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-before/source.rs"), false)]),
-        ).unwrap());
-        state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-            Some(after.clone()), &text_output("nested", nested_text.into()),
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after/current.rs"), false)]),
-        ).unwrap());
-        assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
-            parent_call_id: "parent".into(), call_id: "nested".into(), output: nested_text.into(),
-        }.apply(&mut state));
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(before.clone()),
+                &output,
+                BTreeSet::from([SourceDependencyV1::new(
+                    Path::new("/repo-before/source.rs"),
+                    false,
+                )]),
+            )
+            .unwrap(),
+        );
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(after.clone()),
+                &text_output("nested", nested_text.into()),
+                BTreeSet::from([SourceDependencyV1::new(
+                    Path::new("/repo-after/current.rs"),
+                    false,
+                )]),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+                parent_call_id: "parent".into(),
+                call_id: "nested".into(),
+                output: nested_text.into(),
+            }
+            .apply(&mut state)
+        );
 
         // Sampling must keep bytes in the original tool message, not its notice.
         for pass in 0..2 {
             let sampled = state.project_sampling_with_workspace_cache(
-                Arc::clone(&canonical), Some(&after), &cache,
+                Arc::clone(&canonical),
+                Some(&after),
+                &cache,
             );
             assert!(sampled.items.starts_with(&canonical));
             assert_eq!(sampled.items.len(), canonical.len() + 1);
             // Each pass projects twice; only the very first projection computes.
-            assert_eq!(state.workspace_projection_cache.lock().unwrap()["parent"].hits, pass * 2);
+            assert_eq!(
+                state.workspace_projection_cache.lock().unwrap()["parent"].hits,
+                pass * 2
+            );
             let memoized = {
                 let cached = state.workspace_projection_cache.lock().unwrap();
                 cached["parent"].replacement.clone().unwrap()
@@ -2229,7 +3310,10 @@ fn sampling_freshness_notice_never_copies_tool_output() {
             let delivered = serde_json::to_string(content).unwrap();
             for rendered in [&memoized, &delivered] {
                 for copied in ["permission denied", "current nested source", "session_id"] {
-                    assert!(!rendered.contains(copied), "{copied} was copied: {rendered}");
+                    assert!(
+                        !rendered.contains(copied),
+                        "{copied} was copied: {rendered}"
+                    );
                 }
             }
             let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
@@ -2268,7 +3352,8 @@ async fn workspace_evidence_is_stale_in_a_different_repository() {
             &cache,
             root.path(),
             WorkspaceEvidenceObservation::from_response_item(
-                Some(captured.clone()), &output,
+                Some(captured.clone()),
+                &output,
                 BTreeSet::from([SourceDependencyV1::new(&source, false)]),
             )
             .expect("text evidence observation"),
@@ -2465,7 +3550,10 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
     assert_eq!(notice["stale_workspace_evidence"], true);
     // Only the origin's captured revision can differ from the current one here.
     assert_eq!(notice["reason_code"], "workspace_identity_changed");
-    assert_eq!(state.workspace_evidence[origin_call_id].revision, Some(captured));
+    assert_eq!(
+        state.workspace_evidence[origin_call_id].revision,
+        Some(captured)
+    );
     assert_eq!(notice["historical_authenticity"], "authenticated");
     assert_eq!(notice["valid_for_current_workspace"], false);
     assert!(!state.workspace_evidence[origin_call_id].is_current(Some(&changed), Some(&cache)));
@@ -2603,7 +3691,12 @@ fn workspace_error_outputs_preserve_diagnostics_with_historical_applicability() 
     let notice = &notices[0];
     assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
     assert_eq!(notice["valid_for_current_workspace"], false);
-    assert!(notice["failure_applicability"].as_str().unwrap().contains("current applicability is unverified"));
+    assert!(
+        notice["failure_applicability"]
+            .as_str()
+            .unwrap()
+            .contains("current applicability is unverified")
+    );
     assert!(!notice.to_string().contains("permission denied"));
     assert_eq!(response_item_output_success(&canonical[1]), Some(false));
 }
@@ -2802,7 +3895,10 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
     let notice = &notices[0];
     assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["workspace_evidence_freshness"], "changed");
-    assert!(notice.get("qualification").is_none(), "freshness is stated once");
+    assert!(
+        notice.get("qualification").is_none(),
+        "freshness is stated once"
+    );
     assert_eq!(notice["historical_authenticity"], "authenticated");
     cache.note_host_workspace_mutation();
     let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
@@ -2829,7 +3925,11 @@ async fn external_source_evidence_survives_repo_edits_but_not_attachment_changes
         )
         .await
         .expect("native watches for repository and attachment");
-    assert_eq!(observations.len(), 2, "no dependency may be silently dropped");
+    assert_eq!(
+        observations.len(),
+        2,
+        "no dependency may be silently dropped"
+    );
     let mut before = workspace_identity("before");
     before.repository_root = Some(root.path().to_string_lossy().into_owned());
     let mut after = workspace_identity("unrelated-repo-edit");
@@ -2930,11 +4030,15 @@ async fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     assert_eq!(current.len(), 1);
     assert_eq!(current[0]["call_id"], "b");
     assert_eq!(current[0]["workspace_evidence_freshness"], "current");
-    assert_eq!(current[0]["source_scope"]["dependencies"][0]["path"],
-        SourceDependencyV1::new(&path_b, false).path);
+    assert_eq!(
+        current[0]["source_scope"]["dependencies"][0]["path"],
+        SourceDependencyV1::new(&path_b, false).path
+    );
     assert_eq!(notice["stale_nested_results"][0]["call_id"], "a");
-    assert_eq!(notice["stale_nested_results"][0]["source_scope"]["dependencies"][0]["path"],
-        SourceDependencyV1::new(&path_a, false).path);
+    assert_eq!(
+        notice["stale_nested_results"][0]["source_scope"]["dependencies"][0]["path"],
+        SourceDependencyV1::new(&path_a, false).path
+    );
     // Nested bytes, current or stale, stay in the parent's own tool message.
     assert!(current[0].get("output").is_none());
     let rendered = notice.to_string();
@@ -3131,7 +4235,10 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
         ]);
         for directory in ["", "codex-rs"] {
             for name in [".gitignore", ".ignore", ".rgignore"] {
-                paths.insert(SourceDependencyV1::new(&cwd.join(directory).join(name), true));
+                paths.insert(SourceDependencyV1::new(
+                    &cwd.join(directory).join(name),
+                    true,
+                ));
             }
         }
         paths
@@ -3302,7 +4409,10 @@ fn select_string_named_pattern_retains_positional_paths() {
         &["-Path", "src/second.rs", "needle"],
     ];
     for case in cases {
-        let arguments = case.iter().map(|word| (*word).to_string()).collect::<Vec<_>>();
+        let arguments = case
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
             powershell_path_operands(&arguments, &["-pattern"], true),
             Some(vec!["src/second.rs".to_string()]),
@@ -3314,9 +4424,18 @@ fn select_string_named_pattern_retains_positional_paths() {
         Some(Vec::new()),
         "a named pattern without a path remains a pipeline filter"
     );
-    for case in [&["-Pattern"][..], &["-Pattern", "-Path", "src/second.rs"][..]] {
-        let arguments = case.iter().map(|word| (*word).to_string()).collect::<Vec<_>>();
-        assert_eq!(powershell_path_operands(&arguments, &["-pattern"], true), None);
+    for case in [
+        &["-Pattern"][..],
+        &["-Pattern", "-Path", "src/second.rs"][..],
+    ] {
+        let arguments = case
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            powershell_path_operands(&arguments, &["-pattern"], true),
+            None
+        );
     }
     let wildcard = powershell_path_operands(
         &["-Pattern".into(), "needle".into(), "src/*.rs".into()],
@@ -3347,7 +4466,9 @@ async fn select_string_named_pattern_batch_invalidates_when_positional_path_chan
             "cmd": format!("Get-Content src/first.rs; {search}"),
             "shell": "powershell",
         });
-        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
         let classification = classify_workspace_tool_call("exec_command", &payload, cwd);
         assert_eq!(
             classification.source_dependencies,
@@ -3394,7 +4515,10 @@ async fn select_string_named_pattern_batch_invalidates_when_positional_path_chan
         let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
         assert_eq!(notices.len(), 1, "{search}");
         assert_eq!(notices[0]["stale_workspace_evidence"], true, "{search}");
-        assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated", "{search}");
+        assert_eq!(
+            notices[0]["reason_code"], "source_dependencies_invalidated",
+            "{search}"
+        );
     }
 }
 
@@ -3449,9 +4573,18 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
     let dependencies = source_dependencies_for_tool_call("cargo_test", &payload, temp.path());
     let receipt = serde_json::json!({"runner":"rust_test_runner", "selected_packages":["app"],
         "dependency_manifest":{"source_roots":[temp.path()]}});
-    assert_eq!(runner_receipt_dependencies(&receipt, temp.path()), dependencies);
-    assert!(runner_receipt_dependencies(&serde_json::json!({"runner":"rust_test_runner",
-        "selected_packages":["missing"], "dependency_manifest":{"source_roots":[temp.path()]}}), temp.path()).is_empty());
+    assert_eq!(
+        runner_receipt_dependencies(&receipt, temp.path()),
+        dependencies
+    );
+    assert!(
+        runner_receipt_dependencies(
+            &serde_json::json!({"runner":"rust_test_runner",
+        "selected_packages":["missing"], "dependency_manifest":{"source_roots":[temp.path()]}}),
+            temp.path()
+        )
+        .is_empty()
+    );
     let package_index = cargo_package_index(temp.path());
     assert!(
         dependencies.contains(&SourceDependencyV1::new(&temp.path().join("app"), true,)),
@@ -3464,19 +4597,37 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
         serde_json::json!({"cmd":"cargo nextest run --package=app"}),
         serde_json::json!({"program":"cargo", "args":["test", "-papp", "--", "--package=ignored-test-arg"]}),
     ] {
-        let payload = ToolPayload::Function { arguments: arguments.to_string() };
-        assert_eq!(source_dependencies_for_tool_call("exec_command", &payload, temp.path()), dependencies);
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        assert_eq!(
+            source_dependencies_for_tool_call("exec_command", &payload, temp.path()),
+            dependencies
+        );
     }
     let runner = serde_json::from_value(serde_json::json!({
         "programs":["python"], "prefixes":[["run-lane"]], "passthrough_after":"--",
         "allow_extra_args":true,
-    })).unwrap();
+    }))
+    .unwrap();
     let command = ["python", "run-lane", "--", "cargo", "test", "-p", "app"].map(str::to_owned);
-    assert_eq!(runner_source_dependencies(&command, temp.path(), &[runner]), Some(dependencies));
-    for args in [vec!["test"], vec!["test", "--workspace", "-p", "app"],
+    assert_eq!(
+        runner_source_dependencies(&command, temp.path(), &[runner]),
+        Some(dependencies)
+    );
+    for args in [
+        vec!["test"],
+        vec!["test", "--workspace", "-p", "app"],
         vec!["test", "--manifest-path", "other/Cargo.toml", "-p", "app"],
-        vec!["test", "-p", "unknown"]] {
-        assert!(cargo_argv_dependencies(&args.into_iter().map(str::to_owned).collect::<Vec<_>>(), temp.path()).is_empty());
+        vec!["test", "-p", "unknown"],
+    ] {
+        assert!(
+            cargo_argv_dependencies(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                temp.path()
+            )
+            .is_empty()
+        );
     }
 }
 
@@ -3490,32 +4641,64 @@ fn cargo_local_overrides_do_not_leave_validation_evidence_current() {
         std::fs::create_dir_all(package.join("src")).unwrap();
         std::fs::write(package.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
     }
-    std::fs::write(workspace.join("app/Cargo.toml"),
-        "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\nsupport='0.1.0'\n").unwrap();
+    std::fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\nsupport='0.1.0'\n",
+    )
+    .unwrap();
     std::fs::write(external.join("Cargo.toml"),
         "[package]\nname='support'\nversion='0.1.0'\n[dependencies]\ntransitive={path='../transitive'}\n").unwrap();
-    std::fs::write(transitive.join("Cargo.toml"),
-        "[package]\nname='transitive'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(
+        transitive.join("Cargo.toml"),
+        "[package]\nname='transitive'\nversion='0.1.0'\n",
+    )
+    .unwrap();
     // Cargo local source overrides participate in the selected build even
     // though the selected package declares a registry dependency, not a path.
     std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
     // Without an override this fixture has a known scope, so the unknown
     // scopes below come from the override and not from the fixture.
-    std::fs::write(workspace.join("Cargo.toml"),
-        "[workspace]\nmembers=['app']\nresolver='2'\n").unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app']\nresolver='2'\n",
+    )
+    .unwrap();
     let plain = ToolPayload::Function {
         arguments: serde_json::json!({"package":"app", "workdir":workspace}).to_string(),
     };
-    assert!(!classify_workspace_tool_call("cargo_test", &plain, &workspace)
-        .source_dependencies.is_empty());
+    assert!(
+        !classify_workspace_tool_call("cargo_test", &plain, &workspace)
+            .source_dependencies
+            .is_empty()
+    );
     for (overrides, config_name, config) in [
-        ("[patch.crates-io]\nsupport={path='../external'}\n", "config.toml", ""),
-        ("[replace]\n'support:0.1.0'={path='../external'}\n", "config.toml", ""),
+        (
+            "[patch.crates-io]\nsupport={path='../external'}\n",
+            "config.toml",
+            "",
+        ),
+        (
+            "[replace]\n'support:0.1.0'={path='../external'}\n",
+            "config.toml",
+            "",
+        ),
         ("", "config.toml", "paths=['../external']\n"),
         ("", "config", "paths=['../external']\n"),
-        ("", "config.toml", "[patch.crates-io]\nsupport={path='../external'}\n"),
-        ("", "config.toml", "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n"),
-        ("", "config", "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n"),
+        (
+            "",
+            "config.toml",
+            "[patch.crates-io]\nsupport={path='../external'}\n",
+        ),
+        (
+            "",
+            "config.toml",
+            "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n",
+        ),
+        (
+            "",
+            "config",
+            "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n",
+        ),
     ] {
         for name in ["config", "config.toml"] {
             match std::fs::remove_file(workspace.join(".cargo").join(name)) {
@@ -3525,14 +4708,21 @@ fn cargo_local_overrides_do_not_leave_validation_evidence_current() {
             }
         }
         std::fs::write(workspace.join(".cargo").join(config_name), config).unwrap();
-        std::fs::write(workspace.join("Cargo.toml"),
-            format!("[workspace]\nmembers=['app']\nresolver='2'\n{overrides}")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            format!("[workspace]\nmembers=['app']\nresolver='2'\n{overrides}"),
+        )
+        .unwrap();
         let arguments = serde_json::json!({"package":"app", "workdir":workspace});
-        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
         let classification = classify_workspace_tool_call("cargo_test", &payload, &workspace);
         assert!(classification.observes_workspace);
-        assert!(classification.source_dependencies.is_empty(),
-            "unresolved local overrides must use unknown scope: {overrides} {config}");
+        assert!(
+            classification.source_dependencies.is_empty(),
+            "unresolved local overrides must use unknown scope: {overrides} {config}"
+        );
         for changed_path in [external.join("src/lib.rs"), transitive.join("src/lib.rs")] {
             let output = text_output("validation", "test result: ok. 1 passed".into());
             let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -3540,16 +4730,26 @@ fn cargo_local_overrides_do_not_leave_validation_evidence_current() {
                 output.clone(),
             ]);
             let mut state = ToolHistoryState::default();
-            state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-                Some(workspace_identity("captured")), &output,
-                classification.source_dependencies.clone(),
-            ).unwrap());
+            state.register_workspace_evidence(
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(workspace_identity("captured")),
+                    &output,
+                    classification.source_dependencies.clone(),
+                )
+                .unwrap(),
+            );
             let changed = workspace_identity("override-source-edited");
-            state.invalidate_source_dependencies(Some(&BTreeSet::from([changed_path.clone()])), Some(&changed));
+            state.invalidate_source_dependencies(
+                Some(&BTreeSet::from([changed_path.clone()])),
+                Some(&changed),
+            );
             let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
             let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
-            assert_eq!(notices.len(), 1,
-                "an edited Cargo override must not remain current: {overrides} {changed_path:?}");
+            assert_eq!(
+                notices.len(),
+                1,
+                "an edited Cargo override must not remain current: {overrides} {changed_path:?}"
+            );
             assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
             assert_eq!(notices[0]["valid_for_current_workspace"], false);
             assert_eq!(notices[0]["historical_authenticity"], "authenticated");
@@ -3563,38 +4763,70 @@ fn cargo_configuration_guards_preserve_plain_graph_and_reject_opaque_inputs() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(workspace.join("app")).unwrap();
     std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
-    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=['app']\n").unwrap();
-    std::fs::write(workspace.join("app/Cargo.toml"), "[package]\nname='app'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\n",
+    )
+    .unwrap();
     let arguments = serde_json::json!({"package":"app"});
     let expected = cargo_test_dependencies(&arguments, &workspace);
     assert!(expected.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
     let config = root.path().join(".cargo/config.toml");
-    for source in ["", "paths=[]\n[build]\njobs=2\n",
+    for source in [
+        "",
+        "paths=[]\n[build]\njobs=2\n",
         "[patch.crates-io]\nsupport={git='https://example.com/support', rev='revision'}\n",
-        "[source.crates-io]\nreplace-with='remote'\n[source.remote]\nregistry='https://example.com/index'\n"] {
+        "[source.crates-io]\nreplace-with='remote'\n[source.remote]\nregistry='https://example.com/index'\n",
+    ] {
         std::fs::write(&config, source).unwrap();
         assert_eq!(cargo_test_dependencies(&arguments, &workspace), expected);
     }
-    for source in ["paths=['external']\n".as_bytes(),
+    for source in [
+        "paths=['external']\n".as_bytes(),
         "[patch.crates-io]\nsupport={path='external'}\n".as_bytes(),
-        "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n".as_bytes(),
-        "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n".as_bytes(),
-        b"paths=[", &[0xff]] {
+        "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n"
+            .as_bytes(),
+        "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n"
+            .as_bytes(),
+        b"paths=[",
+        &[0xff],
+    ] {
         std::fs::write(&config, source).unwrap();
         assert!(cargo_test_dependencies(&arguments, &workspace).is_empty());
     }
     std::fs::write(&config, "").unwrap();
-    for options in [vec!["--config", "patch.crates-io.support.path='external'"],
-        vec!["--config=patch.crates-io.support.path='external'"]] {
-        let cargo_args = ["test", "-p", "app"].into_iter().chain(options).map(str::to_owned).collect::<Vec<_>>();
-        assert!(cargo_test_dependencies(&serde_json::json!({"package":"app", "cargo_args":cargo_args}), &workspace).is_empty());
+    for options in [
+        vec!["--config", "patch.crates-io.support.path='external'"],
+        vec!["--config=patch.crates-io.support.path='external'"],
+    ] {
+        let cargo_args = ["test", "-p", "app"]
+            .into_iter()
+            .chain(options)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            cargo_test_dependencies(
+                &serde_json::json!({"package":"app", "cargo_args":cargo_args}),
+                &workspace
+            )
+            .is_empty()
+        );
         let payload = ToolPayload::Function {
             arguments: serde_json::json!({"program":"cargo", "args":cargo_args}).to_string(),
         };
         assert!(source_dependencies_for_tool_call("exec_command", &payload, &workspace).is_empty());
     }
-    let after_separator = ["test", "-p", "app", "--", "--config", "test-argument"].map(str::to_owned);
-    assert_eq!(cargo_argv_dependencies(&after_separator, &workspace), expected);
+    let after_separator =
+        ["test", "-p", "app", "--", "--config", "test-argument"].map(str::to_owned);
+    assert_eq!(
+        cargo_argv_dependencies(&after_separator, &workspace),
+        expected
+    );
     // Exercise the production config reader with a home outside the invocation
     // ancestry, without mutating the process environment shared by other tests.
     let cargo_home = root.path().join("cargo-home");
@@ -3603,20 +4835,31 @@ fn cargo_configuration_guards_preserve_plain_graph_and_reject_opaque_inputs() {
     let config_scope = cargo_configuration_dependencies(&workspace, Some(&cargo_home)).unwrap();
     for name in ["config", "config.toml"] {
         let path = cargo_home.join(name);
-        assert!(config_scope.contains(&SourceDependencyV1::new(&path, false)),
-            "absent Cargo home config must be watched too");
+        assert!(
+            config_scope.contains(&SourceDependencyV1::new(&path, false)),
+            "absent Cargo home config must be watched too"
+        );
         std::fs::write(&path, "[build]\njobs=2\n").unwrap();
-        assert_eq!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)), Some(config_scope.clone()));
-        for source in ["paths=['../external']\n", "[patch.crates-io]\nsupport={path='../external'}\n",
+        assert_eq!(
+            cargo_configuration_dependencies(&workspace, Some(&cargo_home)),
+            Some(config_scope.clone())
+        );
+        for source in [
+            "paths=['../external']\n",
+            "[patch.crates-io]\nsupport={path='../external'}\n",
             "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n",
-            "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n", "paths=["] {
+            "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n",
+            "paths=[",
+        ] {
             std::fs::write(&path, source).unwrap();
             assert!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none());
         }
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none(),
-            "an unreadable config cannot prove a complete graph");
+        assert!(
+            cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none(),
+            "an unreadable config cannot prove a complete graph"
+        );
         std::fs::remove_dir(&path).unwrap();
     }
 }
@@ -3680,8 +4923,11 @@ async fn cargo_configuration_changes_invalidate_observed_validation() {
                 Some(&BTreeSet::from([workspace.join("notes.txt")])),
                 Some(&unrelated),
             );
-            assert_eq!(freshness_notices(&state, &canonical, Some(&unrelated), &cache).len(), 1,
-                "manifest attribution cannot prove an external input is unrelated");
+            assert_eq!(
+                freshness_notices(&state, &canonical, Some(&unrelated), &cache).len(),
+                1,
+                "manifest attribution cannot prove an external input is unrelated"
+            );
             let changed = workspace_identity_at(temp.path(), "configuration-changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
@@ -3707,10 +4953,20 @@ async fn verified_named_runner_scope_uses_manifest_target_package_graph() {
     std::fs::create_dir_all(workspace.join("app")).unwrap();
     std::fs::create_dir_all(workspace.join("tui")).unwrap();
     std::fs::create_dir_all(root.path().join("scripts")).unwrap();
-    for name in ["helper", "prefix-helper"] { std::fs::create_dir_all(workspace.join(name)).unwrap(); }
-    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=[\"app\",\"tui\",\"helper\",\"prefix-helper\"]\n").unwrap();
+    for name in ["helper", "prefix-helper"] {
+        std::fs::create_dir_all(workspace.join(name)).unwrap();
+    }
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=[\"app\",\"tui\",\"helper\",\"prefix-helper\"]\n",
+    )
+    .unwrap();
     for name in ["app", "tui", "helper", "prefix-helper"] {
-        std::fs::write(workspace.join(name).join("Cargo.toml"), format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n")).unwrap();
+        std::fs::write(
+            workspace.join(name).join("Cargo.toml"),
+            format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n"),
+        )
+        .unwrap();
     }
     let manifest = workspace.join(".config/kd4-rust-tests.toml");
     std::fs::write(&manifest, "version=1\n[helpers.runtime]\npackage=\"helper\"\nbin=\"runtime\"\n[helpers.prefix]\npackage=\"prefix-helper\"\nbin=\"prefix\"\n[targets.app_lib]\npackage=\"app\"\nhelpers=[\"runtime\"]\nhelpers_by_test_prefix={ 'suite::'=[\"prefix\"] }\n[targets.tui_lib]\npackage=\"tui\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n[gates.other]\nsteps=[{target=\"tui_lib\"}]\n").unwrap();
@@ -3719,50 +4975,109 @@ async fn verified_named_runner_scope_uses_manifest_target_package_graph() {
         "operations":["test"], "receipt_runner":"rust_test_runner", "allow_extra_args":true,
     })).unwrap();
     runner.path_context = Some((root.path().to_path_buf(), root.path().to_path_buf()));
-    for names in [vec!["small", "other"], vec!["other", "small"], vec!["small", "other", "small"]] {
-        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"].into_iter()
-            .chain(names).map(str::to_owned).collect::<Vec<_>>();
+    for names in [
+        vec!["small", "other"],
+        vec!["other", "small"],
+        vec!["small", "other", "small"],
+    ] {
+        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"]
+            .into_iter()
+            .chain(names)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()]).unwrap();
         for package in ["app", "tui"] {
-            assert!(scope.contains(&SourceDependencyV1::new(&workspace.join(package), true)),
-                "every selected gate contributes dependencies: {command:?} missing {package}");
+            assert!(
+                scope.contains(&SourceDependencyV1::new(&workspace.join(package), true)),
+                "every selected gate contributes dependencies: {command:?} missing {package}"
+            );
         }
     }
-    let unknown = ["python", "scripts/build/rust_test_runner.py", "run-gate", "small", "missing"]
-        .map(str::to_owned);
-    assert!(runner_source_dependencies(&unknown, root.path(), &[runner.clone()])
-        .is_none_or(|scope| scope.is_empty()), "a partial gate selection is not complete scope");
+    let unknown = [
+        "python",
+        "scripts/build/rust_test_runner.py",
+        "run-gate",
+        "small",
+        "missing",
+    ]
+    .map(str::to_owned);
+    assert!(
+        runner_source_dependencies(&unknown, root.path(), &[runner.clone()])
+            .is_none_or(|scope| scope.is_empty()),
+        "a partial gate selection is not complete scope"
+    );
     for (operation, name) in [("run-target", "app_lib"), ("run-gate", "small")] {
-        for options in [vec![], vec!["--profile", "fast"], vec!["--profile=fast"],
-            vec!["--no-fail-fast", "--command-timeout-seconds", "5", "--target-dir", "target",
-                "--success-output=always"]] {
-            let command = ["python", "scripts/build/rust_test_runner.py", operation].into_iter()
-                .chain(options).chain([name]).map(str::to_owned).collect::<Vec<_>>();
+        for options in [
+            vec![],
+            vec!["--profile", "fast"],
+            vec!["--profile=fast"],
+            vec![
+                "--no-fail-fast",
+                "--command-timeout-seconds",
+                "5",
+                "--target-dir",
+                "target",
+                "--success-output=always",
+            ],
+        ] {
+            let command = ["python", "scripts/build/rust_test_runner.py", operation]
+                .into_iter()
+                .chain(options)
+                .chain([name])
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
             let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()])
-                .unwrap_or_else(|| panic!("documented runner selection lost its scope: {command:?}"));
+                .unwrap_or_else(|| {
+                    panic!("documented runner selection lost its scope: {command:?}")
+                });
             assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
             assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)));
             assert!(scope.contains(&SourceDependencyV1::new(&manifest, false)));
             for helper in ["helper", "prefix-helper"] {
-                assert!(scope.contains(&SourceDependencyV1::new(&workspace.join(helper), true)),
-                    "declared helper binaries are test inputs even without a Cargo dependency edge");
+                assert!(
+                    scope.contains(&SourceDependencyV1::new(&workspace.join(helper), true)),
+                    "declared helper binaries are test inputs even without a Cargo dependency edge"
+                );
             }
         }
     }
-    for selection in [vec!["--profile"], vec!["--profile=", "small"],
-        vec!["--profile", "--no-fail-fast", "small"], vec!["--unknown", "small"],
-        vec!["small", "--unknown"], vec!["--command-timeout-seconds"]] {
-        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"].into_iter()
-            .chain(selection).map(str::to_owned).collect::<Vec<_>>();
-        assert!(runner_source_dependencies(&command, root.path(), &[runner.clone()])
-            .is_none_or(|scope| scope.is_empty()), "unknown or missing option value: {command:?}");
+    for selection in [
+        vec!["--profile"],
+        vec!["--profile=", "small"],
+        vec!["--profile", "--no-fail-fast", "small"],
+        vec!["--unknown", "small"],
+        vec!["small", "--unknown"],
+        vec!["--command-timeout-seconds"],
+    ] {
+        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"]
+            .into_iter()
+            .chain(selection)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            runner_source_dependencies(&command, root.path(), &[runner.clone()])
+                .is_none_or(|scope| scope.is_empty()),
+            "unknown or missing option value: {command:?}"
+        );
     }
-    let filtered = ["python", "scripts/build/rust_test_runner.py", "run-target", "--all", "app_lib",
-        "-E", "test(run-gate)", "--", "other"].map(str::to_owned);
+    let filtered = [
+        "python",
+        "scripts/build/rust_test_runner.py",
+        "run-target",
+        "--all",
+        "app_lib",
+        "-E",
+        "test(run-gate)",
+        "--",
+        "other",
+    ]
+    .map(str::to_owned);
     let scope = runner_source_dependencies(&filtered, root.path(), &[runner]).unwrap();
     assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
-    assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)),
-        "target filter remainder does not select another gate");
+    assert!(
+        !scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)),
+        "target filter remainder does not select another gate"
+    );
     // These are dependencies of the runner implementation, not assertions
     // about what tests its output claims passed. Exercise invalidation through
     // the history owner for both Python support and runtime helper changes.
@@ -3771,12 +5086,25 @@ async fn verified_named_runner_scope_uses_manifest_target_package_graph() {
     let output = text_output("runner", "recorded test execution".into());
     let items: Arc<[ResponseItem]> = Arc::from([function_call("runner"), output.clone()]);
     let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(watched(&cache, root.path(),
-        WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), &output, scope).unwrap()
+    state.register_workspace_evidence(
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(revision.clone()),
+                &output,
+                scope,
+            )
+            .unwrap()
             .with_source_scope_complete(false),
-    ).await);
-    assert_eq!(freshness_notices(&state, &items, Some(&revision), &cache).len(), 1,
-        "runner package attribution is not an exhaustive compiler input set");
+        )
+        .await,
+    );
+    assert_eq!(
+        freshness_notices(&state, &items, Some(&revision), &cache).len(),
+        1,
+        "runner package attribution is not an exhaustive compiler input set"
+    );
     for changed in [
         root.path().join("scripts/common/process_owner.py"),
         root.path().join("scripts/build/rust_tool_env.py"),
@@ -3785,8 +5113,14 @@ async fn verified_named_runner_scope_uses_manifest_target_package_graph() {
         workspace.join("prefix-helper/src/main.rs"),
     ] {
         let mut invalidated = state.clone();
-        assert!(invalidated.invalidate_source_dependencies(Some(&BTreeSet::from([changed.clone()])), Some(&revision)),
-            "runner input must invalidate captured proof: {}", changed.display());
+        assert!(
+            invalidated.invalidate_source_dependencies(
+                Some(&BTreeSet::from([changed.clone()])),
+                Some(&revision)
+            ),
+            "runner input must invalidate captured proof: {}",
+            changed.display()
+        );
         let notices = freshness_notices(&invalidated, &items, Some(&revision), &cache);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0]["valid_for_current_workspace"], false);
@@ -4061,18 +5395,29 @@ fn continuation_projection_reuses_unmodified_prepared_storage() {
         let call_id = format!("shared-{index}");
         state.register_non_workspace_code_mode_call(call_id.clone());
         let mut extended = items.to_vec();
-        extended.extend([function_call(&call_id), text_output(&call_id, "result".into())]);
+        extended.extend([
+            function_call(&call_id),
+            text_output(&call_id, "result".into()),
+        ]);
         items = extended.into();
-        let projection = state.project_continuation_with_workspace_cache(
-            &anchor, Arc::clone(&items), None, &workspace,
-        ).unwrap();
+        let projection = state
+            .project_continuation_with_workspace_cache(
+                &anchor,
+                Arc::clone(&items),
+                None,
+                &workspace,
+            )
+            .unwrap();
         assert!(Arc::ptr_eq(&projection.items, &items));
         assert!(Arc::ptr_eq(&projection.unreplaced_items, &items));
-        anchor = SamplingProjectionAnchor { prepared_items: Arc::clone(&items), projection };
+        anchor = SamplingProjectionAnchor {
+            prepared_items: Arc::clone(&items),
+            projection,
+        };
     }
-    let retry = state.project_continuation_with_workspace_cache(
-        &anchor, Arc::clone(&items), None, &workspace,
-    ).unwrap();
+    let retry = state
+        .project_continuation_with_workspace_cache(&anchor, Arc::clone(&items), None, &workspace)
+        .unwrap();
     assert!(Arc::ptr_eq(&retry.items, &items));
 
     // A distinct primary projection must still be extended, while its unchanged
@@ -4082,11 +5427,14 @@ fn continuation_projection_reuses_unmodified_prepared_storage() {
     anchor.projection.items = projected.into();
     state.register_non_workspace_code_mode_call("last".into());
     let mut extended = items.to_vec();
-    extended.extend([function_call("last"), text_output("last", "last result".into())]);
+    extended.extend([
+        function_call("last"),
+        text_output("last", "last result".into()),
+    ]);
     let extended: Arc<[ResponseItem]> = extended.into();
-    let continued = state.project_continuation_with_workspace_cache(
-        &anchor, Arc::clone(&extended), None, &workspace,
-    ).unwrap();
+    let continued = state
+        .project_continuation_with_workspace_cache(&anchor, Arc::clone(&extended), None, &workspace)
+        .unwrap();
     assert!(continued.items.starts_with(&anchor.projection.items));
     assert!(!Arc::ptr_eq(&continued.items, &extended));
     assert!(Arc::ptr_eq(&continued.unreplaced_items, &extended));
@@ -4315,7 +5663,8 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
     tracked.refresh_derived();
     state.register(tracked);
     assert_eq!(
-        state.artifact_reference_positions(&[text_output("sidecar", sidecar.0.clone())])
+        state
+            .artifact_reference_positions(&[text_output("sidecar", sidecar.0.clone())])
             .into_iter()
             .map(|(call_id, (std::cmp::Reverse(index), _))| (call_id, index))
             .collect::<BTreeMap<_, _>>(),
@@ -4413,22 +5762,45 @@ async fn artifact_recovery_marks_persist_until_history_retires_them() {
         record.artifact_id = artifact.artifact_id().unwrap();
         record.artifact_bytes = canonical.exact_bytes;
         record.artifact_sha256 = canonical.sha256;
-        record.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+        record.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".into(),
+            ordinal: 1,
+        });
         state.register(record);
     }
-    assert!(!ToolHistoryMutation::MarkArtifactRecovered { artifact_id: "unknown".into() }.apply(&mut state));
-    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
+    assert!(
+        !ToolHistoryMutation::MarkArtifactRecovered {
+            artifact_id: "unknown".into()
+        }
+        .apply(&mut state)
+    );
+    persist_tool_history_state(temp.path(), "thread", &state)
+        .await
+        .unwrap();
     let mutation = ToolHistoryMutation::MarkArtifactRecovered {
         artifact_id: state.candidates["old-hot"].artifact_id.clone(),
     };
     assert!(mutation.apply(&mut state));
-    assert!(!mutation.apply(&mut state), "repeated recovery must not grow the ledger");
-    persist_tool_history_mutations(temp.path(), "thread", "writer", &[(1, mutation)]).await.unwrap();
+    assert!(
+        !mutation.apply(&mut state),
+        "repeated recovery must not grow the ledger"
+    );
+    persist_tool_history_mutations(temp.path(), "thread", "writer", &[(1, mutation)])
+        .await
+        .unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
-    assert_eq!(restored.recovered_call_ids, BTreeSet::from(["old-hot".to_string()]));
-    persist_tool_history_state(temp.path(), "thread", &restored).await.unwrap();
+    assert_eq!(
+        restored.recovered_call_ids,
+        BTreeSet::from(["old-hot".to_string()])
+    );
+    persist_tool_history_state(temp.path(), "thread", &restored)
+        .await
+        .unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
-    assert_eq!(restored.recovered_call_ids, BTreeSet::from(["old-hot".to_string()]));
+    assert_eq!(
+        restored.recovered_call_ids,
+        BTreeSet::from(["old-hot".to_string()])
+    );
     let mut retired = restored;
     retired.retain_for_history(&[]);
     assert!(retired.recovered_call_ids.is_empty());
@@ -4810,20 +6182,32 @@ async fn corrupt_journal_record_keeps_checkpoint_and_valid_prefix() {
         temp.path(),
         thread_id,
         "writer",
-        &[(1, register("prefix-call")), (2, register("after-corruption"))],
+        &[
+            (1, register("prefix-call")),
+            (2, register("after-corruption")),
+        ],
     )
     .await
     .expect("persist journal");
     let path = journal_path(temp.path(), thread_id);
     let journal = std::fs::read(&path).expect("read journal");
-    let first_end = journal.iter().position(|byte| *byte == b'\n').expect("first record") + 1;
+    let first_end = journal
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("first record")
+        + 1;
     let mut corrupted = journal[..first_end].to_vec();
     corrupted.extend_from_slice(b"{\"version\":1,\"not\":\"a record\"}\n");
     corrupted.extend_from_slice(&journal[first_end..]);
     std::fs::write(&path, &corrupted).expect("corrupt a complete middle record");
 
     let outcome = load_tool_history_state(temp.path(), thread_id).await;
-    let ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path: _, error } = outcome else {
+    let ToolHistoryLoadOutcome::RecoveredJournalPrefix {
+        state,
+        path: _,
+        error,
+    } = outcome
+    else {
         panic!("expected a recovered journal prefix, got {outcome:?}");
     };
     assert_eq!(
@@ -4841,17 +6225,21 @@ async fn corrupt_journal_record_keeps_checkpoint_and_valid_prefix() {
             state.non_workspace_code_mode_calls
         );
     }
-    let checkpoint: ToolHistoryLedgerFile = serde_json::from_slice(
-        &std::fs::read(ledger_path(temp.path(), thread_id)).unwrap(),
-    ).unwrap();
+    let checkpoint: ToolHistoryLedgerFile =
+        serde_json::from_slice(&std::fs::read(ledger_path(temp.path(), thread_id)).unwrap())
+            .unwrap();
     assert_eq!(checkpoint.journal_sequences.get("writer"), Some(&1));
 
     // Also model a crash after checkpoint commit but before journal retirement.
     std::fs::write(&path, &corrupted).unwrap();
     let (recovered, warning) = load_tool_history_state(temp.path(), thread_id)
-        .await.into_state_and_warning();
+        .await
+        .into_state_and_warning();
     assert!(warning.is_some());
-    assert_eq!(recovered.non_workspace_code_mode_calls, state.non_workspace_code_mode_calls);
+    assert_eq!(
+        recovered.non_workspace_code_mode_calls,
+        state.non_workspace_code_mode_calls
+    );
     assert_eq!(
         expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await)
             .non_workspace_code_mode_calls,
@@ -4868,46 +6256,95 @@ async fn unsupported_history_files_fence_cold_and_cached_writers() {
             let writer = Arc::new(std::sync::Mutex::new(ToolHistoryJournalWriter::default()));
             let mut state = ToolHistoryState::default();
             state.register_non_workspace_code_mode_call("checkpoint".into());
-            persist_tool_history_state_with_writer(temp.path(), thread_id, &state, Arc::clone(&writer))
-                .await.unwrap();
-            let mutations = [(1, ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
-                call_id: "journal".into(),
-            })];
+            persist_tool_history_state_with_writer(
+                temp.path(),
+                thread_id,
+                &state,
+                Arc::clone(&writer),
+            )
+            .await
+            .unwrap();
+            let mutations = [(
+                1,
+                ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                    call_id: "journal".into(),
+                },
+            )];
             persist_tool_history_mutations_with_writer(
-                temp.path(), thread_id, "writer", &mutations, Arc::clone(&writer),
-            ).await.unwrap();
+                temp.path(),
+                thread_id,
+                "writer",
+                &mutations,
+                Arc::clone(&writer),
+            )
+            .await
+            .unwrap();
             let ledger = ledger_path(temp.path(), thread_id);
             let journal = journal_path(temp.path(), thread_id);
             // The new format deliberately cannot decode as the old state or
             // mutation schema, and its version does not fit in a u8.
             let future_path = if future_journal { &journal } else { &ledger };
-            std::fs::write(future_path, b"{\"version\":512,\"future_format\":[1,2,3]}\n").unwrap();
+            std::fs::write(
+                future_path,
+                b"{\"version\":512,\"future_format\":[1,2,3]}\n",
+            )
+            .unwrap();
             let ledger_before = std::fs::read(&ledger).unwrap();
             let journal_before = std::fs::read(&journal).unwrap();
             let outcome = load_tool_history_state(temp.path(), thread_id).await;
-            assert!(matches!(&outcome, ToolHistoryLoadOutcome::UnsupportedVersion { found: 512, .. }));
+            assert!(matches!(
+                &outcome,
+                ToolHistoryLoadOutcome::UnsupportedVersion { found: 512, .. }
+            ));
             let (empty, warning) = outcome.into_state_and_warning();
             assert!(warning.is_some_and(|message| message.contains("unsupported version")));
             let writer = if cached { writer } else { Arc::default() };
             // Exercise the same empty initial checkpoint that startup attempts.
-            assert!(persist_tool_history_state_with_writer(
-                temp.path(), thread_id, &empty, Arc::clone(&writer),
-            ).await.is_err());
-            assert!(persist_tool_history_mutations_with_writer(
-                temp.path(), thread_id, "writer", &mutations, writer,
-            ).await.is_err());
+            assert!(
+                persist_tool_history_state_with_writer(
+                    temp.path(),
+                    thread_id,
+                    &empty,
+                    Arc::clone(&writer),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                persist_tool_history_mutations_with_writer(
+                    temp.path(),
+                    thread_id,
+                    "writer",
+                    &mutations,
+                    writer,
+                )
+                .await
+                .is_err()
+            );
             assert_eq!(std::fs::read(&ledger).unwrap(), ledger_before);
             assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
-            assert_eq!(std::fs::read_dir(ledger.parent().unwrap()).unwrap().count(), 2);
+            assert_eq!(
+                std::fs::read_dir(ledger.parent().unwrap()).unwrap().count(),
+                2
+            );
         }
     }
 }
 
 async fn write_recovery_boundary_fixture(home: &Path, thread_id: &str) -> Vec<u8> {
-    persist_tool_history_mutations(home, thread_id, "writer", &[(
-        1,
-        ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id: "prefix".into() },
-    )]).await.unwrap();
+    persist_tool_history_mutations(
+        home,
+        thread_id,
+        "writer",
+        &[(
+            1,
+            ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "prefix".into(),
+            },
+        )],
+    )
+    .await
+    .unwrap();
     let path = journal_path(home, thread_id);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.extend_from_slice(b"{not-json}\n");
@@ -4918,11 +6355,16 @@ async fn write_recovery_boundary_fixture(home: &Path, thread_id: &str) -> Vec<u8
 async fn assert_recovery_boundary_survives_two_restarts(home: &Path, thread_id: &str) {
     for _ in 0..2 {
         let outcome = load_tool_history_state(home, thread_id).await;
-        assert!(matches!(&outcome,
-            ToolHistoryLoadOutcome::RecoveredJournalPrefix { .. } | ToolHistoryLoadOutcome::Loaded(_)
+        assert!(matches!(
+            &outcome,
+            ToolHistoryLoadOutcome::RecoveredJournalPrefix { .. }
+                | ToolHistoryLoadOutcome::Loaded(_)
         ));
         let (state, _) = outcome.into_state_and_warning();
-        assert_eq!(state.non_workspace_code_mode_calls, BTreeSet::from(["prefix".to_string()]));
+        assert_eq!(
+            state.non_workspace_code_mode_calls,
+            BTreeSet::from(["prefix".to_string()])
+        );
     }
     assert!(!journal_path(home, thread_id).exists());
 }
@@ -4938,10 +6380,16 @@ async fn recovery_checkpoint_failure_keeps_source_until_successful_restart() {
     let ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, error, .. } = outcome else {
         panic!("expected recoverable prefix");
     };
-    assert!(error.contains("injected tool-history persistence failure"), "{error}");
+    assert!(
+        error.contains("injected tool-history persistence failure"),
+        "{error}"
+    );
     assert!(state.non_workspace_code_mode_calls.contains("prefix"));
     assert!(!ledger_path(temp.path(), thread_id).exists());
-    assert_eq!(std::fs::read(journal_path(temp.path(), thread_id)).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(journal_path(temp.path(), thread_id)).unwrap(),
+        bytes
+    );
     drop(failure);
     assert_recovery_boundary_survives_two_restarts(temp.path(), thread_id).await;
 }
@@ -4959,7 +6407,10 @@ async fn recovery_checkpoint_cancellation_keeps_source_until_successful_restart(
     assert!(recovery.await.unwrap_err().is_cancelled());
     drop(pause);
     assert!(!ledger_path(temp.path(), thread_id).exists());
-    assert_eq!(std::fs::read(journal_path(temp.path(), thread_id)).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(journal_path(temp.path(), thread_id)).unwrap(),
+        bytes
+    );
     assert_recovery_boundary_survives_two_restarts(temp.path(), thread_id).await;
 }
 
@@ -5175,18 +6626,27 @@ fn receipt_and_candidate_fingerprints_are_cached_and_reused() {
 #[test]
 fn affected_path_index_preserves_source_dependency_overlap_semantics() {
     let dependencies = [
-        (SourceDependencyV1 {
-            path: "src/exact.rs".to_string(),
-            recursive: false,
-        }, true),
-        (SourceDependencyV1 {
-            path: "src/tree".to_string(),
-            recursive: true,
-        }, true),
-        (SourceDependencyV1 {
-            path: "src/tree/leaf.rs".to_string(),
-            recursive: false,
-        }, false),
+        (
+            SourceDependencyV1 {
+                path: "src/exact.rs".to_string(),
+                recursive: false,
+            },
+            true,
+        ),
+        (
+            SourceDependencyV1 {
+                path: "src/tree".to_string(),
+                recursive: true,
+            },
+            true,
+        ),
+        (
+            SourceDependencyV1 {
+                path: "src/tree/leaf.rs".to_string(),
+                recursive: false,
+            },
+            false,
+        ),
     ];
     let affected_paths = BTreeSet::from([
         "docs/unrelated.md".to_string(),
@@ -5227,7 +6687,10 @@ fn root_source_dependencies_overlap_descendants_without_matching_relative_paths(
         ("/scope", true, "/scope-other/file.rs", false),
         ("/scope", true, "/scope/file.rs", true),
     ] {
-        let dependency = SourceDependencyV1 { path: path.into(), recursive };
+        let dependency = SourceDependencyV1 {
+            path: path.into(),
+            recursive,
+        };
         assert_eq!(source_dependency_overlaps(&dependency, changed), expected);
         assert_eq!(
             affected_paths_overlap_dependency(&BTreeSet::from([changed.into()]), &dependency),
@@ -5238,18 +6701,26 @@ fn root_source_dependencies_overlap_descendants_without_matching_relative_paths(
 
     let path = PathBuf::from("/scope/file.rs");
     let output = serde_json::json!({"path":path, "source_sha256":"snapshot",
-        "canonical_bytes":1, "delivered_ranges":[[0,1]]}).to_string();
+        "canonical_bytes":1, "delivered_ranges":[[0,1]]})
+    .to_string();
     let mut record = candidate("root-read", output);
     record.tool_identity = "read_file".into();
     record.source_dependencies = BTreeSet::from([SourceDependencyV1 {
-        path: "/".into(), recursive: true,
+        path: "/".into(),
+        recursive: true,
     }]);
     let mut state = ToolHistoryState::default();
     state.register(record);
-    assert_eq!(state.read_status(std::slice::from_ref(&path), None, &[])["paths"][0]["status"], "observed");
+    assert_eq!(
+        state.read_status(std::slice::from_ref(&path), None, &[])["paths"][0]["status"],
+        "observed"
+    );
     assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([path.clone()])), None));
     assert!(!state.candidates["root-read"].source_dependencies_current);
-    assert_eq!(state.read_status(&[path], None, &[])["paths"][0]["snapshots"][0]["freshness"], "invalidated");
+    assert_eq!(
+        state.read_status(&[path], None, &[])["paths"][0]["snapshots"][0]["freshness"],
+        "invalidated"
+    );
 }
 
 #[test]
@@ -5495,7 +6966,10 @@ async fn cargo_manifest_read_failures_widen_scope_without_losing_selective_inval
         let initial = freshness_notices(&state, &canonical, Some(&captured), &cache);
         assert_eq!(initial.len(), 1, "{case}");
         if let Some(notice) = initial.first() {
-            assert_eq!(notice["reason_code"], "workspace_freshness_unverified", "{case}");
+            assert_eq!(
+                notice["reason_code"], "workspace_freshness_unverified",
+                "{case}"
+            );
         }
 
         for path in [&unrelated, &transitive.join("lib.rs")] {
@@ -5508,12 +6982,19 @@ async fn cargo_manifest_read_failures_widen_scope_without_losing_selective_inval
             assert_eq!(notices.len(), 1, "{case} {path:?}");
             let notice = &notices[0];
             assert_eq!(notice["call_id"], case);
-            assert_eq!(notice["reason_code"], "source_dependencies_invalidated", "{case}");
+            assert_eq!(
+                notice["reason_code"], "source_dependencies_invalidated",
+                "{case}"
+            );
             assert_eq!(notice["historical_authenticity"], "authenticated", "{case}");
             assert_eq!(notice["valid_for_current_workspace"], false, "{case}");
             assert_eq!(
                 notice["source_scope"]["dependency_scope"],
-                if known_dependencies { "recorded" } else { "unknown" },
+                if known_dependencies {
+                    "recorded"
+                } else {
+                    "unknown"
+                },
                 "{case}"
             );
             assert_eq!(
@@ -5820,17 +7301,28 @@ fn exact_recovery_selectors_survive_restore_into_compaction_metadata() {
     state.register(record);
     let selector = serde_json::json!({"kind": "bytes", "start": 100, "end": 200});
     let mutation = ToolHistoryMutation::RecordArtifactRecovery {
-        artifact_id: artifact_id.clone(), recovery_call_id: "recovery".into(),
+        artifact_id: artifact_id.clone(),
+        recovery_call_id: "recovery".into(),
         selectors: vec![selector.clone()],
     };
     assert!(mutation.apply(&mut state));
     assert!(!mutation.apply(&mut state));
-    let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    let mut restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     restored.refresh_derived_and_indexes();
-    let pin: serde_json::Value = serde_json::from_str(&restored.artifact_pin_payload_for_items(&[
-        function_call("origin"), text_output("origin", bounded_output())
-    ]).unwrap()).unwrap();
-    assert_eq!(pin["artifacts"][0]["recovered_selectors"], serde_json::json!([selector]));
+    let pin: serde_json::Value = serde_json::from_str(
+        &restored
+            .artifact_pin_payload_for_items(&[
+                function_call("origin"),
+                text_output("origin", bounded_output()),
+            ])
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pin["artifacts"][0]["recovered_selectors"],
+        serde_json::json!([selector])
+    );
 }
 
 #[test]
@@ -5844,9 +7336,12 @@ fn verified_evidence_oversized_pin_does_not_block_later_handles() {
         state.register(record);
         items.push(text_output(id, bounded_output()));
         if id == "large" {
-            state.recovered_ranges.insert(id.into(), (0..1000).map(|n|
-                serde_json::json!({"kind":"bytes", "start":n * 2, "end":n * 2 + 1})
-            ).collect());
+            state.recovered_ranges.insert(
+                id.into(),
+                (0..1000)
+                    .map(|n| serde_json::json!({"kind":"bytes", "start":n * 2, "end":n * 2 + 1}))
+                    .collect(),
+            );
         }
         assert!(state.artifact_call_ids.contains_key(&artifact));
     }
@@ -5863,16 +7358,24 @@ fn factored_workspace_metadata_round_trips_every_per_call_exception() {
     let base = serde_json::json!({"historical_authenticity":"authenticated", "workspace_evidence_freshness":"unknown",
         "reason":"matching identities do not verify source dependencies", "reason_code":"workspace_freshness_unverified",
         "stale_workspace_evidence":true, "valid_for_current_workspace":false});
-    let notices = (0..5).map(|index| {
-        let mut notice = base.clone();
-        notice["call_id"] = format!("call-{index}").into();
-        notice["current_nested_results"] = serde_json::json!([{"call_id":format!("nested-{index}")}]);
-        if index == 4 { notice["reason_code"] = "source_dependencies_invalidated".into(); }
-        notice
-    }).collect::<Vec<_>>();
+    let notices = (0..5)
+        .map(|index| {
+            let mut notice = base.clone();
+            notice["call_id"] = format!("call-{index}").into();
+            notice["current_nested_results"] =
+                serde_json::json!([{"call_id":format!("nested-{index}")}]);
+            if index == 4 {
+                notice["reason_code"] = "source_dependencies_invalidated".into();
+            }
+            notice
+        })
+        .collect::<Vec<_>>();
     let factored = factor_workspace_notices(notices.clone());
     assert_eq!(factored["observations"].as_array().unwrap().len(), 1);
-    assert_eq!(factored["notices"][4]["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(
+        factored["notices"][4]["reason_code"],
+        "source_dependencies_invalidated"
+    );
     assert!(factored.to_string().len() < serde_json::json!({"notices":notices}).to_string().len());
     assert_eq!(expand_workspace_notices(factored), notices);
 }
@@ -5893,50 +7396,108 @@ async fn overflow_directory_preserves_every_artifact_after_replacement_and_resum
         record.artifact_id = artifact.artifact_id().unwrap();
         record.artifact_bytes = canonical.exact_bytes;
         record.artifact_sha256 = canonical.sha256;
-        protect_active_tool_history_artifact(home.as_path(), &thread, &record.artifact_id,
-            record.artifact_bytes, &record.artifact_sha256).await.unwrap();
+        protect_active_tool_history_artifact(
+            home.as_path(),
+            &thread,
+            &record.artifact_id,
+            record.artifact_bytes,
+            &record.artifact_sha256,
+        )
+        .await
+        .unwrap();
         state.register(record);
         items.push(text_output(&id, bounded_output()));
     }
-    state.recovered_ranges.insert("source-0".into(), (0..1000).map(|index|
-        serde_json::json!({"kind":"bytes","start":index*2,"end":index*2+1})).collect());
-    let payload = session.compaction_artifact_pins(&state, &items).await.unwrap().unwrap();
+    state.recovered_ranges.insert(
+        "source-0".into(),
+        (0..1000)
+            .map(|index| serde_json::json!({"kind":"bytes","start":index*2,"end":index*2+1}))
+            .collect(),
+    );
+    let payload = session
+        .compaction_artifact_pins(&state, &items)
+        .await
+        .unwrap()
+        .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     let instruction = payload["instruction"].as_str().unwrap();
-    assert!(instruction.contains("only when") && !instruction.contains("for every retained artifact"),
-        "the directory is an on-demand index, not a required read after each compaction: {instruction}");
+    assert!(
+        instruction.contains("only when") && !instruction.contains("for every retained artifact"),
+        "the directory is an on-demand index, not a required read after each compaction: {instruction}"
+    );
     let directory = &payload["directory"];
     let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-        session.codex_home().await.as_path(), &session.thread_id().to_string(), directory["artifact_id"].as_str().unwrap()
-    ).await.unwrap();
+        session.codex_home().await.as_path(),
+        &session.thread_id().to_string(),
+        directory["artifact_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
     let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(recovered["items"].as_array().unwrap().len(), COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5);
-    assert_eq!(recovered["items"].as_array().unwrap().iter().find(|pin| pin["call_id"] == "source-0").unwrap()["recovered_selectors"].as_array().unwrap().len(), 1000);
+    assert_eq!(
+        recovered["items"].as_array().unwrap().len(),
+        COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5
+    );
+    assert_eq!(
+        recovered["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pin| pin["call_id"] == "source-0")
+            .unwrap()["recovered_selectors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1000
+    );
     ToolHistoryMutation::RegisterArtifactOrigin {
         artifact_id: directory["artifact_id"].as_str().unwrap().to_string(),
-        call_id: "context:artifact_directory".into(), bytes: directory["bytes"].as_u64().unwrap(),
+        call_id: "context:artifact_directory".into(),
+        bytes: directory["bytes"].as_u64().unwrap(),
         sha256: directory["sha256"].as_str().unwrap().into(),
-    }.apply(&mut state);
+    }
+    .apply(&mut state);
     let replacement = vec![text_output("directory", payload.to_string())];
     ToolHistoryMutation::RegisterArtifactDirectory {
         artifact_id: directory["artifact_id"].as_str().unwrap().into(),
-        members: recovered["items"].as_array().unwrap().iter()
-            .map(|pin| pin["artifact_id"].as_str().unwrap().to_string()).collect(),
-    }.apply(&mut state);
+        members: recovered["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pin| pin["artifact_id"].as_str().unwrap().to_string())
+            .collect(),
+    }
+    .apply(&mut state);
     let mut unrelated = candidate("created-after-directory", bounded_output());
     unrelated.artifact_id = "unrelated-later-artifact".into();
     state.register(unrelated);
     state.retain_for_history(&replacement);
     assert!(!state.candidates.contains_key("created-after-directory"));
-    assert!(!state.artifact_recovery_directory().as_array().unwrap().iter()
-        .any(|pin| pin["call_id"] == "context:artifact_directory"));
-    let mut resumed: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(
+        !state
+            .artifact_recovery_directory()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pin| pin["call_id"] == "context:artifact_directory")
+    );
+    let mut resumed: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     resumed.refresh_derived_and_indexes();
     resumed = reconcile_tool_history_state(home.as_path(), &thread, resumed).await;
     resumed.retain_for_history(&replacement);
-    assert_eq!(resumed.candidates.len(), COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5);
+    assert_eq!(
+        resumed.candidates.len(),
+        COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5
+    );
     for pin in recovered["items"].as_array().unwrap() {
-        let bytes = read_exact_tool_output_artifact(home.as_path(), &thread, pin["artifact_id"].as_str().unwrap()).await.unwrap();
+        let bytes = read_exact_tool_output_artifact(
+            home.as_path(),
+            &thread,
+            pin["artifact_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["required_fact"], pin["call_id"]);
     }
@@ -5945,12 +7506,18 @@ async fn overflow_directory_preserves_every_artifact_after_replacement_and_resum
 }
 #[test]
 fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
-    let fact = format!("{}\nDECISIVE_FACT: use the canonical byte offset, not the display offset\n{}",
-        "source prelude\n".repeat(80), "source suffix\n".repeat(80));
+    let fact = format!(
+        "{}\nDECISIVE_FACT: use the canonical byte offset, not the display offset\n{}",
+        "source prelude\n".repeat(80),
+        "source suffix\n".repeat(80)
+    );
     let failure = "error: the current implementation addresses normalized bytes\n".repeat(8);
     let mut state = ToolHistoryState::default();
     let mut reviewed = candidate("reviewed", fact.clone());
-    reviewed.consumed_by_generation = Some(ModelGenerationId {turn_id:"review".into(), ordinal:1});
+    reviewed.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "review".into(),
+        ordinal: 1,
+    });
     state.register(reviewed);
     let mut failed = candidate("failure", failure.clone());
     failed.successful = false;
@@ -5960,35 +7527,67 @@ fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
     for call_id in ["generic", "reviewed", "failure"] {
         state.register_non_workspace_code_mode_call(call_id.to_string());
     }
-    let receipts = state.phase_checkpoint_receipts(&["reviewed".into()]).unwrap();
+    let receipts = state
+        .phase_checkpoint_receipts(&["reviewed".into()])
+        .unwrap();
     let checkpoint = ResponseItem::Message {
-        id:None, role:"developer".into(), content:vec![codex_protocol::models::ContentItem::InputText {
-            text:format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                serde_json::json!({"receipts":receipts})),
-        }], phase:None, internal_chat_message_metadata_passthrough:None,
+        id: None,
+        role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts":receipts})
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     // The checkpoint is live: a sampling projection would retire the reviewed result.
-    assert_eq!(phase_checkpoint_ids(&checkpoint), Some(vec!["reviewed".to_string()]));
-    let items = [function_call("generic"), text_output("generic", generic),
-        function_call("reviewed"), text_output("reviewed", fact.clone()), checkpoint,
-        function_call("failure"), text_output("failure", failure.clone())];
+    assert_eq!(
+        phase_checkpoint_ids(&checkpoint),
+        Some(vec!["reviewed".to_string()])
+    );
+    let items = [
+        function_call("generic"),
+        text_output("generic", generic),
+        function_call("reviewed"),
+        text_output("reviewed", fact.clone()),
+        checkpoint,
+        function_call("failure"),
+        text_output("failure", failure.clone()),
+    ];
     let mut history = crate::context_manager::ContextManager::new();
     history.set_tool_history_state(state);
     history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
     // The local summarizer cannot read artifacts, so even the checkpointed result stays raw.
     let prompt = history.for_local_compaction_prompt(
-        &[codex_protocol::openai_models::InputModality::Text], None,
-        &GitWorkspaceCache::with_noop_watcher_for_tests());
-    let outputs = prompt.iter().filter_map(canonical_textual_output_identity).collect::<BTreeMap<_, _>>();
-    assert_eq!(outputs.get("reviewed").map(std::convert::AsRef::as_ref), Some(fact.as_str()));
-    assert_eq!(outputs.get("failure").map(std::convert::AsRef::as_ref), Some(failure.as_str()));
+        &[codex_protocol::openai_models::InputModality::Text],
+        None,
+        &GitWorkspaceCache::with_noop_watcher_for_tests(),
+    );
+    let outputs = prompt
+        .iter()
+        .filter_map(canonical_textual_output_identity)
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        outputs.get("reviewed").map(std::convert::AsRef::as_ref),
+        Some(fact.as_str())
+    );
+    assert_eq!(
+        outputs.get("failure").map(std::convert::AsRef::as_ref),
+        Some(failure.as_str())
+    );
 }
 #[test]
 fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
     for (path, complete) in [("owner.rs", true), ("consumer.rs", false)] {
-        let mut record = candidate("read", serde_json::json!({"path":path, "file_complete":complete,
+        let mut record = candidate(
+            "read",
+            serde_json::json!({"path":path, "file_complete":complete,
             "complete":true, "results":[{"selector":{"kind":"lines", "start":5,"end":12},
-                "status":"ok", "complete":true, "text":"success ".repeat(500)}]}).to_string());
+                "status":"ok", "complete":true, "text":"success ".repeat(500)}]})
+            .to_string(),
+        );
         record.tool_identity = "read_file".into();
         record.refresh_derived();
         let pin = record.artifact_pin_value().unwrap();
@@ -5996,7 +7595,8 @@ fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
         assert_eq!(pin["evidence"]["file_complete"], complete);
         assert_eq!(pin["evidence"]["results"][0]["selector"]["start"], 5);
         assert!(pin["evidence"]["results"][0].get("text").is_none());
-        let (_, receipt, _) = record.render_receipt(false, false)
+        let (_, receipt, _) = record
+            .render_receipt(false, false)
             .expect("typed read evidence fits the receipt");
         let receipt: serde_json::Value = serde_json::from_str(receipt).unwrap();
         assert_eq!(receipt["evidence"], pin["evidence"]);
@@ -6005,18 +7605,34 @@ fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
 
 #[test]
 fn verified10_local_compaction_retains_late_counterexample_under_pressure() {
-    let source = format!("All selected unit tests passed.\n{}\nCounterexample: integration failed; do NOT claim complete coverage.\n{}",
-        "irrelevant detail ".repeat(1500), "irrelevant tail ".repeat(1500));
+    let source = format!(
+        "All selected unit tests passed.\n{}\nCounterexample: integration failed; do NOT claim complete coverage.\n{}",
+        "irrelevant detail ".repeat(1500),
+        "irrelevant tail ".repeat(1500)
+    );
     let mut record = candidate("review", source.clone());
-    record.consumed_by_generation = Some(ModelGenerationId {turn_id:"review".into(), ordinal:1});
+    record.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "review".into(),
+        ordinal: 1,
+    });
     let mut state = ToolHistoryState::default();
     state.register(record);
     state.register_non_workspace_code_mode_call("review".into());
     let mut history = crate::context_manager::ContextManager::new();
     history.set_tool_history_state(state);
-    history.record_items([&function_call("review"), &text_output("review", source.clone())], TruncationPolicy::Tokens(100_000));
+    history.record_items(
+        [
+            &function_call("review"),
+            &text_output("review", source.clone()),
+        ],
+        TruncationPolicy::Tokens(100_000),
+    );
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let prompt = history.for_local_compaction_prompt(&[codex_protocol::openai_models::InputModality::Text], None, &cache);
+    let prompt = history.for_local_compaction_prompt(
+        &[codex_protocol::openai_models::InputModality::Text],
+        None,
+        &cache,
+    );
     assert!(prompt.contains(&text_output("review", source)));
 }
 #[test]
@@ -6029,16 +7645,30 @@ fn verified10_directory_closure_is_bounded_across_compaction_and_restart() {
     for cycle in 0..8 {
         let directory = format!("directory-{cycle}");
         let context = format!("context-{cycle}");
-        for (artifact_id, call_id) in [(&directory, "context:artifact_directory"), (&context, "context:plan")] {
-            ToolHistoryMutation::RegisterArtifactOrigin {artifact_id:artifact_id.clone(), call_id:call_id.into(),
-                bytes:1, sha256:sha256(b"x")}.apply(&mut state);
+        for (artifact_id, call_id) in [
+            (&directory, "context:artifact_directory"),
+            (&context, "context:plan"),
+        ] {
+            ToolHistoryMutation::RegisterArtifactOrigin {
+                artifact_id: artifact_id.clone(),
+                call_id: call_id.into(),
+                bytes: 1,
+                sha256: sha256(b"x"),
+            }
+            .apply(&mut state);
         }
-        ToolHistoryMutation::RegisterArtifactDirectory {artifact_id:directory.clone(),
-            members:BTreeSet::from(["required-artifact".into(), context.clone()])}.apply(&mut state);
+        ToolHistoryMutation::RegisterArtifactDirectory {
+            artifact_id: directory.clone(),
+            members: BTreeSet::from(["required-artifact".into(), context.clone()]),
+        }
+        .apply(&mut state);
         let mut unrelated = candidate("unrelated", "unrelated".into());
         unrelated.artifact_id = "unrelated-artifact".into();
         state.register(unrelated);
-        state.retain_for_history(&[text_output("checkpoint", serde_json::json!({"artifact_id":directory}).to_string())]);
+        state.retain_for_history(&[text_output(
+            "checkpoint",
+            serde_json::json!({"artifact_id":directory}).to_string(),
+        )]);
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.internal_artifact_origins.len(), 2);
         assert_eq!(state.artifact_directory_members.len(), 1);
@@ -6059,26 +7689,49 @@ fn continuity_read_status_scopes_keep_legacy_recursive_and_precedence() {
     let path = root.path().join("a.rs");
     let other = root.path().join("b.rs");
     let mut state = ToolHistoryState::default();
-    for (id, scope) in [("exact", Some(SourceDependencyV1::new(&path, false))),
-        ("recursive", Some(SourceDependencyV1::new(root.path(), true))), ("legacy", None)] {
-        let mut entry = candidate(id, serde_json::json!({
-            "path":path, "source_sha256":id, "canonical_bytes":1, "environment_id":"local",
-            "canonical_uri":"file:///a.rs", "delivered_ranges":[[0,1]]
-        }).to_string());
+    for (id, scope) in [
+        ("exact", Some(SourceDependencyV1::new(&path, false))),
+        (
+            "recursive",
+            Some(SourceDependencyV1::new(root.path(), true)),
+        ),
+        ("legacy", None),
+    ] {
+        let mut entry = candidate(
+            id,
+            serde_json::json!({
+                "path":path, "source_sha256":id, "canonical_bytes":1, "environment_id":"local",
+                "canonical_uri":"file:///a.rs", "delivered_ranges":[[0,1]]
+            })
+            .to_string(),
+        );
         entry.tool_identity = "read_file".into();
         entry.source_dependencies = scope.into_iter().collect();
         state.register(entry);
     }
     let expected = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
-    assert_eq!(expected["paths"][0]["snapshots"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        expected["paths"][0]["snapshots"].as_array().unwrap().len(),
+        3
+    );
     let mut unrelated = candidate("elsewhere", "{invalid JSON".into());
     unrelated.tool_identity = "read_file".into();
     unrelated.source_dependencies = BTreeSet::from([SourceDependencyV1::new(&other, false)]);
     state.register(unrelated);
-    assert_eq!(state.read_status(std::slice::from_ref(&path), Some("local"), &[]), expected);
+    assert_eq!(
+        state.read_status(std::slice::from_ref(&path), Some("local"), &[]),
+        expected
+    );
     let output = text_output("exact", serde_json::json!({"path":other}).to_string());
-    state.workspace_evidence.insert("exact".into(), WorkspaceEvidenceObservation::from_response_item(
-        None, &output, BTreeSet::from([SourceDependencyV1::new(&other, false)])).unwrap());
+    state.workspace_evidence.insert(
+        "exact".into(),
+        WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&other, false)]),
+        )
+        .unwrap(),
+    );
     let actual = state.read_status(&[path], Some("local"), &[output]);
     assert_eq!(actual["paths"][0]["snapshots"].as_array().unwrap().len(), 2);
 }
@@ -6092,7 +7745,10 @@ fn continuity_registration_matches_rebuild_with_aliases_and_explicit_origins() {
         state.rebuild_artifact_index();
         assert_eq!(incremental, state.artifact_call_ids);
     }
-    state.internal_artifact_origins.insert("artifact-1".into(), ArtifactOrigin("origin".into(), 1, "hash".into(), None));
+    state.internal_artifact_origins.insert(
+        "artifact-1".into(),
+        ArtifactOrigin("origin".into(), 1, "hash".into(), None),
+    );
     state.register(candidate("0", bounded_output()));
     assert_eq!(state.artifact_call_ids["artifact-1"], "origin");
     let incremental = state.artifact_call_ids.clone();
@@ -6108,9 +7764,16 @@ async fn cargo_validation_history_rejects_external_include_input_changes() {
     let included = workspace.join("core/config.schema.json");
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::create_dir_all(included.parent().unwrap()).unwrap();
-    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=['app']\n").unwrap();
-    std::fs::write(package.join("Cargo.toml"),
-        "[package]\nname='fixture-app'\nversion='0.1.0'\nedition='2021'\n").unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='fixture-app'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
     // Mirror config/src/schema_fixture_tests.rs: the compiler input is outside
     // the selected package graph, although Cargo must rebuild when it changes.
     std::fs::write(package.join("src/lib.rs"),
@@ -6119,11 +7782,16 @@ async fn cargo_validation_history_rejects_external_include_input_changes() {
     let arguments = serde_json::json!({
         "program": "cargo", "args": ["test", "-p", "fixture-app"], "workdir": workspace,
     });
-    let payload = ToolPayload::Function { arguments: arguments.to_string() };
+    let payload = ToolPayload::Function {
+        arguments: arguments.to_string(),
+    };
     let classification = classify_workspace_tool_call("exec_command", &payload, &workspace);
     assert!(classification.observes_workspace);
     assert!(!classification.source_scope_complete);
-    assert!(!classification.source_dependencies.is_empty(), "retain manifest attribution");
+    assert!(
+        !classification.source_dependencies.is_empty(),
+        "retain manifest attribution"
+    );
     let output = text_output("cargo-include-proof", "test result: ok. 1 passed".into());
     let items: Arc<[ResponseItem]> = Arc::from([
         named_function_call_with_arguments("cargo-include-proof", "exec_command", arguments),
@@ -6131,23 +7799,35 @@ async fn cargo_validation_history_rejects_external_include_input_changes() {
     ]);
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let mut history = ToolHistoryState::default();
-    history.register_workspace_evidence(watched(
-        &cache, root.path(), WorkspaceEvidenceObservation::from_response_item(
-            Some(workspace_identity_at(root.path(), "before")), &output,
-            classification.source_dependencies,
-        ).unwrap().with_source_scope_complete(classification.source_scope_complete),
-    ).await);
+    history.register_workspace_evidence(
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(workspace_identity_at(root.path(), "before")),
+                &output,
+                classification.source_dependencies,
+            )
+            .unwrap()
+            .with_source_scope_complete(classification.source_scope_complete),
+        )
+        .await,
+    );
 
     std::fs::write(&included, "after!").unwrap();
-    cache.note_host_workspace_mutation_paths(
-        root.path(), &[included.to_string_lossy().into_owned()],
-    ).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &[included.to_string_lossy().into_owned()])
+        .await;
     let changed = workspace_identity_at(root.path(), "included-file-changed");
     history.invalidate_source_dependencies(Some(&BTreeSet::from([included])), Some(&changed));
     // Exercise the model-visible owner, not just declaration-graph membership.
     // Incomplete package attribution cannot certify the earlier test result.
     let notices = freshness_notices(&history, &items, Some(&changed), &cache);
-    assert_eq!(notices.len(), 1, "an external compiler input changed; old success is not current proof");
+    assert_eq!(
+        notices.len(),
+        1,
+        "an external compiler input changed; old success is not current proof"
+    );
     assert_eq!(notices[0]["valid_for_current_workspace"], false);
     assert_eq!(notices[0]["historical_authenticity"], "authenticated");
 }
@@ -6160,16 +7840,32 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let revision = workspace_identity_at(root.path(), "captured");
     let arguments = serde_json::json!({"path": source});
-    let classification = classify_workspace_tool_call("read_file",
-        &ToolPayload::Function { arguments: arguments.to_string() }, root.path());
-    assert!(classification.source_scope_complete, "native exact inputs remain complete");
+    let classification = classify_workspace_tool_call(
+        "read_file",
+        &ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+        root.path(),
+    );
+    assert!(
+        classification.source_scope_complete,
+        "native exact inputs remain complete"
+    );
     let output = text_output("carrier", "before".into());
     let items: Arc<[ResponseItem]> = Arc::from([function_call("carrier"), output.clone()]);
-    let observation = watched(&cache, root.path(),
+    let observation = watched(
+        &cache,
+        root.path(),
         WorkspaceEvidenceObservation::from_response_item_with_freshness(
-            Some(revision.clone()), &output, classification.source_dependencies, true,
-        ).unwrap().with_source_scope_complete(classification.source_scope_complete),
-    ).await;
+            Some(revision.clone()),
+            &output,
+            classification.source_dependencies,
+            true,
+        )
+        .unwrap()
+        .with_source_scope_complete(classification.source_scope_complete),
+    )
+    .await;
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(observation.clone());
     assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
@@ -6180,40 +7876,107 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     let restored: ToolHistoryState = serde_json::from_value(saved.clone()).unwrap();
     assert!(freshness_notices(&restored, &items, Some(&revision), &cache).is_empty());
     let mut legacy = saved;
-    legacy["workspace_evidence"]["carrier"].as_object_mut().unwrap().remove("source_scope_complete");
+    legacy["workspace_evidence"]["carrier"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_scope_complete");
     let legacy: ToolHistoryState = serde_json::from_value(legacy).unwrap();
-    assert_eq!(freshness_notices(&legacy, &items, Some(&revision), &cache).len(), 1);
+    assert_eq!(
+        freshness_notices(&legacy, &items, Some(&revision), &cache).len(),
+        1
+    );
     assert!(!legacy.can_use_root_only_workspace_identity(&items));
 
     let mut incomplete = observation.clone().with_source_scope_complete(false);
     incomplete.call_id = "cargo-child".into();
     state.register_workspace_evidence(incomplete);
-    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
-        parent_call_id: "carrier".into(), call_id: "cargo-child".into(),
-        output: "test result: ok".into(),
-    }.apply(&mut state));
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(
+        ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+            parent_call_id: "carrier".into(),
+            call_id: "cargo-child".into(),
+            output: "test result: ok".into(),
+        }
+        .apply(&mut state)
+    );
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     let notices = freshness_notices(&restored, &items, Some(&revision), &cache);
-    assert_eq!(notices.len(), 1, "a current carrier must not hide incomplete child provenance");
-    assert_eq!(notices[0]["stale_nested_results"][0]["call_id"], "cargo-child");
-    assert_eq!(notices[0]["stale_nested_results"][0]["source_scope"]["source_scope_complete"], false);
+    assert_eq!(
+        notices.len(),
+        1,
+        "a current carrier must not hide incomplete child provenance"
+    );
+    assert_eq!(
+        notices[0]["stale_nested_results"][0]["call_id"],
+        "cargo-child"
+    );
+    assert_eq!(
+        notices[0]["stale_nested_results"][0]["source_scope"]["source_scope_complete"],
+        false
+    );
     assert!(!restored.can_use_root_only_workspace_identity(&items));
 
     // The runtime cannot certify an aggregate using just a path union. An
     // unretained child can have no nested entry, but exact retained reads still
     // carry independent current proof within the conservative carrier notice.
-    state.workspace_evidence.get_mut("carrier").unwrap().source_scope_complete = false;
+    state
+        .workspace_evidence
+        .get_mut("carrier")
+        .unwrap()
+        .source_scope_complete = false;
     state.code_mode_nested_evidence.clear();
     let mut native = observation;
     native.call_id = "native-child".into();
     state.register_workspace_evidence(native);
-    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
-        parent_call_id: "carrier".into(), call_id: "native-child".into(), output: "before".into(),
-    }.apply(&mut state));
+    assert!(
+        ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+            parent_call_id: "carrier".into(),
+            call_id: "native-child".into(),
+            output: "before".into(),
+        }
+        .apply(&mut state)
+    );
     let notices = freshness_notices(&state, &items, Some(&revision), &cache);
-    assert_eq!(notices.len(), 1, "missing child provenance cannot promote the aggregate");
+    assert_eq!(
+        notices.len(),
+        1,
+        "missing child provenance cannot promote the aggregate"
+    );
     assert_eq!(notices[0]["source_scope"]["source_scope_complete"], false);
-    assert_eq!(notices[0]["current_nested_results"][0]["call_id"], "native-child");
+    assert_eq!(notices[0]["reason_code"], "carrier_scope_incomplete");
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    assert!(notices[0]["source_scope"].get("dependencies").is_none());
+    assert!(
+        notices[0]["current_nested_results"][0]
+            .get("source_scope")
+            .is_none()
+    );
+    assert_eq!(
+        notices[0]["current_nested_results"][0]["call_id"],
+        "native-child"
+    );
+
+    // Cosmetic compaction must not conceal a later real change, even when the
+    // compact notice has already been delivered in the immutable prefix.
+    let delivered = state
+        .project_workspace_freshness_with_cache(Arc::clone(&items), Some(&revision), &cache)
+        .items;
+    assert!(freshness_notices(&state, &delivered, Some(&revision), &cache).is_empty());
+    std::fs::write(&source, "after").unwrap();
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".to_owned()])
+        .await;
+    let changed = freshness_notices(&state, &delivered, Some(&revision), &cache);
+    assert_eq!(changed.len(), 1);
+    assert_ne!(changed[0]["reason_code"], "carrier_scope_incomplete");
+    assert_eq!(
+        changed[0]["stale_nested_results"][0]["call_id"],
+        "native-child"
+    );
+    assert_eq!(
+        changed[0]["stale_nested_results"][0]["source_scope"]["dependencies"][0]["freshness"],
+        "changed"
+    );
 }
 #[test]
 fn paged_source_inspection_requires_bound_identity_attempt_and_complete_ranges() {
@@ -6222,32 +7985,68 @@ fn paged_source_inspection_requires_bound_identity_attempt_and_complete_ranges()
     let source: SourceInspectionOrigin = serde_json::from_value(serde_json::json!({
         "start": {"attempt_id":attempt, "path":"large.rs", "workspace_id":"workspace", "epoch":0},
         "environment_id":"local", "canonical_uri":"file:///repo/large.rs"
-    })).unwrap();
+    }))
+    .unwrap();
     let mut state = ToolHistoryState::default();
     let sha = sha256(b"0123456789");
     ToolHistoryMutation::RegisterArtifactOrigin {
-        artifact_id:"paged-source".into(), call_id:"native-read".into(), bytes:10, sha256:sha.clone(),
-    }.apply(&mut state);
+        artifact_id: "paged-source".into(),
+        call_id: "native-read".into(),
+        bytes: 10,
+        sha256: sha.clone(),
+    }
+    .apply(&mut state);
     // Old three-element origins deserialize but never acquire task proof.
-    let legacy: ArtifactOrigin = serde_json::from_value(serde_json::json!(["native-read",10,sha])).unwrap();
+    let legacy: ArtifactOrigin =
+        serde_json::from_value(serde_json::json!(["native-read", 10, sha])).unwrap();
     assert!(legacy.3.is_none());
     let bind = ToolHistoryMutation::BindSourceInspectionOrigin {
-        artifact_id:"paged-source".into(), call_id:"native-read".into(), bytes:10,
-        sha256:sha.clone(), source,
+        artifact_id: "paged-source".into(),
+        call_id: "native-read".into(),
+        bytes: 10,
+        sha256: sha.clone(),
+        source,
     };
     assert!(bind.apply(&mut state));
-    assert!(!bind.apply(&mut state), "a later attempt cannot reattribute the origin");
+    assert!(
+        !bind.apply(&mut state),
+        "a later attempt cannot reattribute the origin"
+    );
     for (end, complete) in [(5, false), (10, true)] {
         ToolHistoryMutation::RecordArtifactRecovery {
-            artifact_id:"paged-source".into(), recovery_call_id:format!("page-{end}"),
-            selectors:vec![serde_json::json!({"kind":"bytes", "start":0, "end":end})],
-        }.apply(&mut state);
-        let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            artifact_id: "paged-source".into(),
+            recovery_call_id: format!("page-{end}"),
+            selectors: vec![serde_json::json!({"kind":"bytes", "start":0, "end":end})],
+        }
+        .apply(&mut state);
+        let mut restored: ToolHistoryState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         restored.refresh_derived_and_indexes();
-        assert_eq!(restored.completed_source_inspection("paged-source",10,&sha,attempt).is_some(), complete);
-        assert!(restored.completed_source_inspection("paged-source",10,&sha,other_attempt).is_none());
-        assert!(restored.completed_source_inspection("paged-source",9,&sha,attempt).is_none());
-        assert!(restored.completed_source_inspection("paged-source",10,"changed",attempt).is_none());
-        assert!(restored.completed_source_inspection("other-source",10,&sha,attempt).is_none());
+        assert_eq!(
+            restored
+                .completed_source_inspection("paged-source", 10, &sha, attempt)
+                .is_some(),
+            complete
+        );
+        assert!(
+            restored
+                .completed_source_inspection("paged-source", 10, &sha, other_attempt)
+                .is_none()
+        );
+        assert!(
+            restored
+                .completed_source_inspection("paged-source", 9, &sha, attempt)
+                .is_none()
+        );
+        assert!(
+            restored
+                .completed_source_inspection("paged-source", 10, "changed", attempt)
+                .is_none()
+        );
+        assert!(
+            restored
+                .completed_source_inspection("other-source", 10, &sha, attempt)
+                .is_none()
+        );
     }
 }

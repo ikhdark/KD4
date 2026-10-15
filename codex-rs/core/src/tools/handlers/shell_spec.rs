@@ -565,6 +565,18 @@ fn unified_exec_output_schema() -> Value {
             "output": {
                 "type": "string",
                 "description": "Command output text, possibly truncated."
+            },
+            "current_chunk_display_complete": {
+                "type": "boolean",
+                "description": "True when this poll's displayed output chunk was not reduced; the inverse of output_reduced."
+            },
+            "cumulative_streams_complete": {
+                "type": "boolean",
+                "description": "Same as streams_complete: the whole stdout and stderr are available exactly."
+            },
+            "retained_artifact_complete": {
+                "type": "boolean",
+                "description": "Present with raw_output_artifact_id; true only when the process exited and the artifact retains its complete output."
             }
         },
         "required": ["output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],

@@ -210,7 +210,10 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
         err.to_string(),
         "unsupported operation: windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed"
     );
-    assert!(!future_secret.exists(), "a refused command must never execute its write");
+    assert!(
+        !future_secret.exists(),
+        "a refused command must never execute its write"
+    );
     assert_eq!(std::fs::read_to_string(&secret)?, "glob secret\n");
     assert_eq!(std::fs::read_to_string(&public)?, "public ok\n");
     Ok(())

@@ -530,10 +530,18 @@ struct McpResourceServerError {
     message: String,
 }
 
-fn collection_page_errors(server: &str, meta: Option<&rmcp::model::Meta>) -> Vec<McpResourceServerError> {
-    meta.and_then(|meta| meta.get("codex/collectionError")).and_then(Value::as_str)
-        .map(|message| McpResourceServerError { server: server.to_string(), message: message.to_string() })
-        .into_iter().collect()
+fn collection_page_errors(
+    server: &str,
+    meta: Option<&rmcp::model::Meta>,
+) -> Vec<McpResourceServerError> {
+    meta.and_then(|meta| meta.get("codex/collectionError"))
+        .and_then(Value::as_str)
+        .map(|message| McpResourceServerError {
+            server: server.to_string(),
+            message: message.to_string(),
+        })
+        .into_iter()
+        .collect()
 }
 
 impl From<McpServerCollectionError> for McpResourceServerError {

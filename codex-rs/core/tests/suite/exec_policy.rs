@@ -88,7 +88,10 @@ fn assert_blank_script_rejected(output_item: &Value, tool_name: &str, script_fie
     let expected = format!(
         "{tool_name} schema error in `script` branch at `$.{script_field}`: the supplied field was blank; provide a non-blank string, or omit this field when using another command branch."
     );
-    assert!(output.contains(&expected), "unexpected blank-script result: {output}");
+    assert!(
+        output.contains(&expected),
+        "unexpected blank-script result: {output}"
+    );
 }
 
 #[tokio::test]

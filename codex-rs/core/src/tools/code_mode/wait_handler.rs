@@ -125,13 +125,21 @@ impl CodeModeWaitHandler {
                 // An explicit request re-budgets the cell; a plain wait keeps
                 // the budget the cell was started with (e.g. a raised exec
                 // pragma) instead of resetting it to the default.
-                exec.session.services.code_mode_service.record_output_budget(
-                    &cell_id,
-                    args.max_tokens.map(|max_tokens| max_tokens
-                        .min(exec.turn.config.tool_output_token_limit
-                            .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL))
-                        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)),
-                );
+                exec.session
+                    .services
+                    .code_mode_service
+                    .record_output_budget(
+                        &cell_id,
+                        args.max_tokens.map(|max_tokens| {
+                            max_tokens
+                                .min(
+                                    exec.turn.config.tool_output_token_limit.unwrap_or(
+                                        codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+                                    ),
+                                )
+                                .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                        }),
+                    );
                 let effective_max_tokens = exec
                     .session
                     .services
@@ -174,7 +182,8 @@ impl CodeModeWaitHandler {
                         Ok(held) => held,
                         Err(error) if cancellation_token.is_cancelled() => OwnerHeldCodeModeWait {
                             exit: OwnerHeldCodeModeExit::Runtime(
-                                terminate_interrupted_cell(&exec, &cell_id).await
+                                terminate_interrupted_cell(&exec, &cell_id)
+                                    .await
                                     .map_err(FunctionCallError::RespondToModel)?,
                             ),
                             drained_observations: error.drained_observations,
@@ -267,24 +276,32 @@ impl CodeModeWaitHandler {
                     _ = exec.session.services.elicitations.wait_until_clear() => {}
                 }
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
-                    let owner = exec.session.services.code_mode_service.cell_parent_call_id(&cell_id);
-                    let parent_call_id =
-                        failed_cell_owner_call_id(owner.as_deref().or(terminal_parent_call_id.as_deref()), &call_id);
+                    let owner = exec
+                        .session
+                        .services
+                        .code_mode_service
+                        .cell_parent_call_id(&cell_id);
+                    let parent_call_id = failed_cell_owner_call_id(
+                        owner.as_deref().or(terminal_parent_call_id.as_deref()),
+                        &call_id,
+                    );
                     emit_failed_code_mode_cell_item(&exec, parent_call_id, response, started_at)
                         .await;
                 }
                 let response = wait_response.into();
-                exec.session.services.code_mode_service.flush_packet_retention(&cell_id).await;
-                let delivery = exec.session.services.code_mode_service.delivery_for_response(
-                    &cell_id, &exec.turn, &response,
-                );
-                let mut output = handle_runtime_response(
-                    &exec,
-                    response,
-                    effective_max_tokens,
-                    started_at,
-                )
-                .map_err(FunctionCallError::RespondToModel)?;
+                exec.session
+                    .services
+                    .code_mode_service
+                    .flush_packet_retention(&cell_id)
+                    .await;
+                let delivery = exec
+                    .session
+                    .services
+                    .code_mode_service
+                    .delivery_for_response(&cell_id, &exec.turn, &response);
+                let mut output =
+                    handle_runtime_response(&exec, response, effective_max_tokens, started_at)
+                        .map_err(FunctionCallError::RespondToModel)?;
                 output =
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);
                 if let Some(signal) = authoritative_wait_signal {
@@ -337,7 +354,9 @@ pub(super) async fn terminate_interrupted_cell(
                 grace_ms = INTERRUPTED_CELL_TERMINATION_GRACE.as_millis(),
                 "timed out terminating interrupted code mode cell"
             );
-            Err(format!("code-mode cell {cell_id} cancellation cleanup timed out; effects and buffered output are unknown"))
+            Err(format!(
+                "code-mode cell {cell_id} cancellation cleanup timed out; effects and buffered output are unknown"
+            ))
         }
     }
 }
@@ -445,9 +464,13 @@ pub(super) async fn queued_input_activity(
     loop {
         // Mark the wake seen before reading retained state: anything arriving
         // during the read is either in that state or leaves another wake.
-        let internal_completion = *activity_rx.borrow_and_update() == InputQueueActivity::InternalCompletion;
-        if let Some(activity) = exec.session.input_queue
-            .pending_activity(turn_state, internal_completion).await
+        let internal_completion =
+            *activity_rx.borrow_and_update() == InputQueueActivity::InternalCompletion;
+        if let Some(activity) = exec
+            .session
+            .input_queue
+            .pending_activity(turn_state, internal_completion)
+            .await
         {
             return activity;
         }
@@ -856,10 +879,18 @@ mod tests {
         // The real service's missing-cell contract says absence is unknown,
         // not a confirmed terminal outcome or permission to replay effects.
         assert!(output.log_preview().contains("unknown_cell"));
-        assert!(output.log_preview().contains("absence does not prove completion"));
-        assert!(output.sampling_request_signal().as_ref().is_none_or(|signal| {
-            signal.get("authoritative_wait_owner_v1").is_none()
-        }), "missing lifecycle evidence must not mint an authoritative terminal fact");
+        assert!(
+            output
+                .log_preview()
+                .contains("absence does not prove completion")
+        );
+        assert!(
+            output
+                .sampling_request_signal()
+                .as_ref()
+                .is_none_or(|signal| { signal.get("authoritative_wait_owner_v1").is_none() }),
+            "missing lifecycle evidence must not mint an authoritative terminal fact"
+        );
     }
 
     #[test]
@@ -990,19 +1021,28 @@ mod tests {
     async fn held_wait_ignores_non_triggering_mail_until_triggering_mail_arrives() {
         for queued_before_subscription in [true, false] {
             let (session, turn) = crate::session::tests::make_session_and_context().await;
-            let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+            let exec = ExecContext {
+                session: Arc::new(session),
+                turn: Arc::new(turn),
+            };
             let queue = &exec.session.input_queue;
-            let mail = |trigger_turn| codex_protocol::protocol::InterAgentCommunication::new(
-                codex_protocol::AgentPath::root().join("worker").unwrap(),
-                codex_protocol::AgentPath::root(),
-                Vec::new(),
-                "worker update".to_string(),
-                trigger_turn,
-            );
+            let mail = |trigger_turn| {
+                codex_protocol::protocol::InterAgentCommunication::new(
+                    codex_protocol::AgentPath::root().join("worker").unwrap(),
+                    codex_protocol::AgentPath::root(),
+                    Vec::new(),
+                    "worker update".to_string(),
+                    trigger_turn,
+                )
+            };
             if queued_before_subscription {
-                queue.enqueue_mailbox_communication(mail(false)).await.unwrap();
+                queue
+                    .enqueue_mailbox_communication(mail(false))
+                    .await
+                    .unwrap();
             }
-            let (activity_rx, pending_activity) = queue.subscribe_code_mode_activity(None, false).await;
+            let (activity_rx, pending_activity) =
+                queue.subscribe_code_mode_activity(None, false).await;
             assert_eq!(pending_activity, None);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let mut held = Box::pin(hold_until_state_change(
@@ -1013,35 +1053,69 @@ mod tests {
             ));
             assert!(held.as_mut().now_or_never().is_none());
             if !queued_before_subscription {
-                queue.enqueue_mailbox_communication(mail(false)).await.unwrap();
+                queue
+                    .enqueue_mailbox_communication(mail(false))
+                    .await
+                    .unwrap();
             }
             assert!(held.as_mut().now_or_never().is_none());
             assert!(queue.has_pending_mailbox_items().await);
-            queue.enqueue_mailbox_communication(mail(true)).await.unwrap();
+            queue
+                .enqueue_mailbox_communication(mail(true))
+                .await
+                .unwrap();
             let result = held.await.expect("triggering mail wakes the wait");
-            assert!(matches!(result.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Mailbox)));
-            assert_eq!(queue.get_pending_input(&tokio::sync::Mutex::new(None)).await.len(), 2);
+            assert!(matches!(
+                result.exit,
+                OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Mailbox)
+            ));
+            assert_eq!(
+                queue
+                    .get_pending_input(&tokio::sync::Mutex::new(None))
+                    .await
+                    .len(),
+                2
+            );
         }
     }
 
     #[tokio::test]
     async fn held_wait_rechecks_stale_wakes_and_prioritizes_queued_steering() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+        let exec = ExecContext {
+            session: Arc::new(session),
+            turn: Arc::new(turn),
+        };
         let queue = &exec.session.input_queue;
         let (receiver, _) = queue.subscribe_code_mode_activity(None, false).await;
         let mail = codex_protocol::protocol::InterAgentCommunication::new(
             codex_protocol::AgentPath::root().join("worker").unwrap(),
-            codex_protocol::AgentPath::root(), Vec::new(), "update".into(), true,
+            codex_protocol::AgentPath::root(),
+            Vec::new(),
+            "update".into(),
+            true,
         );
-        queue.enqueue_mailbox_communication(mail.clone()).await.unwrap();
-        queue.get_pending_input(&tokio::sync::Mutex::new(None)).await;
+        queue
+            .enqueue_mailbox_communication(mail.clone())
+            .await
+            .unwrap();
+        queue
+            .get_pending_input(&tokio::sync::Mutex::new(None))
+            .await;
         let mut pending = Box::pin(queued_input_activity(&exec, None, receiver));
-        assert!(pending.as_mut().now_or_never().is_none(), "a drained mailbox wake is stale");
-        queue.restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
-            content: vec![codex_protocol::user_input::UserInput::Text { text: "steer".into(), text_elements: Vec::new() }],
-            client_id: None,
-        }]).await;
+        assert!(
+            pending.as_mut().now_or_never().is_none(),
+            "a drained mailbox wake is stale"
+        );
+        queue
+            .restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "steer".into(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
         // A lower-priority broadcast must not mask the retained user input.
         queue.publish_internal_completion();
         assert_eq!(pending.await, InputQueueActivity::Steer);
@@ -1184,7 +1258,10 @@ mod tests {
     #[tokio::test]
     async fn injected_response_item_wakes_a_suspended_owner_observer() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+        let exec = ExecContext {
+            session: Arc::new(session),
+            turn: Arc::new(turn),
+        };
         let session = Arc::clone(&exec.session);
         let turn_state = {
             let mut active_turn = session.active_turn.lock().await;
@@ -1270,7 +1347,10 @@ mod tests {
             .await
             .expect("held wait task")
             .expect("input wakes the held wait");
-        assert!(matches!(held.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)));
+        assert!(matches!(
+            held.exit,
+            OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)
+        ));
         assert_eq!(held.drained_observations, 0);
     }
 
@@ -1332,7 +1412,10 @@ mod tests {
             .await
             .expect("real state-change wait task")
             .expect("real state-change wait should wake on steering");
-        assert!(matches!(held.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)));
+        assert!(matches!(
+            held.exit,
+            OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)
+        ));
 
         // Steering released the wait without touching the cell: it is still
         // live, so explicit termination is what ends it.

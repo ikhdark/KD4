@@ -78,11 +78,9 @@ async fn persisted_reasoning_items(path: &Path) -> Vec<ResponseItem> {
     assert_eq!(parse_errors, 0, "invalid rollout records");
     items
         .into_iter()
-        .filter_map(|item| {
-            match item {
-                RolloutItem::ResponseItem(item @ ResponseItem::Reasoning { .. }) => Some(item),
-                _ => None,
-            }
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item @ ResponseItem::Reasoning { .. }) => Some(item),
+            _ => None,
         })
         .collect()
 }
@@ -248,6 +246,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "read_file",
         "read_status",
         "list_files",
+        "save_turn_diff",
         "update_plan",
         "request_user_input",
         "request_permissions",
@@ -292,7 +291,6 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefixes_context_and_instructions_once_and_consistently_across_requests()
@@ -367,7 +365,8 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
     assert_eq!(
-        input2.len(), input1.len() + 1,
+        input2.len(),
+        input1.len() + 1,
         "only the new user message should extend the unchanged prefix"
     );
     assert_eq_without_metadata(
@@ -599,11 +598,13 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
         .filter(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
         .collect();
     assert_eq!(
-        env_texts.len(), 1,
+        env_texts.len(),
+        1,
         "expected exactly one environment context: {env_texts:?}"
     );
     assert_eq!(
-        environment_contexts(&body).len(), 1,
+        environment_contexts(&body).len(),
+        1,
         "environment context must have the user role"
     );
     assert!(
@@ -636,7 +637,10 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
                 .is_some()
         })
         .count();
-    assert_eq!(env_count, 1, "environment context should appear exactly once");
+    assert_eq!(
+        env_count, 1,
+        "environment context should appear exactly once"
+    );
 
     let permissions_texts: Vec<&str> = input
         .iter()
@@ -899,7 +903,8 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let input1 = body1["input"].as_array().expect("first input array");
     let input2 = body2["input"].as_array().expect("second input array");
     assert_eq!(
-        input2.len(), input1.len() + 1,
+        input2.len(),
+        input1.len() + 1,
         "unchanged overrides must not add trailing context or duplicate input"
     );
     assert_eq_without_metadata(
@@ -1041,8 +1046,8 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
--> anyhow::Result<()> {
+async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout() -> anyhow::Result<()>
+{
     require_network!();
 
     let server = start_mock_server().await;
@@ -1117,7 +1122,10 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
     assert_eq!(request_3_reasoning[0], request_2_reasoning[0]);
     assert_eq!(request_3_reasoning[1]["id"], "rs_reasoning_2");
     assert_eq!(request_3_reasoning[1]["summary"][0]["text"], "summary two");
-    assert_eq!(request_3_reasoning[1]["content"][0]["text"], "plaintext two");
+    assert_eq!(
+        request_3_reasoning[1]["content"][0]["text"],
+        "plaintext two"
+    );
     assert!(request_3_reasoning[1]["encrypted_content"].is_string());
     assert_eq!(
         request_3_reasoning[1]["encrypted_content"],
@@ -1129,10 +1137,16 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
     assert_eq!(persisted_reasoning.len(), 2);
     for (item, expected_summary, expected_plaintext, expected) in [
         (
-            &persisted_reasoning[0], "summary one", "plaintext one", &reasoning_one["item"],
+            &persisted_reasoning[0],
+            "summary one",
+            "plaintext one",
+            &reasoning_one["item"],
         ),
         (
-            &persisted_reasoning[1], "summary two", "plaintext two", &reasoning_two["item"],
+            &persisted_reasoning[1],
+            "summary two",
+            "plaintext two",
+            &reasoning_two["item"],
         ),
     ] {
         let item = serde_json::to_value(item)?;

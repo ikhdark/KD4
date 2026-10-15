@@ -309,15 +309,18 @@ pub(crate) fn strip_images_when_unsupported(
             }
             ResponseItem::ImageGenerationCall { result, .. } => {
                 if !result.is_empty() {
-                    image_omissions.push((index, ResponseItem::Message {
-                        id: None,
-                        role: "developer".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    }));
+                    image_omissions.push((
+                        index,
+                        ResponseItem::Message {
+                            id: None,
+                            role: "developer".to_string(),
+                            content: vec![ContentItem::InputText {
+                                text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    ));
                 }
                 result.clear();
             }

@@ -283,7 +283,12 @@ impl AgentsMdManager {
         let previous = {
             let cache = self.cache.lock().await;
             (cache.key.as_ref() == Some(&key))
-                .then(|| cache.loaded.clone().map(|loaded| (loaded, cache.retained_sources.clone())))
+                .then(|| {
+                    cache
+                        .loaded
+                        .clone()
+                        .map(|loaded| (loaded, cache.retained_sources.clone()))
+                })
                 .flatten()
         };
         let load = load_project_instructions_with_fallback(
@@ -291,7 +296,9 @@ impl AgentsMdManager {
             self.user_instructions.clone(),
             discovery,
             self.omission_recovery.as_ref(),
-            previous.as_ref().map(|(loaded, sources)| (loaded.as_ref(), sources.as_slice())),
+            previous
+                .as_ref()
+                .map(|(loaded, sources)| (loaded.as_ref(), sources.as_slice())),
         )
         .await;
         let mut cache = self.cache.lock().await;

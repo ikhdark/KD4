@@ -13,8 +13,22 @@ use crate::shell::ShellType;
 
 fn rejected(detail: &str) -> String {
     format!(
-        "Raw Cargo launch rejected; no build started. {detail} The core-tests lane is managed-only until build-context compatibility is established. Use `just core-test-fast <target> -E '<filter>'` or `python -I -B scripts/build/rust_test_runner.py run-target --profile fast <target> -E '<filter>'` from the repository root. This is containment, not a cache-reuse fix."
+        "Raw Cargo launch rejected; no build started. {detail} Cargo admission resolves the command's effective target/build directories; ordinary Rust workspaces do not require a repository-specific runner."
     )
+}
+
+/// Build rejection whose remediation matches the tree the command ran in.
+/// Inside a tree that publishes a lane marker, the neutral "no repository-specific
+/// runner" advice contradicts that tree's own managed entrypoint, so name the
+/// marker instead and let the caller consult its documented runner.
+fn rejected_build(detail: &str, cwd: &Path) -> String {
+    match managed_target(cwd) {
+        Ok(Some(root)) => format!(
+            "Raw Cargo launch rejected; no build started. {detail} Cargo admission resolves the command's effective target/build directories; this tree is reserved by a lane marker under {}, so use the managed test/build entrypoint documented for it rather than a raw Cargo command.",
+            root.display()
+        ),
+        _ => rejected(detail),
+    }
 }
 
 pub(crate) async fn check_managed_cargo_lane(
@@ -91,25 +105,35 @@ fn check(
             !stages.is_empty()
                 && stages.iter().all(|stage| {
                     stage.first().is_some_and(|program| {
-                        matches!(
-                            program_name(program).to_ascii_lowercase().as_str(),
-                            "rg" | "rga"
-                                | "echo"
-                                | "write-output"
-                                | "get-content"
-                                | "select-string"
-                        ) || (program_name(program).eq_ignore_ascii_case("cargo")
-                            && !potential_build(stage))
+                        read_only_inspection_program(program)
+                            || (program_name(program).eq_ignore_ascii_case("cargo")
+                                && !potential_build(stage))
                     })
                 })
         });
-        if parsed
+        // A trustworthy parse already carries clause boundaries, and each stage
+        // is checked below. Scanning the flattened script text in that case only
+        // reintroduces false positives from Cargo names inside string literals
+        // and argument lists, so keep the text fallback for opaque scripts.
+        if let Some(offending) = parsed
             .as_ref()
-            .is_some_and(|stages| stages.iter().any(|stage| potential_build(stage)))
-            || (!inspection_only && args.iter().any(|script| visibly_builds(script)))
+            .and_then(|stages| stages.iter().find(|stage| potential_build(stage)))
         {
-            return Err(rejected(
-                "Cannot resolve a raw Cargo build's effective target through this script. Use standalone argv with workdir and a literal --target-dir for an unrelated build.",
+            return Err(rejected_build(
+                &format!(
+                    "Cannot resolve a raw Cargo build's effective target through this script; the `{}` clause would build. Use a standalone Cargo command with an explicit workdir so configuration and directory ownership can be resolved.",
+                    offending.join(" ")
+                ),
+                cwd,
+            ));
+        }
+        if parsed.is_none()
+            && !inspection_only
+            && args.iter().any(|script| visibly_builds(script))
+        {
+            return Err(rejected_build(
+                "Cannot resolve a raw Cargo build's effective target through this script, which names a Cargo build token but could not be parsed into separate commands. Reissue it as standalone argv, or as a command whose program is recognizably read-only, so the effective target can be resolved.",
+                cwd,
             ));
         }
         if let Some(stages) = parsed {
@@ -297,8 +321,7 @@ fn check(
     }
     for value in overrides {
         let layer = if value.contains('=') {
-            let value = value
-                .parse::<toml::Value>()
+            let value = toml::from_str::<toml::Value>(&value)
                 .map_err(|_| rejected("Cannot parse Cargo --config override."))?;
             config_values(&value, &cwd, &cwd, &mut budget, &mut Vec::new())?
         } else {
@@ -333,10 +356,11 @@ fn check(
         None => target.clone(),
     };
     for (kind, path) in [("target", target), ("build", build)] {
-        if managed_target(&path) {
+        if let Some(managed) = managed_target(&path)? {
             return Err(rejected(&format!(
-                "Effective {kind} directory: {}.",
-                path.display()
+                "Effective {kind} directory: {}. It belongs to managed Cargo directory {}. Use that workspace's documented managed build/test entrypoint to reserve it before launching Cargo.",
+                path.display(),
+                managed.display(),
             )));
         }
     }
@@ -459,8 +483,14 @@ fn read_toml(path: &Path, budget: &mut ConfigReadBudget) -> Result<toml::Value, 
             "Cargo configuration exceeds the bounded admission read.",
         ));
     }
-    text.parse()
-        .map_err(|_| rejected("Cannot parse Cargo configuration to resolve its directories."))
+    // Value::from_str parses a single TOML value, not a Cargo document. Even
+    // ordinary [env], [package], and [workspace] tables require from_str.
+    toml::from_str(&text).map_err(|_| {
+        rejected(&format!(
+            "Cannot parse Cargo configuration {} to resolve its directories.",
+            path.display()
+        ))
+    })
 }
 
 fn read_config(
@@ -616,19 +646,31 @@ fn resolved(path: &Path) -> PathBuf {
     result
 }
 
-fn managed_target(path: &Path) -> bool {
+fn managed_target(path: &Path) -> Result<Option<PathBuf>, String> {
     let path = resolved(path);
-    path.ancestors().any(|root| {
-        root.join("codex-rs/.config/kd4-rust-tests.toml").is_file() && {
+    for root in path.ancestors() {
+        // The existing lane owner publishes this marker for default and custom
+        // roots. Honor it anywhere, independent of checkout, crate or lane name.
+        // Presence reserves the tree even if its contents are malformed; only
+        // the owning runner may validate or repair its marker.
+        if config_exists(&root.join(".codex-cargo-lanes-root"))? {
+            return Ok(Some(root.to_path_buf()));
+        }
+        // Preserve the pre-marker core lane reservation in older checkouts.
+        if root.join("codex-rs/.config/kd4-rust-tests.toml").is_file() {
             let lane = resolved(&root.join("codex-rs/target/lanes/core-tests"));
-            if cfg!(windows) {
+            let protected = if cfg!(windows) {
                 Path::new(&path.to_string_lossy().to_ascii_lowercase())
                     .starts_with(lane.to_string_lossy().to_ascii_lowercase())
             } else {
-                path.starts_with(lane)
+                path.starts_with(&lane)
+            };
+            if protected {
+                return Ok(Some(lane));
             }
         }
-    })
+    }
+    Ok(None)
 }
 
 fn raw_build(argv: &[String]) -> bool {
@@ -758,20 +800,91 @@ fn potential_build(argv: &[String]) -> bool {
             && cargo_subcommand(&argv[1..]).is_some_and(|(_, name)| !cargo_builtin(name))
 }
 
+/// Programs that only report on existing processes or text. None of them can
+/// start a build, so a Cargo name appearing in their filters or arguments is
+/// data, not an invocation, and must not reach the build rejection.
+fn read_only_inspection_program(program: &str) -> bool {
+    matches!(
+        program_name(program).to_ascii_lowercase().as_str(),
+        "rg" | "rga"
+            | "echo"
+            | "write-output"
+            | "get-content"
+            | "select-string"
+            | "get-process"
+            | "get-ciminstance"
+            | "get-wmiobject"
+            | "tasklist"
+            | "ps"
+            | "pgrep"
+            | "pidof"
+    )
+}
+
 fn visibly_builds(script: &str) -> bool {
-    let words = script
-        .split(|ch: char| {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    ';' | '|' | '&' | '{' | '}' | ',' | '=' | '\'' | '"' | '(' | ')'
-                )
-        })
-        .filter(|word| !word.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    // Statement/block separators are retained as words so a Cargo name can
+    // be told apart from a Cargo invocation: only a name in command position
+    // starts a build. Quoted newlines/braces remain data; preserve the existing
+    // treatment of other operators, including command substitutions. Commas
+    // and assignments separate words, not commands, so process lists such as
+    // `Get-Process cargo,rustc` do not become invocations.
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in script.chars() {
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+        }
+        if matches!(ch, ';' | '|' | '&' | '(' | ')')
+            || (quote.is_none() && matches!(ch, '{' | '}' | '\r' | '\n'))
+        {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            words.push(ch.to_string());
+        } else if ch.is_whitespace() || matches!(ch, '{' | '}' | ',' | '=' | '\'' | '"') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
     words.iter().enumerate().any(|(index, word)| {
-        program_name(word).eq_ignore_ascii_case("cargo") && potential_build(&words[index..])
+        if !program_name(word).eq_ignore_ascii_case("cargo") {
+            return false;
+        }
+        // Command position: script start, or just after a separator or a
+        // PowerShell/sh call operator.
+        let in_command_position = match index.checked_sub(1).and_then(|prev| words.get(prev)) {
+            None => true,
+            Some(previous) => matches!(
+                previous.as_str(),
+                ";" | "|" | "&" | "(" | ")" | "{" | "}" | "\r" | "\n" | "&&" | "||" | "."
+                    | "exec" | "command"
+            ),
+        };
+        if !in_command_position {
+            return false;
+        }
+        let rest = words[index..]
+            .iter()
+            .take_while(|word| {
+                !matches!(
+                    word.as_str(),
+                    ";" | "|" | "&" | "(" | ")" | "{" | "}" | "\r" | "\n"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        potential_build(&rest)
     })
 }
 
@@ -786,6 +899,62 @@ mod tests {
         root
     }
 
+    #[test]
+    fn ordinary_workspace_documents_and_managed_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("independent-workspace");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers=['member']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        // Built component-wise like Cargo's own lookup, so its display matches the
+        // native-separator path the rejection names.
+        let config = workspace.join(".cargo").join("config.toml");
+        std::fs::write(
+            &config,
+            "[env]\nRUST_TEST_THREADS={value='8',force=false}\n",
+        )
+        .unwrap();
+        let env = HashMap::from([(
+            "CARGO_HOME".into(),
+            root.path().join("cargo-home").display().to_string(),
+        )]);
+        let command = ["cargo", "test", "--locked"].map(str::to_string);
+        for cwd in [&workspace, &member] {
+            assert!(check(&command, cwd, &env, 0).is_ok());
+        }
+        assert!(!workspace.join("target").exists());
+        // A marker reserves an arbitrary workspace's default target tree,
+        // including member invocations. Malformed contents remain reserved.
+        std::fs::create_dir_all(workspace.join("target")).unwrap();
+        std::fs::write(
+            workspace.join("target/.codex-cargo-lanes-root"),
+            "malformed",
+        )
+        .unwrap();
+        let error = check(&command, &member, &env, 0).unwrap_err();
+        assert!(error.contains("managed Cargo directory"));
+        assert!(!workspace.join("target/debug").exists());
+        for target in ["../target-sibling", "../target/../ordinary-output"] {
+            let command = ["cargo", "build", "--target-dir", target].map(str::to_string);
+            assert!(check(&command, &member, &env, 0).is_ok());
+        }
+        std::fs::write(&config, "[env\n").unwrap();
+        let error = check(&command, &member, &env, 0).unwrap_err();
+        assert!(error.contains(&config.display().to_string()));
+        assert!(!error.contains("core-tests"));
+        assert!(!error.contains("rust_test_runner.py"));
+    }
+
     #[tokio::test]
     async fn runtime_admission_rejects_before_execution() {
         let root = fixture();
@@ -798,7 +967,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("no build started"));
-        assert!(error.contains("scripts/build/rust_test_runner.py"));
+        assert!(error.contains("managed build/test entrypoint"));
         assert!(!cwd.join("target").exists());
     }
 
@@ -1190,6 +1359,142 @@ mod tests {
                 "{script}"
             );
         }
+    }
+
+    #[test]
+    fn opaque_powershell_statement_boundaries_cannot_bypass_admission() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        for script in [
+            "$env:CARGO_TARGET_DIR='target/lanes/core-tests'\ncargo build",
+            "$env:CARGO_TARGET_DIR='target/lanes/core-tests'\r\ncargo build",
+            "$env:CARGO_TARGET_DIR='target/lanes/core-tests'; try { cargo build } finally {}",
+            "$env:CARGO_TARGET_DIR='target/lanes/core-tests'\ncargo build\nWrite-Output '--help'",
+            "$env:CARGO_TARGET_DIR='target/lanes/core-tests'; Write-Output \"$(cargo build)\"",
+        ] {
+            let command = ["pwsh".into(), "-Command".into(), script.into()];
+            assert!(
+                argv_commands(&command, Some(ShellType::PowerShell)).is_none(),
+                "regression must exercise the opaque-script fallback: {script}"
+            );
+            let error = check(&command, &cwd, &HashMap::new(), 0)
+                .expect_err("shell-local targets must not bypass managed-directory admission");
+            assert!(
+                error.contains("Raw Cargo launch rejected; no build started"),
+                "{script}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_powershell_quoted_examples_are_not_builds() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        for script in [
+            "$env:EXAMPLE='example\ncargo build'; Write-Output $env:EXAMPLE",
+            "$env:EXAMPLE=\"example\r\ncargo build\"; Write-Output $env:EXAMPLE",
+            "$env:EXAMPLE='try { cargo build }'; Write-Output $env:EXAMPLE",
+            "$env:EXAMPLE='processes'; Get-Process cargo,rustc -ErrorAction SilentlyContinue",
+        ] {
+            let command = ["pwsh".into(), "-Command".into(), script.into()];
+            assert!(
+                argv_commands(&command, Some(ShellType::PowerShell)).is_none(),
+                "positive control must exercise the opaque-script fallback: {script}"
+            );
+            assert!(check(&command, &cwd, &HashMap::new(), 0).is_ok(), "{script}");
+        }
+    }
+
+    #[test]
+    fn read_only_process_inspection_naming_cargo_is_admitted() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        for script in [
+            // A Cargo name inside a regex is data, not an invocation.
+            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'cargo|rustc' }",
+            // A comma-joined process-name list must not read as `cargo rustc`.
+            "Get-Process cargo,rustc -ErrorAction SilentlyContinue | Select-Object Id,ProcessName",
+            "Get-Process -Name cargo,rustc,rustdoc,cargo-nextest | ConvertTo-Json -Compress",
+            "tasklist | Select-String cargo",
+            "Get-Process | Where-Object { $_.Name -eq 'cargo' }",
+        ] {
+            assert!(
+                check(
+                    &["pwsh".into(), "-Command".into(), script.into()],
+                    &cwd,
+                    &HashMap::new(),
+                    0
+                )
+                .is_ok(),
+                "read-only process inspection must not be rejected: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_clause_does_not_block_its_unrelated_siblings() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        // The process query previously rejected the whole command, taking an
+        // unrelated instruction/source search down with it.
+        let script =
+            "Get-Process cargo,rustc -ErrorAction SilentlyContinue; rg -n 'core-test-gates' AGENTS.MD";
+        assert!(
+            check(
+                &["pwsh".into(), "-Command".into(), script.into()],
+                &cwd,
+                &HashMap::new(),
+                0
+            )
+            .is_ok(),
+            "{script}"
+        );
+        // A genuine build clause is still rejected, and names itself.
+        let building = "Get-Process cargo; cargo build";
+        let error = check(
+            &["pwsh".into(), "-Command".into(), building.into()],
+            &cwd,
+            &HashMap::new(),
+            0,
+        )
+        .expect_err("a real build clause must still be rejected");
+        assert!(
+            error.contains("cargo build"),
+            "rejection should name the offending clause: {error}"
+        );
+    }
+
+    #[test]
+    fn build_rejection_remediation_follows_the_lane_marker() {
+        // A marked tree must not be told that no repository-specific runner is
+        // needed; an unmarked workspace must keep the neutral advice.
+        let marked = tempfile::tempdir().unwrap();
+        let workspace = marked.path().join("reserved");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".codex-cargo-lanes-root"), "").unwrap();
+        let reserved = rejected_build("Detail.", &workspace);
+        assert!(
+            reserved.contains("managed test/build entrypoint"),
+            "marked tree should point at its managed entrypoint: {reserved}"
+        );
+        assert!(
+            !reserved.contains("ordinary Rust workspaces do not require"),
+            "marked tree must not claim no runner is needed: {reserved}"
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        let unmarked = plain.path().join("independent");
+        std::fs::create_dir_all(&unmarked).unwrap();
+        std::fs::write(
+            unmarked.join("Cargo.toml"),
+            "[package]\nname='independent'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let neutral = rejected_build("Detail.", &unmarked);
+        assert!(
+            neutral.contains("ordinary Rust workspaces do not require a repository-specific runner"),
+            "unmarked workspace keeps neutral advice: {neutral}"
+        );
     }
 }
 

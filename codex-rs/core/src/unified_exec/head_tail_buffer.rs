@@ -154,7 +154,9 @@ impl HeadTailBuffer {
     pub(crate) fn begin_output_report(&mut self) {
         if self.pending_report.is_none() {
             let mut report = Self {
-                start_offset: self.start_offset.and_then(|start| start.checked_sub(self.utf8_tail.len() as u64)),
+                start_offset: self
+                    .start_offset
+                    .and_then(|start| start.checked_sub(self.utf8_tail.len() as u64)),
                 ..Self::default()
             };
             report.push_chunk(&std::mem::take(&mut self.utf8_tail));
@@ -183,8 +185,14 @@ impl HeadTailBuffer {
         }
     }
 
-    pub(crate) fn projected_pending_output(&mut self, closed: bool, suffix: &[u8]) -> (Vec<u8>, Option<OutputChunkRanges>) {
-        let Some(report) = self.pending_report.as_mut() else { return (Vec::new(), None); };
+    pub(crate) fn projected_pending_output(
+        &mut self,
+        closed: bool,
+        suffix: &[u8],
+    ) -> (Vec<u8>, Option<OutputChunkRanges>) {
+        let Some(report) = self.pending_report.as_mut() else {
+            return (Vec::new(), None);
+        };
         let mut output = report.to_bytes_with_loss_notice(suffix);
         let mut ranges = report.output_ranges();
         report.utf8_tail.clear();
@@ -216,7 +224,8 @@ impl HeadTailBuffer {
 
     pub(crate) fn output_ranges(&self) -> Option<OutputChunkRanges> {
         let start = self.start_offset?;
-        let end = start.checked_add(self.retained_bytes() as u64)?
+        let end = start
+            .checked_add(self.retained_bytes() as u64)?
             .checked_add(self.omitted_bytes as u64)?;
         let gap_start = start.checked_add(self.head.len() as u64)?;
         Some(OutputChunkRanges {
@@ -235,7 +244,8 @@ impl HeadTailBuffer {
         if self.start_offset.is_none() {
             target.start_offset = None;
         }
-        self.start_offset = self.start_offset
+        self.start_offset = self
+            .start_offset
             .and_then(|start| start.checked_add(consumed?));
         let meaningful = omitted > 0
             || lagged > 0

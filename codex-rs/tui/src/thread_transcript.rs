@@ -231,8 +231,23 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
         ThreadItem::ExitedReviewMode { review, .. } => {
             vec![vec!["review finished: ".dim(), review.clone().into()].into()]
         }
-        ThreadItem::ContextCompaction { .. } => {
-            vec!["context compacted".dim().into()]
+        ThreadItem::ContextCompaction {
+            tokens_before,
+            tokens_after,
+            omitted_image_count,
+            omitted_text,
+            ..
+        } => {
+            let detail = codex_app_server_protocol::describe_context_compaction(
+                *tokens_before,
+                *tokens_after,
+                *omitted_image_count,
+                *omitted_text,
+            );
+            match detail {
+                Some(detail) => vec![format!("context compacted ({detail})").dim().into()],
+                None => vec!["context compacted".dim().into()],
+            }
         }
         ThreadItem::UserMessage { .. }
         | ThreadItem::AgentMessage { .. }

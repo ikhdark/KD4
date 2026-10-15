@@ -367,17 +367,21 @@ pub async fn handle(
     } else {
         None
     };
-    let deliver = args.deliver && job.status.as_str() == "completed"
-        && progress.failed_items == 0 && progress.completed_items == progress.total_items
+    let deliver = args.deliver
+        && job.status.as_str() == "completed"
+        && progress.failed_items == 0
+        && progress.completed_items == progress.total_items
         && job_error.is_none();
     if deliver {
         // Bind delivery to the final durable job state, not the mere presence
         // of a CSV that may have been exported during an earlier progress step.
-        export_job_csv_snapshot(db.clone(), &job).await.map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to export final agent job {job_id}: {error}"
-            ))
-        })?;
+        export_job_csv_snapshot(db.clone(), &job)
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to export final agent job {job_id}: {error}"
+                ))
+            })?;
     }
     let delivery_owner = format!("agent-job:{job_id}");
     let content = serde_json::to_string(&SpawnAgentsOnCsvResult {

@@ -52,7 +52,9 @@ const TRUSTED_STABLE_CONTEXT_ITEM_ID_BASE: &str = "msg_sctx";
 const TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX: &str = "msg_sctx_";
 
 pub(crate) fn turn_contribution_text(index: usize, text: &str) -> String {
-    format!("<turn_context_contribution index=\"{index}\">\nCurrent contribution for this source; replaces earlier values with the same index.\n{text}\n</turn_context_contribution>")
+    format!(
+        "<turn_context_contribution index=\"{index}\">\nCurrent contribution for this source; replaces earlier values with the same index.\n{text}\n</turn_context_contribution>"
+    )
 }
 
 pub(crate) fn turn_contribution_removal(index: usize) -> String {
@@ -707,13 +709,24 @@ pub(crate) fn project_stable_context(
     items: Arc<[ResponseItem]>,
     target: StableContextTarget,
 ) -> StableContextProjection {
-    project_stable_context_inner(items, target, false)
+    project_stable_context_inner(items, target, false, false)
 }
 
 /// Replacement history must retain trusted identity, source order, and the
 /// presence markers needed to project the installed history again.
 pub(crate) fn project_compaction_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
-    project_stable_context_inner(items, StableContextTarget::Sampling, true)
+    project_stable_context_inner(items, StableContextTarget::Sampling, true, false)
+        .items
+        .to_vec()
+}
+
+/// Sampling history retires superseded slots like compaction, except
+/// task-state snapshots. Every plan update emits a full snapshot, and retiring
+/// one the model already received rewrites the request at its position, so
+/// the provider re-bills everything after it uncached. Each snapshot states
+/// that it replaces earlier ones; compaction keeps only the latest.
+pub(crate) fn project_sampling_history_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
+    project_stable_context_inner(items, StableContextTarget::Sampling, true, true)
         .items
         .to_vec()
 }
@@ -722,6 +735,7 @@ fn project_stable_context_inner(
     items: Arc<[ResponseItem]>,
     target: StableContextTarget,
     preserve_history: bool,
+    retain_task_state_history: bool,
 ) -> StableContextProjection {
     let fallback_items = Arc::clone(&items);
     let mut occurrences = Vec::new();
@@ -731,12 +745,7 @@ fn project_stable_context_inner(
     let mut user_insertion_by_turn = HashMap::<&str, usize>::new();
 
     for (item_index, item) in items.iter().enumerate() {
-        let ResponseItem::Message {
-            role,
-            content,
-            ..
-        } = item
-        else {
+        let ResponseItem::Message { role, content, .. } = item else {
             continue;
         };
         let trusted_stable_context = is_trusted_stable_context_item(item);
@@ -800,7 +809,11 @@ fn project_stable_context_inner(
         if ambiguous_item {
             // A mixed/ambiguous message stays whole. Fail open for its kinds,
             // not for independent, well-formed instruction sources.
-            ambiguous_kinds.extend(occurrences[occurrence_start..].iter().map(|item| item.slot.kind()));
+            ambiguous_kinds.extend(
+                occurrences[occurrence_start..]
+                    .iter()
+                    .map(|item| item.slot.kind()),
+            );
         }
         if role == "user"
             && contains_ordinary_user_content
@@ -826,7 +839,8 @@ fn project_stable_context_inner(
             }
         });
     }
-    let enabled = target == StableContextTarget::Sampling && (!ambiguous || !occurrences.is_empty());
+    let enabled =
+        target == StableContextTarget::Sampling && (!ambiguous || !occurrences.is_empty());
     let fail_open = ambiguous || target_fail_open;
     let (projected, components): (Arc<[ResponseItem]>, _) = if enabled {
         let (projected, mut components) = project_items(
@@ -835,6 +849,7 @@ fn project_stable_context_inner(
             latest_real_user,
             &user_insertion_by_turn,
             preserve_history,
+            retain_task_state_history,
         );
         if !retained_ambiguous.is_empty() {
             components.extend(analyze_unprojected(&items, &retained_ambiguous, true));
@@ -867,6 +882,7 @@ fn project_items(
     latest_real_user: Option<usize>,
     user_insertion_by_turn: &HashMap<&str, usize>,
     preserve_history: bool,
+    retain_task_state_history: bool,
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
     let selected_skill_indexes =
         current_selected_skill_indexes(items, occurrences, latest_real_user);
@@ -880,21 +896,37 @@ fn project_items(
     let collaboration_removed = latest_by_slot
         .get(&StableContextSlot::Collaboration)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| marked_body_is(occurrence.text(items), COLLABORATION_MODE_OPEN_TAG, "</collaboration_mode>", COLLABORATION_RESET_NOTICE));
+        .is_some_and(|occurrence| {
+            marked_body_is(
+                occurrence.text(items),
+                COLLABORATION_MODE_OPEN_TAG,
+                "</collaboration_mode>",
+                COLLABORATION_RESET_NOTICE,
+            )
+        });
     let repository_removed = latest_by_slot
         .get(&StableContextSlot::Repository)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| occurrence.text(items).trim().split_once("<INSTRUCTIONS>")
-            .is_some_and(|(_, body)| body.strip_suffix(REPOSITORY_CLOSE_TAG)
-                .is_some_and(|body| body.trim() == REPOSITORY_REMOVAL_NOTICE)));
+        .is_some_and(|occurrence| {
+            occurrence
+                .text(items)
+                .trim()
+                .split_once("<INSTRUCTIONS>")
+                .is_some_and(|(_, body)| {
+                    body.strip_suffix(REPOSITORY_CLOSE_TAG)
+                        .is_some_and(|body| body.trim() == REPOSITORY_REMOVAL_NOTICE)
+                })
+        });
     // Observation freshness describes the instruction body current at that
     // point. A later body replacement/removal supersedes the old observation,
     // but an observation must never retract the instruction slot itself.
     let repository_observation_current = latest_by_slot
         .get(&StableContextSlot::RepositoryObservation)
-        .is_some_and(|observation| latest_by_slot
-            .get(&StableContextSlot::Repository)
-            .is_none_or(|repository| observation > repository));
+        .is_some_and(|observation| {
+            latest_by_slot
+                .get(&StableContextSlot::Repository)
+                .is_none_or(|repository| observation > repository)
+        });
     let developer_instructions_removed = latest_by_slot
         .get(&StableContextSlot::DeveloperInstructions)
         .and_then(|index| occurrences.get(*index))
@@ -932,6 +964,14 @@ fn project_items(
     for occurrence_index in &selected_skill_indexes {
         let occurrence = &occurrences[*occurrence_index];
         keep.insert((occurrence.item_index, occurrence.content_index));
+    }
+    if retain_task_state_history {
+        keep.extend(
+            occurrences
+                .iter()
+                .filter(|occurrence| occurrence.slot == StableContextSlot::TaskState)
+                .map(|occurrence| (occurrence.item_index, occurrence.content_index)),
+        );
     }
 
     let occurrence_content = occurrences
@@ -1076,7 +1116,8 @@ fn project_items(
             || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
             || (slot == StableContextSlot::MultiAgentUsageHint && multi_agent_usage_hint_removed);
         let gated = (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current)
-            || (slot == StableContextSlot::RepositoryObservation && !repository_observation_current);
+            || (slot == StableContextSlot::RepositoryObservation
+                && !repository_observation_current);
         let text = occurrence.text(items);
         let mut component = component_from_text(
             slot.kind(),
@@ -1190,7 +1231,9 @@ fn current_selected_skill_indexes(
         let mut seen = HashSet::new();
         selected.retain(|&index| {
             let occurrence = &occurrences[index];
-            let ResponseItem::Message { role, .. } = &items[occurrence.item_index] else { return false; };
+            let ResponseItem::Message { role, .. } = &items[occurrence.item_index] else {
+                return false;
+            };
             // The rendered body includes path and scope. Keep the first exact
             // occurrence in place; different bodies or authority never coalesce.
             seen.insert((role.as_str(), occurrence.text(items)))
@@ -1316,10 +1359,14 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
         ));
     }
     if role == "user" && marked(text, "<subagents_context>", "</subagents_context>") {
-        return Some(StableTextClassification::inline(StableContextSlot::Subagents));
+        return Some(StableTextClassification::inline(
+            StableContextSlot::Subagents,
+        ));
     }
     if role == "user" && marked(text, "<codex_task_state>", "</codex_task_state>") {
-        return Some(StableTextClassification::inline(StableContextSlot::TaskState));
+        return Some(StableTextClassification::inline(
+            StableContextSlot::TaskState,
+        ));
     }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
         return Some(StableTextClassification::inline(
@@ -1330,8 +1377,14 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
         return None;
     }
     let trimmed = text.trim();
-    if marked(text, "<repository_observation>", "</repository_observation>") {
-        return Some(StableTextClassification::inline(StableContextSlot::RepositoryObservation));
+    if marked(
+        text,
+        "<repository_observation>",
+        "</repository_observation>",
+    ) {
+        return Some(StableTextClassification::inline(
+            StableContextSlot::RepositoryObservation,
+        ));
     }
     if trimmed == DEVELOPER_INSTRUCTIONS_PRESENT_MARKER {
         return Some(StableTextClassification {
@@ -1443,26 +1496,59 @@ fn contains_known_open_marker(text: &str) -> bool {
 fn known_open_marker_kind(text: &str) -> Option<StableContextKind> {
     [
         (REPOSITORY_OPEN_TAG, StableContextKind::Repository),
-        (ROOT_ORCHESTRATION_OPEN_TAG, StableContextKind::RootCoordinator),
-        (COLLABORATION_MODE_OPEN_TAG, StableContextKind::Collaboration),
+        (
+            ROOT_ORCHESTRATION_OPEN_TAG,
+            StableContextKind::RootCoordinator,
+        ),
+        (
+            COLLABORATION_MODE_OPEN_TAG,
+            StableContextKind::Collaboration,
+        ),
         (SKILLS_USAGE_OPEN_TAG, StableContextKind::SkillUsage),
-        (SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
-        (EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
-        (ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
+        (
+            SKILLS_INSTRUCTIONS_OPEN_TAG,
+            StableContextKind::SkillCatalog,
+        ),
+        (
+            EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            StableContextKind::SkillCatalog,
+        ),
+        (
+            ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            StableContextKind::SkillCatalog,
+        ),
         (SKILL_OPEN_TAG, StableContextKind::SelectedSkill),
         ("<environment_context>", StableContextKind::Environment),
         ("<subagents_context>", StableContextKind::Environment),
         ("<codex_task_state>", StableContextKind::TaskState),
-        ("<repository_observation>", StableContextKind::RepositoryObservation),
-        ("<recommended_plugins>", StableContextKind::RecommendedPlugins),
+        (
+            "<repository_observation>",
+            StableContextKind::RepositoryObservation,
+        ),
+        (
+            "<recommended_plugins>",
+            StableContextKind::RecommendedPlugins,
+        ),
         (APPS_INSTRUCTIONS_OPEN_TAG, StableContextKind::DesktopApp),
         ("<app-context>", StableContextKind::AppContext),
         (PLUGINS_INSTRUCTIONS_OPEN_TAG, StableContextKind::Plugins),
-        ("<permissions instructions>", StableContextKind::EnvironmentPermissions),
+        (
+            "<permissions instructions>",
+            StableContextKind::EnvironmentPermissions,
+        ),
         (MULTI_AGENT_MODE_OPEN_TAG, StableContextKind::MultiAgent),
-        ("<configured_developer_instructions", StableContextKind::DeveloperInstructions),
-        ("<turn_context_contribution", StableContextKind::TurnContribution),
-        ("<multi_agent_usage_hint", StableContextKind::MultiAgentUsageHint),
+        (
+            "<configured_developer_instructions",
+            StableContextKind::DeveloperInstructions,
+        ),
+        (
+            "<turn_context_contribution",
+            StableContextKind::TurnContribution,
+        ),
+        (
+            "<multi_agent_usage_hint",
+            StableContextKind::MultiAgentUsageHint,
+        ),
         ("<model_switch>", StableContextKind::ModelSwitch),
         ("<personality_spec>", StableContextKind::Personality),
     ]
@@ -1509,7 +1595,10 @@ pub(crate) fn retractable_markers(history: &[ResponseItem]) -> Vec<&'static str>
         }
     }
     [
-        (developer_instructions, DEVELOPER_INSTRUCTIONS_REMOVED_MARKER),
+        (
+            developer_instructions,
+            DEVELOPER_INSTRUCTIONS_REMOVED_MARKER,
+        ),
         (usage_hint, MULTI_AGENT_USAGE_HINT_REMOVED_MARKER),
     ]
     .into_iter()
@@ -1585,7 +1674,9 @@ fn marked(text: &str, open: &str, close: &str) -> bool {
 }
 
 fn marked_body_is(text: &str, open: &str, close: &str, expected: &str) -> bool {
-    text.trim().strip_prefix(open).and_then(|body| body.strip_suffix(close))
+    text.trim()
+        .strip_prefix(open)
+        .and_then(|body| body.strip_suffix(close))
         .is_some_and(|body| body.trim() == expected)
 }
 
@@ -1596,7 +1687,14 @@ fn component_from_text(
     active: bool,
     disposition: StableContextDisposition,
 ) -> StableContextComponent {
-    component_from_bytes(kind, semantic_key, text.as_bytes(), active, disposition, None)
+    component_from_bytes(
+        kind,
+        semantic_key,
+        text.as_bytes(),
+        active,
+        disposition,
+        None,
+    )
 }
 
 fn base_component(model_slug: &str, base_instructions: &str) -> StableContextComponent {
@@ -1746,8 +1844,6 @@ mod tests_optimization {
 
         assert!(retained.is_empty());
     }
-
-
 
     #[test]
     fn changed_and_volatile_injections_remain_turn_scoped() {
@@ -2052,16 +2148,30 @@ mod tests_optimization {
     fn subagent_replacement_keeps_the_independent_environment() {
         let environment = "<environment_context>\ncwd: repo\n</environment_context>";
         let current = "<subagents_context>\nworker finished\n</subagents_context>";
-        let projection = project_stable_context(vec![
-            text_message_for_turn("user", environment, "turn-1"),
-            text_message_for_turn("user", "<subagents_context>\nworker running\n</subagents_context>", "turn-1"),
-            text_message_for_turn("user", current, "turn-1"),
-            text_message_for_turn("user", "continue", "turn-1"),
-        ].into(), StableContextTarget::Sampling);
-        let texts = projection.items.iter().flat_map(|item| match item {
-            ResponseItem::Message { content, .. } => content.iter().filter_map(content_text).collect::<Vec<_>>(),
-            _ => Vec::new(),
-        }).collect::<Vec<_>>();
+        let projection = project_stable_context(
+            vec![
+                text_message_for_turn("user", environment, "turn-1"),
+                text_message_for_turn(
+                    "user",
+                    "<subagents_context>\nworker running\n</subagents_context>",
+                    "turn-1",
+                ),
+                text_message_for_turn("user", current, "turn-1"),
+                text_message_for_turn("user", "continue", "turn-1"),
+            ]
+            .into(),
+            StableContextTarget::Sampling,
+        );
+        let texts = projection
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                ResponseItem::Message { content, .. } => {
+                    content.iter().filter_map(content_text).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
         assert!(texts.contains(&environment));
         assert!(texts.contains(&current));
         assert!(!texts.iter().any(|text| text.contains("worker running")));

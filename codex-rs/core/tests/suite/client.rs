@@ -378,8 +378,8 @@ async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> an
     assert_eq!(requests.len(), 2);
     let user_id = response_message_item_id(&requests[0], "user", "before resume");
     let user_uuid = user_id
-        .strip_prefix("msg_")
-        .expect("message ID should have the Responses API prefix");
+        .strip_prefix("msg_user_")
+        .expect("user input ID should have the Responses API user-input prefix");
     assert_eq!(
         Uuid::parse_str(user_uuid)?.get_version(),
         Some(uuid::Version::SortRand)
@@ -836,7 +836,10 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .iter()
         .filter(|(role, text)| role == "system" || text == "resumed system instruction")
         .count();
-    assert_eq!(system_message_count, 0, "system history must not be replayed");
+    assert_eq!(
+        system_message_count, 0,
+        "system history must not be replayed"
+    );
     let pos_prior_user = messages
         .iter()
         .position(|(role, text)| role == "user" && text == "resumed user message")
@@ -1231,7 +1234,9 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     assert_eq!(request_thread_id, thread_id_string.as_str());
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Test API Key");
-    let cache_key = request_body["prompt_cache_key"].as_str().expect("prefix cache key");
+    let cache_key = request_body["prompt_cache_key"]
+        .as_str()
+        .expect("prefix cache key");
     assert_eq!(cache_key, thread_id_string);
     assert_codex_client_metadata(
         &request_body,
@@ -1678,8 +1683,6 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
-
-
 #[expect(clippy::unwrap_used)]
 async fn apps_guidance_request(
     auth: CodexAuth,
@@ -1750,7 +1753,13 @@ async fn apps_guidance_is_developer_only_and_gated_by_auth_and_config() {
             None,
             false,
         ),
-        ("configured off", create_dummy_codex_auth(), false, None, false),
+        (
+            "configured off",
+            create_dummy_codex_auth(),
+            false,
+            None,
+            false,
+        ),
         // The catalog marks this model as needing no generic Apps guidance.
         (
             "model opts out",
@@ -2087,7 +2096,10 @@ async fn skill_catalog_reports_omissions_under_budget_pressure() {
                 .any(|line| line.starts_with(&format!("- s{index:02} — ")))
         })
         .count();
-    assert!(included > 0 && included < SKILL_COUNT, "exercise partial omission");
+    assert!(
+        included > 0 && included < SKILL_COUNT,
+        "exercise partial omission"
+    );
     assert!(
         developer_text.contains(&format!(
             "Catalog incomplete: {} additional skills omitted",
@@ -2458,10 +2470,12 @@ async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Resul
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls()
--> anyhow::Result<()> {
-    require_network!();
+/// Dispatches one turn against a Lite/parallel capability pair and returns the
+/// recorded request body, so the two capabilities can be asserted independently.
+async fn responses_lite_request_body(
+    use_responses_lite: bool,
+    supports_parallel_tool_calls: bool,
+) -> anyhow::Result<serde_json::Value> {
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -2471,9 +2485,9 @@ async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls(
     .await;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model_info_override("gpt-5.4", |model_info| {
-            model_info.use_responses_lite = true;
-            model_info.supports_parallel_tool_calls = true;
+        .with_model_info_override("gpt-5.4", move |model_info| {
+            model_info.use_responses_lite = use_responses_lite;
+            model_info.supports_parallel_tool_calls = supports_parallel_tool_calls;
         })
         .build(&server)
         .await?;
@@ -2493,7 +2507,19 @@ async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls(
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let request_body = resp_mock.single_request().body_json();
+    Ok(resp_mock.single_request().body_json())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_sets_all_turns_context_and_keeps_parallel_tool_calls() -> anyhow::Result<()>
+{
+    require_network!();
+
+    let request_body = responses_lite_request_body(
+        /* use_responses_lite */ true, /* supports_parallel_tool_calls */ true,
+    )
+    .await?;
+
     pretty_assertions::assert_eq!(
         request_body
             .get("reasoning")
@@ -2501,7 +2527,43 @@ async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls(
             .and_then(|value| value.as_str()),
         Some("all_turns")
     );
-    pretty_assertions::assert_eq!(request_body.get("parallel_tool_calls"), Some(&json!(false)));
+    // Responses Lite relocates tools, pins reasoning context and adds a
+    // transport header. It does not restrict tool-call arity, so it must not
+    // override the model's advertised parallel-tool-call capability.
+    pretty_assertions::assert_eq!(request_body.get("parallel_tool_calls"), Some(&json!(true)));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_tool_calls_follow_model_capability_independent_of_responses_lite()
+-> anyhow::Result<()> {
+    require_network!();
+
+    for use_responses_lite in [false, true] {
+        for supports_parallel_tool_calls in [false, true] {
+            let request_body =
+                responses_lite_request_body(use_responses_lite, supports_parallel_tool_calls)
+                    .await?;
+            // The dispatched flag tracks the capability alone; Lite only
+            // decides whether reasoning context is pinned to all_turns.
+            pretty_assertions::assert_eq!(
+                request_body.get("parallel_tool_calls"),
+                Some(&json!(supports_parallel_tool_calls)),
+                "parallel_tool_calls must follow supports_parallel_tool_calls \
+                 (use_responses_lite={use_responses_lite})"
+            );
+            pretty_assertions::assert_eq!(
+                request_body
+                    .get("reasoning")
+                    .and_then(|reasoning| reasoning.get("context"))
+                    .and_then(|value| value.as_str()),
+                use_responses_lite.then_some("all_turns"),
+                "reasoning context is the Lite-controlled field \
+                 (use_responses_lite={use_responses_lite})"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -2788,7 +2850,9 @@ async fn includes_developer_instructions_message_in_request() {
     assert!(
         developer_messages
             .iter()
-            .any(|item| message_input_texts(item).iter().any(|text| text.contains("be useful"))),
+            .any(|item| message_input_texts(item)
+                .iter()
+                .any(|text| text.contains("be useful"))),
         "expected developer instructions in a developer message, got {:?}",
         request_body["input"]
     );
@@ -3004,7 +3068,8 @@ async fn azure_responses_request_includes_store_and_omits_item_ids() {
 
     let mut completed = false;
     while let Some(event) = stream.next().await {
-        if let ResponseEvent::Completed { .. } = event.expect("Azure response stream must succeed") {
+        if let ResponseEvent::Completed { .. } = event.expect("Azure response stream must succeed")
+        {
             completed = true;
             break;
         }
@@ -3261,7 +3326,8 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
-    let completed = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let completed =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let EventMsg::TurnComplete(completed) = completed else {
         unreachable!();
     };
@@ -3287,7 +3353,10 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
     let requests = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_response_created("resp_seed"), ev_completed("resp_seed")]),
+            sse(vec![
+                ev_response_created("resp_seed"),
+                ev_completed("resp_seed"),
+            ]),
             overflow.clone(),
             sse(vec![
                 json!({
@@ -3374,12 +3443,17 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
     );
 
     let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed) else {
+    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed)
+    else {
         unreachable!();
     };
     assert_eq!(completed.error, Some(error));
 
-    assert_eq!(requests.requests().len(), 4, "recover from overflow only once");
+    assert_eq!(
+        requests.requests().len(),
+        4,
+        "recover from overflow only once"
+    );
     Ok(())
 }
 
@@ -3465,7 +3539,8 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
     );
 
     let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed) else {
+    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed)
+    else {
         unreachable!();
     };
     assert_eq!(completed.error, Some(error));
@@ -3702,7 +3777,8 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         .iter()
         .filter(|item| {
             item["role"] == "assistant"
-                || item.get("content")
+                || item
+                    .get("content")
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(|content| {
                         content.iter().any(|part| {

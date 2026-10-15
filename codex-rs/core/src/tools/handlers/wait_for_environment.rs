@@ -175,7 +175,10 @@ mod tests {
             panic!("expected a function tool");
         };
         assert!(spec.parameters.required.as_ref().is_none_or(Vec::is_empty));
-        assert!(spec.description.contains("call the desired available operation directly"));
+        assert!(
+            spec.description
+                .contains("call the desired available operation directly")
+        );
         assert!(spec.description.contains("readiness-only requests"));
     }
 }

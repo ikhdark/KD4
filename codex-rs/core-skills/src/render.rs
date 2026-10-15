@@ -27,7 +27,7 @@ pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by t
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
 - Load `skill:` locators with `read_file`, and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.
-- If a named skill or required read is unavailable, state it and use the safest fallback; retry a rejected shell read through a dedicated read-only route."###;
+- If a named skill or required read is unavailable, state it and use the safest fallback. Retry shell invocation/transport failures through a permitted dedicated read-only route; never bypass permission denials with another tool."###;
 
 pub fn render_available_skills_body(skill_lines: &[String]) -> String {
     let capacity = "\n## Skills\n".len()
@@ -617,6 +617,16 @@ mod tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn skills_usage_fallback_preserves_permission_denials() {
+        assert!(SKILLS_HOW_TO_USE.contains("shell invocation/transport failures"));
+        assert!(SKILLS_HOW_TO_USE.contains("permitted dedicated read-only route"));
+        assert!(SKILLS_HOW_TO_USE.contains("never bypass permission denials with another tool"));
+        assert!(!SKILLS_HOW_TO_USE.contains("retry a rejected shell read"));
+        // The developer-context consumer's existing prompt budget still applies.
+        assert!(SKILLS_HOW_TO_USE.len() <= 1_000);
+    }
 
     fn make_skill(name: &str, scope: SkillScope) -> SkillMetadata {
         SkillMetadata {

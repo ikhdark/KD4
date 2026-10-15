@@ -94,7 +94,10 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     let (after_fork_thread_id, after_fork_generation) = window_id_parts(&requests[4]);
 
     assert_eq!(first_generation, 0);
-    assert_eq!(initial_thread_id, initial.session_configured.thread_id.to_string());
+    assert_eq!(
+        initial_thread_id,
+        initial.session_configured.thread_id.to_string()
+    );
     assert_eq!(compact_thread_id, initial_thread_id);
     assert_eq!(compact_generation, 0);
     assert_eq!(after_compact_thread_id, initial_thread_id);

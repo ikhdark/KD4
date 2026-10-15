@@ -402,7 +402,10 @@ impl ToolDispatchTiming {
     pub(crate) fn record_outcome(&self, outcome: &'static str) {
         let _ = self.outcome.set(outcome);
         let open = {
-            let events = self.lifecycle_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let events = self
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut open = [false; 4];
             for event in events.iter() {
                 if let Some((gate, entering)) = live_gate_boundary(event.boundary) {
@@ -416,8 +419,13 @@ impl ToolDispatchTiming {
             ToolLifecycleBoundary::DiffTrackerWaitEnd,
             ToolLifecycleBoundary::WorkspaceGateWaitEnd,
             ToolLifecycleBoundary::EvidenceTrackerWaitEnd,
-        ].into_iter().zip(open) {
-            if waiting { self.record_boundary(end); }
+        ]
+        .into_iter()
+        .zip(open)
+        {
+            if waiting {
+                self.record_boundary(end);
+            }
         }
     }
 
@@ -575,9 +583,14 @@ fn live_gate_boundary(boundary: ToolLifecycleBoundary) -> Option<(usize, bool)> 
 
 impl Drop for ToolDispatchTiming {
     fn drop(&mut self) {
-        let Some(turn) = &self.turn_timing else { return; };
+        let Some(turn) = &self.turn_timing else {
+            return;
+        };
         // A cancelled admission future may never reach its matching End boundary.
-        let events = self.lifecycle_events.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = self
+            .lifecycle_events
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut outstanding = [false; 4];
         for event in events {
             if let Some((gate, entering)) = live_gate_boundary(event.boundary) {
@@ -585,7 +598,9 @@ impl Drop for ToolDispatchTiming {
             }
         }
         for (gate, waiting) in outstanding.into_iter().enumerate() {
-            if waiting { turn.adjust_live_gate(gate, false); }
+            if waiting {
+                turn.adjust_live_gate(gate, false);
+            }
         }
     }
 }

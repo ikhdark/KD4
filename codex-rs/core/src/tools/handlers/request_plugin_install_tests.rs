@@ -74,10 +74,16 @@ fn remote_plugin_completion_requires_installed_identity_and_connectors() {
     for (config_id, remote_id, identity_matches) in [
         ("other@openai-curated-remote", "plugin_other", false),
         ("calendar@openai-curated-remote", "plugin_other", true),
-        ("renamed-calendar@openai-curated-remote", "plugin_calendar", true),
+        (
+            "renamed-calendar@openai-curated-remote",
+            "plugin_calendar",
+            true,
+        ),
     ] {
         for installed in [false, true] {
-            let marketplaces = vec![remote_marketplace_with_plugin(config_id, remote_id, installed)];
+            let marketplaces = vec![remote_marketplace_with_plugin(
+                config_id, remote_id, installed,
+            )];
             for connectors_completed in [false, true] {
                 assert_eq!(
                     verified_remote_plugin_install_completed(
@@ -145,7 +151,10 @@ fn local_plugin_completion_requires_requested_connectors() {
         assert!(!verified_local_plugin_install_completed(
             true,
             true,
-            &["connector_calendar".to_string(), "connector_mail".to_string()],
+            &[
+                "connector_calendar".to_string(),
+                "connector_mail".to_string()
+            ],
             Some(std::slice::from_ref(&candidate)),
         ));
     }

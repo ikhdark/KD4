@@ -145,9 +145,12 @@ def _timestamp_ns(value: Any) -> int | None:
         return None
     try:
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        elapsed = parsed.astimezone(dt.timezone.utc) - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
         return None
-    return int(parsed.timestamp() * _NANOSECONDS_PER_SECOND)
+    # Avoid floating-point epoch rounding; retain existing naive/local semantics.
+    return ((elapsed.days * 86400 + elapsed.seconds) * _NANOSECONDS_PER_SECOND
+            + elapsed.microseconds * 1000)
 
 
 def _tool_output_text(payload: dict[str, Any]) -> str:
@@ -184,17 +187,13 @@ def _tool_status(output: str, command: str | None = None) -> str:
     if isinstance(result, dict):
         if result.get("execution_state") == "running":
             return "running"
-        if (
-            result.get("execution_state") == "exited"
-            or result.get("process_exited") is True
-        ):
-            exit_code = result.get("exit_code")
-            if type(exit_code) is int:
-                return (
-                    "completed"
-                    if exit_code == 0 or _is_rg_no_match(command, exit_code, result)
-                    else "failed"
-                )
+        exit_code = result.get("exit_code")
+        if type(exit_code) is int:
+            return (
+                "completed"
+                if exit_code == 0 or _is_rg_no_match(command, exit_code, result)
+                else "failed"
+            )
     if re.search(
         r"\b(?:Script failed|exec cancelled|Traceback \(most recent call last\))\b",
         output,
@@ -899,24 +898,19 @@ def _request_cost_model(records: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _output_channels(
-    visible_bytes: collections.Counter[str], records: list[dict[str, Any]]
+    visible_bytes: collections.Counter[str], tokens: dict[str, Any]
 ) -> dict[str, Any]:
     """Visible output by channel (byte shares) and reasoning's share of output tokens."""
     total = sum(visible_bytes.values())
-    visible_tokens = reasoning_tokens = 0
-    for record in records:
-        for request in record["timing"].get("modelRequests") or []:
-            usage = request.get("tokenUsage") or {}
-            visible_tokens += usage.get("visibleOutputTokens") or 0
-            reasoning_tokens += usage.get("reasoningTokens") or 0
-    output_tokens = visible_tokens + reasoning_tokens
+    # Reuse reconciled provider totals, including request deduplication/coverage.
+    output_tokens = tokens.get("outputTokens") if tokens.get("complete") is True else None
     return {
         "visibleByteShares": {
             name: round(count / total, 3) for name, count in sorted(visible_bytes.items())
         }
         if total
         else {},
-        "reasoningTokenShare": round(reasoning_tokens / output_tokens, 3)
+        "reasoningTokenShare": round(tokens["reasoningTokens"] / output_tokens, 3)
         if output_tokens
         else None,
     }
@@ -1015,6 +1009,8 @@ def _terminal_record(
         "turn_id": payload.get("turn_id"),
         "status": payload.get("type"),
         "lifecycle": lifecycle,
+        "error": payload.get("error"),
+        "reason": payload.get("reason"),
         "cwd": cwd,
         "timing": payload.get("timing"),
     }
@@ -1023,7 +1019,10 @@ def _terminal_record(
 def _iso_from_unix_ms(value: int | None) -> str | None:
     if value is None:
         return None
-    return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat()
+    try:
+        return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def _turn_boundaries(timing: dict[str, Any], terminal_timestamp: Any) -> dict[str, Any]:
@@ -1751,7 +1750,7 @@ def analyze_session_path(
     terminal_turns: set[str] = set()
     terminal_without_timing: set[str] = set()
     terminal_profiles = TerminalProfiles()
-    timed_records = terminal_profiles.records
+    timed_records = {}
     duplicate_timed_terminal_events = 0
     parse_error_count = 0
     parse_errors: list[dict[str, Any]] = []
@@ -1849,7 +1848,7 @@ def analyze_session_path(
                         "type": item.get("type"),
                         "payload": {
                             key: payload[key]
-                            for key in ("type", "name", "execution", "turn_id")
+                            for key in ("type", "name", "execution", "turn_id", "error", "reason")
                             if key in payload
                         }
                         | (
@@ -1890,8 +1889,7 @@ def analyze_session_path(
                     cwd = str(payload.get("cwd") or cwd)
                     build = _build_identity(payload) or build
                 payload_type = payload.get("type")
-                if item.get("type") == "event_msg" and payload_type == "token_count":
-                    subscription_usage.observe(str(file), timestamp_ns, payload.get("rate_limits"))
+                subscription_usage.observe_event(str(file), timestamp_ns, item, line_number)
                 if (
                     item.get("type") == "response_item"
                     and payload_type == "message"
@@ -2038,6 +2036,8 @@ def analyze_session_path(
                                 ),
                             }
                         )
+                if item.get("type") != "event_msg":
+                    continue
                 turn_id = payload.get("turn_id")
                 if turn_id and len(files) > 1:
                     turn_id = json.dumps(
@@ -2064,7 +2064,8 @@ def analyze_session_path(
                 if payload_type not in ("task_complete", "turn_aborted") or not turn_id:
                     continue
                 turn_id = str(turn_id)
-                if timestamp_ns is not None and turn_id in task_started_at:
+                if (timestamp_ns is not None and turn_id in task_started_at
+                        and turn_id not in terminal_turns):
                     execution_loop_counts["terminalTasks"] += 1
                     execution_loop_ns["taskElapsedNs"] += max(
                         0, timestamp_ns - task_started_at[turn_id]
@@ -2093,6 +2094,8 @@ def analyze_session_path(
                 record["turn_id"] = turn_id
                 record["build"] = build
                 terminal_lifecycle_counts[record["lifecycle"]] += 1
+                key = (str(file), turn_id)
+                terminal_profiles.add(key, record)
                 timing = record["timing"]
                 if not isinstance(timing, dict):
                     terminal_without_timing.add(turn_id)
@@ -2100,7 +2103,7 @@ def analyze_session_path(
                 key = (str(file), turn_id)
                 if key in timed_records:
                     duplicate_timed_terminal_events += 1
-                terminal_profiles.add(key, record)
+                timed_records.setdefault(key, record)
                 schema_versions[str(timing.get("schemaVersion", "missing"))] += 1
         for pending in pending_tool_calls.values():
             pending_turn_id = pending.get("turnId")
@@ -2338,7 +2341,7 @@ def analyze_session_path(
     report["requestCostModel"] = _request_cost_model(valid) if include_tokens else None
     report["requestLedger"] = _request_ledger(valid, ledger_calls, valid_tool_calls, include_tokens)
     report["outputChannels"] = _output_channels(
-        output_channel_bytes, valid if include_tokens else []
+        output_channel_bytes, report["populations"]["all"]["tokens"]
     )
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
@@ -2357,7 +2360,8 @@ def _request_ledger(records, calls, tool_calls, include_tokens):
     requests = []
     for record in sorted(records, key=lambda row: (row["timestamp"] or "", row["turn_id"])):
         for index, request in enumerate(_selected_requests(record["timing"])):
-            usage = request.get("tokenUsage") or {}
+            usage = request.get("tokenUsage")
+            usage = usage if isinstance(usage, dict) else {}
             requests.append({
                 "turnId": record["turn_id"], "requestIndex": index,
                 **{key: request.get(key) for key in (
@@ -2389,6 +2393,21 @@ def _request_ledger(records, calls, tool_calls, include_tokens):
 def _ledger_text(value, limit=160):
     text = " ".join(str(value if value is not None else "?").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _ms_text(value):
+    return "unavailable" if value is None else f"{value}ms"
+
+
+def _tokens_text(tokens):
+    """Complete totals, else observed partial counts explicitly labelled partial."""
+    names = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens")
+    observed = tokens.get("observedTotals")
+    if tokens.get("complete") is not True and observed:
+        return ("/".join(str(observed.get(name)) for name in names)
+                + f" billable={tokens.get('observedBillableTokens')} (observed partial)")
+    return ("/".join(str(tokens.get(name)) for name in names)
+            + f" billable={tokens.get('billableTokens')}")
 
 
 def _ledger_action(call):
@@ -2769,15 +2788,16 @@ def render_report(report: dict[str, Any]) -> str:
     lines.append(
         "first domain action: "
         f"canonical={canonical_first_useful['count']} "
-        f"p50={canonical_first_useful['p50']}ms; "
+        f"p50={_ms_text(canonical_first_useful['p50'])}; "
         f"legacy={legacy_first_useful['count']} "
-        f"p50={legacy_first_useful['p50']}ms"
+        f"p50={_ms_text(legacy_first_useful['p50'])}"
     )
     for name in ("all", "eval", "repository_root", "other"):
         population = report["populations"].get(name)
         if not population or not population["turns"]:
             continue
-        if population.get("sameAs") == "all":
+        if name != "all" and (population.get("sameAs") == "all"
+                              or population == report["populations"]["all"]):
             lines.append(
                 f"{name}: {population['turns']} turns; same measurements as all"
             )
@@ -2798,10 +2818,7 @@ def render_report(report: dict[str, Any]) -> str:
             f"ratio={ratio_text}; "
             f"decision coverage={decision['decisionReadyAttempts']}/"
             f"{decision['physicalAttempts']}; "
-            f"tokens input/cached/output/reasoning="
-            f"{tokens['inputTokens']}/{tokens['cachedInputTokens']}/"
-            f"{tokens['outputTokens']}/{tokens['reasoningTokens']} "
-            f"billable={tokens['billableTokens']} "
+            f"tokens input/cached/output/reasoning={_tokens_text(tokens)} "
             f"(coverage {tokens['providerUsageAttempts']}/"
             f"{tokens['physicalAttempts']}); "
             f"unchanged-state/action stream={nonprogress['modelStreamWaitNs'] / 1e9:.1f}s "
@@ -2848,7 +2865,8 @@ def render_report(report: dict[str, Any]) -> str:
         exclusive = turn["exclusive"]
         tokens = turn["tokens"]
         peak_interval = max(
-            turn["tokenIntervals"],
+            (interval for interval in turn["tokenIntervals"]
+             if interval["tokens"]["observedBillableTokens"] is not None),
             key=lambda interval: interval["tokens"]["observedBillableTokens"],
             default=None,
         )
@@ -2871,9 +2889,7 @@ def render_report(report: dict[str, Any]) -> str:
             f"{exclusive['modelOnlyNs'] / 1e9:.1f}/"
             f"{exclusive['toolOnlyNs'] / 1e9:.1f}/"
             f"{exclusive['orchestrationNs'] / 1e9:.1f}s "
-            f"tokens={tokens['inputTokens']}/{tokens['cachedInputTokens']}/"
-            f"{tokens['outputTokens']}/{tokens['reasoningTokens']} "
-            f"billable={tokens['billableTokens']} "
+            f"tokens={_tokens_text(tokens)} "
             f"peak-between-tools={peak_interval_text} "
             f"signals={signals}"
         )
@@ -2884,8 +2900,9 @@ def render_report(report: dict[str, Any]) -> str:
         )
     decision = report["auditDecision"]
     dominant_share = decision["dominantShare"]
-    dominant_share_text = (
-        f"{dominant_share:.1%}" if dominant_share is not None else "unavailable"
+    dominant_text = (
+        f"{decision['dominantPhase']} {decision['dominantNs'] / 1e9:.1f}s/{dominant_share:.1%}"
+        if dominant_share is not None else "unavailable"
     )
     outcome = "finalize" if decision["readyToFinalize"] else "continue"
     codes = (
@@ -2894,8 +2911,7 @@ def render_report(report: dict[str, Any]) -> str:
         else decision["blockerCodes"]
     )
     lines.append(
-        f"audit decision: {outcome}; dominant={decision['dominantPhase']} "
-        f"{decision['dominantNs'] / 1e9:.1f}s/{dominant_share_text}; "
+        f"audit decision: {outcome}; dominant={dominant_text}; "
         f"codes={','.join(codes) or 'none'}. {decision['instruction']}"
     )
     runner = bounded_summary(report).get("runnerDiagnostics", {})
@@ -3239,6 +3255,9 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 if key
                 not in (
                     "promptCategoryEvidence",
+                    "componentCoverage",
+                    "promptCategoryComponentCoverage",
+                    "invalidPromptCategoryMeasurements",
                     "accountingNote",
                     "measurementNote",
                     "providerTotals",
@@ -3317,18 +3336,27 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         result["subscriptionUsage"] = {
             **{
                 key: value for key, value in subscription.items()
-                if key != "measurementNote"
+                if key not in ("measurementNote", "turns")
                 and (subscription["available"] or value or key == "available")
             },
             "windows": [dict(row) for row in subscription["windows"][:8]],
             "omittedWindows": max(0, len(subscription["windows"]) - 8),
+            "turns": [{
+                **turn,
+                "windows": [dict(row) for row in turn["windows"][:8]],
+                "omittedWindows": max(0, len(turn["windows"]) - 8),
+            } for turn in subscription.get("turns", [])[:_MAX_SUMMARY_TURNS]],
+            "omittedTurns": max(0, len(subscription.get("turns", [])) - _MAX_SUMMARY_TURNS),
         }
         if subscription["available"]:
             # Unlike other token notes, retain the essential attribution warning.
             result["subscriptionUsage"]["measurementNote"] = (
                 "Account-level snapshots, not usage attributable to this session or "
                 "monetary cost. Last observed quota, not live; repeated samples are "
-                "not requests. Changes stay within one file/plan/limit/window/reset."
+                "not requests. Changes stay within one file/plan/limit/window/reset and "
+                "use within-turn endpoints only. Turn attribution is unknown; 2 percentage "
+                "points means 2% of the whole allowance, not proven consumption. Weekly "
+                "means 10080 minutes, not a fixed primary/secondary bucket."
             )
     # Full distributions belong in --json baselines, not the compact view.
     # Copy comparison detail before trimming, preserving the full report.
@@ -3410,6 +3438,9 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     if "startupTiming" in result:
         trim_rows(result["startupTiming"], "records", "omittedRecords")
     if "subscriptionUsage" in result:
+        for turn in result["subscriptionUsage"].get("turns", []):
+            trim_rows(turn, "windows", "omittedWindows")
+        trim_rows(result["subscriptionUsage"], "turns", "omittedTurns")
         trim_rows(result["subscriptionUsage"], "windows", "omittedWindows")
     if "baselineComparison" in result:
         trim_rows(result["baselineComparison"], "metrics", "omittedMetrics")
@@ -3518,8 +3549,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         metavar="METRIC",
         help=(
-            "Gate the --baseline comparison on this metric (repeatable). Ratio metrics "
-            "regress when they drop, all others when they rise. Exit status: 0 passed, "
+            "Gate the --baseline comparison on this metric (repeatable). Quality ratios "
+            "and useful evidence/checkpoint counts regress when they drop; other metrics "
+            "regress when they rise. Exit status: 0 passed, "
             f"1 regression, {_GATE_EXIT_CODES['insufficient_evidence']} insufficient "
             "evidence (a selected metric was unavailable or never compared)"
         ),

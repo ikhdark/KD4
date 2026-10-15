@@ -139,7 +139,13 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
 
     // Replace (never append to) the prose excerpt for recognized compiler JSON.
     // Raw output remains the canonical artifact owned by the caller.
-    if let Some(summary) = structured_compiler_summary_with_streams(output, exit_code, timed_out, options.applied_token_limit, streams) {
+    if let Some(summary) = structured_compiler_summary_with_streams(
+        output,
+        exit_code,
+        timed_out,
+        options.applied_token_limit,
+        streams,
+    ) {
         return Some(summary);
     }
 
@@ -158,8 +164,11 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
             // inventory fields containing these words. Require a diagnostic
             // label, not an incidental occurrence inside source evidence.
             let line = line.trim_start();
-            ["error:", "error[", "warning:", "warning[", "fatal:", "npm err!"].iter()
-                .any(|prefix| starts_with_ascii_case(line, prefix))
+            [
+                "error:", "error[", "warning:", "warning[", "fatal:", "npm err!",
+            ]
+            .iter()
+            .any(|prefix| starts_with_ascii_case(line, prefix))
         })
     {
         return None;
@@ -185,7 +194,10 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
     }
     builder.push_line(format!("- selection_policy: {selection_policy}"));
     if selection.collapsed_progress_lines > 0 {
-        builder.push_line(format!("- collapsed_progress_lines: {} (latest sample retained; raw output unchanged)", selection.collapsed_progress_lines));
+        builder.push_line(format!(
+            "- collapsed_progress_lines: {} (latest sample retained; raw output unchanged)",
+            selection.collapsed_progress_lines
+        ));
     }
     if selection.omitted_groups > 0 {
         let qualifier = if selection.groups_overflowed {
@@ -195,13 +207,16 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
         };
         // Name the first omitted group so recovery can start at a diagnostic
         // instead of at whatever line the summary happens to skip first.
-        let first = selection.first_omitted_group.map(|index| {
-            format!(
-                "; {FIRST_OMITTED_GROUP_LABEL} {}-{}",
-                index.saturating_sub(FOCUS_CONTEXT_LINES) + 1,
-                (index + FOCUS_CONTEXT_LINES + 1).min(line_count),
-            )
-        }).unwrap_or_default();
+        let first = selection
+            .first_omitted_group
+            .map(|index| {
+                format!(
+                    "; {FIRST_OMITTED_GROUP_LABEL} {}-{}",
+                    index.saturating_sub(FOCUS_CONTEXT_LINES) + 1,
+                    (index + FOCUS_CONTEXT_LINES + 1).min(line_count),
+                )
+            })
+            .unwrap_or_default();
         builder.push_line(format!("- omitted_diagnostic_groups: at least {} (selection-stage lower bound{qualifier}){first}; final fitting may omit additional diagnostics. To read an omitted group, select its line range (numbers at left) or search the retained artifact with read_tool_output instead of reading it whole", selection.omitted_groups));
     }
     builder.push_line("");
@@ -378,9 +393,13 @@ fn structured_compiler_summary_with_streams(
     // commands retain the conservative stdout/independent-stderr path below.
     let (compiler_output, stderr, diagnostic_stream) = match streams {
         Some(("", stderr))
-            if stderr.lines().find(|line| !line.trim().is_empty()).is_some_and(|line|
-                serde_json::from_str::<serde_json::Value>(line)
-                    .is_ok_and(|record| record["$message_type"] == "diagnostic")) =>
+            if stderr
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|record| record["$message_type"] == "diagnostic")
+                }) =>
         {
             (stderr, None, "stderr")
         }
@@ -388,7 +407,9 @@ fn structured_compiler_summary_with_streams(
         None => (output, None, "aggregated"),
     };
     let recovery_selector = |source_line: usize| {
-        let range = compiler_output.lines().nth(source_line.saturating_sub(1))
+        let range = compiler_output
+            .lines()
+            .nth(source_line.saturating_sub(1))
             .and_then(|line| output.find(line).map(|start| (start, start + line.len())))
             .unwrap_or((0, output.len()));
         serde_json::json!({"kind":"bytes", "start":range.0, "end":range.1})
@@ -403,16 +424,23 @@ fn structured_compiler_summary_with_streams(
     // Build selectors only for these few omissions against canonical bytes.
     let mut omitted_groups = Vec::new();
     let record_omission = |groups: &mut Vec<serde_json::Value>, item: &serde_json::Value| {
-        if groups.len() == 8 { return; }
-        let Some(line) = item["source_line"].as_u64() else { return; };
+        if groups.len() == 8 {
+            return;
+        }
+        let Some(line) = item["source_line"].as_u64() else {
+            return;
+        };
         let mut group = serde_json::json!({"source_line":line,
             "recovery_selector":recovery_selector(line as usize)});
         if let Some(package) = item["package_id"].as_str().filter(|id| id.len() <= 512) {
             group["package_id"] = package.into();
         }
-        if let Some(span) = item["diagnostic"]["spans"].as_array().and_then(|spans|
-            spans.iter().find(|span| span["is_primary"] == true).or_else(|| spans.first()))
-            && let Some(file) = span["file_name"].as_str().filter(|file| file.len() <= 256)
+        if let Some(span) = item["diagnostic"]["spans"].as_array().and_then(|spans| {
+            spans
+                .iter()
+                .find(|span| span["is_primary"] == true)
+                .or_else(|| spans.first())
+        }) && let Some(file) = span["file_name"].as_str().filter(|file| file.len() <= 256)
             && let Some(line) = span["line_start"].as_u64()
         {
             group["location"] = serde_json::json!({"file":file, "line":line});
@@ -422,17 +450,22 @@ fn structured_compiler_summary_with_streams(
     // Evict the latest lowest-priority complete group. This keeps actionable
     // errors ahead of warning floods and preserves source order within ties.
     let lowest_priority_index = |diagnostics: &[serde_json::Value]| {
-        diagnostics.iter().enumerate().max_by_key(|(index, item)| {
-            let diagnostic = &item["diagnostic"];
-            let summary = diagnostic["message"].as_str().is_some_and(|message|
-                message.starts_with("aborting due to "));
-            let priority = match diagnostic["level"].as_str() {
-                Some("error" | "fatal") if !summary => 0,
-                Some("warning") => 1,
-                _ => 2,
-            };
-            (priority, *index)
-        }).map(|(index, _)| index)
+        diagnostics
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, item)| {
+                let diagnostic = &item["diagnostic"];
+                let summary = diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("aborting due to "));
+                let priority = match diagnostic["level"].as_str() {
+                    Some("error" | "fatal") if !summary => 0,
+                    Some("warning") => 1,
+                    _ => 2,
+                };
+                (priority, *index)
+            })
+            .map(|(index, _)| index)
     };
     let mut text_lines = Vec::new();
     let mut text_bytes = stderr.map_or(0, str::len);
@@ -443,10 +476,14 @@ fn structured_compiler_summary_with_streams(
     let mut warnings = 0usize;
     let mut build_success = None;
     for (index, line) in compiler_output.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         if !line.trim_start().starts_with('{') {
             text_bytes = text_bytes.saturating_add(line.len());
-            if text_bytes > SUMMARY_MAX_BYTES / 4 { return None; }
+            if text_bytes > SUMMARY_MAX_BYTES / 4 {
+                return None;
+            }
             text_lines.push(serde_json::json!({"source_line": index + 1, "text": line}));
             continue;
         }
@@ -461,8 +498,9 @@ fn structured_compiler_summary_with_streams(
                 let object = record.as_object_mut()?;
                 package_id = object.remove("package_id");
                 target = object.remove("target").and_then(|mut value| {
-                    value.as_object_mut()?.retain(|key, _|
-                        matches!(key.as_str(), "name" | "kind" | "src_path"));
+                    value
+                        .as_object_mut()?
+                        .retain(|key, _| matches!(key.as_str(), "name" | "kind" | "src_path"));
                     Some(value)
                 });
                 object.get_mut("message")?
@@ -491,13 +529,20 @@ fn structured_compiler_summary_with_streams(
         // Keep locations, source excerpts, children and fix suggestions exact.
         // Only redundant rendered prose and the general error-code manual go.
         diagnostic.as_object_mut()?.remove("rendered");
-        if let Some(code) = diagnostic.get_mut("code").and_then(serde_json::Value::as_object_mut) {
+        if let Some(code) = diagnostic
+            .get_mut("code")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             code.remove("explanation");
         }
         let mut item = serde_json::json!({"source_line": index + 1});
         item["diagnostic"] = std::mem::take(diagnostic);
-        if let Some(package_id) = package_id { item["package_id"] = package_id; }
-        if let Some(target) = target { item["target"] = target; }
+        if let Some(package_id) = package_id {
+            item["package_id"] = package_id;
+        }
+        if let Some(target) = target {
+            item["target"] = target;
+        }
         if item.to_string().len() > SUMMARY_MAX_BYTES / 2
             && compact_compiler_diagnostic(&mut item["diagnostic"])
         {
@@ -511,7 +556,9 @@ fn structured_compiler_summary_with_streams(
             omitted += 1;
         }
     }
-    if total == 0 { return None; }
+    if total == 0 {
+        return None;
+    }
     loop {
         let mut envelope = serde_json::json!({
             "format": "compiler_diagnostics",
@@ -540,16 +587,22 @@ fn structured_compiler_summary_with_streams(
         serde_json::to_writer(&mut summary_bytes, &envelope).ok()?;
         let mut summary = String::from_utf8(summary_bytes).ok()?;
         diagnostics = std::mem::take(envelope["diagnostics"].as_array_mut()?);
-        if summary.len() <= SUMMARY_MAX_BYTES && token_limit.is_none_or(|limit|
-            !codex_utils_string::approx_token_count_exceeds(&summary, limit)) {
+        if summary.len() <= SUMMARY_MAX_BYTES
+            && token_limit.is_none_or(|limit| {
+                !codex_utils_string::approx_token_count_exceeds(&summary, limit)
+            })
+        {
             // Spend spare space only: selectors never evict an actionable
             // diagnostic, enlarge the budget, or replace whole-log recovery.
             while !omitted_groups.is_empty() {
                 let extra = serde_json::json!({"omitted_diagnostic_groups":omitted_groups,
-                    "unlisted_omitted_diagnostic_groups":omitted - omitted_groups.len()}).to_string();
+                    "unlisted_omitted_diagnostic_groups":omitted - omitted_groups.len()})
+                .to_string();
                 let candidate = format!("{},{}", &summary[..summary.len() - 1], &extra[1..]);
-                if candidate.len() <= SUMMARY_MAX_BYTES && token_limit.is_none_or(|limit|
-                    !codex_utils_string::approx_token_count_exceeds(&candidate, limit))
+                if candidate.len() <= SUMMARY_MAX_BYTES
+                    && token_limit.is_none_or(|limit| {
+                        !codex_utils_string::approx_token_count_exceeds(&candidate, limit)
+                    })
                 {
                     summary = candidate;
                     break;
@@ -562,8 +615,11 @@ fn structured_compiler_summary_with_streams(
         let item = &mut diagnostics[index];
         // Warnings/notes yield before actionable error detail. Once only errors
         // remain, shed bulky excerpts before evicting their locations and fixes.
-        if matches!(item["diagnostic"]["level"].as_str(), Some("error" | "fatal"))
-            && compact_compiler_diagnostic(&mut item["diagnostic"]) {
+        if matches!(
+            item["diagnostic"]["level"].as_str(),
+            Some("error" | "fatal")
+        ) && compact_compiler_diagnostic(&mut item["diagnostic"])
+        {
             item["details_omitted"] = true.into();
             item["recovery_selector"] = recovery_selector(item["source_line"].as_u64()? as usize);
             continue;
@@ -585,19 +641,29 @@ fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
         *message = summarize_oversized_line(text, 1_024).into_owned().into();
         changed = true;
     }
-    if let Some(spans) = diagnostic.get_mut("spans").and_then(serde_json::Value::as_array_mut) {
+    if let Some(spans) = diagnostic
+        .get_mut("spans")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for span in spans {
             changed |= compact_compiler_span(span);
         }
     }
-    if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut) {
+    if let Some(children) = diagnostic
+        .get_mut("children")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for child in children {
             changed |= compact_compiler_diagnostic(child);
         }
     }
-    if diagnostic["children"].as_array().is_some_and(|children| !children.is_empty())
+    if diagnostic["children"]
+        .as_array()
+        .is_some_and(|children| !children.is_empty())
         && diagnostic.to_string().len() > SUMMARY_MAX_BYTES / 2
-        && let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut)
+        && let Some(children) = diagnostic
+            .get_mut("children")
+            .and_then(serde_json::Value::as_array_mut)
         && !children.is_empty()
     {
         let before = children.len();
@@ -608,9 +674,14 @@ fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
 }
 
 fn compact_compiler_span(span: &mut serde_json::Value) -> bool {
-    let Some(span) = span.as_object_mut() else { return false; };
+    let Some(span) = span.as_object_mut() else {
+        return false;
+    };
     let mut changed = span.remove("text").is_some();
-    if let Some(expansion) = span.get_mut("expansion").and_then(serde_json::Value::as_object_mut) {
+    if let Some(expansion) = span
+        .get_mut("expansion")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         // Expansion spans identify the invocation and definition, not merely
         // generated source. Bound prose while preserving that location chain.
         if let Some(name) = expansion.get_mut("macro_decl_name")
@@ -620,17 +691,21 @@ fn compact_compiler_span(span: &mut serde_json::Value) -> bool {
             changed = true;
         }
         for key in ["span", "def_site_span"] {
-            if let Some(span) = expansion.get_mut(key) { changed |= compact_compiler_span(span); }
+            if let Some(span) = expansion.get_mut(key) {
+                changed |= compact_compiler_span(span);
+            }
         }
     }
     changed
 }
 
 fn compiler_diagnostic_has_locations(diagnostic: &serde_json::Value) -> bool {
-    diagnostic["spans"].as_array().is_some_and(|spans| !spans.is_empty())
-        || diagnostic["children"].as_array().is_some_and(|children| {
-            children.iter().any(compiler_diagnostic_has_locations)
-        })
+    diagnostic["spans"]
+        .as_array()
+        .is_some_and(|spans| !spans.is_empty())
+        || diagnostic["children"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(compiler_diagnostic_has_locations))
 }
 
 const SUMMARY_HEADING: &str = "Shell output summary:";
@@ -647,13 +722,17 @@ pub(crate) fn line_summary_omitted_group(summary: &str) -> Option<Option<(usize,
         return None;
     }
     // Only the header may name the group; selected lines are command output.
-    Some(lines.take_while(|line| *line != SELECTED_LINES_HEADING).find_map(|line| {
-        let (_, rest) = line
-            .strip_prefix("- omitted_diagnostic_groups:")?
-            .split_once(FIRST_OMITTED_GROUP_LABEL)?;
-        let (start, end) = rest.split(';').next()?.split_once('-')?;
-        Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
-    }))
+    Some(
+        lines
+            .take_while(|line| *line != SELECTED_LINES_HEADING)
+            .find_map(|line| {
+                let (_, rest) = line
+                    .strip_prefix("- omitted_diagnostic_groups:")?
+                    .split_once(FIRST_OMITTED_GROUP_LABEL)?;
+                let (start, end) = rest.split(';').next()?.split_once('-')?;
+                Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+            }),
+    )
 }
 
 fn render_selected_lines(
@@ -696,12 +775,33 @@ fn render_selected_lines(
 
 /// Count path-prefixed rg records before selecting a source-ordered excerpt.
 fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> Option<String> {
-    if !command.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word == "rg") {
+    // Arguments, quoted examples and comments are not executable identity.
+    // Mixed readers have no per-command output boundaries, so retain their
+    // source-order truncation path rather than labeling source as search hits.
+    let commands = codex_shell_command::bash::parse_shell_script_into_commands(command)
+        .or_else(|| {
+            codex_shell_command::powershell::parse_powershell_command_into_plain_commands(&[
+                "pwsh".into(),
+                "-Command".into(),
+                command.into(),
+            ])
+        })?;
+    if commands.is_empty()
+        || !commands.iter().all(|argv| {
+            argv.first().is_some_and(|program| {
+                matches!(program.rsplit(['/', '\\']).next(), Some("rg" | "rg.exe"))
+            })
+        })
+    {
         return None;
     }
-    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
-    static HIT: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(||
-        regex_lite::Regex::new(r"^(.+?):[0-9]+:").expect("rg path and line prefix"));
+    #[expect(
+        clippy::expect_used,
+        reason = "the regex is a fixed source literal, not runtime input"
+    )]
+    static HIT: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(r"^(.+?):[0-9]+:").expect("rg path and line prefix")
+    });
     let mut files = std::collections::BTreeMap::<&str, usize>::new();
     let mut hits = 0usize;
     let mut other_lines = 0usize;
@@ -714,11 +814,16 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
             other_lines += 1;
         }
     }
-    if files.is_empty() { return None; }
+    if files.is_empty() {
+        return None;
+    }
     let limit = token_limit.unwrap_or(8_000).min(8_000);
     let mut ranked = files.iter().collect::<Vec<_>>();
-    ranked.sort_by(|(left_path, left_count), (right_path, right_count)|
-        right_count.cmp(left_count).then_with(|| left_path.cmp(right_path)));
+    ranked.sort_by(|(left_path, left_count), (right_path, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_path.cmp(right_path))
+    });
     let mut summary = format!(
         "rg output summary (path:line records in this output, not unique matches): {hits} hits across {} files; {other_lines} other lines. Raw output is unchanged and recoverable.\nPer-file hit counts:\n",
         files.len(),
@@ -726,18 +831,30 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
     let mut listed = 0;
     for (path, count) in ranked.into_iter().take(64) {
         let line = format!("- {}: {count}\n", serde_json::to_string(path).ok()?);
-        if codex_utils_string::approx_token_count(&summary) + codex_utils_string::approx_token_count(&line) > limit / 2 { break; }
+        if codex_utils_string::approx_token_count(&summary)
+            + codex_utils_string::approx_token_count(&line)
+            > limit / 2
+        {
+            break;
+        }
         summary.push_str(&line);
         listed += 1;
     }
     if listed < files.len() {
-        let _ = writeln!(summary, "- {} additional files omitted from this directory", files.len() - listed);
+        let _ = writeln!(
+            summary,
+            "- {} additional files omitted from this directory",
+            files.len() - listed
+        );
     }
     summary.push_str("\nSource-ordered excerpt (not complete):\n");
     let remaining = limit.saturating_sub(codex_utils_string::approx_token_count(&summary) + 64);
-    if listed == 0 || remaining == 0 { return None; }
+    if listed == 0 || remaining == 0 {
+        return None;
+    }
     summary.push_str(&codex_utils_output_truncation::formatted_truncate_text(
-        output, codex_utils_output_truncation::TruncationPolicy::Tokens(remaining),
+        output,
+        codex_utils_output_truncation::TruncationPolicy::Tokens(remaining),
     ));
     (summary.len() < output.len()).then_some(summary)
 }
@@ -856,7 +973,10 @@ pub(crate) fn ends_with_native_search(command: &str) -> bool {
         return false;
     }
     let Some(last) = powershell_command_segments(command).and_then(|segments| {
-        let mut commands = segments.into_iter().map(str::trim).filter(|segment| !segment.is_empty());
+        let mut commands = segments
+            .into_iter()
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty());
         let only = commands.next()?;
         commands.next().is_none().then_some(only)
     }) else {
@@ -956,18 +1076,28 @@ fn classify_line(line: &str) -> LineClassification {
 fn diagnostic_line_start(line: &str) -> &str {
     let mut text = line.trim_start();
     while let Some(rest) = text.strip_prefix("\x1b[") {
-        let Some(end) = rest.bytes().position(|byte| !(byte.is_ascii_digit() || matches!(byte, b';' | b':')))
-            .filter(|&end| rest.as_bytes()[end] == b'm') else { break; };
+        let Some(end) = rest
+            .bytes()
+            .position(|byte| !(byte.is_ascii_digit() || matches!(byte, b';' | b':')))
+            .filter(|&end| rest.as_bytes()[end] == b'm')
+        else {
+            break;
+        };
         text = rest[end + 1..].trim_start();
     }
     text
 }
 
 fn is_python_exception_line(line: &str) -> bool {
-    let Some((name, _)) = line.split_once(':') else { return false; };
-    (name.ends_with("Error") || name.ends_with("Exception")
+    let Some((name, _)) = line.split_once(':') else {
+        return false;
+    };
+    (name.ends_with("Error")
+        || name.ends_with("Exception")
         || matches!(name, "KeyboardInterrupt" | "SystemExit"))
-        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
 }
 
 fn contains_word_ascii_case(line: &str, word: &str) -> bool {
@@ -1007,15 +1137,12 @@ fn find_ascii_case(line: &str, needle: &str) -> Option<usize> {
 
 pub(crate) fn find_ascii_case_bytes(line: &[u8], needle: &[u8]) -> Option<usize> {
     let (&first, _) = needle.split_first()?;
-    memchr::memchr2_iter(
-        first.to_ascii_lowercase(),
-        first.to_ascii_uppercase(),
-        line,
+    memchr::memchr2_iter(first.to_ascii_lowercase(), first.to_ascii_uppercase(), line).find(
+        |&index| {
+            line.get(index..index + needle.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+        },
     )
-    .find(|&index| {
-        line.get(index..index + needle.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
-    })
 }
 
 // The selector retains at most 64 diagnostic groups and a fixed number of
@@ -1032,33 +1159,42 @@ struct LineSelection {
 }
 
 fn progress_line_key(line: &str) -> Option<String> {
-    if !(contains_word_ascii_case(line, "elapsed")
-        || contains_word_ascii_case(line, "progress"))
+    if !(contains_word_ascii_case(line, "elapsed") || contains_word_ascii_case(line, "progress"))
         || !line.bytes().any(|byte| byte.is_ascii_digit())
     {
         return None;
     }
     let kind = classify_line(line);
     // Never normalize diagnostic identities, file inventories, or JSON records.
-    if kind.critical || kind.advisory || kind.status
+    if kind.critical
+        || kind.advisory
+        || kind.status
         || (line.trim_start().starts_with(['{', '['])
             && serde_json::from_str::<serde_json::Value>(line).is_ok())
     {
         return None;
     }
-    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
+    #[expect(
+        clippy::expect_used,
+        reason = "the regex is a fixed source literal, not runtime input"
+    )]
     static COUNTERS: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"(?i)\b(?P<elapsed>elapsed\s+)\d+(?:\.\d+)?(?P<unit>ms|s)\b",
             r"|\b(?P<progress>progress\s+)\d+(?P<total>/\d+|%)"
-        )).expect("valid progress counters")
+        ))
+        .expect("valid progress counters")
     });
     COUNTERS.is_match(line).then(|| {
         // Elapsed-only records may be independent measurements. Keep distinct
         // values in the existing bounded directory; only explicit progress
         // counters authorize replacing previous numeric samples with the latest.
-        if !contains_word_ascii_case(line, "progress") { return line.to_string(); }
-        COUNTERS.replace_all(line, "${elapsed}${progress}<counter>${unit}${total}").into_owned()
+        if !contains_word_ascii_case(line, "progress") {
+            return line.to_string();
+        }
+        COUNTERS
+            .replace_all(line, "${elapsed}${progress}<counter>${unit}${total}")
+            .into_owned()
     })
 }
 
@@ -1079,16 +1215,27 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
     let mut groups_overflowed = false;
     let mut lines = output.lines().enumerate().peekable();
     while let Some((index, line)) = lines.next() {
-        if !classify_line(line).critical { continue; }
+        if !classify_line(line).critical {
+            continue;
+        }
         // Headlines are not block identities. Keep the complete bounded
         // assertion/owner context; unknown or oversized blocks stay distinct.
-        let recognized = ["error:", "error[", "thread '", "FAILED ", "--- FAIL:"].iter()
+        let recognized = ["error:", "error[", "thread '", "FAILED ", "--- FAIL:"]
+            .iter()
             .any(|prefix| line.trim_start().starts_with(prefix));
         let mut bounded = recognized && line.len() <= 4096;
-        let mut block = if bounded { line.to_string() } else { String::new() };
+        let mut block = if bounded {
+            line.to_string()
+        } else {
+            String::new()
+        };
         for (offset, (_, next)) in lines.clone().enumerate() {
-            if !bounded { break; }
-            if next.is_empty() || classify_line(next).critical { break; }
+            if !bounded {
+                break;
+            }
+            if next.is_empty() || classify_line(next).critical {
+                break;
+            }
             if offset >= 64 || block.len() + next.len() + 1 > 4096 {
                 bounded = false;
                 break;

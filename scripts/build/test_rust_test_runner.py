@@ -2452,6 +2452,133 @@ class RunTargetTest(RunnerTestCase):
         self.assertIn("\ncodex-core::all suite::failed\n", output.getvalue())
         self.assertIn("passed=1, failed=1, not-run=0", output.getvalue())
 
+    def test_compile_failure_before_tests_reports_not_executed_not_zero_failures(self):
+        """A build failure must not render as an executed, clean selection.
+
+        When helper building fails before any test starts, there are no test outcomes
+        at all. Reporting `passed=0, failed=0` beside "Failed test IDs
+        (complete): (none reported; no failed-only rerun available)" reads as a
+        healthy selection and invites treating validation as done. The report
+        must instead name the stage and state that validation is pending, while
+        still preserving the compiler diagnostics.
+        """
+        runner, _ = self.runner(executor=self.build_executor())
+        original = runner.executor
+
+        def execute(args, **kwargs):
+            result = original(args, **kwargs)
+            if args[:2] == ["cargo", "build"]:
+                result.returncode = 101
+                result.stderr = (
+                    "error[E0063]: missing field `x` in initializer\n"
+                    "error: could not compile `codex-core` (lib test)\n"
+                )
+            return result
+
+        runner.executor = execute
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+            runner.run_target("core_all", ["-E", "test(=suite::passed)"])
+        rendered = output.getvalue()
+        self.assertIn("not executed", rendered)
+        self.assertIn("PENDING", rendered)
+        # The selection is still named, so the pending work stays identifiable.
+        self.assertIn("suite::passed", rendered)
+        # The failing stage is still reported with its exit code.
+        self.assertIn("helper-build", rendered)
+        # The misleading executed-run wording must be absent.
+        self.assertNotIn("passed=0, failed=0", rendered)
+        self.assertNotIn("no failed-only rerun available", rendered)
+        # The failure still propagates: nothing is reported as passing.
+        self.assertEqual(caught.exception.outcome, "failed")
+
+    def test_helper_free_compile_failure_has_unverified_outcomes_not_empty_inventory(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers"] = []
+        runner, executor = self.runner(manifest=Manifest.from_data(data))
+
+        def compile_failure(args, **kwargs):
+            executor(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101, "", "error[E0063]: missing field in test target\n",
+            )
+
+        runner.executor = compile_failure
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+            runner.run_target("core_lib", ["-E", "test(=mod::tests::alpha)"])
+        self.assertEqual(len(executor.calls), 1)
+        self.assertEqual(executor.calls[0]["args"][:3], ["cargo", "nextest", "run"])
+        self.assertEqual(caught.exception.result.returncode, 101)
+        self.assertEqual(caught.exception.completed_tests, {})
+        rendered = output.getvalue()
+        self.assertIn("execution status is unverified", rendered)
+        self.assertIn("PENDING, not passed", rendered)
+        self.assertIn("mod::tests::alpha", rendered)
+        self.assertIn("error[E0063]", str(caught.exception))
+        self.assertNotIn("Failed test IDs (complete)", rendered)
+        self.assertNotIn("passed=0, failed=0", rendered)
+        self.assertNotIn("never started", rendered)
+
+    def test_post_start_timeout_and_interrupt_do_not_claim_tests_never_started(self):
+        for outcome in ("timed_out", "cancelled"):
+            with self.subTest(outcome=outcome):
+                data = copy.deepcopy(MANIFEST_DATA)
+                data["targets"]["core_lib"]["helpers"] = []
+                runner, _ = self.runner(manifest=Manifest.from_data(data))
+                marker = self.temp_dir / f"{outcome}-started"
+                payload = nextest_run_payload([("mod::tests::alpha", "ok")])
+                script = (
+                    "import time; from pathlib import Path; "
+                    f"print({payload!r}, flush=True); "
+                    f"Path({str(marker)!r}).write_text('started'); time.sleep(60)"
+                )
+
+                def execute(args, **kwargs):
+                    return rust_test_runner._default_executor(
+                        [sys.executable, "-c", script], **kwargs,
+                    )
+
+                runner.executor = execute
+                real_wait = subprocess.Popen.wait
+                observed = []
+
+                def stop_after_output(process, *args, **kwargs):
+                    if not observed:
+                        observed.append(process)
+                        deadline = time.monotonic() + 5
+                        while not marker.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(marker.exists(), "child must execute before interruption")
+                        if outcome == "timed_out":
+                            raise subprocess.TimeoutExpired(process.args, 5)
+                        raise KeyboardInterrupt
+                    return real_wait(process, *args, **kwargs)
+
+                output = io.StringIO()
+                with (
+                    mock.patch.object(subprocess.Popen, "wait", stop_after_output),
+                    contextlib.redirect_stderr(output),
+                    self.assertRaises(RunnerError) as caught,
+                ):
+                    runner.run_target("core_lib", ["-E", "test(=mod::tests::alpha)"])
+                self.assertEqual(caught.exception.outcome, outcome)
+                self.assertIsNone(caught.exception.result)
+                self.assertIsNotNone(observed[0].returncode, "child must be reaped")
+                self.assertEqual(caught.exception.completed_tests, {})
+                self.assertIn("Full stdout:", str(caught.exception))
+                self.assertIn("Full stderr:", str(caught.exception))
+                rendered = output.getvalue()
+                self.assertIn("execution status is unverified", rendered)
+                self.assertIn("PENDING, not passed", rendered)
+                self.assertNotIn("never started", rendered)
+                self.assertNotIn("before any test started", rendered)
+                self.assertNotIn("Failed test IDs (complete)", rendered)
+                # The child independently demonstrates real execution, even
+                # though the interrupted command produced no CompletedProcess.
+                logs = list((runner.target_dir / "test-runner-logs").glob("rust-test-stdout-*.log"))
+                self.assertTrue(any(payload in path.read_text() for path in logs))
+
     def test_phase_report_separates_build_from_tests_without_extra_commands(
         self,
     ) -> None:
@@ -3145,7 +3272,11 @@ class RunGateTest(RunnerTestCase):
         steps[0]["helpers"] = []
         executor = FakeExecutor(listings=self.matching_listings())
         runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
-        with self.assertRaisesRegex(RunnerError, "executable artifact") as failed:
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaisesRegex(RunnerError, "executable artifact") as failed,
+        ):
             runner.run_gate("demo-gate")
         self.assertEqual(failed.exception.completed_gates, {})
         self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
@@ -3153,6 +3284,11 @@ class RunGateTest(RunnerTestCase):
         self.assertEqual(len(runs), 1)
         self.assertIn("--lib", runs[0])
         self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+        # The call inventory proves only the helper-free library batch ran;
+        # the blocked integration selection must not acquire an empty verdict.
+        self.assertIn("Test results core_all: not executed", output.getvalue())
+        self.assertIn("Selected but never started (1): suite::mod::beta", output.getvalue())
+        self.assertNotIn("Test results core_all: passed=0, failed=0", output.getvalue())
 
         for outcome in ("cancelled", "timed_out", "cleanup_failed"):
             with self.subTest(outcome=outcome):
@@ -3168,6 +3304,32 @@ class RunGateTest(RunnerTestCase):
                     runner.run_gate("demo-gate")
                 self.assertEqual(stopped.exception.outcome, outcome)
                 self.assertEqual(executor.calls, [])
+
+    def test_helper_free_gate_compile_failure_has_no_complete_empty_inventory(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {"pure": {"steps": [
+            {"target": "core_lib", "tests": ["mod::tests::alpha"], "helpers": []},
+        ]}}
+        runner, executor = self.runner(manifest=Manifest.from_data(data))
+
+        def compile_failure(args, **kwargs):
+            executor(args, **kwargs)
+            return subprocess.CompletedProcess(args, 101, "", "error: could not compile test target")
+
+        runner.executor = compile_failure
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+            runner.run_gate("pure")
+        self.assertEqual(len(executor.calls), 1)
+        self.assertEqual(executor.calls[0]["args"][:3], ["cargo", "nextest", "run"])
+        self.assertEqual(caught.exception.completed_gates, {})
+        self.assertIn("could not compile", str(caught.exception))
+        rendered = output.getvalue()
+        self.assertIn("execution status is unverified", rendered)
+        self.assertIn("PENDING, not passed", rendered)
+        self.assertNotIn("Failed test IDs (complete)", rendered)
+        self.assertNotIn("passed=0, failed=0", rendered)
+        self.assertNotIn("never started", rendered)
 
     def test_large_gate_failure_reports_delta_and_retains_inventory_and_command(self):
         tests = tuple(f"large_module::tests::case_{index:03d}" for index in range(100))

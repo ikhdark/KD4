@@ -69,9 +69,13 @@ pub(super) fn freshness(body: &Value) -> Vec<Value> {
             for notice in &mut notices {
                 if let Some(index) = notice["observation"].as_u64() {
                     let shared = value["observations"][index as usize]
-                        .as_object().expect("shared freshness observation");
+                        .as_object()
+                        .expect("shared freshness observation");
                     for (key, field) in shared {
-                        notice.as_object_mut().unwrap().entry(key.clone())
+                        notice
+                            .as_object_mut()
+                            .unwrap()
+                            .entry(key.clone())
                             .or_insert_with(|| field.clone());
                     }
                 }
@@ -99,7 +103,11 @@ fn next_action(body: &Value, step: usize) -> Value {
         1 => {
             assert_eq!(read_text(body, "step-0"), BEFORE);
             let file = payload(body, "step-0")["result"].clone();
-            for key in ["canonical_sha256", "delivered_selection_complete", "artifact_id"] {
+            for key in [
+                "canonical_sha256",
+                "delivered_selection_complete",
+                "artifact_id",
+            ] {
                 assert!(file.get(key).is_none(), "redundant file field: {key}");
             }
             assert!(file["source_sha256"].is_string());
@@ -123,8 +131,12 @@ fn next_action(body: &Value, step: usize) -> Value {
             };
             assert_eq!(schema, payload(body, "step-1")["result"]);
             assert!(schema.to_string().contains("mirror"));
-            let name = codex_tools::code_mode_name_for_tool_name(&codex_tools::ToolName::namespaced("mcp__bench", "mirror"));
-            format!("const r=await tools[{name:?}]({{message:'verified'}}); if(r.content.length!==2) throw Error('raw MCP shape changed'); text({{kind:'mcp',result:r}});")
+            let name = codex_tools::code_mode_name_for_tool_name(
+                &codex_tools::ToolName::namespaced("mcp__bench", "mirror"),
+            );
+            format!(
+                "const r=await tools[{name:?}]({{message:'verified'}}); if(r.content.length!==2) throw Error('raw MCP shape changed'); text({{kind:'mcp',result:r}});"
+            )
         }
         4 => {
             let mcp = payload(body, "step-3");

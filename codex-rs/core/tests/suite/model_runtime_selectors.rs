@@ -164,10 +164,7 @@ async fn response_for_remote_model(
 
     let body = response_mock.single_request().body_json();
     assert_eq!(body["model"], model_slug);
-    Ok(RemoteModelResponse {
-        body,
-        warnings,
-    })
+    Ok(RemoteModelResponse { body, warnings })
 }
 
 async fn response_body_for_remote_model(
@@ -250,7 +247,10 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
     })
     .await?;
     let direct_tools = tool_names(&direct_body);
-    assert!(!direct_tools.is_empty(), "direct mode must still advertise executable tools");
+    assert!(
+        !direct_tools.is_empty(),
+        "direct mode must still advertise executable tools"
+    );
     assert!(
         direct_tools
             .iter()
@@ -429,7 +429,10 @@ async fn remote_multi_agent_selector_overrides_feature_flags() -> Result<()> {
     })
     .await?;
     let disabled_tools = tool_names(&disabled_body);
-    assert!(!disabled_tools.is_empty(), "disabling agents must preserve other tools");
+    assert!(
+        !disabled_tools.is_empty(),
+        "disabling agents must preserve other tools"
+    );
     assert!(disabled_tools.iter().all(|name| !matches!(
         name.as_str(),
         "multi_agent_v1"
@@ -515,7 +518,10 @@ async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> 
         unreachable!();
     };
     assert_eq!(completed.error, None);
-    assert_eq!(response_mock.single_request().body_json()["model"], CHILD_MODEL);
+    assert_eq!(
+        response_mock.single_request().body_json()["model"],
+        CHILD_MODEL
+    );
 
     assert_eq!(
         (

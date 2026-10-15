@@ -11,8 +11,8 @@ pub(crate) use full_suite::check_full_suite_command;
 mod managed_cargo_lane;
 pub(crate) use managed_cargo_lane::check_managed_cargo_lane;
 
-use super::command_search::rg_search_path_operands;
 use super::command_search::rg_search_path_indices;
+use super::command_search::rg_search_path_operands;
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;
 
@@ -203,8 +203,13 @@ fn preflight_command_issues(
         return Err(CommandPreflightIssue::reject(
             CommandPreflightIssueCode::PowerShellSyntax,
             CommandPreflightRejected::Argv(command.to_vec()),
-            format!("PowerShell reported invalid script syntax; no command was started.\n{diagnostic}"),
-            Some("Correct the script syntax. Changing to script_body cannot repair invalid source.".into()),
+            format!(
+                "PowerShell reported invalid script syntax; no command was started.\n{diagnostic}"
+            ),
+            Some(
+                "Correct the script syntax. Changing to script_body cannot repair invalid source."
+                    .into(),
+            ),
             None,
         ));
     }
@@ -267,43 +272,54 @@ pub(crate) async fn preflight_invocation_for_kd4_runtime(
             advisory: None,
         });
     }
-    let mut outcome = match preflight_invocation_for_runtime(
-        direct_runtime, invocation, command, shell_type,
-    ).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            // Windows cannot name a literal '*' file. Expand only a bounded,
-            // single-directory, read-only argv search; scripts retain their
-            // advisory so pipelines, expansion and side effects are untouched.
-            let repaired = if cfg!(windows) && !direct_runtime
-                && let Some(cwd) = local_cwd
-                && invocation.is_argv()
-            {
-                let invocation = invocation.clone();
-                let cwd = cwd.to_path_buf();
-                crate::tools::run_blocking_command_analysis(move || {
-                    repair_rg_leaf_glob(&invocation, &cwd)
-                }).await.ok().flatten()
-            } else {
-                None
-            };
-            repaired.ok_or(error)?
-        }
-    };
+    let mut outcome =
+        match preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Windows cannot name a literal '*' file. Expand only a bounded,
+                // single-directory, read-only argv search; scripts retain their
+                // advisory so pipelines, expansion and side effects are untouched.
+                let repaired = if cfg!(windows)
+                    && !direct_runtime
+                    && let Some(cwd) = local_cwd
+                    && invocation.is_argv()
+                {
+                    let invocation = invocation.clone();
+                    let cwd = cwd.to_path_buf();
+                    crate::tools::run_blocking_command_analysis(move || {
+                        repair_rg_leaf_glob(&invocation, &cwd)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                repaired.ok_or(error)?
+            }
+        };
     // Never inspect the host filesystem for a remote command. Direct-runtime
     // bypass remains authoritative, including for optional advisories.
     if !direct_runtime && let Some(cwd) = local_cwd {
         if cfg!(windows)
             && !outcome.repaired()
-            && outcome.advisory.as_deref().is_some_and(|notice| notice.contains("rg_literal_glob_path"))
-            && shell_type.or_else(|| infer_direct_shell_type(command)) == Some(ShellType::PowerShell)
+            && outcome
+                .advisory
+                .as_deref()
+                .is_some_and(|notice| notice.contains("rg_literal_glob_path"))
+            && shell_type.or_else(|| infer_direct_shell_type(command))
+                == Some(ShellType::PowerShell)
         {
             let invocation = invocation.clone();
             let command = command.to_vec();
             let cwd = cwd.to_path_buf();
             if let Ok(Some(repaired)) = crate::tools::run_blocking_command_analysis(move || {
                 repair_powershell_rg_leaf_glob(&invocation, &command, &cwd)
-            }).await {
+            })
+            .await
+            {
                 outcome = repaired;
             }
         }
@@ -325,7 +341,9 @@ pub(crate) async fn preflight_invocation_for_kd4_runtime(
         };
         if let Ok(Some(notice)) = crate::tools::run_blocking_command_analysis(move || {
             missing_rg_path_advisory(&command, shell_type, &cwd)
-        }).await {
+        })
+        .await
+        {
             outcome.advisory = Some(match outcome.advisory {
                 Some(existing) => format!("{existing}\n{notice}"),
                 None => notice,
@@ -346,15 +364,26 @@ fn repair_powershell_rg_leaf_glob(
     // The existing AST classifier excludes pipelines, redirections, variables,
     // compound statements and profile-dependent interpretation. Keep the shell
     // instead of claiming native executable resolution is proven here.
-    let candidate = codex_shell_command::powershell::parse_noprofile_powershell_command_into_direct_argv(command)?;
+    let candidate =
+        codex_shell_command::powershell::parse_noprofile_powershell_command_into_direct_argv(
+            command,
+        )?;
     let (program, args) = candidate.argv.split_first()?;
-    let repaired = repair_rg_leaf_glob(&CommandInvocation::Argv {
-        program: program.clone(), args: args.to_vec(),
-    }, cwd)?;
+    let repaired = repair_rg_leaf_glob(
+        &CommandInvocation::Argv {
+            program: program.clone(),
+            args: args.to_vec(),
+        },
+        cwd,
+    )?;
     let argv = repaired.invocation.to_direct_argv()?;
-    let script = format!("& {}", argv.iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
-        .collect::<Vec<_>>().join(" "));
+    let script = format!(
+        "& {}",
+        argv.iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let rewritten = match invocation {
         CommandInvocation::Script(_) => CommandInvocation::Script(script),
         CommandInvocation::PowerShellScript(_) => CommandInvocation::PowerShellScript(script),
@@ -363,7 +392,9 @@ fn repair_powershell_rg_leaf_glob(
     Some(CommandPreflightOutcome {
         validation_invocations: repaired.validation_invocations,
         repair_notice: Some(read_only_repair_notice(
-            CommandPreflightIssueCode::RgLiteralGlobPath, invocation, &rewritten,
+            CommandPreflightIssueCode::RgLiteralGlobPath,
+            invocation,
+            &rewritten,
         )),
         invocation: rewritten,
         advisory: None,
@@ -383,21 +414,35 @@ fn repair_rg_leaf_glob(
     let indices = rg_search_path_indices(&argv)?;
     // Expand one leaf glob in place, not a global --glob that would narrow
     // other roots. The shared argument parser keeps patterns/flag values out.
-    let globs = indices.iter().copied().filter(|&index| argv[index].contains('*')).collect::<Vec<_>>();
-    let [operand_index] = globs.as_slice() else { return None };
+    let globs = indices
+        .iter()
+        .copied()
+        .filter(|&index| argv[index].contains('*'))
+        .collect::<Vec<_>>();
+    let [operand_index] = globs.as_slice() else {
+        return None;
+    };
     let operand = &argv[*operand_index];
     let root = cwd.canonicalize().ok()?;
     for &index in &indices {
-        if index == *operand_index { continue; }
+        if index == *operand_index {
+            continue;
+        }
         // Preserve uncertainty rather than guessing another missing operand.
         let path = cwd.join(&argv[index]).canonicalize().ok()?;
-        if !path.starts_with(&root) { return None; }
+        if !path.starts_with(&root) {
+            return None;
+        }
     }
     let path = Path::new(operand);
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let leaf = path.file_name()?.to_str()?;
     if parent.to_str()?.contains(['*', '?', '[', ']'])
-        || leaf.contains(['?', '[', ']', '{', '}']) || leaf.contains("**")
+        || leaf.contains(['?', '[', ']', '{', '}'])
+        || leaf.contains("**")
     {
         return None;
     }
@@ -408,7 +453,9 @@ fn repair_rg_leaf_glob(
     }
     let mut matches = Vec::new();
     for (index, entry) in std::fs::read_dir(directory).ok()?.enumerate() {
-        if index >= 4096 { return None; }
+        if index >= 4096 {
+            return None;
+        }
         let entry = entry.ok()?;
         let name = entry.file_name();
         let name = name.to_str()?;
@@ -420,7 +467,9 @@ fn repair_rg_leaf_glob(
             matches.push(parent.join(name).to_str()?.to_string());
         }
     }
-    if matches.is_empty() { return None; }
+    if matches.is_empty() {
+        return None;
+    }
     matches.sort();
     let mut repaired_argv = argv[..*operand_index].to_vec();
     // Prevent a matched '-name' from becoming an option, including a helper.
@@ -441,7 +490,9 @@ fn repair_rg_leaf_glob(
     Some(CommandPreflightOutcome {
         validation_invocations: validation_invocations(stages, &repaired),
         repair_notice: Some(read_only_repair_notice(
-            CommandPreflightIssueCode::RgLiteralGlobPath, invocation, &repaired,
+            CommandPreflightIssueCode::RgLiteralGlobPath,
+            invocation,
+            &repaired,
         )),
         invocation: repaired,
         advisory: None,
@@ -458,13 +509,18 @@ fn source_paging_advisory(
     let mut reads = 0;
     let mut paged = false;
     for stage in stages {
-        let CommandInvocation::Argv { program, args } = stage else { return None };
+        let CommandInvocation::Argv { program, args } = stage else {
+            return None;
+        };
         if program.eq_ignore_ascii_case("Get-Content") {
             // Encoding conversions, byte streams and live tails are not native
             // UTF-8 snapshot reads. Do not suggest replacing their semantics.
-            if args.iter().any(|arg| arg.starts_with('-') && ![
-                "-LiteralPath", "-Path", "-TotalCount", "-Head",
-            ].iter().any(|allowed| arg.eq_ignore_ascii_case(allowed))) {
+            if args.iter().any(|arg| {
+                arg.starts_with('-')
+                    && !["-LiteralPath", "-Path", "-TotalCount", "-Head"]
+                        .iter()
+                        .any(|allowed| arg.eq_ignore_ascii_case(allowed))
+            }) {
                 return None;
             }
             reads += 1;
@@ -473,10 +529,13 @@ fn source_paging_advisory(
                     && pair[1].parse::<usize>().is_ok()
             });
         } else if program.eq_ignore_ascii_case("Select-Object") {
-            if args.is_empty() || args.len() % 2 != 0 || !args.as_chunks::<2>().0.iter().all(|pair| {
-                matches_ignore_ascii_case(&pair[0], &["-Skip", "-First"])
-                    && pair[1].parse::<usize>().is_ok()
-            }) {
+            if args.is_empty()
+                || args.len() % 2 != 0
+                || !args.as_chunks::<2>().0.iter().all(|pair| {
+                    matches_ignore_ascii_case(&pair[0], &["-Skip", "-First"])
+                        && pair[1].parse::<usize>().is_ok()
+                })
+            {
                 return None;
             }
             paged = true;
@@ -495,13 +554,18 @@ fn missing_rg_path_advisory(
     shell_type: Option<ShellType>,
     cwd: &Path,
 ) -> Option<String> {
-    let commands = argv_commands(command, shell_type.or_else(|| infer_direct_shell_type(command)))?;
+    let commands = argv_commands(
+        command,
+        shell_type.or_else(|| infer_direct_shell_type(command)),
+    )?;
     // A preceding cd, assignment, helper or mutating command can change what
     // these operands mean. Do not guess shell state or run a repository scan.
-    if commands.is_empty() || commands.iter().any(|argv| {
-        !argv.first().is_some_and(|program| is_rg_program(program))
-            || !codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
-    }) {
+    if commands.is_empty()
+        || commands.iter().any(|argv| {
+            !argv.first().is_some_and(|program| is_rg_program(program))
+                || !codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
+        })
+    {
         return None;
     }
     let operands = rg_search_path_operands(&commands)?;
@@ -549,11 +613,17 @@ fn missing_rg_path_advisory(
             .map(|path| json_string(&super::command_search::display_suggestion(&path, cwd)))
             .collect::<Vec<_>>();
         let guidance = if candidates.is_empty() {
-            let parent = if parent == cwd { "./".to_string() }
-                else { super::command_search::display_suggestion(parent, cwd) };
+            let parent = if parent == cwd {
+                "./".to_string()
+            } else {
+                super::command_search::display_suggestion(parent, cwd)
+            };
             format!("Nearest existing directory: {}.", json_string(&parent))
         } else {
-            format!("Possible existing paths (not verified replacements): {}.", candidates.join(", "))
+            format!(
+                "Possible existing paths (not verified replacements): {}.",
+                candidates.join(", ")
+            )
         };
         notices.push(format!(
             "Command preflight advisory (rg_missing_path): {} was not found relative to the command's working directory at preflight time. {guidance} The command is unchanged; a path error is not evidence of no matches.",

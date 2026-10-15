@@ -20,6 +20,30 @@ use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::WorkspaceTaskStatus;
 
+/// Token totals whose `total` is `total` and whose classes sum to it, so assertions on
+/// the aggregate stay meaningful while the per-class split is still exercised.
+fn tokens(total: u64) -> TokenClassTotals {
+    let input = total / 2;
+    let cached_input = input / 2;
+    let output = total - input;
+    TokenClassTotals {
+        input,
+        cached_input,
+        output,
+        reasoning_output: output / 2,
+        total,
+    }
+}
+
+/// Token totals carried only on `total`, for tests about accumulation and overflow
+/// rather than the per-class split.
+fn total_only(total: u64) -> TokenClassTotals {
+    TokenClassTotals {
+        total,
+        ..TokenClassTotals::default()
+    }
+}
+
 fn metric_input() -> TaskMetricInput {
     TaskMetricInput {
         task_id: OpaqueId::new(7),
@@ -29,13 +53,13 @@ fn metric_input() -> TaskMetricInput {
             RoleUsage {
                 role: RoleLabel::Worker,
                 capability: CapabilityLabel::ScopedWrite,
-                tokens: 800,
+                tokens: tokens(800),
                 calls: 4,
             },
             RoleUsage {
                 role: RoleLabel::Worker,
                 capability: CapabilityLabel::ScopedWrite,
-                tokens: 200,
+                tokens: tokens(200),
                 calls: 1,
             },
         ],
@@ -123,6 +147,7 @@ fn completed_task_with_validation(
             task_capsule: None,
             architecture_contract_ref: None,
             integration_plan: codex_agent_task_store::IntegrationPlan::SingleWriter,
+            benign_read_overlap_count: 2,
             created_at: now,
         },
         current_attempt: Attempt {
@@ -156,6 +181,7 @@ fn completed_task_with_validation(
             next_action: None,
             architecture_contract: None,
             evidence_epoch: 0,
+            read_scope_fingerprint: None,
             sealed_at: now,
         }),
         validation_calls: validation_calls
@@ -239,10 +265,18 @@ fn evaluates_complete_privacy_safe_metric_set() {
     assert_eq!(metrics.concurrency_utilization_basis_points, 6_000);
     assert_eq!(metrics.first_pass_acceptance_basis_points, Some(7_500));
     assert_eq!(metrics.final_acceptance_basis_points, 10_000);
+    // Both samples share one role/capability key, so the row and the grand total agree.
+    let expected_tokens = TokenClassTotals {
+        input: 400 + 100,
+        cached_input: 200 + 50,
+        output: 400 + 100,
+        reasoning_output: 200 + 50,
+        total: 1_000,
+    };
     assert_eq!(
         metrics.total_usage,
         UsageTotals {
-            tokens: 1_000,
+            tokens: expected_tokens,
             calls: 5,
         }
     );
@@ -252,10 +286,12 @@ fn evaluates_complete_privacy_safe_metric_set() {
             capability: CapabilityLabel::ScopedWrite,
         }],
         UsageTotals {
-            tokens: 1_000,
+            tokens: expected_tokens,
             calls: 5,
         }
     );
+    // Cached input is tracked separately from the full-rate remainder.
+    assert_eq!(metrics.total_usage.tokens.uncached_input(), 250);
     assert_eq!(
         (
             metrics.duplicate_work,
@@ -297,7 +333,7 @@ fn rejects_inconsistent_or_unbounded_inputs() {
             RoleUsage {
                 role: RoleLabel::Worker,
                 capability: CapabilityLabel::ScopedWrite,
-                tokens: 0,
+                tokens: TokenClassTotals::default(),
                 calls: 0,
             };
             MAX_METRIC_ROWS + 1
@@ -324,7 +360,7 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
         .record_store_role_usage(
             AgentRole::Worker,
             CapabilityProfile::ScopedSourceWrite,
-            800,
+            tokens(800),
             4,
         )
         .expect("first usage sample");
@@ -332,7 +368,7 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
         .record_store_role_usage(
             AgentRole::Worker,
             CapabilityProfile::ScopedSourceWrite,
-            200,
+            tokens(200),
             1,
         )
         .expect("second usage sample");
@@ -358,11 +394,17 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
             capability: CapabilityLabel::ScopedWrite,
         }],
         UsageTotals {
-            tokens: 1_000,
+            tokens: TokenClassTotals {
+                input: 400 + 100,
+                cached_input: 200 + 50,
+                output: 400 + 100,
+                reasoning_output: 200 + 50,
+                total: 1_000,
+            },
             calls: 5,
         }
     );
-    assert_eq!(metrics.total_usage.tokens, 1_000);
+    assert_eq!(metrics.total_usage.tokens.total, 1_000);
     assert_eq!(recorder.recorded_events(), 5);
     assert!(recorder.is_terminal());
 }
@@ -388,7 +430,12 @@ fn recorder_finishes_and_invokes_terminal_emitter_at_most_once() {
     assert_eq!(emissions, 1);
     assert_eq!(recorder.recorded_events(), terminal_event_count);
     assert_eq!(
-        recorder.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 1, 1),
+        recorder.record_role_usage(
+            RoleLabel::Worker,
+            CapabilityLabel::ScopedWrite,
+            total_only(1),
+            1
+        ),
         Err(MetricsError::RecorderFinished)
     );
     assert_eq!(
@@ -428,11 +475,21 @@ fn recorder_rejects_invalid_transitions_and_keeps_aggregating_after_counter_satu
         TaskMetricRecorder::new(OpaqueId::new(13), 1, 5).expect("valid initial state");
     for _ in 0..MAX_RECORDED_EVENTS + 1 {
         bounded
-            .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 1, 1)
+            .record_role_usage(
+                RoleLabel::Worker,
+                CapabilityLabel::ScopedWrite,
+                total_only(1),
+                1,
+            )
             .expect("updates keep aggregating");
     }
     bounded
-        .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 99, 2)
+        .record_role_usage(
+            RoleLabel::Worker,
+            CapabilityLabel::ScopedWrite,
+            total_only(99),
+            2,
+        )
         .expect("late usage");
     bounded
         .transition_concurrency(Duration::from_secs(5), 0, 5)
@@ -444,7 +501,7 @@ fn recorder_rejects_invalid_transitions_and_keeps_aggregating_after_counter_satu
     assert_eq!(
         metrics.total_usage,
         UsageTotals {
-            tokens: MAX_RECORDED_EVENTS as u64 + 100,
+            tokens: total_only(MAX_RECORDED_EVENTS as u64 + 100),
             calls: MAX_RECORDED_EVENTS as u64 + 3
         }
     );
@@ -457,20 +514,59 @@ fn recorder_rejects_invalid_transitions_and_keeps_aggregating_after_counter_satu
 fn recorder_checks_usage_overflow_before_committing_an_event() {
     let mut recorder =
         TaskMetricRecorder::new(OpaqueId::new(14), 1, 5).expect("valid initial state");
+    let saturated = TokenClassTotals {
+        input: u64::MAX,
+        cached_input: u64::MAX,
+        output: u64::MAX,
+        reasoning_output: u64::MAX,
+        total: u64::MAX,
+    };
     recorder
         .record_role_usage(
             RoleLabel::Worker,
             CapabilityLabel::ScopedWrite,
-            u64::MAX,
+            saturated,
             u64::MAX,
         )
         .expect("maximum initial totals");
+    // Each token class is checked independently, so overflow in any one of them
+    // rejects the event rather than silently truncating that class.
+    for overflowing in [
+        TokenClassTotals {
+            input: 1,
+            ..TokenClassTotals::default()
+        },
+        TokenClassTotals {
+            cached_input: 1,
+            ..TokenClassTotals::default()
+        },
+        TokenClassTotals {
+            output: 1,
+            ..TokenClassTotals::default()
+        },
+        TokenClassTotals {
+            reasoning_output: 1,
+            ..TokenClassTotals::default()
+        },
+        total_only(1),
+    ] {
+        assert_eq!(
+            recorder.record_role_usage(
+                RoleLabel::Worker,
+                CapabilityLabel::ScopedWrite,
+                overflowing,
+                0
+            ),
+            Err(MetricsError::ArithmeticOverflow)
+        );
+    }
     assert_eq!(
-        recorder.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 1, 0),
-        Err(MetricsError::ArithmeticOverflow)
-    );
-    assert_eq!(
-        recorder.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 0, 1),
+        recorder.record_role_usage(
+            RoleLabel::Worker,
+            CapabilityLabel::ScopedWrite,
+            TokenClassTotals::default(),
+            1
+        ),
         Err(MetricsError::ArithmeticOverflow)
     );
     assert_eq!(recorder.recorded_events(), 1);
@@ -478,7 +574,13 @@ fn recorder_checks_usage_overflow_before_committing_an_event() {
         .finish(Duration::from_secs(1), terminal_input())
         .expect("overflow must leave the previous totals intact")
         .expect("terminal metrics");
-    assert_eq!(metrics.total_usage, UsageTotals { tokens: u64::MAX, calls: u64::MAX });
+    assert_eq!(
+        metrics.total_usage,
+        UsageTotals {
+            tokens: saturated,
+            calls: u64::MAX
+        }
+    );
 }
 
 #[test]
@@ -663,7 +765,10 @@ fn first_pass_validation_rejects_stale_or_mismatched_structured_evidence() {
     assert!(super::terminal_input(&task).first_pass_validation_succeeded);
     for (case, invalid) in [
         ("no validation", completed_task_with_validation(&[], &[])),
-        ("missing call", completed_task_with_validation(&["validation-1"], &[])),
+        (
+            "missing call",
+            completed_task_with_validation(&["validation-1"], &[]),
+        ),
         (
             "failed call",
             completed_task_with_validation(
@@ -678,7 +783,9 @@ fn first_pass_validation_rejects_stale_or_mismatched_structured_evidence() {
         );
     }
     let mut missing_result = task.clone();
-    missing_result.validation_calls[0].evidence.validation_result = None;
+    missing_result.validation_calls[0]
+        .evidence
+        .validation_result = None;
     assert!(!super::terminal_input(&missing_result).first_pass_validation_succeeded);
     let mut stale = task.clone();
     stale.validation_calls[0].evidence.end_epoch = Some(1);
@@ -709,7 +816,18 @@ fn terminal_adapter_preserves_unavailable_measurements() {
     task.current_attempt.ordinal = 1;
     let terminal = super::terminal_input(&task);
     assert_eq!(terminal.acceptance_first_pass_closed, None);
-    assert_eq!(terminal.duplicate_work, None);
     assert_eq!(terminal.reviewer_findings.rejected, None);
     assert_eq!(terminal.acceptance_final_closed, 1);
+    // Duplicated read-scope overlap is recorded at admission and stays measurable
+    // across attempts, unlike the first-pass-only measurements above.
+    assert_eq!(terminal.duplicate_work, Some(2));
+}
+
+#[test]
+fn terminal_adapter_reports_admission_read_overlap_as_duplicate_work() {
+    let mut task = completed_task_with_validation(&[], &[]);
+    task.assignment.benign_read_overlap_count = 0;
+    assert_eq!(super::terminal_input(&task).duplicate_work, Some(0));
+    task.assignment.benign_read_overlap_count = 3;
+    assert_eq!(super::terminal_input(&task).duplicate_work, Some(3));
 }

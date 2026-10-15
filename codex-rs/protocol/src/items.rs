@@ -465,8 +465,30 @@ pub struct McpToolCallError {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
 pub struct ContextCompactionItem {
     pub id: String,
+    /// Total active context tokens before this compaction replaced history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tokens_before: Option<i64>,
+    /// Total active context tokens after the replacement was published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tokens_after: Option<i64>,
+    /// Images dropped from the bounded task input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub omitted_image_count: Option<usize>,
+    /// Images kept in the bounded task input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retained_image_count: Option<usize>,
+    /// Whether earlier text was dropped rather than summarized in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub omitted_text: Option<bool>,
 }
 
 fn new_item_id() -> String {
@@ -475,7 +497,14 @@ fn new_item_id() -> String {
 
 impl ContextCompactionItem {
     pub fn new() -> Self {
-        Self { id: new_item_id() }
+        Self {
+            id: new_item_id(),
+            tokens_before: None,
+            tokens_after: None,
+            omitted_image_count: None,
+            retained_image_count: None,
+            omitted_text: None,
+        }
     }
 }
 

@@ -392,6 +392,7 @@ async fn reports_cell_actor_panics_to_the_owner() {
         )
         .await
         .expect("start cell");
+    let cell_id = started.cell_id.clone();
     assert_eq!(
         started.initial_event().await,
         Ok(CellEvent::Completed {
@@ -406,7 +407,10 @@ async fn reports_cell_actor_panics_to_the_owner() {
     let failure = failure_rx
         .try_recv()
         .expect("shutdown should wait for the cell failure watcher");
-    assert!(failure.contains("code-mode cell 1 task failed"));
+    assert!(
+        failure.contains(&format!("code-mode cell {cell_id} task failed")),
+        "{failure}"
+    );
 }
 
 #[tokio::test]

@@ -49,7 +49,11 @@ fn shell_projection_uses_shared_success_default_and_reports_reduction() {
         Some("echo ok"),
     );
     assert!(projected.reduced);
-    assert!(projected.text.contains("Warning: truncated output"), "{}", projected.text);
+    assert!(
+        projected.text.contains("Warning: truncated output"),
+        "{}",
+        projected.text
+    );
     assert!(
         approx_token_count(&projected.text)
             <= codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
@@ -73,7 +77,13 @@ fn shell_projection_complete_envelope_respects_requested_limit() {
 
     assert!(projected.reduced);
     assert!(approx_token_count(&projected.text) <= 64);
-    assert!(projected.text.starts_with("Exit code: 0\nWall time: 0 seconds\n"), "{}", projected.text);
+    assert!(
+        projected
+            .text
+            .starts_with("Exit code: 0\nWall time: 0 seconds\n"),
+        "{}",
+        projected.text
+    );
     assert!(projected.text.contains("\nOutput:\n"), "{}", projected.text);
     assert!(projected.text.contains("{}[]"), "{}", projected.text);
 }

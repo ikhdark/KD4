@@ -24,12 +24,15 @@ impl AdditionalContextStore {
     /// huge source appears to fit and its omitted middle becomes unrecoverable.
     /// The application envelope supplies a conservative, untruncated size only;
     /// it never changes the authority of the admitted or retained source.
-    pub(crate) fn recovery_sources(values: &IndexMap<String, AdditionalContextEntry>) -> Vec<String> {
+    pub(crate) fn recovery_sources(
+        values: &IndexMap<String, AdditionalContextEntry>,
+    ) -> Vec<String> {
         let mut remaining = ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET.saturating_sub(2050);
         let mut sources = Vec::new();
         for (key, entry) in policy_first(values) {
-            let full_source = AdditionalContextDeveloperFragment::new(key.clone(), entry.value.clone())
-                .into_response_input_item();
+            let full_source =
+                AdditionalContextDeveloperFragment::new(key.clone(), entry.value.clone())
+                    .into_response_input_item();
             let bytes = serialized_item_bytes(&full_source).saturating_add(1);
             if bytes <= remaining || entry.kind == AdditionalContextKind::Application {
                 remaining = remaining.saturating_sub(bytes);
@@ -45,16 +48,25 @@ impl AdditionalContextStore {
 
     /// Reject a policy update atomically rather than silently dropping its middle
     /// or accepting only some of its application sources.
-    pub(crate) fn validate_application_context(values: &IndexMap<String, AdditionalContextEntry>) -> Result<(), String> {
+    pub(crate) fn validate_application_context(
+        values: &IndexMap<String, AdditionalContextEntry>,
+    ) -> Result<(), String> {
         let mut bytes = 2usize;
         let mut count = 0usize;
-        for (key, entry) in values.iter().filter(|(_, entry)| entry.kind == AdditionalContextKind::Application) {
+        for (key, entry) in values
+            .iter()
+            .filter(|(_, entry)| entry.kind == AdditionalContextKind::Application)
+        {
             count += 1;
             bytes = bytes.saturating_add(serialized_item_bytes(&render_entry(key, entry)) + 1);
         }
         // Reserve one reset/rejection notice for replacing an older snapshot.
-        if count >= ADDITIONAL_CONTEXT_MAX_ITEMS || bytes > ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET - 2048 {
-            return Err(format!("Application policy update rejected: {bytes} serialized bytes across {count} fragments exceed the whole-policy allowance. Previous application policy is unchanged."));
+        if count >= ADDITIONAL_CONTEXT_MAX_ITEMS
+            || bytes > ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET - 2048
+        {
+            return Err(format!(
+                "Application policy update rejected: {bytes} serialized bytes across {count} fragments exceed the whole-policy allowance. Previous application policy is unchanged."
+            ));
         }
         Ok(())
     }
@@ -96,10 +108,12 @@ impl AdditionalContextStore {
             let ResponseInputItem::Message { role, content, .. } = render_entry(key, entry) else {
                 return false;
             };
-            items.iter().any(|item| matches!(item,
-                ResponseItem::Message { role: retained_role, content: retained_content, .. }
-                    if retained_role == &role && retained_content == &content
-            ))
+            items.iter().any(|item| {
+                matches!(item,
+                    ResponseItem::Message { role: retained_role, content: retained_content, .. }
+                        if retained_role == &role && retained_content == &content
+                )
+            })
         });
         self.delivery_invalidated |= self.delivered.len() != before;
     }
@@ -201,9 +215,17 @@ impl AdditionalContextStore {
     }
 }
 
-fn policy_first(values: &IndexMap<String, AdditionalContextEntry>) -> impl Iterator<Item = (&String, &AdditionalContextEntry)> {
-    values.iter().filter(|(_, entry)| entry.kind == AdditionalContextKind::Application)
-        .chain(values.iter().filter(|(_, entry)| entry.kind != AdditionalContextKind::Application))
+fn policy_first(
+    values: &IndexMap<String, AdditionalContextEntry>,
+) -> impl Iterator<Item = (&String, &AdditionalContextEntry)> {
+    values
+        .iter()
+        .filter(|(_, entry)| entry.kind == AdditionalContextKind::Application)
+        .chain(
+            values
+                .iter()
+                .filter(|(_, entry)| entry.kind != AdditionalContextKind::Application),
+        )
 }
 
 fn render_entry(key: &str, entry: &AdditionalContextEntry) -> ResponseInputItem {
@@ -268,10 +290,13 @@ mod tests {
 
     #[test]
     fn application_policy_is_whole_and_oversized_updates_are_rejected() {
-        let mut values = IndexMap::from([("policy".to_string(), AdditionalContextEntry {
-            value: format!("{}Never modify X.{}", "a".repeat(7000), "b".repeat(7000)),
-            kind: AdditionalContextKind::Application,
-        })]);
+        let mut values = IndexMap::from([(
+            "policy".to_string(),
+            AdditionalContextEntry {
+                value: format!("{}Never modify X.{}", "a".repeat(7000), "b".repeat(7000)),
+                kind: AdditionalContextKind::Application,
+            },
+        )]);
         assert!(AdditionalContextStore::validate_application_context(&values).is_ok());
         let rendered = AdditionalContextStore::default().merge(values.clone());
         assert_eq!(rendered.len(), 1);
@@ -520,8 +545,12 @@ mod tests {
             assert!(input_text(item).contains(source));
             assert!(input_text(item).contains("previous_value_obsolete"));
         }
-        assert!(fragments.iter().all(|item| !input_text(item).contains("unchanged")
-            && !input_text(item).contains(ADDITIONAL_CONTEXT_RESET_SOURCE)));
+        assert!(
+            fragments
+                .iter()
+                .all(|item| !input_text(item).contains("unchanged")
+                    && !input_text(item).contains(ADDITIONAL_CONTEXT_RESET_SOURCE))
+        );
         assert_eq!(store.delivered, values);
         assert!(store.merge(values).is_empty());
     }
@@ -529,13 +558,15 @@ mod tests {
     #[test]
     fn replacement_redelivers_only_missing_context() {
         let mut store = AdditionalContextStore::default();
-        let values = IndexMap::from_iter(["retained", "missing"].map(|source| (
-            source.to_string(),
-            AdditionalContextEntry {
-                value: source.to_string(),
-                kind: AdditionalContextKind::Application,
-            },
-        )));
+        let values = IndexMap::from_iter(["retained", "missing"].map(|source| {
+            (
+                source.to_string(),
+                AdditionalContextEntry {
+                    value: source.to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            )
+        }));
         let first = store.merge(values.clone());
         store.reconcile_history(&[ResponseItem::from(first[0].clone())]);
         assert_eq!(store.merge(values.clone()), vec![first[1].clone()]);

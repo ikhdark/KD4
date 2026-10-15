@@ -79,8 +79,10 @@ impl ResponseEvent {
             | Self::ToolCallInputDelta { delta, .. }
             | Self::ReasoningSummaryDelta { delta, .. }
             | Self::ReasoningContentDelta { delta, .. } => !delta.is_empty(),
-            Self::OutputItemAdded(_) | Self::OutputItemDone(_)
-            | Self::ReasoningSummaryDone { .. } | Self::Completed { .. } => true,
+            Self::OutputItemAdded(_)
+            | Self::OutputItemDone(_)
+            | Self::ReasoningSummaryDone { .. }
+            | Self::Completed { .. } => true,
             _ => false,
         }
     }
@@ -190,16 +192,26 @@ pub struct ResponsesInput {
 
 impl ResponsesInput {
     pub fn with_prefix(prefix: Vec<ResponseItem>, shared: Arc<[ResponseItem]>) -> Self {
-        Self { prefix: prefix.into(), shared, contiguous: std::sync::OnceLock::new() }
+        Self {
+            prefix: prefix.into(),
+            shared,
+            contiguous: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ResponseItem> {
         self.prefix.iter().chain(self.shared.iter())
     }
 
-    pub fn len(&self) -> usize { self.prefix.len() + self.shared.len() }
-    pub fn is_empty(&self) -> bool { self.prefix.is_empty() && self.shared.is_empty() }
-    pub fn first(&self) -> Option<&ResponseItem> { self.iter().next() }
+    pub fn len(&self) -> usize {
+        self.prefix.len() + self.shared.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.prefix.is_empty() && self.shared.is_empty()
+    }
+    pub fn first(&self) -> Option<&ResponseItem> {
+        self.iter().next()
+    }
 
     /// Indexed inspection must not materialize the contiguous compatibility copy.
     pub fn get_item(&self, index: usize) -> Option<&ResponseItem> {
@@ -218,25 +230,34 @@ impl ResponsesInput {
 }
 
 impl From<Arc<[ResponseItem]>> for ResponsesInput {
-    fn from(shared: Arc<[ResponseItem]>) -> Self { Self::with_prefix(Vec::new(), shared) }
+    fn from(shared: Arc<[ResponseItem]>) -> Self {
+        Self::with_prefix(Vec::new(), shared)
+    }
 }
 
 impl From<Vec<ResponseItem>> for ResponsesInput {
-    fn from(items: Vec<ResponseItem>) -> Self { Self::from(Arc::<[ResponseItem]>::from(items)) }
+    fn from(items: Vec<ResponseItem>) -> Self {
+        Self::from(Arc::<[ResponseItem]>::from(items))
+    }
 }
 
 impl std::ops::Deref for ResponsesInput {
     type Target = Arc<[ResponseItem]>;
     fn deref(&self) -> &Self::Target {
-        if self.prefix.is_empty() { return &self.shared; }
-        self.contiguous.get_or_init(|| self.iter().cloned().collect::<Vec<_>>().into())
+        if self.prefix.is_empty() {
+            return &self.shared;
+        }
+        self.contiguous
+            .get_or_init(|| self.iter().cloned().collect::<Vec<_>>().into())
     }
 }
 
 impl std::ops::DerefMut for ResponsesInput {
     fn deref_mut(&mut self) -> &mut Self::Target {
         if !self.prefix.is_empty() {
-            self.shared = self.contiguous.take()
+            self.shared = self
+                .contiguous
+                .take()
                 .unwrap_or_else(|| self.iter().cloned().collect::<Vec<_>>().into());
             self.prefix = Arc::from([]);
         }
@@ -245,14 +266,18 @@ impl std::ops::DerefMut for ResponsesInput {
 }
 
 impl PartialEq for ResponsesInput {
-    fn eq(&self, other: &Self) -> bool { self.iter().eq(other.iter()) }
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
 }
 
 impl Serialize for ResponsesInput {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
-        for item in self.iter() { sequence.serialize_element(item)?; }
+        for item in self.iter() {
+            sequence.serialize_element(item)?;
+        }
         sequence.end()
     }
 }
@@ -264,13 +289,19 @@ mod responses_input_tests {
     #[test]
     fn prefixed_serialization_keeps_exact_bytes_without_copying_shared_history() {
         let item = |text: &str| ResponseItem::Message {
-            id: None, role: "developer".into(),
+            id: None,
+            role: "developer".into(),
             content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
-            phase: None, internal_chat_message_metadata_passthrough: None,
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let history: Arc<[ResponseItem]> = Arc::from([item("shared history")]);
         for prefix in [Vec::new(), vec![item("fixed prefix")]] {
-            let expected = prefix.iter().chain(history.iter()).cloned().collect::<Vec<_>>();
+            let expected = prefix
+                .iter()
+                .chain(history.iter())
+                .cloned()
+                .collect::<Vec<_>>();
             let input = ResponsesInput::with_prefix(prefix, Arc::clone(&history));
             for (index, item) in input.iter().enumerate() {
                 assert!(std::ptr::eq(input.get_item(index).unwrap(), item));
@@ -278,7 +309,10 @@ mod responses_input_tests {
             assert!(input.get_item(input.len()).is_none());
             assert!(input.get_item(usize::MAX).is_none());
             for _ in 0..2 {
-                assert_eq!(serde_json::to_vec(&input).unwrap(), serde_json::to_vec(&expected).unwrap());
+                assert_eq!(
+                    serde_json::to_vec(&input).unwrap(),
+                    serde_json::to_vec(&expected).unwrap()
+                );
                 assert!(input.contiguous.get().is_none());
                 assert!(Arc::ptr_eq(&input.shared, &history));
             }
@@ -286,8 +320,14 @@ mod responses_input_tests {
             Arc::make_mut(&mut modified)[0] = item("rewritten");
             let mut expected_modified = expected.clone();
             expected_modified[0] = item("rewritten");
-            assert_eq!(serde_json::to_vec(&modified).unwrap(), serde_json::to_vec(&expected_modified).unwrap());
-            assert_eq!(serde_json::to_vec(&input).unwrap(), serde_json::to_vec(&expected).unwrap());
+            assert_eq!(
+                serde_json::to_vec(&modified).unwrap(),
+                serde_json::to_vec(&expected_modified).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&input).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
         }
     }
 }

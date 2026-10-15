@@ -511,8 +511,12 @@ impl LocalAgentTaskStore {
         )
         .await?;
         let (overlaps, integration_plan) = if selective {
-            selective_admission_tx(&mut transaction, &assignment, isolated_integrator_available)
-                .await?
+            selective_admission_tx(
+                &mut transaction,
+                &assignment,
+                isolated_integrator_available,
+            )
+            .await?
         } else {
             (
                 AdmissionOverlapSummary::default(),
@@ -520,6 +524,10 @@ impl LocalAgentTaskStore {
             )
         };
         assignment.integration_plan = integration_plan;
+        // Retain the admission-time overlap count in the same durable body so terminal
+        // usage metrics can attribute duplicated repository discovery after the
+        // transient admission summary is gone.
+        assignment.benign_read_overlap_count = overlaps.benign_read_overlap_count;
         sqlx::query(
             "INSERT INTO assignments (assignment_id, root_session_id, body_json, created_at) VALUES (?, ?, ?, ?)",
         )
@@ -1537,6 +1545,8 @@ LIMIT 1
             next_action: draft.next_action,
             architecture_contract,
             evidence_epoch,
+            // Seal-time bytes do not identify the inputs the producer observed.
+            read_scope_fingerprint: None,
             sealed_at: Utc::now(),
         };
         let state = receipt.status.attempt_state();
@@ -1775,6 +1785,9 @@ LIMIT 1
             next_action: None,
             architecture_contract: None,
             evidence_epoch: 0,
+            // A recovery receipt records an abandoned attempt, never a result
+            // whose inputs were observed, so it is never reusable.
+            read_scope_fingerprint: None,
             sealed_at: Utc::now(),
         };
         sqlx::query("INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at) VALUES (?, ?, ?, ?, ?)")
@@ -2424,6 +2437,8 @@ LIMIT 1
             next_action: None,
             architecture_contract: None,
             evidence_epoch: current_epoch,
+            // An abandoned assignment produced no observed result to reuse.
+            read_scope_fingerprint: None,
             sealed_at: now,
         };
         sqlx::query("INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at) VALUES (?, ?, ?, ?, ?)")
@@ -2704,7 +2719,7 @@ impl LocalAgentTaskStore {
                     "repository root changed during reuse lookup".to_string(),
                 ));
             }
-            assignment.workspace_id = repository.workspace_id;
+            assignment.workspace_id = repository.workspace_id.clone();
             if assignment.role != AgentRole::Explorer
                 || assignment.workspace_strategy == WorkspaceStrategy::Isolated
             {
@@ -2719,9 +2734,16 @@ impl LocalAgentTaskStore {
                 None,
             )
             .await?;
-            let result = selective_admission_tx(&mut transaction, &assignment, false).await;
+            let result = selective_admission_tx(
+                &mut transaction,
+                &assignment,
+                false,
+            )
+            .await;
             transaction.rollback().await?;
             match result {
+                // Only an investigation still in flight can be shared. Sealed
+                // receipts have no binding to the inputs the producer observed.
                 Err(StoreError::AdmissionRejected {
                     reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
                     reusable_assignment_id,
@@ -3854,6 +3876,8 @@ async fn seal_architecture_contract_for_receipt_tx(
     }))
 }
 
+
+
 async fn validate_architecture_contract_reference_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     worker: &Assignment,
@@ -4468,8 +4492,7 @@ async fn selective_admission_tx(
         let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
         let existing_is_active = existing_state == AttemptState::Active
             && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
-        // In-flight work in this checkout can be shared. A sealed result has no
-        // authoritative input fingerprint, so semantic identity cannot prove reuse.
+        // In-flight work in this checkout can be shared outright.
         if existing_is_active
             && candidate_identity.is_some()
             && candidate_identity == existing.primary_investigation_identity()
@@ -4482,6 +4505,9 @@ async fn selective_admission_tx(
         }
 
         if !existing_is_active {
+            // Even persisted seal-time fingerprints cannot prove what the
+            // producer read. Until observed inputs are bound to the result,
+            // completed investigations never certify fresh reuse.
             continue;
         }
         let read_overlaps = existing.read_scope.iter().any(|existing_scope| {

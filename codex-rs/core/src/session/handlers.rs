@@ -304,12 +304,20 @@ pub(super) async fn user_input_or_turn_inner(
     current_context.session_telemetry.user_prompt(&items);
     sess.refresh_mcp_servers_if_requested(&current_context)
         .await;
-    let additional_context = match sess.recoverable_additional_context(additional_context).await {
+    let additional_context = match sess
+        .recoverable_additional_context(additional_context)
+        .await
+    {
         Ok(values) => values,
         Err(error) => {
-            sess.send_event_raw(Event { id: sub_id.clone(), msg: EventMsg::Error(ErrorEvent {
-                message: error.to_string(), codex_error_info: Some(CodexErrorInfo::InternalServerError),
-            }) }).await;
+            sess.send_event_raw(Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                }),
+            })
+            .await;
             if let Some((permit, admission)) = start_only_admission.take() {
                 drop(permit);
                 let _ = admission.send(Err(error));
@@ -521,7 +529,8 @@ pub async fn request_user_input_response(
     call_id: Option<String>,
     response: RequestUserInputResponse,
 ) {
-    sess.notify_user_input_response_for_request(&id, call_id.as_deref(), response).await;
+    sess.notify_user_input_response_for_request(&id, call_id.as_deref(), response)
+        .await;
 }
 
 pub async fn request_permissions_response(
@@ -533,8 +542,14 @@ pub async fn request_permissions_response(
         .await;
 }
 
-pub async fn dynamic_tool_response(sess: &Arc<Session>, turn_id: String, id: String, response: DynamicToolResponse) {
-    sess.notify_dynamic_tool_response(&turn_id, &id, response).await;
+pub async fn dynamic_tool_response(
+    sess: &Arc<Session>,
+    turn_id: String,
+    id: String,
+    response: DynamicToolResponse,
+) {
+    sess.notify_dynamic_tool_response(&turn_id, &id, response)
+        .await;
 }
 
 pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
@@ -628,16 +643,20 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    if let Err(err) = sess.commit_rollback_history(
-        &turn_context, replay_items, rollback_msg.clone(),
-    ).await {
+    if let Err(err) = sess
+        .commit_rollback_history(&turn_context, replay_items, rollback_msg.clone())
+        .await
+    {
         sess.send_event_raw(Event {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
-                message: format!("failed to commit rollback marker; no rollback success was published: {err}"),
+                message: format!(
+                    "failed to commit rollback marker; no rollback success was published: {err}"
+                ),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
-        }).await;
+        })
+        .await;
         return;
     }
     sess.deliver_event_raw(Event {
@@ -727,7 +746,10 @@ async fn shutdown_thread_persistence(sess: &Arc<Session>) -> Result<(), String> 
         async move {
             sess.terminal_tasks.wait().await;
             sess.wait_for_ordered_history_commits().await;
-            let result = live_thread.shutdown().await.map_err(|error| error.to_string());
+            let result = live_thread
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string());
             if let Err(error) = &result {
                 warn!(%error, "owned thread persistence shutdown failed");
             }
@@ -737,7 +759,10 @@ async fn shutdown_thread_persistence(sess: &Arc<Session>) -> Result<(), String> 
     match tokio::time::timeout(TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT, owner).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("thread persistence shutdown remains owned and pending; durability is unconfirmed".to_string()),
+        Err(_) => Err(
+            "thread persistence shutdown remains owned and pending; durability is unconfirmed"
+                .to_string(),
+        ),
     }
 }
 
@@ -1055,7 +1080,11 @@ async fn dispatch_submission(
                 patch_approval(&sess, id, decision).await;
                 false
             }
-            Op::UserInputAnswer { id, call_id, response } => {
+            Op::UserInputAnswer {
+                id,
+                call_id,
+                response,
+            } => {
                 request_user_input_response(&sess, id, call_id, response).await;
                 false
             }
@@ -1063,7 +1092,11 @@ async fn dispatch_submission(
                 request_permissions_response(&sess, id, response).await;
                 false
             }
-            Op::DynamicToolResponse { turn_id, id, response } => {
+            Op::DynamicToolResponse {
+                turn_id,
+                id,
+                response,
+            } => {
                 dynamic_tool_response(&sess, turn_id, id, response).await;
                 false
             }
@@ -1161,7 +1194,8 @@ mod dispatch_tests {
 
     #[tokio::test]
     async fn interrupted_mcp_preparation_retains_refresh_for_the_next_turn() {
-        let (session, context, events) = crate::session::tests::make_session_and_context_with_rx().await;
+        let (session, context, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
         let requested = McpServerRefreshConfig {
             mcp_servers: serde_json::json!({"retained-config": {"url": "https://unused.example/mcp", "enabled": false}}),
             mcp_oauth_credentials_store_mode: serde_json::json!("auto"),
@@ -1172,39 +1206,65 @@ mod dispatch_tests {
         let pause = Arc::new(super::super::mcp::TestMcpStartupPause::new());
         let (sender, receiver) = async_channel::bounded(8);
         let queued = |submission| super::super::QueuedSubmission {
-            submission, mailbox_admission: None, preparation_permit: None,
+            submission,
+            mailbox_admission: None,
+            preparation_permit: None,
         };
-        sender.send(queued(user_submission("mcp-preparing"))).await.unwrap();
+        sender
+            .send(queued(user_submission("mcp-preparing")))
+            .await
+            .unwrap();
         let dispatcher = tokio::spawn(super::super::mcp::with_test_mcp_startup_pause(
-            Arc::clone(&pause), submission_loop(Arc::clone(&session), Arc::clone(&context.config), receiver),
+            Arc::clone(&pause),
+            submission_loop(Arc::clone(&session), Arc::clone(&context.config), receiver),
         ));
-        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire()).await
-            .expect("real submission preparation reaches MCP startup").unwrap().forget();
+        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire())
+            .await
+            .expect("real submission preparation reaches MCP startup")
+            .unwrap()
+            .forget();
         let mut control = user_submission("interrupt-mcp-preparation");
         control.op = Op::Interrupt;
         sender.send(queued(control)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let EventMsg::TurnAborted(event) = events.recv().await.unwrap().msg
-                    && event.turn_id.as_deref() == Some("mcp-preparing") {
+                    && event.turn_id.as_deref() == Some("mcp-preparing")
+                {
                     break;
                 }
             }
-        }).await.expect("interrupt drops the actual preparation owner");
-        let retained = session.pending_mcp_server_refresh_config.lock().await.is_some();
-        assert!(Arc::ptr_eq(&old_runtime, &session.services.latest_mcp_runtime()));
+        })
+        .await
+        .expect("interrupt drops the actual preparation owner");
+        let retained = session
+            .pending_mcp_server_refresh_config
+            .lock()
+            .await
+            .is_some();
+        assert!(Arc::ptr_eq(
+            &old_runtime,
+            &session.services.latest_mcp_runtime()
+        ));
         assert!(pause.token.lock().await.as_ref().unwrap().is_cancelled());
         if retained {
-            assert!(session.mcp_startup_cancellation_token().await.is_cancelled());
+            assert!(
+                session
+                    .mcp_startup_cancellation_token()
+                    .await
+                    .is_cancelled()
+            );
             // A new real admission retries configuration, not the cancelled
             // user's effects. Empty review fails after refresh without sampling.
             let mut retry = user_submission("retry-mcp-config");
-            retry.op = Op::Review { review_request: ReviewRequest {
-                target: codex_protocol::protocol::ReviewTarget::Custom {
-                    instructions: String::new(),
+            retry.op = Op::Review {
+                review_request: ReviewRequest {
+                    target: codex_protocol::protocol::ReviewTarget::Custom {
+                        instructions: String::new(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            }};
+            };
             sender.send(queued(retry)).await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -1213,18 +1273,40 @@ mod dispatch_tests {
                         break;
                     }
                 }
-            }).await.expect("next admission completes refresh before review rejection");
-            let actual = codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config());
-            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(
-                serde_json::from_value::<std::collections::HashMap<String, codex_config::types::McpServerConfig>>(requested.mcp_servers).unwrap()
-            ).unwrap());
-            assert!(session.pending_mcp_server_refresh_config.lock().await.is_none());
+            })
+            .await
+            .expect("next admission completes refresh before review rejection");
+            let actual =
+                codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config());
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(
+                    serde_json::from_value::<
+                        std::collections::HashMap<String, codex_config::types::McpServerConfig>,
+                    >(requested.mcp_servers)
+                    .unwrap()
+                )
+                .unwrap()
+            );
+            assert!(
+                session
+                    .pending_mcp_server_refresh_config
+                    .lock()
+                    .await
+                    .is_none()
+            );
         }
         let mut control = user_submission("shutdown");
         control.op = Op::Shutdown;
         sender.send(queued(control)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), dispatcher).await.unwrap().unwrap();
-        assert!(retained, "interrupt must not silently consume an unapplied configuration refresh");
+        tokio::time::timeout(Duration::from_secs(5), dispatcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained,
+            "interrupt must not silently consume an unapplied configuration refresh"
+        );
     }
 
     #[tokio::test]
@@ -1246,14 +1328,21 @@ mod dispatch_tests {
             session: Arc::clone(&session),
             session_loop_termination: futures::future::ready(()).boxed().shared(),
         };
-        codex.enqueue_submission(user_submission("blocked")).await.unwrap();
+        codex
+            .enqueue_submission(user_submission("blocked"))
+            .await
+            .unwrap();
         let mut dispatcher = Box::pin(submission_loop(
-            Arc::clone(&session), Arc::clone(&context.config), receiver,
+            Arc::clone(&session),
+            Arc::clone(&context.config),
+            receiver,
         ));
         assert!(futures::poll!(dispatcher.as_mut()).is_pending());
         for index in 0..8 {
-            codex.enqueue_submission(user_submission(&format!("deferred-{index}")))
-                .await.unwrap();
+            codex
+                .enqueue_submission(user_submission(&format!("deferred-{index}")))
+                .await
+                .unwrap();
         }
         assert!(futures::poll!(dispatcher.as_mut()).is_pending());
         assert_eq!(session.submission_preparation_slots.available_permits(), 0);
@@ -1263,20 +1352,33 @@ mod dispatch_tests {
 
         let active = crate::state::ActiveTurn::default();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        active.turn_state.lock().await
+        active
+            .turn_state
+            .lock()
+            .await
             .try_insert_pending_dynamic_tool("tool".to_string(), context.sub_id.clone(), reply_tx)
             .unwrap();
         *session.active_turn.lock().await = Some(active);
-        let response = DynamicToolResponse { content_items: Vec::new(), success: true };
-        codex.submit(Op::DynamicToolResponse {
-            turn_id: context.sub_id.clone(), id: "tool".to_string(), response: response.clone(),
-        }).await.unwrap();
+        let response = DynamicToolResponse {
+            content_items: Vec::new(),
+            success: true,
+        };
+        codex
+            .submit(Op::DynamicToolResponse {
+                turn_id: context.sub_id.clone(),
+                id: "tool".to_string(),
+                response: response.clone(),
+            })
+            .await
+            .unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::select! {
                 result = reply_rx => result.unwrap(),
                 _ = dispatcher.as_mut() => panic!("dispatcher exited"),
             }
-        }).await.expect("a full deferred queue must not block an approval reply");
+        })
+        .await
+        .expect("a full deferred queue must not block an approval reply");
         assert_eq!(delivered, response);
         *session.active_turn.lock().await = None;
         codex.submit(Op::Interrupt).await.unwrap();
@@ -1293,9 +1395,12 @@ mod dispatch_tests {
                 }
             }
             aborted
-        }).await.expect("interrupt must cancel every admitted preparation");
+        })
+        .await
+        .expect("interrupt must cancel every admitted preparation");
         let expected = std::iter::once("blocked".to_string())
-            .chain((0..8).map(|index| format!("deferred-{index}"))).collect::<Vec<_>>();
+            .chain((0..8).map(|index| format!("deferred-{index}")))
+            .collect::<Vec<_>>();
         assert_eq!(aborted, expected);
         assert_eq!(session.submission_preparation_slots.available_permits(), 9);
         drop(reserved);
@@ -1303,9 +1408,17 @@ mod dispatch_tests {
         assert!(futures::poll!(dispatcher.as_mut()).is_pending());
         assert!(session.active_turn.lock().await.is_none());
         codex.submit(Op::Shutdown).await.unwrap();
-        codex.enqueue_submission(user_submission("after-shutdown")).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), dispatcher).await.unwrap();
-        assert_eq!(session.submission_preparation_slots.available_permits(), super::super::SUBMISSION_CHANNEL_CAPACITY);
+        codex
+            .enqueue_submission(user_submission("after-shutdown"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.submission_preparation_slots.available_permits(),
+            super::super::SUBMISSION_CHANNEL_CAPACITY
+        );
     }
 
     #[tokio::test]
@@ -1313,11 +1426,14 @@ mod dispatch_tests {
         let (session, _, events) = crate::session::tests::make_session_and_context_with_rx().await;
         let reserved = Arc::clone(&session.submission_preparation_slots)
             .acquire_many_owned((super::super::SUBMISSION_CHANNEL_CAPACITY - 1) as u32)
-            .await.unwrap();
+            .await
+            .unwrap();
         let (sender, receiver) = async_channel::bounded(1);
         let codex = super::super::Codex {
-            tx_sub: sender, rx_event: events,
-            agent_status: session.agent_status.subscribe(), session: Arc::clone(&session),
+            tx_sub: sender,
+            rx_event: events,
+            agent_status: session.agent_status.subscribe(),
+            session: Arc::clone(&session),
             session_loop_termination: futures::future::ready(()).boxed().shared(),
         };
         codex.submit(Op::Interrupt).await.unwrap();
@@ -1327,12 +1443,23 @@ mod dispatch_tests {
         drop(sending);
         assert_eq!(session.submission_preparation_slots.available_permits(), 1);
         drop(receiver.recv().await.unwrap());
-        codex.enqueue_submission(user_submission("queued")).await.unwrap();
+        codex
+            .enqueue_submission(user_submission("queued"))
+            .await
+            .unwrap();
         let mut waiting = Box::pin(codex.enqueue_submission(user_submission("waiting")));
         assert!(futures::poll!(waiting.as_mut()).is_pending());
         receiver.close();
-        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap(), Err(CodexErr::InternalAgentDied)));
-        assert!(matches!(codex.enqueue_submission(user_submission("closed")).await, Err(CodexErr::InternalAgentDied)));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap(),
+            Err(CodexErr::InternalAgentDied)
+        ));
+        assert!(matches!(
+            codex.enqueue_submission(user_submission("closed")).await,
+            Err(CodexErr::InternalAgentDied)
+        ));
         // Closing retains buffered values; the dispatcher drains them on teardown.
         drop(receiver.recv().await.unwrap());
         assert_eq!(session.submission_preparation_slots.available_permits(), 1);

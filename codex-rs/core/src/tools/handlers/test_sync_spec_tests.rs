@@ -81,8 +81,13 @@ fn synchronization_schema_enforces_documented_numeric_domains() {
         assert!(validator.is_valid(&value), "{value}");
     }
     for field in ["participants", "timeout_ms"] {
-        for invalid in [serde_json::json!(-1), serde_json::json!(0), serde_json::json!(1.5)] {
-            let mut value = serde_json::json!({"barrier": {"id": "b", "participants": 1, "timeout_ms": 1}});
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(1.5),
+        ] {
+            let mut value =
+                serde_json::json!({"barrier": {"id": "b", "participants": 1, "timeout_ms": 1}});
             value["barrier"][field] = invalid;
             assert!(!validator.is_valid(&value), "{value}");
         }

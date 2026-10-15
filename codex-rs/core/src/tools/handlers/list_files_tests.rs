@@ -156,7 +156,11 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     let root = tempfile::tempdir().unwrap();
     let call = invocation(root.path(), json!({"path": "."})).await;
     let payload = call.payload.clone();
-    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    let output = ListFilesHandler
+        .handle(call)
+        .await
+        .unwrap()
+        .code_mode_result(&payload);
     assert_eq!(output["complete"], true);
     assert_eq!(output["entries"], json!([]));
     let ToolSpec::Function(spec) = ListFilesHandler.spec() else {
@@ -180,19 +184,42 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     }
     // These limits are the public tool contract, not implementation constants.
     for (arguments, expected_depth, expected_entries, expected_directories) in [
-        (json!({"path": ".", "max_entries": 50_001}), 8, 50_000, 10_000),
+        (
+            json!({"path": ".", "max_entries": 50_001}),
+            8,
+            50_000,
+            10_000,
+        ),
         (json!({"path": ".", "max_depth": 65}), 64, 2000, 2000),
-        (json!({"path": ".", "max_directories": 10_001}), 8, 2000, 10_000),
+        (
+            json!({"path": ".", "max_directories": 10_001}),
+            8,
+            2000,
+            10_000,
+        ),
     ] {
         assert!(validator.is_valid(&arguments));
         let call = invocation(root.path(), arguments).await;
         let payload = call.payload.clone();
-        let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+        let output = ListFilesHandler
+            .handle(call)
+            .await
+            .unwrap()
+            .code_mode_result(&payload);
         assert_eq!(output["complete"], true);
         assert_eq!(output["limits_clamped"], true);
-        assert_eq!(output["effective_walk_options"]["max_depth"], expected_depth);
-        assert_eq!(output["effective_walk_options"]["max_entries"], expected_entries);
-        assert_eq!(output["effective_walk_options"]["max_directories"], expected_directories);
+        assert_eq!(
+            output["effective_walk_options"]["max_depth"],
+            expected_depth
+        );
+        assert_eq!(
+            output["effective_walk_options"]["max_entries"],
+            expected_entries
+        );
+        assert_eq!(
+            output["effective_walk_options"]["max_directories"],
+            expected_directories
+        );
     }
     assert!(
         ListFilesHandler
@@ -204,7 +231,10 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     std::fs::write(root.path().join("regular.txt"), "not a directory").unwrap();
     let error = ListFilesHandler
         .handle(invocation(root.path(), json!({"path": "regular.txt"})).await)
-        .await.err().unwrap().to_string();
+        .await
+        .err()
+        .unwrap()
+        .to_string();
     assert!(error.contains("walk root is not a directory"), "{error}");
     let cancelled = invocation(root.path(), json!({"path": "."})).await;
     cancelled.cancellation_token.cancel();
@@ -231,7 +261,12 @@ async fn listing_does_not_follow_directory_symlinks() {
     assert_eq!(output["complete"], true);
     assert!(!output.to_string().contains("outside.txt"));
     let call = invocation(root.path(), json!({"path":"link"})).await;
-    let error = ListFilesHandler.handle(call).await.err().unwrap().to_string();
+    let error = ListFilesHandler
+        .handle(call)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
     assert!(error.contains("root symlink skipped"), "{error}");
 }
 
@@ -240,17 +275,35 @@ async fn listing_unreadable_file_link_preserves_siblings_without_claiming_comple
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("ordinary.txt"), "ordinary").unwrap();
     #[cfg(windows)]
-    std::os::windows::fs::symlink_file(root.path().join("missing"), root.path().join("dangling")).unwrap();
+    std::os::windows::fs::symlink_file(root.path().join("missing"), root.path().join("dangling"))
+        .unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.path().join("missing"), root.path().join("dangling")).unwrap();
-    let call = invocation(root.path(), json!({
-        "path": ".", "max_depth": 0, "max_entries": 10, "include_hidden": true,
-    })).await;
+    let call = invocation(
+        root.path(),
+        json!({
+            "path": ".", "max_depth": 0, "max_entries": 10, "include_hidden": true,
+        }),
+    )
+    .await;
     let payload = call.payload.clone();
-    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
-    assert_eq!(output["complete"], false, "unreadable entries do not prove absence");
-    assert_eq!(output["truncated"], false, "this is a metadata failure, not a budget cutoff");
-    assert_eq!(output["entries"], json!([{"path":"ordinary.txt", "kind":"file"}]));
+    let output = ListFilesHandler
+        .handle(call)
+        .await
+        .unwrap()
+        .code_mode_result(&payload);
+    assert_eq!(
+        output["complete"], false,
+        "unreadable entries do not prove absence"
+    );
+    assert_eq!(
+        output["truncated"], false,
+        "this is a metadata failure, not a budget cutoff"
+    );
+    assert_eq!(
+        output["entries"],
+        json!([{"path":"ordinary.txt", "kind":"file"}])
+    );
     assert_eq!(output["errors"].as_array().unwrap().len(), 1);
     assert_eq!(output["errors"][0]["path"], "dangling");
     assert!(!output["errors"][0]["message"].as_str().unwrap().is_empty());
@@ -259,8 +312,16 @@ async fn listing_unreadable_file_link_preserves_siblings_without_claiming_comple
 #[tokio::test]
 async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode() {
     let root = tempfile::tempdir().unwrap();
-    for dir in ["src", "target", ".hidden"] { std::fs::create_dir(root.path().join(dir)).unwrap(); }
-    for name in ["src/keep.rs", "src/drop.rs", "src/readme.txt", "target/build.rs", ".hidden/secret.rs"] {
+    for dir in ["src", "target", ".hidden"] {
+        std::fs::create_dir(root.path().join(dir)).unwrap();
+    }
+    for name in [
+        "src/keep.rs",
+        "src/drop.rs",
+        "src/readme.txt",
+        "target/build.rs",
+        ".hidden/secret.rs",
+    ] {
         std::fs::write(root.path().join(name), "content").unwrap();
     }
     for (extra, expected_entries) in [
@@ -288,34 +349,62 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
         ),
     ] {
         let mut args = json!({"path":"."});
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let call = invocation(root.path(), args).await;
         let payload = call.payload.clone();
-        let result = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+        let result = ListFilesHandler
+            .handle(call)
+            .await
+            .unwrap()
+            .code_mode_result(&payload);
         assert_eq!(result["complete"], true);
-        assert_eq!(result["effective_walk_options"]["max_response_bytes"], codex_exec_server::MAX_WALK_RESPONSE_BYTES);
+        assert_eq!(
+            result["effective_walk_options"]["max_response_bytes"],
+            codex_exec_server::MAX_WALK_RESPONSE_BYTES
+        );
         assert_listing_entries(root.path(), &result, &expected_entries);
     }
     let call = invocation(root.path(), json!({"path":".","max_directories":1})).await;
     let payload = call.payload.clone();
-    let result = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    let result = ListFilesHandler
+        .handle(call)
+        .await
+        .unwrap()
+        .code_mode_result(&payload);
     assert_eq!(result["complete"], false);
-    assert!(result["unexplored"].as_array().unwrap().iter().any(|stop| stop["reason"] == "directory_limit"));
+    assert!(
+        result["unexplored"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stop| stop["reason"] == "directory_limit")
+    );
 }
 
 #[tokio::test]
 async fn verified_evidence_directory_scope_includes_effective_walk_policy() {
     let root = tempfile::tempdir().unwrap();
     let mut evidence = Vec::new();
-    for extra in [json!({"max_depth":1}), json!({"max_depth":2}), json!({"max_depth":1,"include_hidden":true})] {
+    for extra in [
+        json!({"max_depth":1}),
+        json!({"max_depth":2}),
+        json!({"max_depth":1,"include_hidden":true}),
+    ] {
         let mut args = json!({"path":"."});
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let call = invocation(root.path(), args).await;
         let payload = call.payload.clone();
         let output = ListFilesHandler.handle(call).await.unwrap();
         assert_eq!(output.code_mode_result(&payload)["entries"], json!([]));
         let essential = output.projection_metadata().unwrap().essential_inline;
-        assert_eq!(essential["effective_walk_options"], output.code_mode_result(&payload)["effective_walk_options"]);
+        assert_eq!(
+            essential["effective_walk_options"],
+            output.code_mode_result(&payload)["effective_walk_options"]
+        );
         assert_eq!(essential["limits_clamped"], false);
         evidence.push(output.sampling_request_signal().unwrap());
     }
@@ -398,10 +487,14 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
     let session = Arc::new(session);
     let step_context = StepContext::for_test(Arc::new(turn));
     let call = |payload: ToolPayload| ToolInvocation {
-        session: Arc::clone(&session), step_context: Arc::clone(&step_context),
-        cancellation_token: CancellationToken::new(), tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: "remote-list".into(), tool_name: ToolName::plain("list_files"),
-        source: ToolCallSource::Direct, payload,
+        session: Arc::clone(&session),
+        step_context: Arc::clone(&step_context),
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "remote-list".into(),
+        tool_name: ToolName::plain("list_files"),
+        source: ToolCallSource::Direct,
+        payload,
     };
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -414,16 +507,28 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
     let filtered_payload = ToolPayload::Function {
         arguments: json!({"path":".", "environment_id":"remote-listing", "include":["*.txt"], "exclude_directories":["target"]}).to_string(),
     };
-    let filtered = ListFilesHandler.handle(call(filtered_payload.clone())).await.unwrap().code_mode_result(&filtered_payload);
+    let filtered = ListFilesHandler
+        .handle(call(filtered_payload.clone()))
+        .await
+        .unwrap()
+        .code_mode_result(&filtered_payload);
     assert_eq!(filtered["complete"], false);
     assert_eq!(filtered["truncated"], true);
     assert_eq!(filtered["errors"], output["errors"]);
-    let incompatible = ListFilesHandler.handle(call(filtered_payload)).await.err().unwrap().to_string();
+    let incompatible = ListFilesHandler
+        .handle(call(filtered_payload))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
     assert!(incompatible.contains("did not apply requested walk filters"));
     stop_tx.send(()).unwrap();
     let walks = server.await.unwrap();
     assert_eq!(walks.len(), 3);
-    assert_eq!(walks[1]["options"]["filters"], json!({"include":["*.txt"],"excludeDirectories":["target"]}));
+    assert_eq!(
+        walks[1]["options"]["filters"],
+        json!({"include":["*.txt"],"excludeDirectories":["target"]})
+    );
     assert_eq!(walks[0]["sandbox"], json!(expected_sandbox));
     assert_eq!(walks[0]["options"]["maxEntries"], 17);
     assert_eq!(walks[0]["options"]["followDirectorySymlinks"], false);

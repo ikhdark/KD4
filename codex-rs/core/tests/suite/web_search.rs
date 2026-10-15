@@ -59,7 +59,6 @@ async fn web_search_mode_cached_sets_external_web_access_false() {
     );
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_updates_between_turns_with_permission_profile() {
     require_network!();

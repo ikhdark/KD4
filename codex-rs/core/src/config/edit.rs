@@ -653,10 +653,17 @@ fn apply_blocking_to_resolved_file(
     // Aliases must share the target's lock, including aliases in parent paths.
     let resolve_target = || -> anyhow::Result<_> {
         let mut paths = resolve_symlink_write_paths(resolved_config_file)?;
-        let parent = paths.write_path.parent().context("config target has no parent")?;
+        let parent = paths
+            .write_path
+            .parent()
+            .context("config target has no parent")?;
         std::fs::create_dir_all(parent)?;
-        paths.write_path = std::fs::canonicalize(parent)?
-            .join(paths.write_path.file_name().context("config target has no file name")?);
+        paths.write_path = std::fs::canonicalize(parent)?.join(
+            paths
+                .write_path
+                .file_name()
+                .context("config target has no file name")?,
+        );
         paths.read_path = Some(paths.write_path.clone());
         Ok(paths)
     };

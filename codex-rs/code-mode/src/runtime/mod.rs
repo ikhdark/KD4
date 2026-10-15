@@ -642,6 +642,12 @@ pub(super) struct RuntimeState {
 pub(crate) const MAX_OUTSTANDING_CALLBACKS_PER_CELL: usize = 128;
 pub(crate) const MAX_SESSION_STORED_VALUES: usize = 256;
 pub(crate) const MAX_SESSION_STORED_VALUE_BYTES: usize = 8 * 1024 * 1024;
+/// Keys returned by one `listKeys` page when the caller does not ask.
+pub(crate) const DEFAULT_LIST_KEYS_LIMIT: u64 = 32;
+/// Largest `listKeys` page. A larger request is clamped to this and paged with
+/// `next_after`, so the ceiling bounds one result without hiding any key.
+/// Public so the tool contract can state the real number to the model.
+pub const MAX_LIST_KEYS_LIMIT: u64 = 64;
 
 /// Counts serialized bytes without retaining them.
 #[derive(Default)]

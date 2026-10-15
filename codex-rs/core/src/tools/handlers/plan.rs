@@ -51,12 +51,22 @@ impl PlanToolOutput {
         serde_json::json!(PlanToolResponse {
             obligations: self.lineage.obligation_summary(&self.current_plan),
             completion_authority: crate::plan_store::checklist_completion_authority(),
-            lineage: if lineage_complete { self.lineage.compact_for_plan(&self.current_plan) }
-                else { self.lineage.active_for_plan(&self.current_plan) },
+            lineage: if lineage_complete {
+                self.lineage.compact_for_plan(&self.current_plan)
+            } else {
+                self.lineage.active_for_plan(&self.current_plan)
+            },
             lineage_complete,
-            revision: crate::plan_store::plan_revision_with_lineage(Some(&self.current_plan), &self.lineage),
-            step_ids: self.current_plan.plan.iter()
-                .map(|item| self.lineage.step_id(&item.step)).collect(),
+            revision: crate::plan_store::plan_revision_with_lineage(
+                Some(&self.current_plan),
+                &self.lineage
+            ),
+            step_ids: self
+                .current_plan
+                .plan
+                .iter()
+                .map(|item| self.lineage.step_id(&item.step))
+                .collect(),
             message: self.message().to_string(),
             effect: self.effect.as_str().to_string(),
             no_progress: self.effect == PlanUpdateEffect::NoOp,
@@ -176,7 +186,9 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
         create_update_plan_tool()
     }
 
-    fn supports_parallel_tool_calls(&self) -> bool { true }
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(invocation))
@@ -184,7 +196,10 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
 }
 
 impl PlanHandler {
-    #[expect(clippy::await_holding_invalid_type, reason = "session-local publication gate must order durable persistence, state commit, and client events; releasing it early can reorder plan revisions")]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "session-local publication gate must order durable persistence, state commit, and client events; releasing it early can reorder plan revisions"
+    )]
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
@@ -216,11 +231,12 @@ impl PlanHandler {
             ));
         }
 
-        let mut requested_args = serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to parse function arguments: {error}"
-            ))
-        })?;
+        let mut requested_args =
+            serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to parse function arguments: {error}"
+                ))
+            })?;
         requested_args.sampling_revision = step_context.plan_sampling_revision.clone();
         if requested_args.plan.is_some() == requested_args.set.is_some() {
             return Err(FunctionCallError::RespondToModel(
@@ -253,18 +269,23 @@ impl PlanHandler {
             let mut resolved = std::collections::BTreeMap::new();
             let coordinator = session.services.agent_control.task_coordinator();
             for (step_id, assignment_id) in workflow {
-                let task = coordinator.get_agent_task(*assignment_id, Some(0)).await
+                let task = coordinator
+                    .get_agent_task(*assignment_id, Some(0))
+                    .await
                     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
                 if task.assignment.root_session_id != session.thread_id.to_string() {
                     return Err(FunctionCallError::RespondToModel(
                         "workflow assignments must belong to this root session".into(),
                     ));
                 }
-                resolved.insert(step_id.clone(), crate::plan_store::PlanExecutionNode {
-                    assignment_id: *assignment_id,
-                    dependencies: task.assignment.dependencies,
-                    capability_profile: task.assignment.capability_profile,
-                });
+                resolved.insert(
+                    step_id.clone(),
+                    crate::plan_store::PlanExecutionNode {
+                        assignment_id: *assignment_id,
+                        dependencies: task.assignment.dependencies,
+                        capability_profile: task.assignment.capability_profile,
+                    },
+                );
             }
             requested_args.resolved_workflow = Some(resolved);
         }

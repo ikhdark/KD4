@@ -9,6 +9,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents::apply_spawn_agent_model_defaults_and_overrides;
 use crate::tools::handlers::multi_agents::apply_spawn_agent_service_tier;
 use crate::tools::handlers::multi_agents::build_agent_spawn_config;
+use crate::tools::handlers::multi_agents::inherit_live_service_tier;
 use crate::tools::handlers::parse_arguments;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -153,6 +154,7 @@ async fn build_runner_options(
     }
     let max_concurrency = normalize_concurrency(requested_concurrency, agent_max_threads);
     let mut spawn_config = build_agent_spawn_config(turn.as_ref())?;
+    let parent_service_tier = inherit_live_service_tier(session, &mut spawn_config).await;
     apply_spawn_agent_model_defaults_and_overrides(
         session,
         turn.as_ref(),
@@ -166,7 +168,7 @@ async fn build_runner_options(
         session,
         turn.as_ref(),
         &mut spawn_config,
-        turn.config.service_tier.as_deref(),
+        parent_service_tier.as_deref(),
         /*requested_service_tier*/ None,
     )
     .await?;
@@ -486,9 +488,13 @@ async fn run_agent_job_loop(
             }
             if !progressed {
                 wait_for_status_change(
-                    active_items, &mut job_changes, &mut capacity_changes,
-                    &cancellation_token, runtime_timeout,
-                ).await;
+                    active_items,
+                    &mut job_changes,
+                    &mut capacity_changes,
+                    &cancellation_token,
+                    runtime_timeout,
+                )
+                .await;
             }
             continue;
         }
@@ -830,7 +836,11 @@ async fn wait_for_status_change(
     // reconciliation cadence. Local commits and capacity releases wake directly.
     let mut deadline = Instant::now() + ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL;
     for item in active_items.values() {
-        deadline = deadline.min(item.started_at + runtime_timeout);
+        // Persisted timeouts can exceed Instant's platform-specific range.
+        // Keep reconciliation and notification wakeups when no deadline fits.
+        if let Some(runtime_deadline) = item.started_at.checked_add(runtime_timeout) {
+            deadline = deadline.min(runtime_deadline);
+        }
         if let Some(status_rx) = item.status_rx.as_ref()
             && status_rx.has_changed().is_ok()
         {

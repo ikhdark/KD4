@@ -62,7 +62,10 @@ impl ListAvailablePluginsToInstallHandler {
                         MAX_LIST_AVAILABLE_PLUGINS_TO_INSTALL_DESCRIPTION_CHARS,
                     );
                     if prefix.len() != description.len() {
-                        tool["description"] = format!("{prefix} [... recover full description with read_tool_output]").into();
+                        tool["description"] = format!(
+                            "{prefix} [... recover full description with read_tool_output]"
+                        )
+                        .into();
                     }
                 }
             }
@@ -213,19 +216,34 @@ mod tests {
     fn preview_suffixes_remain_distinguishable_in_canonical_recovery() {
         use codex_tools::ToolOutput;
         let prefix = "界".repeat(MAX_LIST_AVAILABLE_PLUGINS_TO_INSTALL_DESCRIPTION_CHARS);
-        let candidates = ["calendar export", "document export"].into_iter().map(|suffix| RequestPluginInstallEntry {
-            id: suffix.into(), name: suffix.into(), description: Some(format!("{prefix}{suffix}")),
-            tool_type: DiscoverableToolType::Plugin, has_skills: false,
-            mcp_server_names: Vec::new(), app_connector_ids: Vec::new(),
-        }).collect::<Vec<_>>();
-        let output = ListAvailablePluginsToInstallHandler::new(candidates.clone()).output().unwrap();
+        let candidates = ["calendar export", "document export"]
+            .into_iter()
+            .map(|suffix| RequestPluginInstallEntry {
+                id: suffix.into(),
+                name: suffix.into(),
+                description: Some(format!("{prefix}{suffix}")),
+                tool_type: DiscoverableToolType::Plugin,
+                has_skills: false,
+                mcp_server_names: Vec::new(),
+                app_connector_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let output = ListAvailablePluginsToInstallHandler::new(candidates.clone())
+            .output()
+            .unwrap();
         assert!(output.requires_canonical_artifact());
-        let payload = ToolPayload::Function { arguments: "{}".into() };
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
         let raw = output.code_mode_result(&payload);
         for (index, candidate) in candidates.iter().enumerate() {
-            assert_eq!(raw["tools"][index]["description"], candidate.description.as_ref().unwrap().as_str());
+            assert_eq!(
+                raw["tools"][index]["description"],
+                candidate.description.as_ref().unwrap().as_str()
+            );
         }
-        let preview: serde_json::Value = serde_json::from_str(&output.projection_metadata().unwrap().spillable_text[0]).unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_str(&output.projection_metadata().unwrap().spillable_text[0]).unwrap();
         assert_eq!(preview["tools"].as_array().unwrap().len(), candidates.len());
         for index in 0..candidates.len() {
             assert_eq!(
@@ -233,7 +251,15 @@ mod tests {
                 format!("{prefix} [... recover full description with read_tool_output]")
             );
         }
-        assert_eq!(output.canonical_result(&payload), JsonToolOutput::new(raw).canonical_result(&payload));
-        assert!(!ListAvailablePluginsToInstallHandler::new(Vec::new()).output().unwrap().requires_canonical_artifact());
+        assert_eq!(
+            output.canonical_result(&payload),
+            JsonToolOutput::new(raw).canonical_result(&payload)
+        );
+        assert!(
+            !ListAvailablePluginsToInstallHandler::new(Vec::new())
+                .output()
+                .unwrap()
+                .requires_canonical_artifact()
+        );
     }
 }

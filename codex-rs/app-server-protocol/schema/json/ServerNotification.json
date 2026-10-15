@@ -4527,6 +4527,47 @@
             "id": {
               "type": "string"
             },
+            "omittedImageCount": {
+              "description": "Images dropped from the retained task input.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "omittedText": {
+              "description": "Whether earlier text was dropped rather than summarized in place.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "retainedImageCount": {
+              "description": "Images kept in the retained task input.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tokensAfter": {
+              "description": "Active context tokens after the replacement.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tokensBefore": {
+              "description": "Active context tokens before the replacement.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "contextCompaction"

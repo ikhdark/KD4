@@ -1349,8 +1349,6 @@ async fn await_captured_output_until_deadline(
     Ok((stdout?, stderr?))
 }
 
-
-
 #[cfg(test)]
 async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,

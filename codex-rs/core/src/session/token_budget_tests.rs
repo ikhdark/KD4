@@ -53,30 +53,53 @@ fn history_text(items: &[ResponseItem]) -> String {
 // measurement. Unlike a mutation of shared production source, this cannot
 // affect another session's build or calls.
 async fn legacy_fresh_window_reference(
-    session: &Arc<Session>, step: &Arc<StepContext>,
+    session: &Arc<Session>,
+    step: &Arc<StepContext>,
     world: &Arc<crate::context::world_state::WorldState>,
 ) {
     let turn = &step.turn;
     let history = session.clone_history().await;
-    let source = history.raw_items().iter().filter(|item| !matches!(item,
-        ResponseItem::Message { id: Some(id), role, .. }
-            if role == "developer" && id.as_str().starts_with("msg_token_budget_")
-    )).cloned().collect::<Vec<_>>();
+    let source = history
+        .raw_items()
+        .iter()
+        .filter(|item| {
+            !matches!(item,
+                ResponseItem::Message { id: Some(id), role, .. }
+                    if role == "developer" && id.as_str().starts_with("msg_token_budget_")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let (retained, _, omitted_text) = crate::compact::build_task_input_checkpoint(&source);
-    let recovery = crate::compact::persist_task_compaction_text_recovery(session, &source, omitted_text).await.unwrap();
+    let recovery =
+        crate::compact::persist_task_compaction_text_recovery(session, &source, omitted_text)
+            .await
+            .unwrap();
     let (mut items, snapshot, digests) = session
-        .build_initial_context_with_world_state_and_provenance(turn, world).await;
+        .build_initial_context_with_world_state_and_provenance(turn, world)
+        .await;
     items.extend(retained);
     if let Some(text) = recovery {
         items.push(crate::compact::compaction_context_message(text));
     }
-    session.replace_compacted_history(turn, items,
-        Some(turn.to_turn_context_item_async().await), Some(snapshot), digests,
-        codex_protocol::protocol::CompactedItem {
-            message: String::new(), replacement_history: None, window_number: None,
-            first_window_id: None, previous_window_id: None, window_id: None,
-        },
-    ).await.unwrap();
+    session
+        .replace_compacted_history(
+            turn,
+            items,
+            Some(turn.to_turn_context_item_async().await),
+            Some(snapshot),
+            digests,
+            codex_protocol::protocol::CompactedItem {
+                message: String::new(),
+                replacement_history: None,
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            },
+        )
+        .await
+        .unwrap();
     session.recompute_token_usage(turn).await;
 }
 
@@ -86,30 +109,57 @@ async fn benchmark_audit21_fresh_window_pipeline() {
     use codex_protocol::plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs};
     let mut samples = [Vec::new(), Vec::new()];
     for round in 0..7 {
-        for candidate in if round % 2 == 0 { [false, true] } else { [true, false] } {
+        for candidate in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
             let (mut session, mut turn) = make_session_and_context().await;
             install_recovery_tools(&mut session);
             enable(&mut turn);
             let session = Arc::new(session);
             let turn = Arc::new(turn);
-            let plan = |step: &str| UpdatePlanArgs { explanation: None,
-                plan: vec![PlanItemArg { step: step.into(), status: StepStatus::Pending }] };
-            session.services.plan_store.restore(Some(plan("obsolete obligation"))).await;
-            let world = crate::session::tests::build_world_state_from_turn_context(&session, &turn).await;
-            let initial = session.build_initial_context_with_world_state(&turn, &world).await;
-            session.record_conversation_items(&turn, &initial).await.unwrap();
-            session.services.plan_store.restore(Some(plan("current obligation"))).await;
+            let plan = |step: &str| UpdatePlanArgs {
+                explanation: None,
+                plan: vec![PlanItemArg {
+                    step: step.into(),
+                    status: StepStatus::Pending,
+                }],
+            };
+            session
+                .services
+                .plan_store
+                .restore(Some(plan("obsolete obligation")))
+                .await;
+            let world =
+                crate::session::tests::build_world_state_from_turn_context(&session, &turn).await;
+            let initial = session
+                .build_initial_context_with_world_state(&turn, &world)
+                .await;
+            session
+                .record_conversation_items(&turn, &initial)
+                .await
+                .unwrap();
+            session
+                .services
+                .plan_store
+                .restore(Some(plan("current obligation")))
+                .await;
             let step = StepContext::for_test(Arc::clone(&turn));
             let world = Arc::new(session.build_world_state_for_step(&step).await);
             let started = std::time::Instant::now();
             if candidate {
-                session.start_new_context_window(&step, world).await.unwrap();
+                session
+                    .start_new_context_window(&step, world)
+                    .await
+                    .unwrap();
             } else {
                 legacy_fresh_window_reference(&session, &step, &world).await;
             }
             let history = session.clone_history().await;
             let projection = crate::stable_context::project_stable_context(
-                history.raw_items().to_vec().into(), crate::stable_context::StableContextTarget::Sampling,
+                history.raw_items().to_vec().into(),
+                crate::stable_context::StableContextTarget::Sampling,
             );
             samples[usize::from(candidate)].push(started.elapsed().as_micros());
             let text = history_text(&projection.items);
@@ -117,8 +167,13 @@ async fn benchmark_audit21_fresh_window_pipeline() {
             assert_eq!(text.contains("obsolete obligation"), !candidate);
         }
     }
-    for values in &mut samples { values.sort_unstable(); }
-    eprintln!("audit21_native_reset samples=7 baseline_median_us={} candidate_median_us={} baseline_correct=0 candidate_correct=7", samples[0][3], samples[1][3]);
+    for values in &mut samples {
+        values.sort_unstable();
+    }
+    eprintln!(
+        "audit21_native_reset samples=7 baseline_median_us={} candidate_median_us={} baseline_correct=0 candidate_correct=7",
+        samples[0][3], samples[1][3]
+    );
 }
 
 #[tokio::test]
@@ -238,7 +293,10 @@ async fn fresh_window_preserves_environment_and_cancellation_preserves_history()
             }],
         },
     );
-    session.record_conversation_items(&turn, &[request]).await.unwrap();
+    session
+        .record_conversation_items(&turn, &[request])
+        .await
+        .unwrap();
     maybe_record(&session, &turn, Some(0), true).await.unwrap();
     let history_before = session.clone_history().await.raw_items().to_vec();
     let ids_before = session.state.lock().await.auto_compact_window_ids();
@@ -351,49 +409,86 @@ async fn fresh_window_replaces_stale_task_state_from_the_plan_owner() {
     let turn = Arc::new(turn);
     let plan = |step: &str| UpdatePlanArgs {
         explanation: None,
-        plan: vec![PlanItemArg { step: step.into(), status: StepStatus::Pending }],
+        plan: vec![PlanItemArg {
+            step: step.into(),
+            status: StepStatus::Pending,
+        }],
     };
-    session.services.plan_store.restore(Some(plan("obsolete obligation"))).await;
-    let old_world = crate::session::tests::build_world_state_from_turn_context(&session, &turn).await;
-    let old_context = session.build_initial_context_with_world_state(&turn, &old_world).await;
+    session
+        .services
+        .plan_store
+        .restore(Some(plan("obsolete obligation")))
+        .await;
+    let old_world =
+        crate::session::tests::build_world_state_from_turn_context(&session, &turn).await;
+    let old_context = session
+        .build_initial_context_with_world_state(&turn, &old_world)
+        .await;
     assert!(history_text(&old_context).contains("obsolete obligation"));
-    session.record_conversation_items(&turn, &old_context).await.unwrap();
+    session
+        .record_conversation_items(&turn, &old_context)
+        .await
+        .unwrap();
     let request = ResponseItem::from(codex_protocol::models::ResponseInputItem::Message {
-        role: "user".into(), phase: None,
+        role: "user".into(),
+        phase: None,
         content: vec![ContentItem::InputText {
             text: "Preserve my literal <codex_task_state>example</codex_task_state>.".into(),
         }],
     });
-    session.record_conversation_items(&turn, &[request]).await.unwrap();
-    session.services.plan_store.restore(Some(plan("current obligation"))).await;
+    session
+        .record_conversation_items(&turn, &[request])
+        .await
+        .unwrap();
+    session
+        .services
+        .plan_store
+        .restore(Some(plan("current obligation")))
+        .await;
     let step = StepContext::for_test(Arc::clone(&turn));
     let world = Arc::new(session.build_world_state_for_step(&step).await);
     // Sensitivity check using the former assembly operation, with the same
     // real plan/world producers and final sampling projector as the reset.
     let source = session.clone_history().await;
     let (retained, _, _) = crate::compact::build_task_input_checkpoint(source.raw_items());
-    let mut legacy = session.build_initial_context_with_world_state(&turn, &world).await;
+    let mut legacy = session
+        .build_initial_context_with_world_state(&turn, &world)
+        .await;
     legacy.extend(retained);
     let legacy = crate::stable_context::project_stable_context(
-        legacy.into(), crate::stable_context::StableContextTarget::Sampling,
+        legacy.into(),
+        crate::stable_context::StableContextTarget::Sampling,
     );
     let legacy_text = history_text(&legacy.items);
     assert!(legacy_text.contains("obsolete obligation"));
     assert!(!legacy_text.contains("current obligation"));
     let started = std::time::Instant::now();
-    session.start_new_context_window(&step, world).await.unwrap();
-    eprintln!("fresh_window_task_state_reset_elapsed={:?}", started.elapsed());
+    session
+        .start_new_context_window(&step, world)
+        .await
+        .unwrap();
+    eprintln!(
+        "fresh_window_task_state_reset_elapsed={:?}",
+        started.elapsed()
+    );
     let history = session.clone_history().await;
     let text = history_text(history.raw_items());
     assert!(!text.contains("obsolete obligation"), "{text}");
     assert!(text.contains("current obligation"), "{text}");
     assert!(text.contains("Preserve my literal <codex_task_state>example</codex_task_state>."));
-    let trusted = history.raw_items().iter()
+    let trusted = history
+        .raw_items()
+        .iter()
         .filter(|item| crate::stable_context::is_trusted_stable_context_item(item))
-        .cloned().collect::<Vec<_>>();
-    assert_eq!(history_text(&trusted).matches("<codex_task_state>").count(), 1);
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history_text(&trusted).matches("<codex_task_state>").count(),
+        1
+    );
     let projected = crate::stable_context::project_stable_context(
-        history.raw_items().to_vec().into(), crate::stable_context::StableContextTarget::Sampling,
+        history.raw_items().to_vec().into(),
+        crate::stable_context::StableContextTarget::Sampling,
     );
     assert!(history_text(&projected.items).contains("current obligation"));
     assert!(!history_text(&projected.items).contains("obsolete obligation"));

@@ -7,60 +7,111 @@ use serde_json::json;
 #[test]
 fn epistemic_diagnostic_coordinates_preserve_owners_and_nonlocations() {
     for (first, second) in [
-        ("at C:\\work\\test.rs:12:9\r\nFinished test in 1s", "at C:\\work\\test.rs:30:2\r\nFinished test in 2s"),
+        (
+            "at C:\\work\\test.rs:12:9\r\nFinished test in 1s",
+            "at C:\\work\\test.rs:30:2\r\nFinished test in 2s",
+        ),
         ("  --> src/é.rs:12:3", "  --> src/é.rs:23:4"),
     ] {
-        assert_eq!(normalize_tool_failure_text(first), normalize_tool_failure_text(second));
+        assert_eq!(
+            normalize_tool_failure_text(first),
+            normalize_tool_failure_text(second)
+        );
     }
-    for text in ["localhost:8080", "expected 120ms", "assertion: file.rs:value", "no location\r\n", ""] {
+    for text in [
+        "localhost:8080",
+        "expected 120ms",
+        "assertion: file.rs:value",
+        "no location\r\n",
+        "",
+    ] {
         assert_eq!(normalize_tool_failure_text(text), text);
     }
-    assert_ne!(normalize_tool_failure_text("at a.rs:12:9"), normalize_tool_failure_text("at b.rs:12:9"));
-    assert_eq!(normalize_tool_failure_text("at a.rs:12:9\n"), "at a.rs:<location>\n");
+    assert_ne!(
+        normalize_tool_failure_text("at a.rs:12:9"),
+        normalize_tool_failure_text("at b.rs:12:9")
+    );
+    assert_eq!(
+        normalize_tool_failure_text("at a.rs:12:9\n"),
+        "at a.rs:<location>\n"
+    );
 }
 
 #[test]
 fn evidence_salience_stop_feedback_preserves_measurements_and_deadlines() {
     for (first, second) in [
-        ("Latency gate failed: p95 is 120ms; limit is 100ms", "Latency gate failed: p95 is 950ms; limit is 100ms"),
+        (
+            "Latency gate failed: p95 is 120ms; limit is 100ms",
+            "Latency gate failed: p95 is 950ms; limit is 100ms",
+        ),
         ("deadline is 12:00:00", "deadline is 13:00:00"),
         ("expected 1s", "expected 2s"),
         ("cutoff 2026-10-01T12:00:00Z", "cutoff 2026-10-02T12:00:00Z"),
     ] {
-        assert_ne!(normalize_observation_text(first), normalize_observation_text(second));
+        assert_ne!(
+            normalize_observation_text(first),
+            normalize_observation_text(second)
+        );
     }
-    assert_eq!(normalize_observation_text("2026-10-01T12:00:00Z ERROR gate rejected\nFinished test in 1s"),
-        normalize_observation_text("2026-10-02T12:00:00Z ERROR gate rejected\nFinished test in 2s"));
+    assert_eq!(
+        normalize_observation_text("2026-10-01T12:00:00Z ERROR gate rejected\nFinished test in 1s"),
+        normalize_observation_text("2026-10-02T12:00:00Z ERROR gate rejected\nFinished test in 2s")
+    );
 }
 
 #[test]
 fn evidence_salience_successful_validation_preserves_owners_and_exact_values() {
     let validation = crate::validation::CommandValidation {
-        execution_context: None, declared: None,
+        execution_context: None,
+        declared: None,
         classification: crate::validation::classify_validation_script("cargo check"),
         receipt_runner: None,
     };
     for (first, second) in [
-        ("src/a.rs:10:warning: unused key", "src/b.rs:10:warning: unused key"),
-        ("warning: unused key\n --> src/a.rs:2:1\n2 | let key = 1;", "warning: unused key\n --> src/b.rs:2:1\n2 | let key = 1;"),
+        (
+            "src/a.rs:10:warning: unused key",
+            "src/b.rs:10:warning: unused key",
+        ),
+        (
+            "warning: unused key\n --> src/a.rs:2:1\n2 | let key = 1;",
+            "warning: unused key\n --> src/b.rs:2:1\n2 | let key = 1;",
+        ),
         ("warning: threshold 120ms", "warning: threshold 950ms"),
         ("  actual: x", " actual: x"),
     ] {
         let evidence = |text: &str| {
             let direct = successful_command_evidence(text.as_bytes(), Some("cargo check"));
             let mut signal = json!({});
-            attach_command_validation(&mut signal, text.as_bytes(), Some(&validation), Some(0), true);
+            attach_command_validation(
+                &mut signal,
+                text.as_bytes(),
+                Some(&validation),
+                Some(0),
+                true,
+            );
             assert_eq!(signal["semantic_evidence"], json!(direct));
             direct
         };
         assert_ne!(evidence(first), evidence(second));
     }
-    assert_eq!(successful_command_evidence(b"src/a.rs:10:2: warning: key\nFinished test in 1s", Some("cargo check")),
-        successful_command_evidence(b"src/a.rs:20:3: warning: key\nFinished test in 2s", Some("cargo check")));
-    assert_ne!(successful_command_evidence(b"Finished test in 1s", Some("cat report.txt")),
-        successful_command_evidence(b"Finished test in 2s", Some("cat report.txt")));
-    assert_ne!(successful_command_evidence(&[0xff, b'a'], Some("cargo check")),
-        successful_command_evidence("�a".as_bytes(), Some("cargo check")));
+    assert_eq!(
+        successful_command_evidence(
+            b"src/a.rs:10:2: warning: key\nFinished test in 1s",
+            Some("cargo check")
+        ),
+        successful_command_evidence(
+            b"src/a.rs:20:3: warning: key\nFinished test in 2s",
+            Some("cargo check")
+        )
+    );
+    assert_ne!(
+        successful_command_evidence(b"Finished test in 1s", Some("cat report.txt")),
+        successful_command_evidence(b"Finished test in 2s", Some("cat report.txt"))
+    );
+    assert_ne!(
+        successful_command_evidence(&[0xff, b'a'], Some("cargo check")),
+        successful_command_evidence("�a".as_bytes(), Some("cargo check"))
+    );
 }
 
 #[test]
@@ -85,22 +136,38 @@ fn command_evidence_ignores_durations_and_timestamps() {
     for (first, second) in [
         ("Finished test in 2.31s", "Finished test in 9.84s"),
         ("1 failed in 0.12s", "1 failed in 1.55s"),
-        ("2026-09-29T12:03:01.555Z error: broken", "2026-09-30T01:02:03Z error: broken"),
-        ("2026-09-29 12:03:01 error: broken", "2026-09-30 01:02:03 error: broken"),
+        (
+            "2026-09-29T12:03:01.555Z error: broken",
+            "2026-09-30T01:02:03Z error: broken",
+        ),
+        (
+            "2026-09-29 12:03:01 error: broken",
+            "2026-09-30 01:02:03 error: broken",
+        ),
     ] {
-        assert_eq!(validation_diagnostic_evidence(first.as_bytes()),
-            validation_diagnostic_evidence(second.as_bytes()));
+        assert_eq!(
+            validation_diagnostic_evidence(first.as_bytes()),
+            validation_diagnostic_evidence(second.as_bytes())
+        );
     }
-    assert_ne!(validation_diagnostic_evidence(b"1 failed in 0.12s"),
-        validation_diagnostic_evidence(b"2 failed in 0.12s"));
-    assert_ne!(validation_diagnostic_evidence(b"localhost:8080"),
-        validation_diagnostic_evidence(b"localhost:9090"));
+    assert_ne!(
+        validation_diagnostic_evidence(b"1 failed in 0.12s"),
+        validation_diagnostic_evidence(b"2 failed in 0.12s")
+    );
+    assert_ne!(
+        validation_diagnostic_evidence(b"localhost:8080"),
+        validation_diagnostic_evidence(b"localhost:9090")
+    );
     // Generic prose has no producer framing: its coordinates and durations
     // can be substantive facts rather than volatile diagnostics.
-    assert_ne!(normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
-        normalize_tool_failure_text("invalid at line 30 column 2 in 8.0s"));
-    assert_eq!(normalize_tool_failure_text("at example.rs:12:9\nFinished test in 1.5s"),
-        normalize_tool_failure_text("at example.rs:30:2\nFinished test in 8.0s"));
+    assert_ne!(
+        normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
+        normalize_tool_failure_text("invalid at line 30 column 2 in 8.0s")
+    );
+    assert_eq!(
+        normalize_tool_failure_text("at example.rs:12:9\nFinished test in 1.5s"),
+        normalize_tool_failure_text("at example.rs:30:2\nFinished test in 8.0s")
+    );
 }
 
 #[test]
@@ -110,9 +177,18 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
             "test result: FAILED. 2 passed; 1 failed; 0 ignored; finished in 0.01s",
             "test result: FAILED. 2 passed; 1 failed; 0 ignored; finished in 4.25s",
         ),
-        ("Finished `test` profile [unoptimized] in 0.12s", "Finished `test` profile [unoptimized] in 9.13s"),
-        ("================ 2 passed, 1 skipped in 0.12s ================", "================ 2 passed, 1 skipped in 8.32s ================"),
-        ("Summary [0.112s] 2 tests run: 1 passed, 1 failed", "Summary [2.541s] 2 tests run: 1 passed, 1 failed"),
+        (
+            "Finished `test` profile [unoptimized] in 0.12s",
+            "Finished `test` profile [unoptimized] in 9.13s",
+        ),
+        (
+            "================ 2 passed, 1 skipped in 0.12s ================",
+            "================ 2 passed, 1 skipped in 8.32s ================",
+        ),
+        (
+            "Summary [0.112s] 2 tests run: 1 passed, 1 failed",
+            "Summary [2.541s] 2 tests run: 1 passed, 1 failed",
+        ),
     ] {
         let first_evidence = validation_diagnostic_evidence(first.as_bytes());
         let second_evidence = validation_diagnostic_evidence(second.as_bytes());
@@ -128,11 +204,20 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
     }
     for (first, second) in [
         ("timeout = 1s", "timeout = 2s"),
-        ("assertion failed: expected 1s", "assertion failed: expected 2s"),
+        (
+            "assertion failed: expected 1s",
+            "assertion failed: expected 2s",
+        ),
         ("error: deadline was 1s", "error: deadline was 2s"),
         ("2026-09-29T12:00:00Z", "2026-09-30T12:00:00Z"),
-        ("test result: ok. 1 passed; finished in 1s", "test result: ok. 2 passed; finished in 1s"),
-        ("2026-09-29T12:00:00Z ERROR timeout = 1s", "2026-09-29T12:00:00Z ERROR timeout = 2s"),
+        (
+            "test result: ok. 1 passed; finished in 1s",
+            "test result: ok. 2 passed; finished in 1s",
+        ),
+        (
+            "2026-09-29T12:00:00Z ERROR timeout = 1s",
+            "2026-09-29T12:00:00Z ERROR timeout = 2s",
+        ),
         (
             "diff --git a/a b/a\n@@ -1 +1 @@\n+Finished test in 1s",
             "diff --git a/a b/a\n@@ -1 +1 @@\n+Finished test in 2s",
@@ -184,7 +269,10 @@ fn exec_validation_timing_is_stable_without_normalizing_source_reads() {
         assert_ne!(first.raw_output, second.raw_output);
         let first = first.sampling_request_signal().unwrap();
         let second = second.sampling_request_signal().unwrap();
-        assert_eq!(first["semantic_evidence"] == second["semantic_evidence"], same);
+        assert_eq!(
+            first["semantic_evidence"] == second["semantic_evidence"],
+            same
+        );
         if exit_code == 1 {
             assert_eq!(first["failure_signature"], second["failure_signature"]);
         }
@@ -241,34 +329,83 @@ fn parallel_test_failures_ignore_runner_noise_but_preserve_failure_changes() {
         "assertion failed: expected 1s; log_id=abcd\n",
         "Summary [13.005s] 2 tests run: 2 failed\n",
     );
-    let fingerprint = |text: &str| command_failure_signature(
-        &failed_command_evidence(text.as_bytes(), Some("cargo nextest run")), Some(1),
-    );
+    let fingerprint = |text: &str| {
+        command_failure_signature(
+            &failed_command_evidence(text.as_bytes(), Some("cargo nextest run")),
+            Some(1),
+        )
+    };
     assert_eq!(fingerprint(first), fingerprint(reordered));
-    assert_ne!(fingerprint(first), fingerprint(&format!("{first}TIMEOUT [ 30.0s] (3/3) suite case_c\n")));
-    assert_ne!(fingerprint(first), fingerprint(&first.replace("log_id=abcd", "log_id=efgh")));
-    assert_ne!(fingerprint(first), fingerprint(&first.replace("missing fixture", " missing fixture")));
-    let skipped = format!("{first}SKIP [ 0.001s] (3/3) suite sibling\n");
-    assert_ne!(fingerprint(&skipped), fingerprint(&skipped.replace("SKIP ", "TIMEOUT ")));
-    assert_ne!(fingerprint(first), fingerprint(&first.replace("2 tests run: 2 failed", "3 tests run: 2 failed, 1 timed out")));
-    let unknown = format!("unknown diagnostic payload\n{first}");
-    assert_eq!(failed_command_evidence(unknown.as_bytes(), Some("cargo nextest run")), canonical_output_evidence(unknown.as_bytes()));
-    assert_ne!(fingerprint(first), fingerprint(&reordered.replace("case_b", "case_c")));
-    assert_ne!(fingerprint(first), fingerprint(&reordered.replace("expected 1s", "expected 2s")));
-    let assertion = first.replace("assertion failed: expected 1s; log_id=abcd",
-        "assertion `left == right` failed\n  left: 10\n right: 20");
-    assert_ne!(fingerprint(&assertion), fingerprint(&assertion.replace("left: 10", "left: 11")));
-    let identifier = assertion.replace("left: 10", "left: run_id=10");
-    assert_ne!(fingerprint(&identifier), fingerprint(&identifier.replace("left: run_id=10", "left: run_id=11")));
-    assert_ne!(fingerprint(first), fingerprint(&first
-        .replace("thread 'case_a'", "thread 'swapped'")
-        .replace("thread 'case_b'", "thread 'case_a'")
-        .replace("thread 'swapped'", "thread 'case_b'")));
-    assert_ne!(successful_command_evidence(first.as_bytes(), Some("cat failure.txt")),
-        successful_command_evidence(reordered.as_bytes(), Some("cat failure.txt")));
     assert_ne!(
-        test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=123 expected 1s\n"),
-        test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=456 expected 1s\n"),
+        fingerprint(first),
+        fingerprint(&format!("{first}TIMEOUT [ 30.0s] (3/3) suite case_c\n"))
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(&first.replace("log_id=abcd", "log_id=efgh"))
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(&first.replace("missing fixture", " missing fixture"))
+    );
+    let skipped = format!("{first}SKIP [ 0.001s] (3/3) suite sibling\n");
+    assert_ne!(
+        fingerprint(&skipped),
+        fingerprint(&skipped.replace("SKIP ", "TIMEOUT "))
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(&first.replace(
+            "2 tests run: 2 failed",
+            "3 tests run: 2 failed, 1 timed out"
+        ))
+    );
+    let unknown = format!("unknown diagnostic payload\n{first}");
+    assert_eq!(
+        failed_command_evidence(unknown.as_bytes(), Some("cargo nextest run")),
+        canonical_output_evidence(unknown.as_bytes())
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(&reordered.replace("case_b", "case_c"))
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(&reordered.replace("expected 1s", "expected 2s"))
+    );
+    let assertion = first.replace(
+        "assertion failed: expected 1s; log_id=abcd",
+        "assertion `left == right` failed\n  left: 10\n right: 20",
+    );
+    assert_ne!(
+        fingerprint(&assertion),
+        fingerprint(&assertion.replace("left: 10", "left: 11"))
+    );
+    let identifier = assertion.replace("left: 10", "left: run_id=10");
+    assert_ne!(
+        fingerprint(&identifier),
+        fingerprint(&identifier.replace("left: run_id=10", "left: run_id=11"))
+    );
+    assert_ne!(
+        fingerprint(first),
+        fingerprint(
+            &first
+                .replace("thread 'case_a'", "thread 'swapped'")
+                .replace("thread 'case_b'", "thread 'case_a'")
+                .replace("thread 'swapped'", "thread 'case_b'")
+        )
+    );
+    assert_ne!(
+        successful_command_evidence(first.as_bytes(), Some("cat failure.txt")),
+        successful_command_evidence(reordered.as_bytes(), Some("cat failure.txt"))
+    );
+    assert_ne!(
+        test_failure_evidence(
+            b"FAILED tests/a.py::test_one - AssertionError: run_id=123 expected 1s\n"
+        ),
+        test_failure_evidence(
+            b"FAILED tests/a.py::test_one - AssertionError: run_id=456 expected 1s\n"
+        ),
     );
 }
 
@@ -278,11 +415,23 @@ fn search_evidence_preserves_exact_output_including_file_order() {
     let reordered = b"b.rs:1:other\na.rs:1:first\na.rs:2:second\n";
     let search = |bytes: &[u8]| successful_command_evidence(bytes, Some("rg -n pattern src"));
     assert_ne!(search(first), search(reordered));
-    assert_ne!(search(first), search(b"a.rs:2:second\na.rs:1:first\nb.rs:1:other\n"));
-    assert_ne!(search(first), search(b"a.rs:1:changed\na.rs:2:second\nb.rs:1:other\n"));
-    for command in ["cat report.txt", "rg -n pattern src; cat report.txt", "rg -n --json pattern src"] {
-        assert_ne!(successful_command_evidence(first, Some(command)),
-            successful_command_evidence(reordered, Some(command)));
+    assert_ne!(
+        search(first),
+        search(b"a.rs:2:second\na.rs:1:first\nb.rs:1:other\n")
+    );
+    assert_ne!(
+        search(first),
+        search(b"a.rs:1:changed\na.rs:2:second\nb.rs:1:other\n")
+    );
+    for command in [
+        "cat report.txt",
+        "rg -n pattern src; cat report.txt",
+        "rg -n --json pattern src",
+    ] {
+        assert_ne!(
+            successful_command_evidence(first, Some(command)),
+            successful_command_evidence(reordered, Some(command))
+        );
     }
 }
 
@@ -290,10 +439,19 @@ fn search_evidence_preserves_exact_output_including_file_order() {
 fn verified_evidence_failed_command_preserves_unknown_owner_and_whitespace() {
     for command in [None, Some("custom-producer"), Some("cargo check")] {
         let first = failed_command_evidence(b"src/a.rs:7:3: failed\n  actual: x\n", command);
-        assert_ne!(first, failed_command_evidence(b"src/b.rs:7:3: failed\n  actual: x\n", command));
-        assert_ne!(first, failed_command_evidence(b"src/a.rs:7:3: failed\n actual: x\n", command));
+        assert_ne!(
+            first,
+            failed_command_evidence(b"src/b.rs:7:3: failed\n  actual: x\n", command)
+        );
+        assert_ne!(
+            first,
+            failed_command_evidence(b"src/a.rs:7:3: failed\n actual: x\n", command)
+        );
     }
-    assert_ne!(failed_command_evidence(b"a:7\n", None), failed_command_evidence(b"a:9\n", None));
+    assert_ne!(
+        failed_command_evidence(b"a:7\n", None),
+        failed_command_evidence(b"a:9\n", None)
+    );
     let validation = crate::validation::CommandValidation {
         execution_context: None,
         declared: None,
@@ -305,8 +463,14 @@ fn verified_evidence_failed_command_preserves_unknown_owner_and_whitespace() {
         attach_command_validation(&mut signal, bytes, Some(&validation), Some(1), true);
         signal["semantic_evidence"].clone()
     };
-    assert_ne!(evidence(b"src/a.rs:7:3: failed\n"), evidence(b"src/b.rs:7:3: failed\n"));
-    assert_ne!(evidence(b"src/a.rs:7:3: failed\n  actual: x\n"), evidence(b"src/a.rs:7:3: failed\n actual: x\n"));
+    assert_ne!(
+        evidence(b"src/a.rs:7:3: failed\n"),
+        evidence(b"src/b.rs:7:3: failed\n")
+    );
+    assert_ne!(
+        evidence(b"src/a.rs:7:3: failed\n  actual: x\n"),
+        evidence(b"src/a.rs:7:3: failed\n actual: x\n")
+    );
 }
 
 fn mcp_tool_output(
@@ -407,41 +571,100 @@ async fn applied_patch_diffs_report_committed_lines_and_bounds() {
     std::fs::write(root.path().join("overwrite.txt"), "displaced\n").unwrap();
     let mut patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+λ changed\n*** Delete File: deleted.txt\n*** Add File: overwrite.txt\n+replacement\n".to_string();
     for index in 0..5 {
-        patch.push_str(&format!("*** Add File: large{index}.txt\n+{}\n", "λ".repeat(6000)));
+        patch.push_str(&format!(
+            "*** Add File: large{index}.txt\n+{}\n",
+            "λ".repeat(6000)
+        ));
     }
     patch.push_str("*** End Patch");
-    let delta = codex_apply_patch::apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(),
-        codex_exec_server::LOCAL_FS.as_ref(), None).await.unwrap();
+    let delta = codex_apply_patch::apply_patch(
+        &patch,
+        &cwd,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
     // The receipt is built from committed bytes, not a post-patch read.
     std::fs::write(root.path().join("new.txt"), "independent later edit\n").unwrap();
     let output = ApplyPatchToolOutput::from_delta("applied".into(), true, &delta, None);
-    let changed = output.changes.iter().find(|change| change["kind"] == "update").unwrap();
+    let changed = output
+        .changes
+        .iter()
+        .find(|change| change["kind"] == "update")
+        .unwrap();
     assert_eq!(changed["unified_diff"], "@@ -1,2 +1,2 @@\n");
     assert_eq!(changed["diff_format"], "hunk_headers");
     assert_eq!(changed["diff_complete"], true);
     assert!(changed["move_path"].as_str().unwrap().ends_with("new.txt"));
-    for change in output.changes.iter().filter(|change| change["path"].as_str().unwrap().contains("large")) {
+    for change in output
+        .changes
+        .iter()
+        .filter(|change| change["path"].as_str().unwrap().contains("large"))
+    {
         assert!(change.get("unified_diff").is_none());
     }
-    let overwritten = output.changes.iter().find(|change| change["path"].as_str().unwrap().ends_with("overwrite.txt")).unwrap();
-    assert!(overwritten["unified_diff"].as_str().unwrap().contains("-displaced"));
+    let overwritten = output
+        .changes
+        .iter()
+        .find(|change| change["path"].as_str().unwrap().ends_with("overwrite.txt"))
+        .unwrap();
+    assert!(
+        overwritten["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("-displaced")
+    );
     assert!(!output.model_text().contains("+λ changed"));
     // Failed/partial operations keep the complete bounded diff representation.
     let output = ApplyPatchToolOutput::from_delta("partial failure".into(), false, &delta, None);
-    let changed = output.changes.iter().find(|change| change["kind"] == "update").unwrap();
-    assert!(changed["unified_diff"].as_str().unwrap().contains("@@ -1,2 +1,2 @@"));
-    assert!(changed["unified_diff"].as_str().unwrap().contains("+λ changed"));
+    let changed = output
+        .changes
+        .iter()
+        .find(|change| change["kind"] == "update")
+        .unwrap();
+    assert!(
+        changed["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("@@ -1,2 +1,2 @@")
+    );
+    assert!(
+        changed["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+λ changed")
+    );
     assert_eq!(changed["diff_complete"], true);
     assert!(changed["move_path"].as_str().unwrap().ends_with("new.txt"));
-    let deleted = output.changes.iter().find(|change| change["kind"] == "delete").unwrap();
-    assert!(deleted["unified_diff"].as_str().unwrap().contains("-deleted"));
-    assert!(output.changes.iter().any(|change| change["diff_complete"] == false));
+    let deleted = output
+        .changes
+        .iter()
+        .find(|change| change["kind"] == "delete")
+        .unwrap();
+    assert!(
+        deleted["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("-deleted")
+    );
+    assert!(
+        output
+            .changes
+            .iter()
+            .any(|change| change["diff_complete"] == false)
+    );
     let mut total = 0;
     for change in &output.changes {
         let diff = change["unified_diff"].as_str().unwrap();
         assert!(diff.len() <= 8 * 1024);
         total += diff.len();
-        assert_eq!(change["diff_complete"] == true, diff.len() as u64 == change["diff_bytes"].as_u64().unwrap());
+        assert_eq!(
+            change["diff_complete"] == true,
+            diff.len() as u64 == change["diff_bytes"].as_u64().unwrap()
+        );
     }
     assert!(total <= 32 * 1024);
     assert!(output.model_text().contains("+λ changed"));
@@ -1179,23 +1402,43 @@ fn verified10_search_receipts_match_advertised_schema() {
     let schema = codex_tools::code_mode_tool_search_output_schema();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let payload = ToolPayload::ToolSearch {
-        arguments: SearchToolCallParams { query: "messages".into(), limit: None },
+        arguments: SearchToolCallParams {
+            query: "messages".into(),
+            limit: None,
+        },
     };
     let mut output = ToolSearchOutput {
-        tools: vec![], omitted_result_count: 0, activated_omitted_tools: vec![],
-        unactivated_matches: vec![], unmatched_identifiers: vec![], exact_name_ambiguity: None,
+        tools: vec![],
+        omitted_result_count: 0,
+        activated_omitted_tools: vec![],
+        unactivated_matches: vec![],
+        unmatched_identifiers: vec![],
+        exact_name_ambiguity: None,
     };
-    validator.validate(&output.code_mode_result(&payload)).unwrap();
+    validator
+        .validate(&output.code_mode_result(&payload))
+        .unwrap();
     output.omitted_result_count = 1;
     output.activated_omitted_tools.push("mail.messages".into());
-    validator.validate(&output.code_mode_result(&payload)).unwrap();
+    validator
+        .validate(&output.code_mode_result(&payload))
+        .unwrap();
     output.exact_name_ambiguity = Some(json!({
         "match_count": 2, "omitted_alternative_count": 0,
         "qualified_alternatives": ["mail.messages", "chat.messages"]
     }));
     output.unmatched_identifiers.push("project_alpha".into());
-    validator.validate(&output.code_mode_result(&payload)).unwrap();
-    validator.validate(&AbortedToolOutput { message: "cancelled".into() }.code_mode_result(&payload)).unwrap();
+    validator
+        .validate(&output.code_mode_result(&payload))
+        .unwrap();
+    validator
+        .validate(
+            &AbortedToolOutput {
+                message: "cancelled".into(),
+            }
+            .code_mode_result(&payload),
+        )
+        .unwrap();
     let mut invalid = output.code_mode_result(&payload);
     invalid["resolution"]["helper"] = json!("invented");
     assert!(!validator.is_valid(&invalid));
@@ -1204,11 +1447,16 @@ fn verified10_search_receipts_match_advertised_schema() {
 #[test]
 fn verified10_search_rejects_invented_filters_with_scope_guidance() {
     for field in ["source", "provider", "namespace"] {
-        let error = serde_json::from_value::<SearchToolCallParams>(json!({"query":"messages", (field):"gmail"})).unwrap_err().to_string();
+        let error = serde_json::from_value::<SearchToolCallParams>(
+            json!({"query":"messages", (field):"gmail"}),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("unknown field"), "{error}");
         assert!(error.contains("source:<canonical namespace>"), "{error}");
     }
-    let args: SearchToolCallParams = serde_json::from_value(json!({"query":"messages source:gmail", "limit":1})).unwrap();
+    let args: SearchToolCallParams =
+        serde_json::from_value(json!({"query":"messages source:gmail", "limit":1})).unwrap();
     assert_eq!(args.limit, Some(1));
 }
 
@@ -1219,16 +1467,26 @@ fn verified10_anchor_survives_actual_input_normalization() {
         "type":"object", "properties":{"duration":{"$ref":"#Bounded"}},
         "$defs":{"duration":{"$anchor":"Bounded", "type":"number", "minimum":1, "maximum":5}}
     });
-    let normalized = serde_json::to_value(codex_tools::parse_tool_input_schema(&input).unwrap()).unwrap();
+    let normalized =
+        serde_json::to_value(codex_tools::parse_tool_input_schema(&input).unwrap()).unwrap();
     assert_eq!(normalized["$defs"]["duration"]["$anchor"], "Bounded");
     let before = jsonschema::validator_for(&input).unwrap();
     let after = jsonschema::validator_for(&normalized).unwrap();
-    for (value, valid) in [(json!({"duration":3}), true), (json!({"duration":6}), false), (json!({"duration":"3"}), false)] {
+    for (value, valid) in [
+        (json!({"duration":3}), true),
+        (json!({"duration":6}), false),
+        (json!({"duration":"3"}), false),
+    ] {
         assert_eq!(before.is_valid(&value), valid);
         assert_eq!(after.is_valid(&value), valid);
     }
     for keyword in ["$dynamicAnchor", "$recursiveAnchor"] {
-        assert!(codex_tools::parse_tool_input_schema(&json!({"type":"object", (keyword):"Bounded"})).unwrap_err().to_string().contains(keyword));
+        assert!(
+            codex_tools::parse_tool_input_schema(&json!({"type":"object", (keyword):"Bounded"}))
+                .unwrap_err()
+                .to_string()
+                .contains(keyword)
+        );
     }
 }
 
@@ -1278,22 +1536,13 @@ fn command_semantic_evidence_preserves_distinct_read_only_presentations() {
     ];
     let expected = evidence(presentations[0].as_bytes());
     for presentation in &presentations[1..] {
+        assert_ne!(evidence(presentation.as_bytes()), expected);
         assert_ne!(
-            evidence(presentation.as_bytes()),
-            expected
-        );
-        assert_ne!(
-            command_failure_signature(
-                &evidence(presentation.as_bytes()),
-                Some(1)
-            ),
+            command_failure_signature(&evidence(presentation.as_bytes()), Some(1)),
             command_failure_signature(&expected, Some(1))
         );
     }
-    assert_ne!(
-        evidence(b"let changed = compute();"),
-        expected
-    );
+    assert_ne!(evidence(b"let changed = compute();"), expected);
 }
 
 #[test]
@@ -1339,26 +1588,15 @@ fn command_semantic_evidence_preserves_diagnostics_and_non_location_numbers() {
         evidence(b"10 | legitimate table value"),
         evidence(b"legitimate table value")
     );
-    assert_ne!(
-        evidence(b"fact\n}"),
-        evidence(b"fact\n]")
-    );
+    assert_ne!(evidence(b"fact\n}"), evidence(b"fact\n]"));
     assert_ne!(
         evidence(b"first fact\nsecond fact"),
         evidence(b"second fact\nfirst fact")
     );
+    assert_ne!(evidence(b"Ok"), evidence(b"No"));
+    assert_ne!(evidence(&[0xff, b'a']), evidence("�a".as_bytes()));
     assert_ne!(
-        evidence(b"Ok"),
-        evidence(b"No")
-    );
-    assert_ne!(
-        evidence(&[0xff, b'a']),
-        evidence("�a".as_bytes())
-    );
-    assert_ne!(
-        evidence(
-            b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: first"
-        ),
+        evidence(b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: first"),
         evidence(
             b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: second"
         )
@@ -1372,17 +1610,11 @@ fn command_semantic_evidence_preserves_removed_and_context_diff_lines() {
         b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old value\n+new value";
     let second_removal =
         b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-other old value\n+new value";
-    assert_ne!(
-        evidence(first_removal),
-        evidence(second_removal)
-    );
+    assert_ne!(evidence(first_removal), evidence(second_removal));
 
     let first_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n first context\n-old value\n+new value";
     let second_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n second context\n-old value\n+new value";
-    assert_ne!(
-        evidence(first_context),
-        evidence(second_context)
-    );
+    assert_ne!(evidence(first_context), evidence(second_context));
 }
 
 #[test]
@@ -1403,10 +1635,7 @@ fn command_semantic_evidence_includes_facts_after_the_old_limit() {
         .join("\n");
     let first = format!("{shared}\nfirst tail fact");
     let second = format!("{shared}\nsecond tail fact");
-    assert_ne!(
-        evidence(first.as_bytes()),
-        evidence(second.as_bytes())
-    );
+    assert_ne!(evidence(first.as_bytes()), evidence(second.as_bytes()));
 
     let long_prefix = "x".repeat(4_096);
     assert_ne!(
@@ -1414,10 +1643,6 @@ fn command_semantic_evidence_includes_facts_after_the_old_limit() {
         evidence(format!("{long_prefix} second").as_bytes())
     );
 }
-
-
-
-
 
 #[test]
 fn token_efficiency_exec_output_omits_redundant_headers() {
@@ -1629,13 +1854,25 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
     );
 
     output.raw_output = b"first\r\nsecond\r\n".to_vec();
-    assert_eq!(output.code_mode_result(&payload)["output"], "first\nsecond\n");
-    assert_eq!(output.projection_metadata().unwrap().spillable_text, ["first\nsecond\n"]);
-    assert_eq!(output.canonical_result(&payload).unwrap().bytes, b"first\r\nsecond\r\n");
+    assert_eq!(
+        output.code_mode_result(&payload)["output"],
+        "first\nsecond\n"
+    );
+    assert_eq!(
+        output.projection_metadata().unwrap().spillable_text,
+        ["first\nsecond\n"]
+    );
+    assert_eq!(
+        output.canonical_result(&payload).unwrap().bytes,
+        b"first\r\nsecond\r\n"
+    );
     output.raw_output = "word ".repeat(30_000).into_bytes();
     output.max_output_tokens = Some(25_000);
     assert_eq!(output.model_output_limits("", None).applied_limit, 10_000);
-    assert_eq!(output.model_output_limits("", Some(8_000)).applied_limit, 8_000);
+    assert_eq!(
+        output.model_output_limits("", Some(8_000)).applied_limit,
+        8_000
+    );
 
     // A literal replacement character in valid UTF-8 is not evidence of loss.
     output.raw_output = "valid: \u{fffd}".as_bytes().to_vec();
@@ -1775,12 +2012,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
     let raw_output = String::from_utf8_lossy(&output.raw_output);
     let projected = output.projected_model_output(raw_output.as_ref(), None);
     assert!(projected.reduced);
-    assert_eq!(
-        projected.text.matches('…').count(),
-        1,
-        "{}",
-        projected.text
-    );
+    assert_eq!(projected.text.matches('…').count(), 1, "{}", projected.text);
     assert!(codex_utils_string::approx_token_count(&projected.text) <= 5);
     assert!(!projected.text.contains("tokens truncated"));
 }
@@ -1863,13 +2095,11 @@ fn high_signal_validation_exposes_failure_anchored_predetermined_range() {
 
     assert_eq!(
         ranges,
-        vec![
-            ToolOutputProjectionRange {
-                id: "validation:diagnostics".to_string(),
-                start_line: 1,
-                end_line: 200,
-            },
-        ]
+        vec![ToolOutputProjectionRange {
+            id: "validation:diagnostics".to_string(),
+            start_line: 1,
+            end_line: 200,
+        },]
     );
     assert_eq!(
         ranges
@@ -2060,7 +2290,8 @@ async fn artifact_backed_exec_output(
         .join(format!("{artifact_id}.log"));
     let output = ExecCommandToolOutput {
         output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
-            range: 0..raw_output.len() as u64, gap: None,
+            range: 0..raw_output.len() as u64,
+            gap: None,
         }),
         process_output: None,
         error: None,
@@ -2089,20 +2320,29 @@ async fn artifact_backed_exec_output(
 async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     use crate::unified_exec::head_tail_buffer::OutputChunkRanges;
     let prefix = b"already observed\r\n";
-    let chunk = (0..500).map(|index| format!("current line {index:04}: exact λ evidence\r\n"))
+    let chunk = (0..500)
+        .map(|index| format!("current line {index:04}: exact λ evidence\r\n"))
         .collect::<String>();
     let raw = [prefix.as_slice(), chunk.as_bytes()].concat();
     let (mut output, id, _, root) = artifact_backed_exec_output(&raw, Some(80)).await;
     output.raw_output = chunk.as_bytes().to_vec();
-    output.output_ranges = Some(OutputChunkRanges { range: prefix.len() as u64..raw.len() as u64, gap: None });
-    let payload = ToolPayload::Function { arguments: "{}".into() };
+    output.output_ranges = Some(OutputChunkRanges {
+        range: prefix.len() as u64..raw.len() as u64,
+        gap: None,
+    });
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
     let packet = output.code_mode_result(&payload);
     let selector = &packet["recovery_selector"];
     assert_eq!(selector["kind"], "bytes");
     let start = selector["start"].as_u64().unwrap() as usize;
     let end = selector["end"].as_u64().unwrap() as usize;
     assert!(start >= prefix.len() && start < end && end <= raw.len());
-    assert!(end - start > 4096, "the hint must not clip the known missing range");
+    assert!(
+        end - start > 4096,
+        "the hint must not clip the known missing range"
+    );
     let retained = String::from_utf8_lossy(&raw[start..end]);
     assert!(!retained.contains("already observed"));
     assert!(retained.starts_with("current line"));
@@ -2114,24 +2354,42 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     // One recovery request can now deliver this entire gap, without guessing
     // the next 4 KiB window or rereading the already observed cumulative prefix.
     let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
-        root.path(), "thread", &id.to_string(),
-        vec![serde_json::from_value(selector.clone()).unwrap()], true,
+        root.path(),
+        "thread",
+        &id.to_string(),
+        vec![serde_json::from_value(selector.clone()).unwrap()],
+        true,
         &tokio_util::sync::CancellationToken::new(),
-    ).await.unwrap().output;
+    )
+    .await
+    .unwrap()
+    .output;
     assert!(recovered.complete);
-    let exact = recovered.results.iter().map(|result| result.text.as_deref().unwrap())
+    let exact = recovered
+        .results
+        .iter()
+        .map(|result| result.text.as_deref().unwrap())
         .collect::<String>();
     assert_eq!(exact.as_bytes(), &raw[start..end]);
 
     // The first retention gap is known even if the displayed head/tail fit.
     output.raw_output = b"head\n[output retention gap]\ntail\n".to_vec();
-    output.output_ranges = Some(OutputChunkRanges { range: 18..100, gap: Some(22..96) });
+    output.output_ranges = Some(OutputChunkRanges {
+        range: 18..100,
+        gap: Some(22..96),
+    });
     output.max_output_tokens = Some(1000);
     let gap = output.code_mode_result(&payload);
-    assert_eq!(gap["recovery_selector"], json!({"kind":"bytes", "start":22, "end":96}));
+    assert_eq!(
+        gap["recovery_selector"],
+        json!({"kind":"bytes", "start":22, "end":96})
+    );
     assert_eq!(gap["output_reduced"], true);
     output.raw_output.clear();
-    output.output_ranges = Some(OutputChunkRanges { range: raw.len() as u64..raw.len() as u64, gap: None });
+    output.output_ranges = Some(OutputChunkRanges {
+        range: raw.len() as u64..raw.len() as u64,
+        gap: None,
+    });
     let empty = output.code_mode_result(&payload);
     assert!(empty.get("recovery_selector").is_none());
     assert_eq!(empty["output_reduced"], false);
@@ -2140,18 +2398,26 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     output.raw_output = chunk.into_bytes();
     output.output_ranges = None;
     output.max_output_tokens = Some(80);
-    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+    assert!(
+        output
+            .code_mode_result(&payload)
+            .get("recovery_selector")
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn line_summary_recovery_names_its_first_omitted_diagnostic_group() {
-    let filler = |index: usize| format!("ordinary output line {index:04} padded so the log exceeds the display budget");
+    let filler = |index: usize| {
+        format!("ordinary output line {index:04} padded so the log exceeds the display budget")
+    };
     let mut lines = (0..900).map(filler).collect::<Vec<_>>();
     for index in 0..12 {
         lines[40 + index * 20] = format!("fatal: distinct category {index}");
     }
     let raw = lines.join("\n");
-    let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    let (mut output, id, _, _root) =
+        artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.exit_code = Some(1);
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     let text = direct["output"].as_str().unwrap();
@@ -2160,23 +2426,38 @@ async fn line_summary_recovery_names_its_first_omitted_diagnostic_group() {
     // 121, addressed with the same three context lines a shown group gets.
     assert_eq!(lines[120], "fatal: distinct category 4");
     assert!(!text.contains("fatal: distinct category 4"), "{text}");
-    assert!(text.contains("first omitted group at lines 118-124"), "{text}");
+    assert!(
+        text.contains("first omitted group at lines 118-124"),
+        "{text}"
+    );
     let selector = json!({"kind": "lines", "start": 118, "end": 124});
     assert_eq!(direct["recovery_selector"], selector);
-    assert_eq!(direct["recovery"]["arguments"], json!({"artifact_id": id.to_string(), "selectors": [selector]}));
-    let payload = ToolPayload::Function { arguments: "{}".into() };
-    assert_eq!(output.code_mode_result(&payload)["recovery_selector"], selector);
+    assert_eq!(
+        direct["recovery"]["arguments"],
+        json!({"artifact_id": id.to_string(), "selectors": [selector]})
+    );
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    assert_eq!(
+        output.code_mode_result(&payload)["recovery_selector"],
+        selector
+    );
 
     // With every diagnostic shown, the unselected head is not offered as the
     // ready-to-use recovery; the artifact stays addressable.
     let mut lines = (0..900).map(filler).collect::<Vec<_>>();
     lines[400] = "fatal: the only failure".to_string();
     let raw = lines.join("\n");
-    let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    let (mut output, id, _, _root) =
+        artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.exit_code = Some(1);
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     let text = direct["output"].as_str().unwrap();
-    assert!(text.contains("Shell output summary:") && text.contains("fatal: the only failure"), "{text}");
+    assert!(
+        text.contains("Shell output summary:") && text.contains("fatal: the only failure"),
+        "{text}"
+    );
     assert!(!text.contains("ordinary output line 0000"), "{text}");
     assert_eq!(direct["artifact_id"], id.to_string());
     assert!(direct.get("recovery_selector").is_none() && direct.get("recovery").is_none());
@@ -2189,14 +2470,25 @@ async fn command_recovery_preserves_gap_extent_and_retained_bounds() {
     let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(80)).await;
     let retained = raw.len() as u64;
     output.raw_output = b"head\n[output retention gap]\ntail\n".to_vec();
-    let payload = ToolPayload::Function { arguments: "{}".into() };
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
     for (gap, expected) in [
-        (18..12_000, Some(json!({"kind":"bytes", "start":18, "end":12_000}))),
-        (18..u64::MAX, Some(json!({"kind":"bytes", "start":18, "end":retained}))),
+        (
+            18..12_000,
+            Some(json!({"kind":"bytes", "start":18, "end":12_000})),
+        ),
+        (
+            18..u64::MAX,
+            Some(json!({"kind":"bytes", "start":18, "end":retained})),
+        ),
         (retained..u64::MAX, None),
         (retained + 1..u64::MAX, None),
     ] {
-        output.output_ranges = Some(OutputChunkRanges { range: 0..u64::MAX, gap: Some(gap) });
+        output.output_ranges = Some(OutputChunkRanges {
+            range: 0..u64::MAX,
+            gap: Some(gap),
+        });
         let result = output.code_mode_result(&payload);
         assert_eq!(result.get("recovery_selector"), expected.as_ref());
     }
@@ -2204,67 +2496,162 @@ async fn command_recovery_preserves_gap_extent_and_retained_bounds() {
     // Exact line-to-byte mapping for a later chunk must retain the requested
     // end, including CRLF and multibyte UTF-8, without a second size limit.
     output.raw_output = raw.as_bytes().to_vec();
-    output.output_ranges = Some(OutputChunkRanges { range: 18..18 + retained, gap: None });
-    let mapped = output.missing_output_selector(&raw, "", Some((2, 800)), false, Some(18 + retained));
+    output.output_ranges = Some(OutputChunkRanges {
+        range: 18..18 + retained,
+        gap: None,
+    });
+    let mapped =
+        output.missing_output_selector(&raw, "", Some((2, 800)), false, Some(18 + retained));
     let line_bytes = "exact λ evidence\r\n".len() as u64;
-    assert_eq!(mapped, Some(json!({
-        "kind":"bytes", "start":18 + line_bytes, "end":18 + 800 * line_bytes,
-    })));
+    assert_eq!(
+        mapped,
+        Some(json!({
+            "kind":"bytes", "start":18 + line_bytes, "end":18 + 800 * line_bytes,
+        }))
+    );
 }
 
 #[tokio::test]
 async fn exec_small_output_spills_only_when_its_display_is_reduced() {
     let raw = "retained producer bytes\n".repeat(256);
-    assert!(raw.len() < crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES);
+    assert!(
+        raw.len() < crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES
+    );
     for pending in [false, true] {
-        let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+        let (mut output, _, _, _root) =
+            artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
         let home = tempfile::tempdir().unwrap();
-        output.raw_output_artifact = pending.then(|| RawOutputArtifact::pending(home.path(), "thread"));
-        output.prepare_recovery_artifact(home.path(), "thread").await;
-        assert!(!home.path().join("tool-output").exists(), "inline output must not spill");
+        output.raw_output_artifact =
+            pending.then(|| RawOutputArtifact::pending(home.path(), "thread"));
+        output
+            .prepare_recovery_artifact(home.path(), "thread")
+            .await;
+        assert!(
+            !home.path().join("tool-output").exists(),
+            "inline output must not spill"
+        );
 
         output.max_output_tokens = Some(100);
-        output.prepare_recovery_artifact(home.path(), "thread").await;
-        let artifact_id = output.raw_output_artifact.as_ref().unwrap().artifact_id().unwrap();
-        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+        output
+            .prepare_recovery_artifact(home.path(), "thread")
+            .await;
+        let artifact_id = output
+            .raw_output_artifact
+            .as_ref()
+            .unwrap()
+            .artifact_id()
+            .unwrap();
+        let result = output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into(),
+        });
         assert_eq!(result["output_reduced"], true);
         assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
         let direct: serde_json::Value = serde_json::from_str(&output.response_text()).unwrap();
         assert_eq!(direct["artifact_id"], artifact_id.to_string());
-        assert_eq!(std::fs::read(home.path().join("tool-output/thread").join(format!("{artifact_id}.log"))).unwrap(), raw.as_bytes());
-        output.prepare_recovery_artifact(home.path(), "thread").await;
-        assert_eq!(output.raw_output_artifact.as_ref().unwrap().artifact_id(), Some(artifact_id));
+        assert_eq!(
+            std::fs::read(
+                home.path()
+                    .join("tool-output/thread")
+                    .join(format!("{artifact_id}.log"))
+            )
+            .unwrap(),
+            raw.as_bytes()
+        );
+        output
+            .prepare_recovery_artifact(home.path(), "thread")
+            .await;
+        assert_eq!(
+            output.raw_output_artifact.as_ref().unwrap().artifact_id(),
+            Some(artifact_id)
+        );
     }
 }
 
 #[test]
 fn final_test_summaries_attribute_counts_without_execution_receipts() {
     for (command, output, expected) in [
-        ("python -m unittest", "Ran 98 tests in 1.2s\n\nOK\n", Some(98)),
-        ("python -m unittest", "Ran 4 tests in 1.2s\n\nOK (skipped=2)\n", Some(2)),
-        ("pytest", "=== 12 passed, 2 skipped in 0.20s ===\n", Some(12)),
-        ("cargo test", "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n", Some(3)),
-        ("cargo test", "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.0s\n", None),
-        ("python -m unittest", "Ran 4 tests in 1.2s\nOK (skipped=4)\n", None),
-        ("python -m unittest", "Ran 4 tests in 1.2s\nFAILED (failures=1)\n", None),
+        (
+            "python -m unittest",
+            "Ran 98 tests in 1.2s\n\nOK\n",
+            Some(98),
+        ),
+        (
+            "python -m unittest",
+            "Ran 4 tests in 1.2s\n\nOK (skipped=2)\n",
+            Some(2),
+        ),
+        (
+            "pytest",
+            "=== 12 passed, 2 skipped in 0.20s ===\n",
+            Some(12),
+        ),
+        (
+            "cargo test",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n",
+            Some(3),
+        ),
+        (
+            "cargo test",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.0s\n",
+            None,
+        ),
+        (
+            "python -m unittest",
+            "Ran 4 tests in 1.2s\nOK (skipped=4)\n",
+            None,
+        ),
+        (
+            "python -m unittest",
+            "Ran 4 tests in 1.2s\nFAILED (failures=1)\n",
+            None,
+        ),
         ("pytest", "2 failed, 12 passed in 0.20s", None),
         ("echo OK", "Ran 98 tests in 1.2s\nOK", None),
-        ("npm test", "ℹ tests 14\nℹ suites 0\nℹ pass 14\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 812.3\n", Some(14)),
-        ("npm test", "# tests 2\n# pass 2\n# fail 0\n# duration_ms 77\n", Some(2)),
-        ("npm test", "ℹ pass 13\nℹ fail 1\nℹ duration_ms 812.3\n", None),
+        (
+            "npm test",
+            "ℹ tests 14\nℹ suites 0\nℹ pass 14\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 812.3\n",
+            Some(14),
+        ),
+        (
+            "npm test",
+            "# tests 2\n# pass 2\n# fail 0\n# duration_ms 77\n",
+            Some(2),
+        ),
+        (
+            "npm test",
+            "ℹ pass 13\nℹ fail 1\nℹ duration_ms 812.3\n",
+            None,
+        ),
         ("npm test", "ℹ pass 0\nℹ fail 0\nℹ duration_ms 1\n", None),
     ] {
         let validation = crate::validation::CommandValidation {
             execution_context: None,
-            declared: None, receipt_runner: None,
+            declared: None,
+            receipt_runner: None,
             classification: crate::validation::classify_validation_script(command),
         };
         let mut signal = json!({});
-        attach_command_validation(&mut signal, output.as_bytes(), Some(&validation), Some(0), true);
-        assert_eq!(signal["validation_summary_tests"].as_u64(), expected, "{command}: {output}");
+        attach_command_validation(
+            &mut signal,
+            output.as_bytes(),
+            Some(&validation),
+            Some(0),
+            true,
+        );
+        assert_eq!(
+            signal["validation_summary_tests"].as_u64(),
+            expected,
+            "{command}: {output}"
+        );
         assert!(signal.get("runner_execution_receipt").is_none());
         let mut failed = json!({});
-        attach_command_validation(&mut failed, output.as_bytes(), Some(&validation), Some(1), true);
+        attach_command_validation(
+            &mut failed,
+            output.as_bytes(),
+            Some(&validation),
+            Some(1),
+            true,
+        );
         assert!(failed.get("validation_summary_tests").is_none());
     }
 }
@@ -2280,42 +2667,73 @@ fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
         "executions": [pure, helper], "required_executions": [pure, helper],
         "satisfied_gates": {"a": ["same"], "b": ["same"]}, "exit_code": 0,
     });
-    assert_eq!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")), Some(receipt.clone()));
+    assert_eq!(
+        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")),
+        Some(receipt.clone())
+    );
     receipt["exit_code"] = json!(2);
     receipt["executions"] = json!([pure]);
     receipt["executed_tests"] = json!(1);
     let validation = crate::validation::CommandValidation {
-        execution_context: None, declared: None,
+        execution_context: None,
+        declared: None,
         classification: crate::validation::classify_validation_script("cargo test"),
         receipt_runner: Some("rust_test_runner".into()),
     };
     let mut signal = json!({});
-    attach_command_validation(&mut signal, receipt.to_string().as_bytes(), Some(&validation), Some(2), true);
+    attach_command_validation(
+        &mut signal,
+        receipt.to_string().as_bytes(),
+        Some(&validation),
+        Some(2),
+        true,
+    );
     assert_eq!(signal["runner_execution_receipt"], receipt);
     assert!(signal.get("failure_signature").is_some());
     for exit_code in [0, 1] {
         let mut signal = json!({});
-        attach_command_validation(&mut signal, receipt.to_string().as_bytes(), Some(&validation), Some(exit_code), true);
-        assert!(signal.get("runner_execution_receipt").is_none(), "actual exit must match receipt");
+        attach_command_validation(
+            &mut signal,
+            receipt.to_string().as_bytes(),
+            Some(&validation),
+            Some(exit_code),
+            true,
+        );
+        assert!(
+            signal.get("runner_execution_receipt").is_none(),
+            "actual exit must match receipt"
+        );
     }
     receipt["exit_code"] = json!(0);
-    assert!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")).is_none(), "partial selection is not success");
+    assert!(
+        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner"))
+            .is_none(),
+        "partial selection is not success"
+    );
     receipt["exit_code"] = json!(2);
     receipt["executions"] = json!([pure, pure]);
     receipt["executed_tests"] = json!(2);
-    assert!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")).is_none(), "duplicate execution identities are not two passes");
+    assert!(
+        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner"))
+            .is_none(),
+        "duplicate execution identities are not two passes"
+    );
 }
 
 #[tokio::test]
 async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
-    let tests = (0..160).map(|index| format!("module::日本語::test_{index:04}")).collect::<Vec<_>>();
+    let tests = (0..160)
+        .map(|index| format!("module::日本語::test_{index:04}"))
+        .collect::<Vec<_>>();
     let receipt = json!({
         "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
         "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["core_lib"],
         "completed_tests": {"codex-core": tests}, "executed_tests": 160,
         "skipped_tests": null, "exit_code": 0,
     });
-    let raw = format!("warning: retain this diagnostic\n{receipt}\nRust phase build/test: wall=1.234s; exit=0\n");
+    let raw = format!(
+        "warning: retain this diagnostic\n{receipt}\nRust phase build/test: wall=1.234s; exit=0\n"
+    );
     let (mut output, artifact_id, artifact_path, _root) =
         artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.hook_command = Some("cargo test --lib".into());
@@ -2325,12 +2743,19 @@ async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_pro
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: Some("rust_test_runner".into()),
     });
-    output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
-        aggregated_output: raw.as_bytes().to_vec(), stdout: raw.as_bytes().to_vec(), stderr: Vec::new(),
-        aggregated_output_is_exact: true, streams_are_exact: true,
-    }));
+    output.process_output = Some(std::sync::Arc::new(
+        crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: raw.as_bytes().to_vec(),
+            stdout: raw.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            aggregated_output_is_exact: true,
+            streams_are_exact: true,
+        },
+    ));
     assert!(codex_utils_string::approx_token_count(&raw) < 10_000);
-    let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".into(),
+    });
     let display = result["output"].as_str().unwrap();
     assert!(display.len() * 5 < raw.len(), "{display}");
     assert!(display.contains("codex_test_execution_summary_v1"));
@@ -2342,29 +2767,55 @@ async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_pro
     assert_eq!(result["output_reduced"], true);
     assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
     assert_eq!(std::fs::read(artifact_path).unwrap(), raw.as_bytes());
-    assert!(output.response_text().contains("codex_test_execution_summary_v1"));
+    assert!(
+        output
+            .response_text()
+            .contains("codex_test_execution_summary_v1")
+    );
     let mut signal = json!({});
-    attach_command_validation(&mut signal, &output.raw_output, output.validation.as_ref(), Some(0), true);
+    attach_command_validation(
+        &mut signal,
+        &output.raw_output,
+        output.validation.as_ref(),
+        Some(0),
+        true,
+    );
     assert_eq!(signal["runner_execution_receipt"], receipt);
     assert!(runner_execution_receipt(display.as_bytes(), Some("rust_test_runner")).is_none());
 
     output.validation.as_mut().unwrap().receipt_runner = None;
-    assert!(output.summarized_output(&raw, 10_000).is_none(), "untrusted output is not a receipt");
+    assert!(
+        output.summarized_output(&raw, 10_000).is_none(),
+        "untrusted output is not a receipt"
+    );
     output.validation.as_mut().unwrap().receipt_runner = Some("rust_test_runner".into());
     output.process_id = Some(7);
-    assert!(output.summarized_output(&raw, 10_000).is_none(), "live output must not be summarized as success");
+    assert!(
+        output.summarized_output(&raw, 10_000).is_none(),
+        "live output must not be summarized as success"
+    );
     output.process_id = None;
     output.exit_code = Some(1);
-    assert!(output.summarized_output(&raw, 10_000).is_none(), "failures retain existing diagnostics");
+    assert!(
+        output.summarized_output(&raw, 10_000).is_none(),
+        "failures retain existing diagnostics"
+    );
     output.exit_code = Some(0);
     output.raw_output_artifact = None;
-    assert!(output.summarized_output(&raw, 10_000).is_none(), "never discard unrecoverable evidence");
+    assert!(
+        output.summarized_output(&raw, 10_000).is_none(),
+        "never discard unrecoverable evidence"
+    );
 }
 
 #[tokio::test]
 async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget() {
-    let raw = format!("{}test result: ok. 160 passed; 0 failed; 2 ignored\n",
-        (0..160).map(|index| format!("test case_{index:04} ... ok\n")).collect::<String>());
+    let raw = format!(
+        "{}test result: ok. 160 passed; 0 failed; 2 ignored\n",
+        (0..160)
+            .map(|index| format!("test case_{index:04} ... ok\n"))
+            .collect::<String>()
+    );
     let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.hook_command = Some("cargo test --lib".into());
     output.validation = Some(crate::validation::CommandValidation {
@@ -2373,11 +2824,16 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: None,
     });
-    let summary = output.summarized_output(&raw, 10_000).expect("compact passing validation");
+    let summary = output
+        .summarized_output(&raw, 10_000)
+        .expect("compact passing validation");
     assert!(summary.len() < raw.len());
     assert!(summary.contains("160 passed; 0 failed; 2 ignored"));
     output.validation = None;
-    assert!(output.summarized_output(&raw, 10_000).is_none(), "ordinary output stays exact below budget");
+    assert!(
+        output.summarized_output(&raw, 10_000).is_none(),
+        "ordinary output stays exact below budget"
+    );
 }
 
 #[tokio::test]
@@ -2454,7 +2910,11 @@ async fn silence_observation_survives_zero_display_budget() {
     output.exit_code = None;
     output.process_id = Some(1);
     output.session_capabilities = Some(ExecSessionCapabilities {
-        incarnation: uuid::Uuid::nil(), stdin: false, interrupt: false, cancellation: true, polling: true,
+        incarnation: uuid::Uuid::nil(),
+        stdin: false,
+        interrupt: false,
+        cancellation: true,
+        polling: true,
         observation: Some(ExecSilenceObservation {
             silent_for_ms: 100,
             reason: ExecObservationReason::NoOutputObserved,
@@ -2462,11 +2922,19 @@ async fn silence_observation_survives_zero_display_budget() {
             termination_requested: false,
         }),
     });
-    let result = output.code_mode_result_with_budget(&ToolPayload::Function { arguments: "{}".into() }, 0);
-    assert_eq!(result["session_capabilities"]["observation"], serde_json::json!({
-        "silent_for_ms": 100, "reason": "no_output_observed",
-        "process_exited": false, "termination_requested": false,
-    }));
+    let result = output.code_mode_result_with_budget(
+        &ToolPayload::Function {
+            arguments: "{}".into(),
+        },
+        0,
+    );
+    assert_eq!(
+        result["session_capabilities"]["observation"],
+        serde_json::json!({
+            "silent_for_ms": 100, "reason": "no_output_observed",
+            "process_exited": false, "termination_requested": false,
+        })
+    );
 }
 
 #[tokio::test]
@@ -2474,23 +2942,54 @@ async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contr
     let raw = b"validation completed: 5 passed\r\n";
     let (mut output, _, _, _root) = artifact_backed_exec_output(raw, Some(1000)).await;
     output.raw_output.clear();
-    let payload = ToolPayload::Function { arguments: "{}".into() };
-    for (exact, live, expected) in [(true, false, true), (false, false, false), (true, true, false)] {
-        output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
-            aggregated_output: raw.to_vec(), stdout: raw.to_vec(), stderr: Vec::new(),
-            aggregated_output_is_exact: exact, streams_are_exact: exact,
-        }));
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    for (exact, live, expected) in [
+        (true, false, true),
+        (false, false, false),
+        (true, true, false),
+    ] {
+        output.process_output = Some(std::sync::Arc::new(
+            crate::unified_exec::ProcessOutputSnapshot {
+                aggregated_output: raw.to_vec(),
+                stdout: raw.to_vec(),
+                stderr: Vec::new(),
+                aggregated_output_is_exact: exact,
+                streams_are_exact: exact,
+            },
+        ));
         output.process_id = live.then_some(7);
         output.process_exited = !live;
         output.exit_code = (!live).then_some(0);
         let result = output.code_mode_result(&payload);
-        assert_eq!(result["output"], "", "terminal polls must not replay earlier chunks");
-        assert_eq!(format!("{}{}", String::from_utf8_lossy(raw), result["output"].as_str().unwrap()), String::from_utf8_lossy(raw));
+        assert_eq!(
+            result["output"], "",
+            "terminal polls must not replay earlier chunks"
+        );
+        assert_eq!(
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(raw),
+                result["output"].as_str().unwrap()
+            ),
+            String::from_utf8_lossy(raw)
+        );
         assert_eq!(result["streams_complete"], expected);
-        assert_eq!(result["stdout"].as_str(), expected.then_some("validation completed: 5 passed\r\n"));
-        assert_eq!(result["output_complete"], false, "the chunk alone is not cumulative coverage");
+        assert_eq!(
+            result["stdout"].as_str(),
+            expected.then_some("validation completed: 5 passed\r\n")
+        );
+        assert_eq!(
+            result["output_complete"], false,
+            "the chunk alone is not cumulative coverage"
+        );
         assert!(
-            output.canonical_result(&payload).expect("canonical chunk").bytes.is_empty(),
+            output
+                .canonical_result(&payload)
+                .expect("canonical chunk")
+                .bytes
+                .is_empty(),
             "canonical chunk is unchanged"
         );
     }
@@ -2502,7 +3001,9 @@ async fn fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix(
     let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(1000)).await;
     output.raw_output = b"last chunk\n".to_vec();
     output.output_ranges = None;
-    let payload = ToolPayload::Function { arguments: "{}".into() };
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
     let result = output.code_mode_result(&payload);
     assert_eq!(result["raw_output_artifact_id"], id.to_string());
     assert!(result.get("recovery_selector").is_none());
@@ -2514,10 +3015,20 @@ async fn fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix(
     assert!(reduced.get("recovery_selector").is_none());
     assert!(reduced.get("recovery").is_none());
     output.raw_output_artifact = None;
-    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+    assert!(
+        output
+            .code_mode_result(&payload)
+            .get("recovery_selector")
+            .is_none()
+    );
     output.raw_output = raw.into_bytes();
     output.max_output_tokens = Some(10_000);
-    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+    assert!(
+        output
+            .code_mode_result(&payload)
+            .get("recovery_selector")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2525,33 +3036,65 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
     let (mut output, _, _, _root) = artifact_backed_exec_output(b"", Some(1000)).await;
     output.exit_code = Some(1);
     output.search_no_match = true;
-    let payload = ToolPayload::Function { arguments: "{}".into() };
-    for (stderr, exact, expected) in [("", true, true), ("rg: missing path (os error 123)", true, false), ("", false, false)] {
-        output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
-            aggregated_output: stderr.as_bytes().to_vec(), stdout: Vec::new(), stderr: stderr.as_bytes().to_vec(),
-            aggregated_output_is_exact: exact, streams_are_exact: exact,
-        }));
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    for (stderr, exact, expected) in [
+        ("", true, true),
+        ("rg: missing path (os error 123)", true, false),
+        ("", false, false),
+    ] {
+        output.process_output = Some(std::sync::Arc::new(
+            crate::unified_exec::ProcessOutputSnapshot {
+                aggregated_output: stderr.as_bytes().to_vec(),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+                aggregated_output_is_exact: exact,
+                streams_are_exact: exact,
+            },
+        ));
         assert_eq!(output.success_for_logging(), expected);
-        assert_eq!(output.code_mode_result(&payload)["search_no_match"].as_bool().unwrap_or(false), expected);
+        assert_eq!(
+            output.code_mode_result(&payload)["search_no_match"]
+                .as_bool()
+                .unwrap_or(false),
+            expected
+        );
     }
     // Exact, error-free streams still prove nothing while the process is
     // running or its output has not been drained.
-    output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
-        aggregated_output: Vec::new(), stdout: Vec::new(), stderr: Vec::new(),
-        aggregated_output_is_exact: true, streams_are_exact: true,
-    }));
+    output.process_output = Some(std::sync::Arc::new(
+        crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            aggregated_output_is_exact: true,
+            streams_are_exact: true,
+        },
+    ));
     for (process_id, process_exited) in [(Some(7), true), (None, false)] {
         output.process_id = process_id;
         output.process_exited = process_exited;
         assert!(!output.success_for_logging());
-        assert!(output.code_mode_result(&payload).get("search_no_match").is_none());
+        assert!(
+            output
+                .code_mode_result(&payload)
+                .get("search_no_match")
+                .is_none()
+        );
     }
     output.process_id = None;
     output.process_exited = true;
     output.process_output = None;
-    assert!(!output.success_for_logging(), "unknown streams are not a no-match proof");
+    assert!(
+        !output.success_for_logging(),
+        "unknown streams are not a no-match proof"
+    );
     output.exit_code = Some(0);
-    assert!(output.success_for_logging(), "ordinary successes are unchanged");
+    assert!(
+        output.success_for_logging(),
+        "ordinary successes are unchanged"
+    );
 }
 
 #[tokio::test]
@@ -2634,12 +3177,21 @@ async fn code_mode_command_result_fits_its_cell_when_printed() {
         let (span, total) = marker.split_once(" of ").expect("marker total");
         assert_eq!(total, source.len().to_string(), "whole boundary lines");
         let (first, last) = span.split_once('-').expect("marker span");
-        let (first, last) = (first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap());
-        assert_eq!(retained.lines().collect::<Vec<_>>(), source[next - 1..first - 1].to_vec());
+        let (first, last) = (
+            first.parse::<usize>().unwrap(),
+            last.parse::<usize>().unwrap(),
+        );
+        assert_eq!(
+            retained.lines().collect::<Vec<_>>(),
+            source[next - 1..first - 1].to_vec()
+        );
         gaps.push((first, last));
         (next, rest) = (last + 1, after);
     }
-    assert_eq!(rest.lines().collect::<Vec<_>>(), source[next - 1..].to_vec());
+    assert_eq!(
+        rest.lines().collect::<Vec<_>>(),
+        source[next - 1..].to_vec()
+    );
     assert_eq!(gaps.len(), 2);
     let (first, last) = gaps[0];
     // Recovery selectors describe the known missing scope. The reader's
@@ -2650,11 +3202,13 @@ async fn code_mode_command_result_fits_its_cell_when_printed() {
     );
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     assert!(
-        codex_utils_string::approx_token_count(direct["output"].as_str().unwrap())
-            <= 10_000,
+        codex_utils_string::approx_token_count(direct["output"].as_str().unwrap()) <= 10_000,
         "the direct response must cap oversized requests"
     );
-    assert_eq!(output.model_output_limits(&raw_output, None).applied_limit, 10_000);
+    assert_eq!(
+        output.model_output_limits(&raw_output, None).applied_limit,
+        10_000
+    );
     assert_eq!(direct["artifact_id"], artifact_id.to_string());
 }
 
@@ -2671,7 +3225,10 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     let packet: JsonValue = serde_json::from_str(&response).unwrap();
     assert_eq!(packet["artifact_id"], artifact_id.to_string());
     assert_eq!(response.matches(&artifact_id.to_string()).count(), 2);
-    assert_eq!(packet["recovery"]["arguments"]["artifact_id"], artifact_id.to_string());
+    assert_eq!(
+        packet["recovery"]["arguments"]["artifact_id"],
+        artifact_id.to_string()
+    );
     assert!(codex_utils_string::approx_token_count(packet["output"].as_str().unwrap()) <= 200);
     assert!(packet["recovery"]["arguments"]["selectors"].is_array());
     let code_mode = output.code_mode_result(&ToolPayload::Function {
@@ -2685,10 +3242,6 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
             .contains(&artifact_id.to_string())
     );
 }
-
-
-
-
 
 #[tokio::test]
 async fn audit_tiny_recovery_budget_preserves_process_state() {
@@ -2717,8 +3270,8 @@ async fn exec_projection_retains_diagnostics_outside_generic_cut_regions() {
     output.exit_code = Some(1);
     output.hook_command = Some("cargo check".into());
     let metadata = output.projection_metadata_from_raw(&raw);
-    assert!(metadata.fragments.iter().any(|fragment|
-        fragment.kind == ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+    assert!(metadata.fragments.iter().any(|fragment| fragment.kind
+        == ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
         && fragment.text.contains("unique important failure")));
     assert!(metadata.predetermined_ranges.is_empty());
     let ranges = predetermined_validation_ranges(&raw, Some("cargo check"));

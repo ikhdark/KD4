@@ -11,7 +11,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 
-use crate::policy::is_persisted_rollout_item;
+use crate::policy::is_persisted_rollout_item_with_activity;
 
 const ITEM_BYTES_METRIC: &str = "codex.rollout.persistence.item_bytes";
 const APPEND_METRIC: &str = "codex.rollout.persistence.append";
@@ -99,6 +99,15 @@ pub fn measure_and_filter_rollout_items(
     items: &[RolloutItem],
     history_mode: ThreadHistoryMode,
 ) -> (Vec<RolloutItem>, RolloutPersistenceBatchMeasurement) {
+    measure_and_filter_rollout_items_with_activity(items, history_mode, false)
+}
+
+/// Use the same opt-in policy for telemetry and the canonical append path.
+pub fn measure_and_filter_rollout_items_with_activity(
+    items: &[RolloutItem],
+    history_mode: ThreadHistoryMode,
+    capture_activity: bool,
+) -> (Vec<RolloutItem>, RolloutPersistenceBatchMeasurement) {
     let mut persisted = Vec::new();
     let mut measurement = RolloutPersistenceBatchMeasurement {
         items: Vec::with_capacity(items.len()),
@@ -106,7 +115,7 @@ pub fn measure_and_filter_rollout_items(
     };
 
     for item in items {
-        let kept = is_persisted_rollout_item(item, history_mode);
+        let kept = is_persisted_rollout_item_with_activity(item, history_mode, capture_activity);
         let decision = if kept {
             PersistenceDecision::Kept
         } else {

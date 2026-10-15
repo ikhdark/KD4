@@ -51,38 +51,64 @@ impl Session {
 
         let previous_world_state = self.state.lock().await.history.world_state_baseline();
         let mut world_state = WorldState::default();
-        world_state.add_section(self.services.plan_store.task_state(
-            turn_context.collaboration_mode.mode == codex_protocol::config_types::ModeKind::Plan,
-        ).await);
-        if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
+        world_state.add_section(
+            self.services
+                .plan_store
+                .task_state(
+                    turn_context.collaboration_mode.mode
+                        == codex_protocol::config_types::ModeKind::Plan,
+                )
+                .await,
+        );
+        if turn_context
+            .config
+            .features
+            .enabled(codex_features::Feature::TokenBudget)
+        {
             let ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(crate::context::TokenBudgetContext::new(
-                turn_context.session_source.get_agent_path().unwrap_or_else(codex_protocol::AgentPath::root),
+                turn_context
+                    .session_source
+                    .get_agent_path()
+                    .unwrap_or_else(codex_protocol::AgentPath::root),
                 ids.first_window_id,
                 ids.previous_window_id,
                 ids.window_id,
-                turn_context.config.token_budget.as_ref()
+                turn_context
+                    .config
+                    .token_budget
+                    .as_ref()
                     .and_then(|config| config.guidance_message.as_deref())
                     .filter(|_| self.token_budget_recovery_available())
-                    .map(|guidance| crate::context::ContextualUserFragment::render(
-                        &crate::context::ContextWindowGuidance::new(guidance))),
+                    .map(|guidance| {
+                        crate::context::ContextualUserFragment::render(
+                            &crate::context::ContextWindowGuidance::new(guidance),
+                        )
+                    }),
             ));
         }
-        world_state.add_section(AgentsMdState::new_cached(
-            step_context.loaded_agents_md.as_deref(),
-            step_context.agents_md_stable_context.as_ref(),
-            step_context.agents_md_freshness,
-        ).with_unavailable_fallback(|| previous_world_state.as_ref()
-            .and_then(|previous| previous.section("agents_md")).cloned()));
+        world_state.add_section(
+            AgentsMdState::new_cached(
+                step_context.loaded_agents_md.as_deref(),
+                step_context.agents_md_stable_context.as_ref(),
+                step_context.agents_md_freshness,
+            )
+            .with_unavailable_fallback(|| {
+                previous_world_state
+                    .as_ref()
+                    .and_then(|previous| previous.section("agents_md"))
+                    .cloned()
+            }),
+        );
         if turn_context.config.include_environment_context {
-            world_state.add_section(
-                EnvironmentsState::from_turn_context_with_environments(
-                    turn_context,
-                    &step_context.environments,
-                ),
-            );
+            world_state.add_section(EnvironmentsState::from_turn_context_with_environments(
+                turn_context,
+                &step_context.environments,
+            ));
             if !environment_subagents.is_empty()
-                || previous_world_state.as_ref().is_some_and(|state| state.section("subagents").is_some())
+                || previous_world_state
+                    .as_ref()
+                    .is_some_and(|state| state.section("subagents").is_some())
             {
                 world_state.add_section(SubagentsState::new(environment_subagents));
             }
@@ -96,21 +122,19 @@ impl Session {
                 .as_ref()
                 .is_some_and(|state| state.section(id).is_some())
         };
-        if turn_context.model_info.include_apps_usage_instructions || tracked("apps_instructions")
-        {
-            let apps_available = if turn_context.config.include_apps_instructions
-                && turn_context.apps_enabled()
-            {
-                let tools = step_context.mcp_tools().await;
-                connectors::with_app_enabled_state(
-                    connectors::accessible_connectors_from_mcp_tools(tools),
-                    &turn_context.config,
-                )
-                .into_iter()
-                .any(|connector| connector.is_accessible && connector.is_enabled)
-            } else {
-                false
-            };
+        if turn_context.model_info.include_apps_usage_instructions || tracked("apps_instructions") {
+            let apps_available =
+                if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
+                    let tools = step_context.mcp_tools().await;
+                    connectors::with_app_enabled_state(
+                        connectors::accessible_connectors_from_mcp_tools(tools),
+                        &turn_context.config,
+                    )
+                    .into_iter()
+                    .any(|connector| connector.is_accessible && connector.is_enabled)
+                } else {
+                    false
+                };
             world_state.add_section(AppsInstructionsState::new(apps_available));
         }
         if turn_context.model_info.include_plugin_usage_instructions
@@ -179,9 +203,15 @@ impl Session {
                             .as_ref()
                             .and_then(|previous| previous.section(id))
                         {
-                            let rendering = previous_world_state.as_ref()
-                                .and_then(|previous| previous.rendered_extension(id)).cloned();
-                            world_state.add_preserved_extension_section(id, snapshot.clone(), rendering);
+                            let rendering = previous_world_state
+                                .as_ref()
+                                .and_then(|previous| previous.rendered_extension(id))
+                                .cloned();
+                            world_state.add_preserved_extension_section(
+                                id,
+                                snapshot.clone(),
+                                rendering,
+                            );
                         }
                     }
                 }

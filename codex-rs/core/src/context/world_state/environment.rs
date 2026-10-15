@@ -125,45 +125,44 @@ impl WorldStateSection for EnvironmentsState {
             || current.network != previous.network
             || current.filesystem != previous.filesystem;
         let subagents_changed = current.subagents != previous.subagents;
-        let mut updates = self
-            .environments
-            .iter()
-            .filter(|(id, _)| {
-                let environment = &current.environments[*id];
-                previous
-                    .environments
-                    .get(*id)
-                    .is_none_or(|previous| !environment.has_same_diff_value(previous))
-            })
-            .map(|(id, environment)| {
-                let mut environment = environment.clone();
-                if environment.shell.is_none()
-                    && previous
+        let mut updates =
+            self.environments
+                .iter()
+                .filter(|(id, _)| {
+                    let environment = &current.environments[*id];
+                    previous
                         .environments
-                        .get(id)
-                        .is_some_and(|previous| previous.shell.is_some())
-                {
-                    environment.shell = Some("unknown".to_string());
-                }
-                if environment.os.is_none()
-                    && previous
-                        .environments
-                        .get(id)
-                        .is_some_and(|previous| previous.os.is_some())
-                {
-                    environment.os = Some("unknown".to_string());
-                }
-                let became_available = environment.status == EnvironmentStatus::Available
-                    && previous
-                        .environments
-                        .get(id)
-                        .is_some_and(|previous| previous.status != EnvironmentStatus::Available);
-                (
-                    id.clone(),
-                    EnvironmentUpdate::Current(environment, became_available),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+                        .get(*id)
+                        .is_none_or(|previous| !environment.has_same_diff_value(previous))
+                })
+                .map(|(id, environment)| {
+                    let mut environment = environment.clone();
+                    if environment.shell.is_none()
+                        && previous
+                            .environments
+                            .get(id)
+                            .is_some_and(|previous| previous.shell.is_some())
+                    {
+                        environment.shell = Some("unknown".to_string());
+                    }
+                    if environment.os.is_none()
+                        && previous
+                            .environments
+                            .get(id)
+                            .is_some_and(|previous| previous.os.is_some())
+                    {
+                        environment.os = Some("unknown".to_string());
+                    }
+                    let became_available = environment.status == EnvironmentStatus::Available
+                        && previous.environments.get(id).is_some_and(|previous| {
+                            previous.status != EnvironmentStatus::Available
+                        });
+                    (
+                        id.clone(),
+                        EnvironmentUpdate::Current(environment, became_available),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
         updates.extend(
             previous
                 .environments

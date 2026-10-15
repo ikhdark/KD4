@@ -211,8 +211,70 @@ class SubscriptionUsage:
              "invalidRateLimitSnapshots", "missingWindows", "invalidWindows"), 0
         )
         self.windows: dict[tuple, dict[str, Any]] = {}
+        self.sessions: dict[str, str | None] = {}
+        self.turns: dict[tuple[str, str], dict[str, Any]] = {}
+        self.active: dict[str, set[str]] = {}
+        self.unassigned_token_events = 0
 
-    def observe(self, file: str, timestamp_ns: int | None, snapshot: Any) -> None:
+    def _turn(self, file: str, turn_id: str) -> dict[str, Any]:
+        key = (file, turn_id)
+        if key not in self.turns:
+            self.turns[key] = {
+                "file": file, "sessionId": self.sessions.get(file), "turnId": turn_id,
+                "status": "unknown", "startedAtUnixMs": None, "endedAtUnixMs": None,
+                "_association": set(), "_usage": SubscriptionUsage(),
+                "_snapshotTimes": [],
+            }
+        return self.turns[key]
+
+    def observe_event(self, file: str, timestamp_ns: int | None,
+                      item: dict[str, Any], line: int) -> None:
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if item.get("type") == "session_meta":
+            session = payload.get("id")
+            self.sessions[file] = session if isinstance(session, str) else None
+            return
+        if item.get("type") != "event_msg":
+            return
+        kind = payload.get("type")
+        turn_id = payload.get("turn_id")
+        invalid_turn_id = turn_id is not None and (not isinstance(turn_id, str) or not turn_id)
+        turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+        active = self.active.setdefault(file, set())
+        timestamp_ms = timestamp_ns // 1_000_000 if timestamp_ns is not None else None
+        if kind in ("task_started", "task_complete", "turn_aborted") and turn_id:
+            turn = self._turn(file, turn_id)
+            if kind == "task_started":
+                active.add(turn_id)
+                turn["status"] = "active"
+                if turn["startedAtUnixMs"] is None:
+                    turn["startedAtUnixMs"] = timestamp_ms
+            else:
+                active.discard(turn_id)
+                turn["status"] = "completed" if kind == "task_complete" else "aborted"
+                turn["endedAtUnixMs"] = timestamp_ms
+        if kind != "token_count":
+            return
+        snapshot = payload.get("rate_limits")
+        self.observe(file, timestamp_ns, snapshot, line=line)
+        if invalid_turn_id:
+            self.unassigned_token_events += 1
+            return
+        association = "explicit_turn_id" if turn_id else "single_active_turn"
+        if not turn_id and len(active) == 1:
+            turn_id = next(iter(active))
+        if turn_id is None:
+            self.unassigned_token_events += 1
+            return
+        turn = self._turn(file, turn_id)
+        turn["_association"].add(association)
+        turn["_snapshotTimes"].append((timestamp_ms, line))
+        turn["_usage"].observe(file, timestamp_ns, snapshot, line=line)
+
+    def observe(self, file: str, timestamp_ns: int | None, snapshot: Any,
+                *, line: int | None = None) -> None:
         self.counts["tokenCountEvents"] += 1
         if snapshot is None:
             self.counts["missingRateLimitSnapshots"] += 1
@@ -240,20 +302,28 @@ class SubscriptionUsage:
             ):
                 self.counts["invalidWindows"] += 1
                 continue
-            # Never subtract across files, plans, buckets, or reset boundaries.
+            window_id = window.get("window_id")
+            if window_id is not None and (not isinstance(window_id, str) or not window_id):
+                self.counts["invalidWindows"] += 1
+                continue
+            # Recorded stable IDs survive slot changes, never reset/plan changes.
             key = (file, snapshot.get("limit_id"), snapshot.get("plan_type"),
-                   name, minutes, reset)
+                   ("id", window_id) if window_id else ("slot", name), minutes, reset)
             timestamp_ms = timestamp_ns // 1_000_000 if timestamp_ns is not None else None
             row = self.windows.setdefault(key, {
                 "file": file,
                 "limitId": snapshot.get("limit_id"),
                 "planType": snapshot.get("plan_type"),
                 "window": name,
+                "windowId": window_id,
+                "observedSlots": [],
                 "windowMinutes": minutes,
                 "resetsAt": reset,
                 "samples": 0,
                 "firstObservedAtUnixMs": timestamp_ms,
                 "lastObservedAtUnixMs": timestamp_ms,
+                "firstRecordLine": line,
+                "lastRecordLine": line,
                 "firstUsedPercent": used,
                 "lastUsedPercent": used,
                 "peakUsedPercent": used,
@@ -261,6 +331,8 @@ class SubscriptionUsage:
                 "_decreased": False,
             })
             previous_ms = row["lastObservedAtUnixMs"]
+            if name not in row["observedSlots"]:
+                row["observedSlots"].append(name)
             row["_invalidTime"] |= (
                 timestamp_ms is None or previous_ms is None
                 or timestamp_ms < previous_ms
@@ -269,10 +341,11 @@ class SubscriptionUsage:
             row["_decreased"] |= used < row["lastUsedPercent"]
             row["samples"] += 1
             row["lastObservedAtUnixMs"] = timestamp_ms
+            row["lastRecordLine"] = line
             row["lastUsedPercent"] = used
             row["peakUsedPercent"] = max(row["peakUsedPercent"], used)
 
-    def report(self, parse_errors: int = 0) -> dict[str, Any]:
+    def _window_rows(self, parse_errors: int) -> list[dict[str, Any]]:
         windows = []
         for row in self.windows.values():
             reason = (
@@ -284,16 +357,51 @@ class SubscriptionUsage:
                 else "usage_decreased_within_window" if row["_decreased"]
                 else None
             )
+            minutes = row["windowMinutes"]
+            label = ("weekly" if minutes == 10080 else "5-hour" if minutes == 300
+                     else f"{minutes}-minute" if minutes is not None else "unknown-window")
+            change = row["lastUsedPercent"] - row["firstUsedPercent"] if reason is None else None
             windows.append({
                 **{key: value for key, value in row.items() if not key.startswith("_")},
+                "windowLabel": label,
                 "lastRemainingPercent": 100 - row["lastUsedPercent"],
-                "observedChangePercentagePoints": (
-                    row["lastUsedPercent"] - row["firstUsedPercent"] if reason is None else None
+                "observedChangePercentagePoints": change,
+                "observedChangeLabel": (
+                    f"{change:g}% of {label} allowance (observed account change)"
+                    if change is not None else None
                 ),
                 "changeUnavailableReason": reason,
             })
+        return windows
+
+    def report(self, parse_errors: int = 0) -> dict[str, Any]:
+        windows = self._window_rows(parse_errors)
+        turns = []
+        for turn in self.turns.values():
+            usage = turn["_usage"]
+            turn_windows = usage._window_rows(parse_errors)
+            start, end = turn["startedAtUnixMs"], turn["endedAtUnixMs"]
+            ambiguous = [line for stamp, line in turn["_snapshotTimes"]
+                         if stamp is None or start is None or stamp < start
+                         or (end is not None and stamp > end)]
+            if ambiguous:
+                for window in turn_windows:
+                    window.update(observedChangePercentagePoints=None, observedChangeLabel=None,
+                                  changeUnavailableReason="ambiguous_turn_interval")
+            turns.append({
+                **{key: value for key, value in turn.items() if not key.startswith("_")},
+                **usage.counts,
+                "associationSources": sorted(turn["_association"]),
+                "associationStatus": "ambiguous" if ambiguous else "within_recorded_interval",
+                "ambiguousSnapshotLines": ambiguous,
+                "available": bool(turn_windows),
+                "windowCount": len(turn_windows),
+                "windows": turn_windows,
+                "attributableUsagePercentagePoints": None,
+                "attributionUnavailableReason": "shared_account_quota_and_potentially_delayed_snapshots",
+            })
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "available": bool(windows),
             "measurementNote": (
                 "Persisted account-level subscription-limit snapshots, including active turns; "
@@ -301,12 +409,26 @@ class SubscriptionUsage:
                 "Other sessions can consume the same quota. Samples may repeat cached state "
                 "and are not request counts. Percentages describe the last observation, not "
                 "live remaining quota. Changes compare observed endpoints only within one "
-                "file/plan/limit/window/reset; no cross-window or cross-session total is inferred."
+                "file/plan/limit/window/reset; no cross-window or cross-session total is inferred. "
+                "Per-turn changes use only snapshots linked by an explicit turn ID or a single "
+                "active turn in recorded lifecycle order, never the previous turn's balance. "
+                "A 40% to 42% change is 2 percentage points (2% of the whole allowance), not "
+                "a relative percent increase or proven turn consumption. Weekly means a recorded "
+                "10080-minute window, whether primary or secondary. First snapshots can be late, "
+                "last snapshots can be cached, and zero observed change does not prove zero usage. "
+                "Turn rows include active/aborted turns and do not require a valid timing profile."
             ),
             **self.counts,
             "parseErrorCount": parse_errors,
             "windowCount": len(windows),
             "windows": windows,
+            "turnCount": len(turns),
+            "turnsWithQuotaSnapshots": sum(turn["available"] for turn in turns),
+            "turnsWithObservedChanges": sum(any(
+                row["observedChangePercentagePoints"] is not None for row in turn["windows"]
+            ) for turn in turns),
+            "unassignedTokenCountEvents": self.unassigned_token_events,
+            "turns": turns,
         }
 
 
@@ -419,7 +541,7 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
             metrics["terminalModelMs"] = sum(row["modelStreamWaitNs"] for row in terminal) / 1e6
         token_computation_disabled = turn.get("tokens", {}).get("enabled") is False
         categories = [] if token_computation_disabled else [
-            row.get("requestTokenCategories", {}) for row in requests
+            row.get("requestTokenCategories") or {} for row in requests
         ]
         if token_computation_disabled:
             reasons["inputEstimateAbsoluteErrorTokens"] = "token_computation_disabled"
@@ -936,8 +1058,8 @@ def gate_metric_names() -> frozenset[str]:
 def regression_gate(comparison: dict[str, Any], metrics: list[str]) -> dict[str, Any]:
     """Gate a baseline comparison on explicitly selected metrics.
 
-    Ratios measure answer and evidence quality, so a drop regresses; every other
-    unit is a cost, so a rise regresses. A selected metric that is unavailable in
+    Quality ratios and useful evidence/checkpoint counts improve when higher.
+    Other metrics are costs, so a rise regresses. A selected metric unavailable in
     any cohort, or never compared, is insufficient evidence, never a pass.
     """
     selected = sorted(set(metrics))
@@ -948,13 +1070,14 @@ def regression_gate(comparison: dict[str, Any], metrics: list[str]) -> dict[str,
             if unknown
             else "a regression gate needs at least one metric"
         )
-    units = {name: spec[0] for name, spec in _METRICS.items()} | _DERIVED_UNITS
+    higher_is_better = {"usefulCheckpoints", "discoveredEvidence", "finalizedEvidence",
+                        "evidenceSurvival", "finalAnswerRecall", "finalAnswerPrecision"}
     rows = [row for row in comparison["metrics"] if row["metric"] in selected]
     regressions = [
         row
         for row in rows
         if row["status"]
-        == ("decreased" if units[row["metric"]] == "ratio" else "increased")
+        == ("decreased" if row["metric"] in higher_is_better else "increased")
     ]
     unavailable = [row for row in rows if row["status"] == "unavailable"]
     compared = {row["metric"] for row in rows if row["status"] != "unavailable"}
@@ -969,7 +1092,7 @@ def regression_gate(comparison: dict[str, Any], metrics: list[str]) -> dict[str,
         "schemaVersion": 1,
         "metrics": selected,
         "directions": {
-            name: "higher_is_better" if units[name] == "ratio" else "lower_is_better"
+            name: "higher_is_better" if name in higher_is_better else "lower_is_better"
             for name in selected
         },
         "minSamples": comparison["minSamples"],
@@ -1027,6 +1150,28 @@ def render_diagnostics(report: dict[str, Any]) -> list[str]:
             )
         if len(subscription["windows"]) > 8:
             lines.append("  additional subscription windows in JSON output")
+        for turn in subscription.get("turns", [])[:8]:
+            lines.append(
+                f"  subscription turn={turn['turnId']} session={turn['sessionId']} "
+                f"status={turn['status']} file={turn['file']}"
+            )
+            if not turn["available"]:
+                lines.append("    subscription limits unavailable; not measured as zero")
+            for window in turn["windows"][:8]:
+                change = window["observedChangeLabel"] or (
+                    "unavailable (" + window["changeUnavailableReason"] + ")"
+                )
+                lines.append(
+                    f"    {window['windowLabel']}: {window['firstUsedPercent']:g}% -> "
+                    f"{window['lastUsedPercent']:g}%; {change}; "
+                    f"remaining={window['lastRemainingPercent']:g}%; "
+                    f"resetsAt={window['resetsAt']}; "
+                    f"records={window['firstRecordLine']}..{window['lastRecordLine']}"
+                )
+            if len(turn["windows"]) > 8:
+                lines.append("    additional turn windows in JSON output")
+        if len(subscription.get("turns", [])) > 8:
+            lines.append("  additional subscription turns in JSON output")
     if diagnostics["coverageBlockers"]:
         lines.append(
             f"  comparison coverage blockers: {diagnostics['coverageBlockers']}"

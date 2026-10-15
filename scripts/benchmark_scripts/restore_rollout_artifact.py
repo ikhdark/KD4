@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 import argparse
 from contextlib import closing
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -20,6 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.benchmark_scripts.rollout_snapshot import iter_rollout_records
+from scripts.common.atomic_json import write_stream_atomic
 
 
 def main(argv=None):
@@ -43,8 +45,7 @@ def main(argv=None):
     if len(matches) != 1:
         raise ValueError(f"expected one deleted-file record, found {len(matches)}")
     data = matches[0].encode("utf-8")
-    with args.output.open("xb") as destination:
-        destination.write(data)
+    write_stream_atomic(args.output, io.BytesIO(data), exclusive=True)
     print(json.dumps({"output": str(args.output.resolve()), "bytes": len(data),
                       "sha256": hashlib.sha256(data).hexdigest()}))
     return 0

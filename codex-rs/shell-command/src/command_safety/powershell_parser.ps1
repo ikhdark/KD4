@@ -97,6 +97,13 @@ function Invoke-ParseRequest {
         if (Test-NativeExitGuard $statement) {
             continue
         }
+        if ($statement -is [System.Management.Automation.Language.IfStatementAst]) {
+            if (Add-CommandsFromIfStatement $statement $commands $localConstants) {
+                continue
+            }
+            $commands = $null
+            break
+        }
         if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
             if ($statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
                 return @{ id = $RequestId; status = 'unsupported' }
@@ -134,6 +141,14 @@ function Invoke-ParseRequest {
         }
 
         if (-not (Add-CommandsFromPipelineBase $statement $commands $localConstants)) {
+            if (Test-DataOutputLoop $statement) {
+                # This bounded AST proof describes output, not literal argv or
+                # iteration count. Keep the command visible to policy consumers.
+                $null = $commands.Add(@('Write-Output'))
+                $localConstants.Clear()
+                $commandOutputVariables.Clear()
+                continue
+            }
             $commands = $null
             break
         }
@@ -301,6 +316,37 @@ function Test-PureLocalStatement {
             (Test-PureLocalStatement $statement.Condition) -and (Test-PureLocalBlock $statement.Body)
     }
     return $false
+}
+
+# An inventory loop may print strings that look like test commands. Prove its
+# body is data-only rather than making the full-suite policy scan those strings.
+# Do not relax Test-PureLocalStatement: scriptblock arguments and substitutions
+# still must not contain commands. Parameters, redirects and dynamic invocation
+# remain unsupported, including common parameters that overwrite bindings.
+function Test-DataOutputLoop {
+    param($statement)
+    if ($statement -isnot [System.Management.Automation.Language.ForEachStatementAst] -or
+        [int]$statement.Flags -ne 0 -or
+        -not (Test-PureLocalExpression $statement.Variable) -or
+        -not (Test-PureLocalStatement $statement.Condition) -or
+        $statement.Body.Traps.Count -gt 0) { return $false }
+    foreach ($item in $statement.Body.Statements) {
+        if (Test-PureLocalStatement $item) { continue }
+        if (Test-DataOutputLoop $item) { continue }
+        if ($item -isnot [System.Management.Automation.Language.PipelineAst] -or
+            $item.PipelineElements.Count -ne 1) { return $false }
+        $background = $item.PSObject.Properties['Background']
+        if ($background -ne $null -and $background.Value) { return $false }
+        $command = $item.PipelineElements[0]
+        if ($command -isnot [System.Management.Automation.Language.CommandAst] -or
+            $command.GetCommandName() -ne 'Write-Output' -or
+            $command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+            $command.Redirections.Count -gt 0) { return $false }
+        foreach ($argument in ($command.CommandElements | Select-Object -Skip 1)) {
+            if (-not (Test-PureLocalExpression $argument)) { return $false }
+        }
+    }
+    return $true
 }
 
 function Write-Response {
@@ -539,6 +585,20 @@ function Convert-CommandElement {
         return @($localConstants[$key])
     }
 
+    # A comma list such as `Get-ChildItem src,tests` passes every element to one
+    # parameter. Each element must itself be literal-ish; one word per element.
+    if ($element -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+        $words = [System.Collections.ArrayList]::new()
+        foreach ($item in $element.Elements) {
+            $converted = @(Convert-CommandElement $item $localConstants)
+            if ($converted.Count -ne 1 -or $null -eq $converted[0]) {
+                return $null
+            }
+            $null = $words.Add($converted[0])
+        }
+        return $words.ToArray()
+    }
+
     return $null
 }
 
@@ -748,6 +808,39 @@ function Add-CommandsFromPipelineBase {
     }
 
     return $false
+}
+
+# A conditional runs at most the commands in its conditions and branches, so
+# lowering all of them covers whichever path executes. Branches may hold only
+# pipelines: assignments, loops, exits and nested control flow stay unsupported.
+function Add-CommandsFromIfStatement {
+    param($statement, $commands, $localConstants)
+
+    foreach ($clause in $statement.Clauses) {
+        if (-not (Add-CommandsFromPipelineBase $clause.Item1 $commands $localConstants) -or
+            -not (Add-CommandsFromStatementBlock $clause.Item2 $commands $localConstants)) {
+            return $false
+        }
+    }
+    if ($statement.ElseClause -ne $null -and
+        -not (Add-CommandsFromStatementBlock $statement.ElseClause $commands $localConstants)) {
+        return $false
+    }
+    return $true
+}
+
+function Add-CommandsFromStatementBlock {
+    param($block, $commands, $localConstants)
+
+    if ($block.Traps.Count -gt 0) {
+        return $false
+    }
+    foreach ($statement in $block.Statements) {
+        if (-not (Add-CommandsFromPipelineBase $statement $commands $localConstants)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 # This script stays alive so the Rust caller can amortize PowerShell startup across

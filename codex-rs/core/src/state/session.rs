@@ -49,7 +49,11 @@ pub(crate) struct PromptTokenCalibration {
 
 impl PromptTokenCalibration {
     pub(crate) fn observe(&mut self, provider: &str, model: &str, sample: Option<(u64, u64)>) {
-        if self.basis.as_ref().is_none_or(|(p, m)| p != provider || m != model) {
+        if self
+            .basis
+            .as_ref()
+            .is_none_or(|(p, m)| p != provider || m != model)
+        {
             self.samples.clear();
             self.basis = Some((provider.to_string(), model.to_string()));
         }
@@ -66,7 +70,11 @@ impl PromptTokenCalibration {
     }
 
     pub(crate) fn estimate(&self, provider: &str, model: &str, local: i64) -> i64 {
-        if self.basis.as_ref().is_none_or(|(p, m)| p != provider || m != model) {
+        if self
+            .basis
+            .as_ref()
+            .is_none_or(|(p, m)| p != provider || m != model)
+        {
             return local;
         }
         let Some(&(denominator, numerator)) = self.samples.iter().max_by(|(al, ap), (bl, bp)| {
@@ -74,8 +82,8 @@ impl PromptTokenCalibration {
         }) else {
             return local;
         };
-        let adjusted = (local.max(0) as u128 * u128::from(numerator))
-            .div_ceil(u128::from(denominator));
+        let adjusted =
+            (local.max(0) as u128 * u128::from(numerator)).div_ceil(u128::from(denominator));
         i64::try_from(adjusted).unwrap_or(i64::MAX)
     }
 }

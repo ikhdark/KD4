@@ -15,6 +15,7 @@ use super::REQUEST_SCHEMA_CACHE_CAPACITY;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
+use super::STREAM_THROUGHPUT_COLLAPSE_STREAK;
 use super::SharedModelHttpClients;
 use super::StreamThroughputCollapse;
 use super::UnauthorizedRecoveryExecution;
@@ -146,8 +147,24 @@ fn websocket_rotates_before_the_server_connection_age_limit() {
     ));
 }
 
+/// A small inherited context, so rotation remains worth its replay cost and
+/// these cases continue to exercise the rate logic itself.
+const SMALL_INHERITED_CONTEXT_TOKENS: i64 = 1_000;
+
 fn record_response_rate(throughput: &mut WebsocketStreamThroughput, tokens_per_second: i64) {
-    throughput.record(tokens_per_second * 100, Duration::from_secs(100));
+    record_response_rate_at_context(throughput, tokens_per_second, SMALL_INHERITED_CONTEXT_TOKENS);
+}
+
+fn record_response_rate_at_context(
+    throughput: &mut WebsocketStreamThroughput,
+    tokens_per_second: i64,
+    input_tokens: i64,
+) {
+    throughput.record(
+        tokens_per_second * 100,
+        Duration::from_secs(100),
+        input_tokens,
+    );
 }
 
 #[test]
@@ -172,7 +189,7 @@ fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses
         "recovery resets the streak"
     );
     // Too small to say anything about the stream rate.
-    throughput.record(100, Duration::from_secs(60));
+    throughput.record(100, Duration::from_secs(60), SMALL_INHERITED_CONTEXT_TOKENS);
     assert_eq!(throughput.take_collapse(), None);
 
     record_response_rate(&mut throughput, 12);
@@ -181,9 +198,61 @@ fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses
         Some(StreamThroughputCollapse {
             observed_tokens_per_second: 12.0,
             baseline_tokens_per_second: 40.0,
+            inherited_input_tokens: SMALL_INHERITED_CONTEXT_TOKENS,
         })
     );
     assert_eq!(throughput.take_collapse(), None, "reported once");
+}
+
+#[test]
+fn websocket_throughput_collapse_declines_rotation_costlier_than_its_replay() {
+    // Rotation discards the inherited prefix, so a large context must resend it
+    // uncached. At a 40 -> 10 tok/s collapse the recovered output time cannot
+    // pay for replaying a 400k-token conversation, but it can pay for a small one.
+    let collapse_at = |inherited_input_tokens| {
+        let mut throughput = WebsocketStreamThroughput::default();
+        for _ in 0..5 {
+            record_response_rate_at_context(&mut throughput, 40, inherited_input_tokens);
+        }
+        record_response_rate_at_context(&mut throughput, 10, inherited_input_tokens);
+        record_response_rate_at_context(&mut throughput, 10, inherited_input_tokens);
+        throughput
+    };
+
+    let mut small = collapse_at(1_000);
+    assert!(
+        small.take_collapse().is_some(),
+        "a cheap replay should still escape a collapsed backend"
+    );
+
+    let mut large = collapse_at(400_000);
+    assert_eq!(
+        large.take_collapse(),
+        None,
+        "replaying a large prefix costs more than the slowdown it escapes"
+    );
+    // The declined collapse must not burn the streak or the cooldown: the
+    // connection is still bad, so a later cheaper opportunity may rotate.
+    assert!(large.collapsed_streak >= STREAM_THROUGHPUT_COLLAPSE_STREAK);
+    assert_eq!(large.responses_since_rotation, None);
+    record_response_rate_at_context(&mut large, 10, 1_000);
+    assert!(
+        large.take_collapse().is_some(),
+        "a later collapse at a small context can still rotate"
+    );
+}
+
+#[test]
+fn websocket_throughput_rotation_cost_ignores_an_unmeasured_context() {
+    // Without usable input accounting, keep the original escape behavior rather
+    // than pinning the turn to a backend that collapsed.
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..5 {
+        record_response_rate_at_context(&mut throughput, 40, 0);
+    }
+    record_response_rate_at_context(&mut throughput, 10, 0);
+    record_response_rate_at_context(&mut throughput, 10, 0);
+    assert!(throughput.take_collapse().is_some());
 }
 
 #[test]
@@ -240,8 +309,6 @@ fn throughput_collapse_replaces_websocket_history_and_sticky_turn_state() {
     assert_eq!(session.turn_state.get(), None);
     assert!(session.websocket_session.last_response.is_none());
 }
-
-
 
 #[tokio::test]
 async fn websocket_throughput_excludes_downstream_stalls_but_not_terminal_delivery() {
@@ -468,12 +535,18 @@ async fn model_http_transport_preserves_system_proxy_redirect_handoff() {
     let mut setup = client.current_client_setup().await.unwrap();
     setup.api_provider.base_url = server.uri();
     for _ in 0..2 {
-        let transport = client.build_api_transport(&setup.api_provider, "responses").await.unwrap();
+        let transport = client
+            .build_api_transport(&setup.api_provider, "responses")
+            .await
+            .unwrap();
         let request = codex_http_client::Request::new(
             http::Method::POST,
             setup.api_provider.url_for_path("responses"),
         );
-        let mut response = transport.stream(request).await.expect("follow the redirect");
+        let mut response = transport
+            .stream(request)
+            .await
+            .expect("follow the redirect");
         assert_eq!(response.status, http::StatusCode::OK);
         let mut body = Vec::new();
         while let Some(chunk) = response.bytes.next().await {
@@ -636,13 +709,19 @@ async fn websocket_fallback_timeout_server_error_and_upgrade_rejection_are_perma
         let client = websocket_test_model_client();
         let mut session = client.new_session();
         session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
-        assert!(session.try_switch_fallback_transport_after_error(&test_session_telemetry(), &error));
+        assert!(
+            session.try_switch_fallback_transport_after_error(&test_session_telemetry(), &error)
+        );
         tokio::time::advance(Duration::from_secs(60 * 60)).await;
         assert!(!client.responses_websocket_enabled());
     }
 
     let client = websocket_test_model_client();
-    assert!(client.new_session().try_switch_fallback_transport(&test_session_telemetry()));
+    assert!(
+        client
+            .new_session()
+            .try_switch_fallback_transport(&test_session_telemetry())
+    );
     tokio::time::advance(Duration::from_secs(60 * 60)).await;
     assert!(!client.responses_websocket_enabled());
 }
@@ -740,8 +819,16 @@ async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
         while let Some(event) = stream.next().await {
             event.unwrap();
         }
-        assert!(client.state.cached_websocket_transport.lock().unwrap()
-            .fallback.last_transient_failure.is_none());
+        assert!(
+            client
+                .state
+                .cached_websocket_transport
+                .lock()
+                .unwrap()
+                .fallback
+                .last_transient_failure
+                .is_none()
+        );
         assert_eq!(session.websocket_session.connection_reused(), turn == 1);
         drop(session);
         session = client.new_session();
@@ -751,8 +838,15 @@ async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
     assert_eq!(requests.len(), 2);
     for request in requests {
         let body = request.body_json();
-        assert!(body.get("previous_response_id").is_none_or(serde_json::Value::is_null));
-        assert!(body["input"].to_string().contains("history including HTTP work"));
+        assert!(
+            body.get("previous_response_id")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("history including HTTP work")
+        );
     }
     server.shutdown().await;
     // Another service restart after successful requests starts a new cooldown,
@@ -772,18 +866,37 @@ async fn websocket_fallback_only_current_completed_requests_clear_failures() {
         let telemetry = test_session_telemetry();
         client.activate_http_fallback(&telemetry, true);
         tokio::time::advance(Duration::from_secs(60)).await;
-        let epoch = client.state.cached_websocket_transport.lock().unwrap().epoch;
+        let epoch = client
+            .state
+            .cached_websocket_transport
+            .lock()
+            .unwrap()
+            .epoch;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let (mut stream, _) = super::map_response_stream(
-            codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
-            telemetry.clone(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
-            None, None,
+            codex_api::ResponseStream {
+                rx_event: receiver,
+                upstream_request_id: None,
+            },
+            telemetry.clone(),
+            InferenceTraceAttempt::disabled().into(),
+            test_model_provider(),
+            None,
+            None,
             (scenario != "http").then(|| (client.clone(), epoch)),
         );
         sender.send(Ok(ResponseEvent::Created)).await.unwrap();
         stream.next().await.unwrap().unwrap();
-        assert!(client.state.cached_websocket_transport.lock().unwrap()
-            .fallback.last_transient_failure.is_some());
+        assert!(
+            client
+                .state
+                .cached_websocket_transport
+                .lock()
+                .unwrap()
+                .fallback
+                .last_transient_failure
+                .is_some()
+        );
         if scenario == "stale" {
             // A newer recoverable failure outside the window must retain its cooldown.
             tokio::time::advance(Duration::from_secs(30 * 60)).await;
@@ -792,18 +905,29 @@ async fn websocket_fallback_only_current_completed_requests_clear_failures() {
             client.force_http_fallback(&telemetry);
         }
         if scenario == "error" {
-            sender.send(Err(ApiError::Stream("closed".into()))).await.unwrap();
+            sender
+                .send(Err(ApiError::Stream("closed".into())))
+                .await
+                .unwrap();
         } else if scenario != "partial" {
-            sender.send(Ok(ResponseEvent::Completed {
-                response_id: "done".into(), token_usage: None, end_turn: Some(true),
-            })).await.unwrap();
+            sender
+                .send(Ok(ResponseEvent::Completed {
+                    response_id: "done".into(),
+                    token_usage: None,
+                    end_turn: Some(true),
+                }))
+                .await
+                .unwrap();
         }
         drop(sender);
         let terminal = stream.next().await.unwrap();
         assert_eq!(terminal.is_ok(), !matches!(scenario, "partial" | "error"));
         assert!(stream.next().await.is_none());
         let cache = client.state.cached_websocket_transport.lock().unwrap();
-        assert_eq!(cache.fallback.last_transient_failure.is_none(), scenario == "completed");
+        assert_eq!(
+            cache.fallback.last_transient_failure.is_none(),
+            scenario == "completed"
+        );
         assert_eq!(cache.fallback.disabled, scenario == "disabled");
     }
 }
@@ -848,7 +972,10 @@ async fn turn_preconnect_for_spawned_agents_waits_for_attestation_readiness() {
             Box::pin(std::future::pending())
         }
 
-        fn header_for_request(&self, _context: AttestationContext) -> GenerateAttestationFuture<'_> {
+        fn header_for_request(
+            &self,
+            _context: AttestationContext,
+        ) -> GenerateAttestationFuture<'_> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { None })
         }
@@ -864,12 +991,14 @@ async fn turn_preconnect_for_spawned_agents_waits_for_attestation_readiness() {
         TestCodexResponsesRequestKind::Turn,
     );
     let mut session = client.new_session();
-    session.start_websocket_preconnect(
-        &test_model_info(),
-        None,
-        &test_session_telemetry(),
-        &metadata,
-    ).await;
+    session
+        .start_websocket_preconnect(
+            &test_model_info(),
+            None,
+            &test_session_telemetry(),
+            &metadata,
+        )
+        .await;
     assert!(session.pending_websocket_preconnect.is_some());
     drop(session);
 
@@ -881,12 +1010,14 @@ async fn turn_preconnect_for_spawned_agents_waits_for_attestation_readiness() {
     state.attestation_provider = Some(provider.clone());
     let mut session = client.new_session();
     let started = tokio::time::Instant::now();
-    session.start_websocket_preconnect(
-        &test_model_info(),
-        None,
-        &test_session_telemetry(),
-        &metadata,
-    ).await;
+    session
+        .start_websocket_preconnect(
+            &test_model_info(),
+            None,
+            &test_session_telemetry(),
+            &metadata,
+        )
+        .await;
     let transport = session
         .pending_websocket_preconnect
         .take()
@@ -911,12 +1042,14 @@ async fn turn_preconnect_skips_http_fallback_and_non_websocket_clients() {
             TestCodexResponsesRequestKind::Turn,
         );
         let mut session = client.new_session();
-        session.start_websocket_preconnect(
-            &test_model_info(),
-            None,
-            &test_session_telemetry(),
-            &metadata,
-        ).await;
+        session
+            .start_websocket_preconnect(
+                &test_model_info(),
+                None,
+                &test_session_telemetry(),
+                &metadata,
+            )
+            .await;
         assert!(session.pending_websocket_preconnect.is_none());
     }
 }
@@ -931,7 +1064,10 @@ async fn turn_preconnect_is_single_flight_and_aborted_on_drop() {
             false
         }
 
-        fn header_for_request(&self, _context: AttestationContext) -> GenerateAttestationFuture<'_> {
+        fn header_for_request(
+            &self,
+            _context: AttestationContext,
+        ) -> GenerateAttestationFuture<'_> {
             Box::pin(async { None })
         }
     }
@@ -949,25 +1085,34 @@ async fn turn_preconnect_is_single_flight_and_aborted_on_drop() {
         TestCodexResponsesRequestKind::Turn,
     );
     let mut session = client.new_session();
-    session.start_websocket_preconnect(
-        &test_model_info(),
-        None,
-        &test_session_telemetry(),
-        &metadata,
-    ).await;
+    session
+        .start_websocket_preconnect(
+            &test_model_info(),
+            None,
+            &test_session_telemetry(),
+            &metadata,
+        )
+        .await;
     let abort = session
         .pending_websocket_preconnect
         .as_ref()
         .unwrap()
         .abort_handle();
-    session.start_websocket_preconnect(
-        &test_model_info(),
-        None,
-        &test_session_telemetry(),
-        &metadata,
-    ).await;
+    session
+        .start_websocket_preconnect(
+            &test_model_info(),
+            None,
+            &test_session_telemetry(),
+            &metadata,
+        )
+        .await;
     assert_eq!(
-        session.pending_websocket_preconnect.as_ref().unwrap().abort_handle().id(),
+        session
+            .pending_websocket_preconnect
+            .as_ref()
+            .unwrap()
+            .abort_handle()
+            .id(),
         abort.id()
     );
     // No yield before drop: the background task must be cancelled before it can connect.
@@ -1004,45 +1149,79 @@ async fn turn_preconnect_replaces_unusable_cached_socket(expiring: bool) {
             accept_delay: Some(Duration::from_millis(50)),
             close_after_requests: true,
         },
-    ]).await;
+    ])
+    .await;
     let mut client = websocket_test_model_client();
-    let mut provider = create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
     provider.supports_websockets = true;
     Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(provider, None);
     let metadata = test_responses_metadata_for_client(
-        &client, None, "window".into(), None, TestCodexResponsesRequestKind::Turn,
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
     );
     let telemetry = test_session_telemetry();
     let model = test_model_info();
     let mut session = client.new_session();
-    let mut stream = session.stream(
-        &Prompt::default(), &model, &telemetry, None,
-        codex_protocol::config_types::ReasoningSummary::None, None,
-        &metadata, &InferenceTraceContext::disabled(),
-    ).await.unwrap();
+    let mut stream = session
+        .stream(
+            &Prompt::default(),
+            &model,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .unwrap();
     while let Some(event) = stream.next().await {
         event.unwrap();
     }
     if expiring {
-        session.websocket_session.connected_at = Some(std::time::Instant::now() - super::WEBSOCKET_ROTATION_AGE);
+        session.websocket_session.connected_at =
+            Some(std::time::Instant::now() - super::WEBSOCKET_ROTATION_AGE);
     } else {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !session.websocket_session.connection.as_ref().unwrap().is_closed().await {
+            while !session
+                .websocket_session
+                .connection
+                .as_ref()
+                .unwrap()
+                .is_closed()
+                .await
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
     drop(session);
     let mut next_turn = client.new_session();
     assert!(next_turn.websocket_session.connection.is_some());
-    next_turn.start_websocket_preconnect(&model, None, &telemetry, &metadata).await;
+    next_turn
+        .start_websocket_preconnect(&model, None, &telemetry, &metadata)
+        .await;
     assert!(server.wait_for_handshakes(2, Duration::from_secs(5)).await);
     assert!(server.connections().iter().skip(1).all(Vec::is_empty));
-    let mut stream = next_turn.stream(
-        &Prompt::default(), &model, &telemetry, None,
-        codex_protocol::config_types::ReasoningSummary::None, None,
-        &metadata, &InferenceTraceContext::disabled(),
-    ).await.unwrap();
+    let mut stream = next_turn
+        .stream(
+            &Prompt::default(),
+            &model,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .unwrap();
     while let Some(event) = stream.next().await {
         event.unwrap();
     }
@@ -1341,8 +1520,14 @@ fn model_request_measurements_count_serialized_tools_independently() {
     );
     assert_eq!(measured.tool_schema_breakdown.len(), 1);
     assert_eq!(measured.tool_schema_breakdown[0].name, "lookup");
-    assert_eq!(measured.tool_schema_breakdown[0].serialized_bytes, serialized_tool.len() as u64);
-    assert_eq!(measured.tool_schema_breakdown[0].approx_tokens, approx_token_count(&serialized_tool) as u64);
+    assert_eq!(
+        measured.tool_schema_breakdown[0].serialized_bytes,
+        serialized_tool.len() as u64
+    );
+    assert_eq!(
+        measured.tool_schema_breakdown[0].approx_tokens,
+        approx_token_count(&serialized_tool) as u64
+    );
     assert!(measured.producer_selected_context_tokens() <= categories.logical_total);
     assert!(measured.density_bps(measured.producer_selected_context_tokens()) <= 10_000);
 }
@@ -1519,7 +1704,8 @@ fn model_request_measurements_reuse_authoritative_encoded_request_length() {
             .expect("serialize request")
             .len(),
     )
-    .unwrap() + 47; // Distinguish trusting the supplied length from recomputing it.
+    .unwrap()
+        + 47; // Distinguish trusting the supplied length from recomputing it.
     let measured = ModelRequestMeasurements::for_responses_request_cancellable(
         &request,
         &history_test_provenance(&request),
@@ -1710,10 +1896,17 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
         timing.mark_turn_started();
         drop(timing.begin_model_request_wait());
         timing.record_model_attempt_identity("sections", "attempt");
-        let expected_sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&encoded)
-            .unwrap().into_iter().map(|(key, value)| {
-                (key, format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())))
-            }).collect::<BTreeMap<_, _>>();
+        let expected_sections =
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&encoded)
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
         let prompt = Prompt {
             input: original.into(),
             prompt_provenance: provenance,
@@ -1732,10 +1925,13 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
             tokio_util::sync::CancellationToken::new(),
             Some(encoded.len() as u64),
             use_encoded_bytes.then(|| encoded.into()),
-            Some((Arc::clone(&timing), super::ResponseAttemptIdentity {
-                sampling_request_id: "sections".into(),
-                physical_attempt_id: "attempt".into(),
-            })),
+            Some((
+                Arc::clone(&timing),
+                super::ResponseAttemptIdentity {
+                    sampling_request_id: "sections".into(),
+                    physical_attempt_id: "attempt".into(),
+                },
+            )),
         )
         .await
         .unwrap();
@@ -1759,7 +1955,10 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
         if use_encoded_bytes {
             assert_eq!(sections.get("attempt"), Some(&expected_sections));
         } else {
-            assert!(sections.is_empty(), "never fingerprint an undispatched logical body");
+            assert!(
+                sections.is_empty(),
+                "never fingerprint an undispatched logical body"
+            );
         }
     }
 }
@@ -2004,6 +2203,72 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     );
 }
 
+/// A category that reaches the model as an input item behind the conversation
+/// cannot invalidate the provider's cached prefix, so it must not be named as
+/// the cause of a break. Only the ordered sections ahead of every input item,
+/// the leading fixed input run, and dispatched settings may be reported.
+#[test]
+fn injected_context_behind_history_is_not_blamed_for_a_prefix_break() {
+    let stable_digests = crate::client_common::PromptDigests {
+        instructions: Some([1; 32]),
+        tools: Some([2; 32]),
+        history: Some([3; 32]),
+    };
+    let first_request = history_test_request(vec![
+        history_test_tool_output("call-1", "first result"),
+        history_test_item("task", Some("turn-1")),
+    ]);
+    let mut first = ModelRequestMeasurements::for_responses_request(
+        &first_request,
+        &history_test_provenance(&first_request),
+        &first_request.instructions,
+    )
+    .expect("measure first request");
+    let mut baseline = None;
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
+
+    // Break reuse with a dispatched setting, then mark an injected category as
+    // changed. Only the real cause may appear.
+    let second_request = history_test_request(vec![
+        history_test_tool_output("call-1", "first result"),
+        history_test_item("task", Some("turn-1")),
+        history_test_tool_output("call-2", "second result"),
+    ]);
+    let mut second = ModelRequestMeasurements::for_responses_request(
+        &second_request,
+        &history_test_provenance(&second_request),
+        &second_request.instructions,
+    )
+    .expect("measure second request");
+    second.compare_and_remember_prompt_context(
+        &mut baseline,
+        // A different cache key breaks reuse without touching any category.
+        Some("other-cache-key"),
+        stable_digests,
+    );
+    assert!(!second.fixed_prefix_reuse_eligible);
+
+    // Simulate injected context that changed but sits behind the history.
+    second
+        .prompt_context_categories
+        .push(crate::context::PromptContextMeasurement {
+            category: PromptContextCategory::OtherInjected.as_str(),
+            serialized_bytes: 20_000,
+            estimated_tokens: 5_000,
+            sha256: String::new(),
+            unchanged_from_previous_request: false,
+            hash: [9; 32],
+        });
+
+    let changed = second
+        .request_token_categories()
+        .fixed_prefix_changed_categories;
+    assert!(
+        !changed.iter().any(|category| category == "other_injected"),
+        "injected context behind history must not be blamed: {changed:?}"
+    );
+}
+
 #[test]
 fn history_growth_alone_keeps_fixed_prefix_reuse_eligible() {
     let stable_digests = crate::client_common::PromptDigests {
@@ -2160,7 +2425,9 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
     );
     let wire_requests = server.received_requests().await.expect("captured requests");
     let wire_body: serde_json::Value = serde_json::from_slice(&wire_requests[0].body)?;
-    let cache_key = wire_body["prompt_cache_key"].as_str().expect("wire cache key");
+    let cache_key = wire_body["prompt_cache_key"]
+        .as_str()
+        .expect("wire cache key");
     let fingerprint = format!("{:x}", sha2::Sha256::digest(cache_key.as_bytes()));
     for request in &protocol.model_requests {
         assert_eq!(
@@ -2416,7 +2683,8 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await??;
+    })
+    .await??;
     let mut captures = Vec::new();
     for entry in std::fs::read_dir(trace_dir.path().join("payloads"))? {
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
@@ -2439,10 +2707,7 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
                 .iter()
                 .any(|id| capture["_codex"]["physical_attempt_id"] == *id)
         );
-        assert_eq!(
-            capture["_codex"]["settings"]["parallel_tool_calls"],
-            false
-        );
+        assert_eq!(capture["_codex"]["settings"]["parallel_tool_calls"], false);
         let mut provider_capture = capture.clone();
         provider_capture.as_object_mut().unwrap().remove("_codex");
         let wire: serde_json::Value = serde_json::from_slice(&wire.body)?;
@@ -2562,10 +2827,11 @@ fn websocket_prefix_hash_scratch_preserves_exact_chain_and_chunk_boundaries() {
         prefix.extend_items(&items[boundary..]).unwrap();
         assert_eq!(prefix, reference);
     }
-    assert_eq!(CanonicalPrefixHash::from_items(&[]).unwrap(), CanonicalPrefixHash::empty());
+    assert_eq!(
+        CanonicalPrefixHash::from_items(&[]).unwrap(),
+        CanonicalPrefixHash::empty()
+    );
 }
-
-
 
 /// A named property and the mutation that changes it on a request under test.
 type LabeledRequestMutation = (&'static str, fn(&mut ResponsesApiRequest));
@@ -2812,22 +3078,40 @@ async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacemen
         vec![ev_response_created("second"), ev_completed("second")],
         vec![ev_response_created("third"), ev_completed("third")],
         vec![ev_response_created("fourth"), ev_completed("fourth")],
-    ]]).await;
-    let mut provider = create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    ]])
+    .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
     provider.supports_websockets = true;
     let client = ModelClient::new(
-        None, AgentIdentityAuthPolicy::JwtOnly, ThreadId::new(), provider, SessionSource::Cli,
-        "test_originator".into(), None, false, false, None, false, None,
+        None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".into(),
+        None,
+        false,
+        false,
+        None,
+        false,
+        None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
-    let metadata = test_responses_metadata_for_client(&client, None,
-        format!("{}:0", client.state.thread_id), None, TestCodexResponsesRequestKind::Turn);
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        format!("{}:0", client.state.thread_id),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
     let mut session = client.new_session();
     let model = test_model_info();
     let telemetry = test_session_telemetry();
     let mut prompt = Prompt {
         input: vec![history_test_item("first", None)].into(),
-        stable_context_manifest: StableContextManifest::default().with_base_model("gpt-test", "first"),
+        stable_context_manifest: StableContextManifest::default()
+            .with_base_model("gpt-test", "first"),
         ..Default::default()
     };
     for step in 0..4 {
@@ -2836,34 +3120,57 @@ async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacemen
                 let mut input = prompt.input.to_vec();
                 input.push(history_test_item("appended", None));
                 prompt.input = input.into();
-                prompt.stable_context_manifest = StableContextManifest::default().with_base_model("gpt-test", "appended");
+                prompt.stable_context_manifest =
+                    StableContextManifest::default().with_base_model("gpt-test", "appended");
             }
             2 => Arc::make_mut(&mut prompt.input)[0] = history_test_item("replacement", None),
             3 => prompt.base_instructions.text = "changed request property".into(),
             _ => {}
         }
-        let result = session.stream_responses_websocket(
-            &prompt, &model, &telemetry, "fixture", ModelAttemptRequestKind::Initial,
-            None, codex_protocol::config_types::ReasoningSummary::None, None, &metadata,
-            false, None, &InferenceTraceContext::disabled(), None,
-        ).await.unwrap();
-        let super::WebsocketStreamOutcome::Stream(mut stream) = result else { panic!("unexpected fallback") };
-        while let Some(event) = stream.next().await { event.unwrap(); }
+        let result = session
+            .stream_responses_websocket(
+                &prompt,
+                &model,
+                &telemetry,
+                "fixture",
+                ModelAttemptRequestKind::Initial,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+                false,
+                None,
+                &InferenceTraceContext::disabled(),
+                None,
+            )
+            .await
+            .unwrap();
+        let super::WebsocketStreamOutcome::Stream(mut stream) = result else {
+            panic!("unexpected fallback")
+        };
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
     }
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 4, "exactly one provider request per logical request");
+    assert_eq!(
+        requests.len(),
+        4,
+        "exactly one provider request per logical request"
+    );
     let appended = requests[1].body_json();
     assert_eq!(appended["previous_response_id"], "first");
     assert_eq!(appended["input"].as_array().unwrap().len(), 1);
     assert!(appended["input"][0].to_string().contains("appended"));
     for request in &requests[2..] {
         let body = request.body_json();
-        assert!(body.get("previous_response_id").is_none_or(serde_json::Value::is_null));
+        assert!(
+            body.get("previous_response_id")
+                .is_none_or(serde_json::Value::is_null)
+        );
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
     }
 }
-
-
 
 #[test]
 fn websocket_exact_stable_prefix_inherits_existing_response_id() {
@@ -3585,8 +3892,12 @@ fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identi
     assert!(Arc::ptr_eq(&raw.tools, &digested.tools));
     assert_eq!(raw.text, digested.text);
     let lite_client = test_model_client(SessionSource::Cli);
-    let fresh_lite = lite_client.request_schema_components(&raw_prompt, None, true).unwrap();
-    let cached_lite = client.request_schema_components(&digested_prompt, None, true).unwrap();
+    let fresh_lite = lite_client
+        .request_schema_components(&raw_prompt, None, true)
+        .unwrap();
+    let cached_lite = client
+        .request_schema_components(&digested_prompt, None, true)
+        .unwrap();
     assert_eq!(raw.tools, fresh_lite.tools);
     assert_eq!(raw.text, fresh_lite.text);
     assert!(Arc::ptr_eq(&raw.tools, &cached_lite.tools));
@@ -3598,8 +3909,6 @@ fn request_schema_cache_reuses_equivalent_raw_and_precomputed_tool_schema_identi
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(cache.diagnostics(), (2, 1, 1));
 }
-
-
 
 #[tokio::test]
 async fn non_openai_metadata_cleanup_keeps_unmodified_history_shared() {
@@ -3977,8 +4286,6 @@ impl futures::Stream for NotifyAfterEventStream {
     }
 }
 
-
-
 #[test]
 fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
     let parent_thread_id = ThreadId::new();
@@ -4044,11 +4351,17 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
         "memory_consolidation".into(),
     )));
     let metadata = test_responses_metadata_for_client(
-        &other, None, "window".into(), None, TestCodexResponsesRequestKind::Turn,
+        &other,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
     );
     assert_eq!(
-        other.build_ws_client_metadata(&metadata, false)
-            .get(X_OPENAI_SUBAGENT_HEADER).map(String::as_str),
+        other
+            .build_ws_client_metadata(&metadata, false)
+            .get(X_OPENAI_SUBAGENT_HEADER)
+            .map(String::as_str),
         Some("memory_consolidation"),
     );
 }
@@ -4470,6 +4783,65 @@ async fn response_stream_records_last_model_feedback_ids() {
     );
 }
 
+#[test]
+fn missing_bearer_reported_as_400_still_reaches_the_token_refresh() {
+    fn http(status: http::StatusCode, body: &str, auth_header: bool) -> TransportError {
+        let headers = auth_header.then(|| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "x-openai-authorization-error",
+                http::HeaderValue::from_static("missing_authorization_header"),
+            );
+            headers
+        });
+        TransportError::Http {
+            retry_after: None,
+            status,
+            url: None,
+            headers,
+            body: Some(body.to_string()),
+        }
+    }
+
+    // 401 keeps working exactly as before.
+    assert!(super::is_recoverable_authentication_failure(&http(
+        http::StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        /*auth_header*/ false,
+    )));
+
+    // The backend also spells a missing/expired bearer as HTTP 400. Both the
+    // header signal and the body sentence must route into the refresh path;
+    // previously this became a non-retryable InvalidRequest and killed the turn.
+    assert!(super::is_recoverable_authentication_failure(&http(
+        http::StatusCode::BAD_REQUEST,
+        "Missing bearer or basic authentication in header",
+        /*auth_header*/ false,
+    )));
+    assert!(super::is_recoverable_authentication_failure(&http(
+        http::StatusCode::BAD_REQUEST,
+        "some other wording",
+        /*auth_header*/ true,
+    )));
+
+    // An ordinary malformed 400 must still fail fast rather than burn a refresh.
+    assert!(!super::is_recoverable_authentication_failure(&http(
+        http::StatusCode::BAD_REQUEST,
+        "The image data you provided does not represent a valid image",
+        /*auth_header*/ false,
+    )));
+    // Other statuses are untouched.
+    assert!(!super::is_recoverable_authentication_failure(&http(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        "Missing bearer or basic authentication in header",
+        /*auth_header*/ false,
+    )));
+    // A non-HTTP transport error carries no status to classify.
+    assert!(!super::is_recoverable_authentication_failure(
+        &TransportError::Network("socket closed".to_string())
+    ));
+}
+
 #[tokio::test]
 async fn bedrock_unauthorized_error_uses_provider_mapping() {
     let provider = create_model_provider(
@@ -4686,8 +5058,6 @@ async fn response_header_builders_generate_attestation_only_for_supported_endpoi
     }
 }
 
-
-
 #[tokio::test]
 async fn audit_reports_17_19_stream_has_exactly_one_terminal_outcome() {
     for scenario in [
@@ -4838,7 +5208,11 @@ async fn cache_diagnostics_survive_provider_resets() {
             assert!(session.websocket_session.last_request.is_none());
             assert!(session.websocket_session.last_response.is_none());
             assert_eq!(
-                session.latest_measurement_attempt.lock().unwrap().as_deref(),
+                session
+                    .latest_measurement_attempt
+                    .lock()
+                    .unwrap()
+                    .as_deref(),
                 Some("previous")
             );
             if pending {
@@ -4892,7 +5266,8 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
         (true, true, "stable_context_tool_history_fallback"),
     ] {
         for cancelled in [false, true] {
-            let request = history_test_request(vec![history_test_item("private prompt text", None)]);
+            let request =
+                history_test_request(vec![history_test_item("private prompt text", None)]);
             let cancellation = tokio_util::sync::CancellationToken::new();
             if cancelled {
                 cancellation.cancel();
@@ -4913,7 +5288,11 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
             .unwrap();
             let events = CacheEvents(Arc::default());
             let _subscriber = tracing_subscriber::registry()
-                .with(events.clone().with_filter(codex_state::log_db::default_filter()))
+                .with(
+                    events
+                        .clone()
+                        .with_filter(codex_state::log_db::default_filter()),
+                )
                 .set_default();
             let telemetry = test_session_telemetry();
             assert!(!telemetry.model_attempt_logging_enabled());
@@ -4931,17 +5310,43 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
                 None,
             );
             for _ in 0..2 {
-                attempt.finish(codex_otel::ModelAttemptOutcome::Success, Some(100), Some(90), &[]);
+                attempt.finish(
+                    codex_otel::ModelAttemptOutcome::Success,
+                    Some(100),
+                    Some(90),
+                    &[],
+                );
             }
             drop(attempt);
             let events = events.0.lock().unwrap();
             assert_eq!(events.len(), 1);
             let event = &events[0];
-            assert_eq!(event.get("input_representation").map(String::as_str), Some(label));
+            assert_eq!(
+                event.get("input_representation").map(String::as_str),
+                Some(label)
+            );
             assert_eq!(event["diagnostics_available"], (!cancelled).to_string());
             assert_eq!(event["sampling_request_id"], "sampling");
             assert_eq!(event["uncached_input_tokens"], "10");
             assert!(!format!("{event:?}").contains("private prompt text"));
+
+            // The per-category breakdown must reach the local event without
+            // OTEL, so a cache investigation can attribute a moved prefix to a
+            // category. It carries counts and hashes only.
+            let categories: Vec<serde_json::Value> =
+                serde_json::from_str(&event["prompt_context_categories"])
+                    .expect("categories are serialized as JSON");
+            assert_eq!(categories.is_empty(), cancelled, "{label}");
+            for category in &categories {
+                assert!(category["bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+                assert_eq!(category["sha256"].as_str().map(str::len), Some(64));
+                // No predecessor was dispatched, so churn is unresolved rather
+                // than reported as every category having changed.
+                assert!(category["changed"].is_null(), "{category}");
+            }
+            assert!(event.contains_key("fixed_prefix_reuse_eligible"));
+            assert!(event.contains_key("fixed_prefix_item_count"));
+            assert!(!format!("{categories:?}").contains("private prompt text"));
         }
     }
 }
@@ -5114,7 +5519,11 @@ fn appended_developer_context_keeps_an_intact_fixed_prefix_reusable() {
     assert!(second.fixed_prefix_reuse_eligible);
 
     // Editing the leading fixed item still breaks reuse.
-    let mut third = measure(vec![history_test_item("edited instructions", None), task, notice]);
+    let mut third = measure(vec![
+        history_test_item("edited instructions", None),
+        task,
+        notice,
+    ]);
     third.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
     assert!(!third.fixed_prefix_reuse_eligible);
 }
@@ -5281,10 +5690,12 @@ fn websocket_response_cache_shares_output_and_replaces_only_on_completion() {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     session.websocket_session.last_response_rx = Some(receiver);
     assert!(session.get_last_response().is_none());
-    sender.send(LastResponse {
-        response_id: "first".into(),
-        items_added: vec![history_test_item("retained output", None)],
-    }).unwrap();
+    sender
+        .send(LastResponse {
+            response_id: "first".into(),
+            items_added: vec![history_test_item("retained output", None)],
+        })
+        .unwrap();
     let first = session.get_last_response().unwrap();
     assert!(Arc::ptr_eq(&first, &session.get_last_response().unwrap()));
 
@@ -5297,14 +5708,22 @@ fn websocket_response_cache_shares_output_and_replaces_only_on_completion() {
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
     session.websocket_session.last_response_rx = Some(receiver);
-    sender.send(LastResponse { response_id: "second".into(), items_added: Vec::new() }).unwrap();
+    sender
+        .send(LastResponse {
+            response_id: "second".into(),
+            items_added: Vec::new(),
+        })
+        .unwrap();
     let second = session.get_last_response().unwrap();
     assert!(!Arc::ptr_eq(&first, &second));
     assert_eq!(first.response_id, "first");
     assert_eq!(second.response_id, "second");
     session.invalidate_incremental_history("test reset");
     assert!(session.get_last_response().is_none());
-    assert_eq!(first.items_added, vec![history_test_item("retained output", None)]);
+    assert_eq!(
+        first.items_added,
+        vec![history_test_item("retained output", None)]
+    );
 }
 
 #[test]
@@ -5323,26 +5742,36 @@ fn websocket_history_lookup_preserves_global_substitution_indices() {
     };
     for previous in [None, Some(request)] {
         session.websocket_session.last_request = previous;
-        let flat = session.websocket_session.last_request.as_ref().into_iter()
-            .flat_map(|request| request.input.iter()).chain(&response.items_added)
-            .cloned().collect::<Vec<_>>();
+        let flat = session
+            .websocket_session
+            .last_request
+            .as_ref()
+            .into_iter()
+            .flat_map(|request| request.input.iter())
+            .chain(&response.items_added)
+            .cloned()
+            .collect::<Vec<_>>();
         for index in (0..=flat.len()).chain([usize::MAX]) {
             for (call_id, hash) in [("call", "bounded"), ("wrong", "bounded"), ("call", "wrong")] {
                 let substitution = ToolHistorySubstitution {
-                    item_index: index, call_id: call_id.into(),
+                    item_index: index,
+                    call_id: call_id.into(),
                     bounded_output_sha256: crate::tool_history::sha256(hash.as_bytes()),
-                    receipt_id: "receipt".into(), substituted_output_sha256: String::new(),
+                    receipt_id: "receipt".into(),
+                    substituted_output_sha256: String::new(),
                 };
                 assert_eq!(
-                    session.substitutions_overlap_provider_history(std::slice::from_ref(&substitution), &response),
-                    crate::tool_history::substitutions_overlap_items(&[substitution], |i| flat.get(i)),
+                    session.substitutions_overlap_provider_history(
+                        std::slice::from_ref(&substitution),
+                        &response
+                    ),
+                    crate::tool_history::substitutions_overlap_items(&[substitution], |i| flat
+                        .get(i)),
                 );
             }
         }
     }
 }
-
-
 
 #[tokio::test]
 async fn inference_stream_preserves_delta_and_large_item_contents_with_or_without_history() {
@@ -5479,28 +5908,66 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
     clock.mark_dispatch_ready();
     clock.mark_stream_established();
     let attempt = ModelAttemptGuard::new(
-        test_session_telemetry(), new_attempt_identity("milestones"), 0,
-        ModelAttemptRetryReason::None, ModelAttemptRequestKind::Initial,
-        ModelAttemptTransport::ResponsesHttp, None,
-        ModelRequestMeasurements::default(), clock.clone(), None, None,
+        test_session_telemetry(),
+        new_attempt_identity("milestones"),
+        0,
+        ModelAttemptRetryReason::None,
+        ModelAttemptRequestKind::Initial,
+        ModelAttemptTransport::ResponsesHttp,
+        None,
+        ModelRequestMeasurements::default(),
+        clock.clone(),
+        None,
+        None,
     );
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let (mut stream, history) = super::map_response_stream(
-        codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
-        test_session_telemetry(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
-        Some(attempt.into()), None, None,
+        codex_api::ResponseStream {
+            rx_event: receiver,
+            upstream_request_id: None,
+        },
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled().into(),
+        test_model_provider(),
+        Some(attempt.into()),
+        None,
+        None,
     );
     // The HTTP path drops history immediately; this must not affect delivery.
     drop(history);
     sender.send(Ok(ResponseEvent::Created)).await.unwrap();
-    assert!(matches!(stream.next().await, Some(Ok(ResponseEvent::Created))));
-    assert!(clock.offsets.lock().unwrap().first_model_output_us.is_none());
-    sender.send(Ok(ResponseEvent::OutputTextDelta(String::new()))).await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::Created))
+    ));
+    assert!(
+        clock
+            .offsets
+            .lock()
+            .unwrap()
+            .first_model_output_us
+            .is_none()
+    );
+    sender
+        .send(Ok(ResponseEvent::OutputTextDelta(String::new())))
+        .await
+        .unwrap();
     stream.next().await.unwrap().unwrap();
-    assert!(clock.offsets.lock().unwrap().first_model_output_us.is_none());
-    sender.send(Ok(ResponseEvent::ReasoningContentDelta {
-        delta: "reasoning".into(), content_index: 0,
-    })).await.unwrap();
+    assert!(
+        clock
+            .offsets
+            .lock()
+            .unwrap()
+            .first_model_output_us
+            .is_none()
+    );
+    sender
+        .send(Ok(ResponseEvent::ReasoningContentDelta {
+            delta: "reasoning".into(),
+            content_index: 0,
+        }))
+        .await
+        .unwrap();
     stream.next().await.unwrap().unwrap();
     // The timestamp is recorded after forwarding, so let the mapper finish
     // that send before inspecting it on this single-threaded runtime.
@@ -5510,22 +5977,52 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
         assert!(offsets.first_model_output_us.is_some());
         assert!(offsets.first_visible_output_us.is_some());
         assert!(offsets.first_actionable_output_us.is_none());
-        (offsets.first_provider_event_us, offsets.first_model_output_us, offsets.first_visible_output_us)
+        (
+            offsets.first_provider_event_us,
+            offsets.first_model_output_us,
+            offsets.first_visible_output_us,
+        )
     };
-    sender.send(Ok(ResponseEvent::OutputTextDelta("answer".into()))).await.unwrap();
+    sender
+        .send(Ok(ResponseEvent::OutputTextDelta("answer".into())))
+        .await
+        .unwrap();
     stream.next().await.unwrap().unwrap();
-    let actionable = clock.offsets.lock().unwrap().first_actionable_output_us.unwrap();
+    let actionable = clock
+        .offsets
+        .lock()
+        .unwrap()
+        .first_actionable_output_us
+        .unwrap();
     for _ in 0..3 {
-        sender.send(Ok(ResponseEvent::OutputTextDelta("more".into()))).await.unwrap();
+        sender
+            .send(Ok(ResponseEvent::OutputTextDelta("more".into())))
+            .await
+            .unwrap();
         stream.next().await.unwrap().unwrap();
     }
-    sender.send(Ok(ResponseEvent::Completed {
-        response_id: "complete".into(), token_usage: None, end_turn: Some(true),
-    })).await.unwrap();
-    assert!(matches!(stream.next().await, Some(Ok(ResponseEvent::Completed { .. }))));
+    sender
+        .send(Ok(ResponseEvent::Completed {
+            response_id: "complete".into(),
+            token_usage: None,
+            end_turn: Some(true),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::Completed { .. }))
+    ));
     assert!(stream.next().await.is_none());
     let offsets = clock.offsets.lock().unwrap();
-    assert_eq!((offsets.first_provider_event_us, offsets.first_model_output_us, offsets.first_visible_output_us), initial);
+    assert_eq!(
+        (
+            offsets.first_provider_event_us,
+            offsets.first_model_output_us,
+            offsets.first_visible_output_us
+        ),
+        initial
+    );
     assert_eq!(offsets.first_actionable_output_us, Some(actionable));
     assert!(offsets.completed_us.unwrap() >= actionable);
 }
@@ -5540,18 +6037,35 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
     clock.mark_dispatch_ready();
     clock.mark_stream_established();
     let attempt = ModelAttemptGuard::new(
-        test_session_telemetry(), new_attempt_identity("timing-lock"), 0,
-        ModelAttemptRetryReason::None, ModelAttemptRequestKind::Initial,
-        ModelAttemptTransport::ResponsesHttp, None,
-        ModelRequestMeasurements::default(), clock.clone(), None, None,
+        test_session_telemetry(),
+        new_attempt_identity("timing-lock"),
+        0,
+        ModelAttemptRetryReason::None,
+        ModelAttemptRequestKind::Initial,
+        ModelAttemptTransport::ResponsesHttp,
+        None,
+        ModelRequestMeasurements::default(),
+        clock.clone(),
+        None,
+        None,
     );
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let (mut stream, _) = super::map_response_stream(
-        codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
-        test_session_telemetry(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
-        Some(attempt.into()), None, None,
+        codex_api::ResponseStream {
+            rx_event: receiver,
+            upstream_request_id: None,
+        },
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled().into(),
+        test_model_provider(),
+        Some(attempt.into()),
+        None,
+        None,
     );
-    sender.send(Ok(ResponseEvent::OutputTextDelta("first".into()))).await.unwrap();
+    sender
+        .send(Ok(ResponseEvent::OutputTextDelta("first".into())))
+        .await
+        .unwrap();
     stream.next().await.unwrap().unwrap();
     // Receiving a following event proves the previous post-send visible marker
     // has executed, without relying on sleeps or cross-thread scheduler order.
@@ -5559,15 +6073,28 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
     stream.next().await.unwrap().unwrap();
     let offsets = clock.offsets.lock().unwrap();
     assert!(offsets.first_visible_output_us.is_some());
-    sender.send(Ok(ResponseEvent::OutputTextDelta("next".into()))).await.unwrap();
+    sender
+        .send(Ok(ResponseEvent::OutputTextDelta("next".into())))
+        .await
+        .unwrap();
     let repeated = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
     // Release even on failure so the old blocking implementation cannot strand
     // a runtime worker during test teardown.
     drop(offsets);
-    assert!(matches!(repeated, Ok(Some(Ok(ResponseEvent::OutputTextDelta(text)))) if text == "next"));
-    sender.send(Ok(ResponseEvent::Completed {
-        response_id: "complete".into(), token_usage: None, end_turn: Some(true),
-    })).await.unwrap();
-    assert!(matches!(stream.next().await, Some(Ok(ResponseEvent::Completed { .. }))));
+    assert!(
+        matches!(repeated, Ok(Some(Ok(ResponseEvent::OutputTextDelta(text)))) if text == "next")
+    );
+    sender
+        .send(Ok(ResponseEvent::Completed {
+            response_id: "complete".into(),
+            token_usage: None,
+            end_turn: Some(true),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::Completed { .. }))
+    ));
     assert!(stream.next().await.is_none());
 }

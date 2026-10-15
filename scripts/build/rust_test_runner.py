@@ -1658,7 +1658,9 @@ class RustTestRunner:
                     if required_ids is None:
                         required_ids = sorted(selected)
                 except RunnerError:
-                    self._report_failed_tests(name, [], [], None)
+                    # Discovery compiles the test binary; a failure here means
+                    # nothing was selected or executed.
+                    self._report_failed_tests(name, [], [], None, executed=False)
                     raise
             required = []
             for test in selected:
@@ -1676,7 +1678,8 @@ class RustTestRunner:
         try:
             env = self._helper_environment([target], helpers, self._build_helpers(helpers))
         except RunnerError:
-            self._report_failed_tests(name, [], [], selected)
+            # Helper build failed: the selected tests never started.
+            self._report_failed_tests(name, [], [], selected, executed=False)
             raise
         # Discovery already compiled this invocation's test binary. Inserting a
         # helper build can change Cargo's feature fingerprints and otherwise
@@ -1694,6 +1697,8 @@ class RustTestRunner:
             result = self._checked(command, env=env, capture=self._test_run_capture())
         except RunnerError as error:
             if error.result is None:
+                # A timeout or interruption can lose the result after tests
+                # started. No result is not proof that nothing executed.
                 self._report_failed_tests(name, [], [], selected)
                 raise
             failure = error
@@ -1744,8 +1749,47 @@ class RustTestRunner:
         self, name: str, passed: Sequence[str], failed: Sequence[str],
         selected: Sequence[str] | None,
         *, selected_count: int | None = None,
+        executed: bool | None = None,
     ) -> None:
-        """Keep the failure inventory outside the bounded diagnostic excerpt."""
+        """Keep the failure inventory outside the bounded diagnostic excerpt.
+
+        `executed=False` requires a known pre-test failure (discovery or helper
+        setup). A test-phase launch with no confirmed outcomes has unknown
+        execution coverage: compilation, interruption, or lost receipts cannot
+        establish that selected tests never started.
+        """
+        if executed is False:
+            print(
+                f"Test results {name}: not executed - the run failed before any "
+                "test started; no test outcome was produced. Validation for this "
+                "target is PENDING, not passed. See the phase diagnostics above "
+                "for the failing stage.",
+                file=sys.stderr,
+            )
+            if selected is not None:
+                print(
+                    f"Selected but never started ({len(set(selected))}): "
+                    + ", ".join(sorted(set(selected))[:20])
+                    + (" ..." if len(set(selected)) > 20 else ""),
+                    file=sys.stderr,
+                )
+            return
+        if not passed and not failed:
+            print(
+                f"Test results {name}: no confirmed test outcomes; execution "
+                "status is unverified. Validation for this target is PENDING, "
+                "not passed. Inspect the phase diagnostics and retained logs "
+                "before deciding what may be rerun.",
+                file=sys.stderr,
+            )
+            if selected is not None:
+                print(
+                    f"Selected without confirmed outcomes ({len(set(selected))}): "
+                    + ", ".join(sorted(set(selected))[:20])
+                    + (" ..." if len(set(selected)) > 20 else ""),
+                    file=sys.stderr,
+                )
+            return
         not_run = (len(set(selected) - set(passed) - set(failed)) if selected is not None
                    else max(0, selected_count - len(set(passed) | set(failed)))
                    if selected_count is not None else "unknown (selection count unavailable)")
@@ -1857,9 +1901,12 @@ class RustTestRunner:
                 names, include_generated=discover, discovered_builds=discovered_builds,
             )
         except RunnerError:
+            # Gate resolution failed before any gate ran its tests.
             for name in dict.fromkeys(names):
                 for step in self.gate(name).steps:
-                    self._report_failed_tests(step.target, [], [], step.tests or None)
+                    self._report_failed_tests(
+                        step.target, [], [], step.tests or None, executed=False,
+                    )
             raise
         grouped = self._group_gate_steps(names, resolved_tests=resolved_tests)
 
@@ -1892,6 +1939,7 @@ class RustTestRunner:
 
         failures: list[RunnerError] = []
         reports = {step: (step.target, [], [], step.tests) for step in grouped}
+        not_started = set(grouped)
         try:
             artifacts = self._build_helpers(
                 self._active_helper_names(
@@ -1920,13 +1968,15 @@ class RustTestRunner:
             )
             try:
                 env = self._helper_environment(targets, helpers, artifacts)
+                command = self._gate_run_command(
+                    targets[0],
+                    self._batch_filter_args(targets, batch),
+                    batch=targets[1:],
+                    binaries_metadata=binaries_metadata,
+                )
+                not_started.difference_update(batch)
                 result = self._checked(
-                    self._gate_run_command(
-                        targets[0],
-                        self._batch_filter_args(targets, batch),
-                        batch=targets[1:],
-                        binaries_metadata=binaries_metadata,
-                    ),
+                    command,
                     env=env,
                     capture=self._test_run_capture(),
                 )
@@ -2016,8 +2066,10 @@ class RustTestRunner:
                 for step in batch:
                     print(f"gate {step.target}: {len(step.tests)} passed")
         if failures:
-            for report in reports.values():
-                self._report_failed_tests(*report)
+            for step, report in reports.items():
+                self._report_failed_tests(
+                    *report, executed=False if step in not_started else None,
+                )
             outcomes = {error.outcome for error in failures}
             raise RunnerError(
                 "gate runs failed after completing the unblocked selected targets:\n"

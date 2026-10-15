@@ -446,7 +446,9 @@ pub(crate) fn powershell_script_failure_advisory(
     .any(|needle| lower.contains(needle));
 
     if looks_like_syntax_failure {
-        return Some("Hint: correct the PowerShell script syntax at the reported location; script_body encoding does not repair invalid source.");
+        return Some(
+            "Hint: correct the PowerShell script syntax at the reported location; script_body encoding does not repair invalid source.",
+        );
     }
     (!is_powershell_script && (lower.contains("positionalparameternotfound")
         || lower.contains("parameter cannot be processed"))).then_some(

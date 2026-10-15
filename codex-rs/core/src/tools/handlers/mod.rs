@@ -37,6 +37,7 @@ mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
+mod save_turn_diff;
 mod shell;
 pub(crate) use shell::validation_diagnostic_range;
 #[cfg(test)]
@@ -90,6 +91,10 @@ pub use mcp_resource::ReadMcpResourceHandler;
 pub use plan::PlanHandler;
 pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
+pub(crate) use read_file::canonical_read_file_arguments;
+pub(crate) use read_file::reselect_read_file_output;
+pub(crate) use read_file::validate_read_file_arguments;
+pub(crate) use read_file::validate_retained_file_hash;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;
@@ -98,6 +103,7 @@ pub(crate) use read_tool_output::execute_recovery_transaction_with_continuations
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
+pub(crate) use save_turn_diff::SaveTurnDiffHandler;
 pub use shell::ShellCommandHandler;
 pub(crate) use shell::ShellCommandHandlerOptions;
 pub(crate) use shell::VALIDATION_COMMAND_TIMEOUT_MS;
@@ -108,10 +114,6 @@ pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub(crate) use unified_exec::validate_exec_command_arguments;
-pub(crate) use read_file::validate_read_file_arguments;
-pub(crate) use read_file::canonical_read_file_arguments;
-pub(crate) use read_file::reselect_read_file_output;
-pub(crate) use read_file::validate_retained_file_hash;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
@@ -139,9 +141,9 @@ impl ParsedFunctionArguments {
     fn from_raw(arguments: &str) -> Self {
         // Admission, dispatch and typed handlers can enter nested parse scopes.
         // Reuse only an exact input match; a hook rewrite must parse anew.
-        if let Ok(Some(parsed)) = PARSED_FUNCTION_ARGUMENTS.try_with(|parsed| {
-            (parsed.raw.as_ref() == arguments).then(|| parsed.clone())
-        }) {
+        if let Ok(Some(parsed)) = PARSED_FUNCTION_ARGUMENTS
+            .try_with(|parsed| (parsed.raw.as_ref() == arguments).then(|| parsed.clone()))
+        {
             return parsed;
         }
         Self {
@@ -373,7 +375,9 @@ pub(crate) async fn wait_for_tool_environment(
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<TurnEnvironment>, FunctionCallError> {
     let ready = match environment_id {
-        Some(id) => environments.turn_environments.iter()
+        Some(id) => environments
+            .turn_environments
+            .iter()
             .find(|environment| environment.environment_id == id),
         None => environments.primary(),
     };
@@ -381,14 +385,17 @@ pub(crate) async fn wait_for_tool_environment(
         return Ok(Some(ready.clone()));
     }
     let starting = match environment_id {
-        Some(id) => environments.starting.iter()
+        Some(id) => environments
+            .starting
+            .iter()
             .find(|environment| environment.selection.environment_id == id),
-        None => environments.starting.iter()
+        None => environments
+            .starting
+            .iter()
             .find(|environment| environment.selection_index == 0),
     };
     let Some(starting) = starting else {
-        return resolve_tool_environment(environments, environment_id)
-            .map(Option::<&_>::cloned);
+        return resolve_tool_environment(environments, environment_id).map(Option::<&_>::cloned);
     };
     tokio::select! {
         biased;
@@ -787,7 +794,8 @@ mod tests {
                 let changed = super::ParsedFunctionArguments::from_raw(r#"{"path":"changed"}"#);
                 assert!(!std::sync::Arc::ptr_eq(&original.raw, &changed.raw));
                 assert_eq!(changed.value().unwrap()["path"], "changed");
-            }).await;
+            })
+            .await;
             let independent = super::ParsedFunctionArguments::from_raw(raw);
             assert!(!std::sync::Arc::ptr_eq(&original.raw, &independent.raw));
         }
@@ -1014,7 +1022,11 @@ mod tests {
                     permissions_preapproved: false,
                 },
             );
-            assert_eq!(implicit, expected.then(|| granted_permissions.clone()), "{mode:?}, explicit={explicit}");
+            assert_eq!(
+                implicit,
+                expected.then(|| granted_permissions.clone()),
+                "{mode:?}, explicit={explicit}"
+            );
         }
     }
 

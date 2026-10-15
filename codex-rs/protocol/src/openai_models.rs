@@ -809,7 +809,10 @@ mod tests {
         )
         .expect("approval messages without on_request should deserialize");
 
-        assert_eq!(missing.approvals, Some(ApprovalMessages { on_request: None }));
+        assert_eq!(
+            missing.approvals,
+            Some(ApprovalMessages { on_request: None })
+        );
     }
 
     #[test]
@@ -1077,7 +1080,10 @@ mod tests {
         .expect("deserialize model info");
 
         assert_eq!(model.effective_context_window_percent, 95);
-        assert_eq!(model.input_modalities, vec![InputModality::Text, InputModality::Image]);
+        assert_eq!(
+            model.input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
         assert_eq!(model.availability_nux, None);
         assert!(!model.include_skills_usage_instructions);
         // A catalog that does not mention the Apps and Plugins blocks keeps them.

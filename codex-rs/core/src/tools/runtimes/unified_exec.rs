@@ -123,7 +123,8 @@ pub struct UnifiedExecRequest {
 
 impl UnifiedExecRequest {
     fn canonical_additional_permissions(&self) -> Option<UriAdditionalPermissionProfile> {
-        self.additional_permissions_uri.clone()
+        self.additional_permissions_uri
+            .clone()
             .or_else(|| self.additional_permissions.clone().map(Into::into))
     }
 }
@@ -132,15 +133,21 @@ fn unified_exec_approval_reason(
     reason: Option<String>,
     permissions: Option<&UriAdditionalPermissionProfile>,
 ) -> Option<String> {
-    let Some(permissions) = permissions else { return reason; };
+    let Some(permissions) = permissions else {
+        return reason;
+    };
     #[expect(
         clippy::expect_used,
         reason = "URI permission profiles contain only JSON-serializable scalars, paths serialized as strings, and sequences; never silently omit approval grants"
     )]
-    let profile = serde_json::to_string(permissions)
-        .expect("URI permission profiles are JSON serializable");
-    Some(format!("{}Additional permissions (canonical URI profile): {profile}",
-        reason.map(|reason| format!("{reason}\n")).unwrap_or_default()))
+    let profile =
+        serde_json::to_string(permissions).expect("URI permission profiles are JSON serializable");
+    Some(format!(
+        "{}Additional permissions (canonical URI profile): {profile}",
+        reason
+            .map(|reason| format!("{reason}\n"))
+            .unwrap_or_default()
+    ))
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -267,9 +274,9 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         let reason = unified_exec_approval_reason(reason, permissions.as_ref());
         Box::pin(async move {
             with_cached_approval(&session.services, "unified_exec", keys, || async move {
-                let available_decisions = permissions.as_ref().map(|_| {
-                    vec![ReviewDecision::Approved, ReviewDecision::Abort]
-                });
+                let available_decisions = permissions
+                    .as_ref()
+                    .map(|_| vec![ReviewDecision::Approved, ReviewDecision::Abort]);
                 session
                     .request_command_approval(
                         turn,
@@ -357,13 +364,19 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         // Reject busy admission before process creation instead of hiding an
         // unbounded wait before the caller can receive a resumable handle.
         // Arbitrary long-lived servers and opaque scripts do not use this gate.
-        let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval) {
+        let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval)
+        {
             let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
-            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
+            let _phase =
+                crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
             let permit = crate::workspace_operation_gate::acquire_validation_operation(
                 &req.turn_environment.environment,
                 &req.cwd,
                 &req.hook_command,
+                crate::workspace_operation_gate::ValidationOwner::for_command(
+                    ctx.session.thread_id(),
+                    &req.command_for_approval,
+                ),
             )
             .await
             .map_err(ToolError::Rejected)?;
@@ -371,11 +384,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         } else {
             self.pending_spawns.clone()
         };
-        let setup_timing = ctx.turn.turn_timing_state
+        let setup_timing = ctx
+            .turn
+            .turn_timing_state
             .begin_local_phase(crate::turn_timing::TurnLocalPhase::ExecutorReadinessWait);
         let setup_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_setup");
         let native_cwd = req.cwd.to_abs_path().ok();
-        let classification_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_mutation_classification");
+        let classification_phase =
+            crate::tools::tool_dispatch_trace::begin_tool_phase("command_mutation_classification");
         let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
             native_cwd
@@ -454,13 +470,21 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         })
         .await;
 
-        if ctx.turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+        if ctx
+            .turn
+            .config
+            .features
+            .enabled(codex_features::Feature::Kd4Runtime)
             && !req.turn_environment.environment.is_remote()
             && let Some(cwd) = native_cwd.as_ref()
         {
             crate::tools::handlers::command_preflight::check_managed_cargo_lane(
-                &req.command_for_approval, cwd.as_path(), &env,
-            ).await.map_err(ToolError::Rejected)?;
+                &req.command_for_approval,
+                cwd.as_path(),
+                &env,
+            )
+            .await
+            .map_err(ToolError::Rejected)?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
@@ -473,7 +497,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             &req.cwd,
             &env,
             managed_network_context,
-            permissions.clone().and_then(|permissions| AdditionalPermissionProfile::try_from(permissions).ok()),
+            permissions
+                .clone()
+                .and_then(|permissions| AdditionalPermissionProfile::try_from(permissions).ok()),
         )
         .map_err(|error| match error {
             ToolError::Rejected(_) => {
@@ -552,8 +578,19 @@ mod tests {
             (vec!["cargo", "fmt"], true),
             (vec!["cargo", "fmt", "--check"], false),
             (vec!["cargo", "+nightly", "fmt", "--", "--check"], false),
-            (vec!["pwsh.exe", "-NoProfile", "-Command", "cargo fmt --all --check"], false),
-            (vec!["pwsh", "-Command", "cargo fmt --check && cargo test"], true),
+            (
+                vec![
+                    "pwsh.exe",
+                    "-NoProfile",
+                    "-Command",
+                    "cargo fmt --all --check",
+                ],
+                false,
+            ),
+            (
+                vec!["pwsh", "-Command", "cargo fmt --check && cargo test"],
+                true,
+            ),
             (vec!["python", "-m", "pytest", "tests"], true),
             (vec!["cargo", "run"], false),
             (vec!["cargo", "fuzz", "run", "target"], false),
@@ -578,7 +615,17 @@ mod tests {
         let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
         let cwd = PathUri::from_abs_path(&root);
         let owner_command = "cargo test -p held-validation";
-        let owner = crate::workspace_operation_gate::acquire_workspace_validation(&root, owner_command).await.unwrap();
+        let holder = crate::workspace_operation_gate::ValidationOwner::for_command(
+            codex_protocol::ThreadId::new(),
+            &["cargo".to_string(), "test".to_string()],
+        );
+        let owner = crate::workspace_operation_gate::acquire_workspace_validation(
+            &root,
+            owner_command,
+            holder,
+        )
+        .await
+        .unwrap();
         let manager = UnifiedExecProcessManager::default();
         let mut runtime = UnifiedExecRuntime::new(&manager);
         let mut request = test_request(
@@ -597,7 +644,9 @@ mod tests {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         // Dispatch must reach admission rather than wait for an approval that
         // this fixture has no user/event consumer to answer.
-        turn.approval_policy.set(codex_protocol::protocol::AskForApproval::Never).unwrap();
+        turn.approval_policy
+            .set(codex_protocol::protocol::AskForApproval::Never)
+            .unwrap();
         turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         Arc::make_mut(&mut turn.config).cwd = root.clone();
         turn.environments.turn_environments = vec![test_turn_environment(cwd.clone())];
@@ -623,8 +672,10 @@ mod tests {
             network_proxy: None,
         };
         let (result, observed) = test_observation::observe(tokio::time::timeout(
-            Duration::from_secs(1), runtime.run(&request, &attempt, &ctx),
-        )).await;
+            Duration::from_secs(1),
+            runtime.run(&request, &attempt, &ctx),
+        ))
+        .await;
         let result = result.expect("busy admission must not wait for the held owner");
         assert!(matches!(result, Err(ToolError::Rejected(message))
             if message.contains("No process was started or queued")
@@ -657,23 +708,35 @@ mod tests {
         let baseline = control.baselines(0);
         let collector = control.collector(&baseline);
         let dispatch = ToolCallRuntime::new(
-            Arc::clone(&ctx.session), step,
-            Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
-        ).with_sampling_request_signals(collector.clone());
+            Arc::clone(&ctx.session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+        )
+        .with_sampling_request_signals(collector.clone());
         let (response, observed) = test_observation::observe(tokio::time::timeout(
-            Duration::from_secs(10), dispatch.handle_tool_call(
-            ToolCall {
-                tool_name: codex_tools::ToolName::plain("exec_command"),
-                call_id: "busy-validation-dispatch".into(),
-                payload: ToolPayload::Function { arguments: serde_json::json!({
-                    "program": "cargo", "args": ["test", "busy_fixture"],
-                    "workdir": root.as_path(),
-                }).to_string() },
-            },
-            CancellationToken::new(),
-        ))).await;
+            Duration::from_secs(10),
+            dispatch.handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    call_id: "busy-validation-dispatch".into(),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "program": "cargo", "args": ["test", "busy_fixture"],
+                            "workdir": root.as_path(),
+                        })
+                        .to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            ),
+        ))
+        .await;
         let ResponseInputItem::FunctionCallOutput { output, .. } = response
-            .expect("busy dispatch must settle without waiting for the owner").unwrap() else {
+            .expect("busy dispatch must settle without waiting for the owner")
+            .unwrap()
+        else {
             panic!("busy rejection must be a function failure");
         };
         assert_eq!(output.success, Some(false));
@@ -682,23 +745,69 @@ mod tests {
         };
         assert!(message.contains(owner_command), "{message}");
         assert!(message.contains("This validation did not run"), "{message}");
-        assert!(message.contains("No process was started or queued"), "{message}");
-        assert_eq!(observed.process_launches, 0);
-        control.settle(&baseline, &collector, &SamplingRequestSettledState {
-            mutation_revision: 0, attributed_mutation_revision: 0, tool_exposure_revision: 0,
-        });
-        let assessment = control.completion_assessment_with_changed_paths(
-            0, Some(&[(LOCAL_ENVIRONMENT_ID.into(), root.as_path().join("changed.rs"))]), false,
+        assert!(
+            message.contains("No process was started or queued"),
+            "{message}"
         );
-        assert!(!assessment.failed_checks.is_empty(), "busy is an unresolved check, not a pass");
-        assert!(assessment.verification_gaps.iter().any(|gap| gap.contains("No passing validation")));
-        assert!(assessment.advisories.is_empty(), "no passing test or check may be attributed");
-        let counters = ctx.turn.turn_timing_state.complete_snapshot().protocol_timing().counters;
+        assert_eq!(observed.process_launches, 0);
+        control.settle(
+            &baseline,
+            &collector,
+            &SamplingRequestSettledState {
+                mutation_revision: 0,
+                attributed_mutation_revision: 0,
+                tool_exposure_revision: 0,
+            },
+        );
+        let assessment = control.completion_assessment_with_changed_paths(
+            0,
+            Some(&[(
+                LOCAL_ENVIRONMENT_ID.into(),
+                root.as_path().join("changed.rs"),
+            )]),
+            false,
+        );
+        assert!(
+            !assessment.failed_checks.is_empty(),
+            "busy is an unresolved check, not a pass"
+        );
+        assert!(
+            assessment
+                .verification_gaps
+                .iter()
+                .any(|gap| gap.contains("No passing validation"))
+        );
+        assert!(
+            assessment.advisories.is_empty(),
+            "no passing test or check may be attributed"
+        );
+        let counters = ctx
+            .turn
+            .turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters;
         assert_eq!(counters.executed_validation_count, 0);
         assert_eq!(counters.executed_validation_duration_ns, 0);
-        assert!(crate::workspace_operation_gate::acquire_workspace_validation(&root, "cargo check").await.is_err());
+        assert!(
+            crate::workspace_operation_gate::acquire_workspace_validation(
+                &root,
+                "cargo check",
+                holder
+            )
+            .await
+            .is_err()
+        );
         drop(owner);
-        assert!(crate::workspace_operation_gate::acquire_workspace_validation(&root, "cargo check").await.is_ok());
+        assert!(
+            crate::workspace_operation_gate::acquire_workspace_validation(
+                &root,
+                "cargo check",
+                holder
+            )
+            .await
+            .is_ok()
+        );
     }
 
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {
@@ -781,7 +890,12 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(
             keys[0].command,
-            vec!["__codex_powershell_script__", "pwsh", "profiles-enabled", "Get-ChildItem"]
+            vec![
+                "__codex_powershell_script__",
+                "pwsh",
+                "profiles-enabled",
+                "Get-ChildItem"
+            ]
         );
         assert_ne!(
             keys[0].command,
@@ -795,17 +909,27 @@ mod tests {
         let runtime = UnifiedExecRuntime::new(&manager);
         let mut request = test_request(
             SandboxPermissions::UseDefault,
-            ExecApprovalRequirement::Skip { bypass_sandbox: false, proposed_execpolicy_amendment: None },
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
         );
         let native = PathUri::from_abs_path(&AbsolutePathBuf::current_dir().unwrap()).to_string();
-        let profile = |foreign: &str| serde_json::from_value::<UriAdditionalPermissionProfile>(
-            serde_json::json!({"file_system": {"read": [native, foreign]}}),
-        ).unwrap();
+        let profile = |foreign: &str| {
+            serde_json::from_value::<UriAdditionalPermissionProfile>(
+                serde_json::json!({"file_system": {"read": [native, foreign]}}),
+            )
+            .unwrap()
+        };
         request.additional_permissions_uri = Some(profile("file:///foreign/a"));
         let first = runtime.approval_keys(&request);
         request.additional_permissions_uri = Some(profile("file:///foreign/b"));
         assert_ne!(first, runtime.approval_keys(&request));
-        let reason = unified_exec_approval_reason(Some("reason".into()), request.additional_permissions_uri.as_ref()).unwrap();
+        let reason = unified_exec_approval_reason(
+            Some("reason".into()),
+            request.additional_permissions_uri.as_ref(),
+        )
+        .unwrap();
         assert!(reason.starts_with("reason\nAdditional permissions (canonical URI profile): "));
         assert!(reason.contains("file:///foreign/b"));
         assert!(reason.contains(&native));

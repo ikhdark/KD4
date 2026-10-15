@@ -33,6 +33,10 @@ const TASK_CRITICAL_PATH_IDLE_DURATION_METRIC: &str =
 const TASK_CRITICAL_PATH_IDLE_RATIO_METRIC: &str =
     "codex.multi_agent.task.critical_path_idle.basis_points";
 const TASK_TOKEN_USAGE_METRIC: &str = "codex.multi_agent.task.token_usage";
+const TOKEN_CLASS_TAG: &str = "token_class";
+const SUBTREE_TOKEN_USAGE_METRIC: &str = "codex.multi_agent.subtree.token_usage";
+const SUBTREE_AGENT_COUNT_METRIC: &str = "codex.multi_agent.subtree.agents";
+const SUBTREE_SCOPE_TAG: &str = "scope";
 const TASK_INFERENCE_CALLS_METRIC: &str = "codex.multi_agent.task.inference_calls";
 const TASK_CONCURRENCY_UTILIZATION_METRIC: &str =
     "codex.multi_agent.task.concurrency_utilization.basis_points";
@@ -156,13 +160,55 @@ pub(crate) struct RoleCapability {
 pub(crate) struct RoleUsage {
     pub role: RoleLabel,
     pub capability: CapabilityLabel,
-    pub tokens: u64,
+    pub tokens: TokenClassTotals,
     pub calls: u64,
+}
+
+/// Per-class token accounting for one agent's model requests.
+///
+/// `total` is reported by the provider rather than derived, so a provider whose total
+/// does not equal the sum of its classes is preserved as measured instead of silently
+/// reconciled. Aggregate parent-plus-child comparisons need the classes separated:
+/// cached input and reasoning output have materially different costs from fresh input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenClassTotals {
+    pub input: u64,
+    pub cached_input: u64,
+    pub output: u64,
+    pub reasoning_output: u64,
+    pub total: u64,
+}
+
+impl TokenClassTotals {
+    /// Non-cached input tokens, the portion billed at the full input rate.
+    pub(crate) fn uncached_input(self) -> u64 {
+        self.input.saturating_sub(self.cached_input)
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_add(other.input)?,
+            cached_input: self.cached_input.checked_add(other.cached_input)?,
+            output: self.output.checked_add(other.output)?,
+            reasoning_output: self.reasoning_output.checked_add(other.reasoning_output)?,
+            total: self.total.checked_add(other.total)?,
+        })
+    }
+
+    fn classes(self) -> [(&'static str, u64); 5] {
+        [
+            ("input", self.input),
+            ("cached_input", self.cached_input),
+            ("uncached_input", self.uncached_input()),
+            ("output", self.output),
+            ("reasoning_output", self.reasoning_output),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UsageTotals {
-    pub tokens: u64,
+    pub tokens: TokenClassTotals,
     pub calls: u64,
 }
 
@@ -406,11 +452,25 @@ impl TaskMetrics {
                 (ROLE_TAG, role_capability.role.as_str()),
                 (CAPABILITY_TAG, role_capability.capability.as_str()),
             ];
+            // Report the provider-reported total and each class separately. A single
+            // collapsed scalar cannot distinguish a child that re-read the repository
+            // from one that reused a cached prompt prefix.
             session_telemetry.histogram(
                 TASK_TOKEN_USAGE_METRIC,
-                saturating_metric_value(usage.tokens),
+                saturating_metric_value(usage.tokens.total),
                 &tags,
             );
+            for (token_class, value) in usage.tokens.classes() {
+                session_telemetry.histogram(
+                    TASK_TOKEN_USAGE_METRIC,
+                    saturating_metric_value(value),
+                    &[
+                        (ROLE_TAG, role_capability.role.as_str()),
+                        (CAPABILITY_TAG, role_capability.capability.as_str()),
+                        (TOKEN_CLASS_TAG, token_class),
+                    ],
+                );
+            }
             session_telemetry.histogram(
                 TASK_INFERENCE_CALLS_METRIC,
                 saturating_metric_value(usage.calls),
@@ -515,7 +575,7 @@ impl TaskMetricRecorder {
         &mut self,
         role: RoleLabel,
         capability: CapabilityLabel,
-        tokens: u64,
+        tokens: TokenClassTotals,
         calls: u64,
     ) -> Result<(), MetricsError> {
         self.ensure_recordable()?;
@@ -537,7 +597,7 @@ impl TaskMetricRecorder {
         &mut self,
         role: AgentRole,
         capability: CapabilityProfile,
-        tokens: u64,
+        tokens: TokenClassTotals,
         calls: u64,
     ) -> Result<(), MetricsError> {
         self.record_role_usage(role.into(), capability.into(), tokens, calls)
@@ -710,7 +770,11 @@ impl TaskMetricRuntime {
             .transition_concurrency(self.started_at.elapsed(), active_turns, capacity)
     }
 
-    pub(crate) fn record_usage(&mut self, tokens: u64, calls: u64) -> Result<(), MetricsError> {
+    pub(crate) fn record_usage(
+        &mut self,
+        tokens: TokenClassTotals,
+        calls: u64,
+    ) -> Result<(), MetricsError> {
         self.recorder
             .record_store_role_usage(self.role, self.capability, tokens, calls)
     }
@@ -755,6 +819,47 @@ const fn attempt_state_metric_label(state: AttemptState) -> &'static str {
         AttemptState::Violated => "violated",
         AttemptState::Abandoned => "abandoned",
     }
+}
+
+/// Emits aggregate parent-plus-child usage for one completed delegation subtree.
+///
+/// Root and descendant scopes are reported separately, plus their combined total, so a
+/// delegation that merely moves tokens into children is distinguishable from one that
+/// reduces overall work. `complete` is false when a subtree member's usage could not be
+/// read, which makes the combined figure a lower bound.
+pub(crate) fn emit_subtree_usage(
+    session_telemetry: &SessionTelemetry,
+    usage: &crate::agent::control::SubtreeUsage,
+) {
+    let combined = usage.combined();
+    for (scope, totals) in [
+        ("root", usage.root),
+        ("descendants", usage.descendants),
+        ("combined", combined),
+    ] {
+        for (token_class, value) in [
+            ("input", totals.input_tokens),
+            ("cached_input", totals.cached_input_tokens),
+            ("output", totals.output_tokens),
+            ("reasoning_output", totals.reasoning_output_tokens),
+            ("total", totals.total_tokens),
+        ] {
+            session_telemetry.histogram(
+                SUBTREE_TOKEN_USAGE_METRIC,
+                saturating_metric_value(value),
+                &[
+                    (SUBTREE_SCOPE_TAG, scope),
+                    (TOKEN_CLASS_TAG, token_class),
+                    ("complete", bool_tag(usage.is_complete())),
+                ],
+            );
+        }
+    }
+    session_telemetry.histogram(
+        SUBTREE_AGENT_COUNT_METRIC,
+        i64::from(usage.descendant_threads),
+        &[("complete", bool_tag(usage.is_complete()))],
+    );
 }
 
 pub(crate) fn terminal_metrics_ready(task: &AgentTask) -> bool {
@@ -872,7 +977,9 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
         acceptance_total,
         acceptance_first_pass_closed,
         acceptance_final_closed,
-        duplicate_work: None,
+        // Concurrently active assignments whose read scope overlapped this one at
+        // admission: the measurable form of duplicated repository discovery.
+        duplicate_work: Some(task.assignment.benign_read_overlap_count),
         conflicts,
         drift,
         reviewer_findings,
@@ -921,7 +1028,11 @@ fn saturating_metric_value(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn add_usage(totals: &mut UsageTotals, tokens: u64, calls: u64) -> Result<(), MetricsError> {
+fn add_usage(
+    totals: &mut UsageTotals,
+    tokens: TokenClassTotals,
+    calls: u64,
+) -> Result<(), MetricsError> {
     totals.tokens = totals
         .tokens
         .checked_add(tokens)
