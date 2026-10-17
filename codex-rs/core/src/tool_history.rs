@@ -1246,13 +1246,38 @@ pub(crate) fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
 /// the receipt IDs alone, but carry no assistant conclusions.
 const PRESSURE_RETIREMENT_SOURCE: &str = "context_pressure";
 
-pub(crate) fn pressure_retirement_checkpoint(call_ids: &[String]) -> ResponseItem {
+/// Why the runtime retired consumed tool results. Recorded in the checkpoint
+/// so a rollout distinguishes the two triggers without inferring them from
+/// the reason of the request that follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressureRetirementTrigger {
+    /// Below the automatic-compaction limit, once re-sending the results had
+    /// cost more than the cache miss retiring them causes.
+    Proactive,
+    /// At the automatic-compaction limit, instead of an LLM summary.
+    ContextLimit,
+}
+
+impl PressureRetirementTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Proactive => "proactive",
+            Self::ContextLimit => "context_limit",
+        }
+    }
+}
+
+pub(crate) fn pressure_retirement_checkpoint(
+    call_ids: &[String],
+    trigger: PressureRetirementTrigger,
+) -> ResponseItem {
     let receipts = call_ids
         .iter()
         .map(|call_id| (call_id.clone(), serde_json::json!({})))
         .collect::<serde_json::Map<_, _>>();
     let payload = serde_json::json!({
         "source": PRESSURE_RETIREMENT_SOURCE,
+        "trigger": trigger.as_str(),
         "note": "The runtime replaced these consumed tool results with recovery pins to keep the context window under its limit. Each pin names its artifact; read_tool_output recovers exact bytes when they are needed again.",
         "receipts": receipts,
     });

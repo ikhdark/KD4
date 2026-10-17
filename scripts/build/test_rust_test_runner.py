@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from scripts.benchmark_scripts import kd4_perf_snapshot
 from scripts.build import rust_build_status
 from scripts.build import rust_test_runner
 from scripts.build.build_tooling_test_support import REPO_ROOT
@@ -594,11 +593,10 @@ class WallClockRunnerTest(RunnerTestCase):
         self.assertEqual(builds, [])
 
     def test_focused_benchmark_skips_discovery_and_helper_builds(self):
-        scenario = kd4_perf_snapshot.scenario_catalog()["focused-core-test"]
-        # The benchmark owner names this one test. Do not obtain the fake
-        # execution result from the selection parser being tested.
+        # Keep the retired benchmark's exact selection as an independent runner
+        # fixture; runner validation does not depend on a benchmark launcher.
         expected_test = "agent::task_capabilities::tests::typed_agents_inherit_every_non_root_tool_class"
-        self.assertEqual(scenario.command[3:], ("-E", f"test(={expected_test})"))
+        selection = ("-E", f"test(={expected_test})")
         runner, executor = self.runner(
             manifest=Manifest.load(rust_test_runner.DEFAULT_MANIFEST),
             executor=FakeExecutor(default_listing={expected_test: False}),
@@ -607,13 +605,13 @@ class WallClockRunnerTest(RunnerTestCase):
             {"name": "codex-windows-sandbox-setup", "kind": ["bin"]}
         )
 
-        receipt = runner.run_target(scenario.command[2], scenario.command[3:])
+        receipt = runner.run_target("core_lib", selection)
         self.assertEqual(receipt, {"codex-core": [expected_test]})
 
         self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
         self.assertEqual(executor.commands(["cargo", "build"]), [])
         (command,) = executor.commands(["cargo", "nextest", "run"])
-        self.assertEqual(command[-2:], list(scenario.command[-2:]))
+        self.assertEqual(command[-2:], list(selection))
         self.assertIn("--no-tests=fail", command)
         self.assertFalse((self.target_dir / "debug").exists())
 

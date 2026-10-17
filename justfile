@@ -93,10 +93,6 @@ fmt-check *args:
     sys.argv = [script, "--check", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
-[no-cd]
-kd4-perf-snapshot *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/benchmark_scripts/kd4_perf_snapshot.py" {args}
-
 # Inspect committed blobs; pass --base, --head, and an explicit --allowlist.
 [working-directory("..")]
 [script("python")]

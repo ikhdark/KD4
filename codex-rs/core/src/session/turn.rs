@@ -1074,12 +1074,12 @@ pub(crate) async fn run_turn(
                 if request_signals.is_wait_only() {
                     turn_context.turn_timing_state.record_wait_only_generation();
                 }
-                // Retire consumed, exactly recoverable evidence once the prompt
-                // passes its steady-state ceiling, rather than only after it
-                // reaches the compaction limit. This costs no model request and
-                // keeps the next request from re-sending evidence that was
-                // already eligible. Only a continuing turn builds a next
-                // prompt, so a finishing turn gains nothing from retiring.
+                // Retire consumed, exactly recoverable evidence above the
+                // steady-state ceiling once re-sending it has cost more than
+                // the cache miss retiring it causes, rather than only at the
+                // compaction limit. This costs no model request. Only a
+                // continuing turn builds a next prompt, so a finishing turn
+                // gains nothing from retiring.
                 let mut token_status = token_status;
                 if needs_follow_up
                     && !token_status.token_limit_reached
@@ -1178,7 +1178,7 @@ pub(crate) async fn run_turn(
                         &cancellation_token,
                     )
                     .await?;
-                    if let Err(err) = run_auto_compact(
+                    let relief = match run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
                         /*fallback_step_context*/ None,
@@ -1194,24 +1194,32 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        if matches!(err, CodexErr::TurnAborted) {
-                            return Err(err);
+                        Ok(relief) => relief,
+                        Err(err) => {
+                            if matches!(err, CodexErr::TurnAborted) {
+                                return Err(err);
+                            }
+                            let error = err.to_codex_protocol_error();
+                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                                .await;
+                            last_agent_message =
+                                sampling_request_last_agent_message.or(last_agent_message);
+                            defer_pending_input |= has_pending_input;
+                            break 'sampling_loop;
                         }
-                        let error = err.to_codex_protocol_error();
-                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                            .await;
-                        last_agent_message =
-                            sampling_request_last_agent_message.or(last_agent_message);
-                        defer_pending_input |= has_pending_input;
-                        break 'sampling_loop;
-                    }
+                    };
                     can_drain_pending_input = true;
                     pending_continuation_cause = Some(ContinuationCause::Compaction);
-                    subagent_context_budget_reached |= observe_context_pressure_event(
-                        &turn_context.session_source,
-                        &mut context_pressure_events,
-                        logical_generation_budget,
-                    );
+                    // Routine retirement is the exact, recoverable operation that
+                    // proactive retirement performs uncounted; only pressure it
+                    // cannot absorb spends a spawned agent's compaction budget.
+                    if relief == ContextPressureRelief::Compaction {
+                        subagent_context_budget_reached |= observe_context_pressure_event(
+                            &turn_context.session_source,
+                            &mut context_pressure_events,
+                            logical_generation_budget,
+                        );
+                    }
                     // A requested reset still commits, but it cannot revoke an
                     // already accepted answer or manufacture another generation.
                     // Completion hooks and pending-input admission remain below.
@@ -1317,12 +1325,17 @@ pub(crate) async fn run_turn(
                             defer_pending_input,
                         ));
                     }
-                    let (changed_paths, has_untracked_changes, unattributed_paths) = {
+                    let (changed_paths, has_untracked_changes, unattributed_paths, changed_tests) = {
                         let tracker = turn_diff_tracker.lock().await;
                         (
                             Some(tracker.changed_paths()),
                             tracker.has_untracked_changes(),
                             tracker.unattributed_display_paths(),
+                            tracker
+                                .changed_existing_display_paths()
+                                .into_iter()
+                                .filter(|path| conventional_test_path(path))
+                                .collect::<Vec<_>>(),
                         )
                     };
                     let changed_paths = match changed_paths {
@@ -1340,6 +1353,9 @@ pub(crate) async fn run_turn(
                         has_untracked_changes,
                     );
                     if let Some(advisory) = unattributed_changes_advisory(&unattributed_paths) {
+                        assessment.advisories.push(advisory);
+                    }
+                    if let Some(advisory) = changed_tests_advisory(&changed_tests) {
                         assessment.advisories.push(advisory);
                     }
                     if finalized_mutation_revision
@@ -1871,7 +1887,7 @@ async fn record_forced_terminal_budget_boundary(
             "This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
         ),
         ForcedTerminalReason::SubagentContextBudget => format!(
-            "This spawned agent reached its budget of {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} context-pressure events (compactions or retirements). It will report what it covered and the unread scope so its parent can split the remaining work."
+            "This spawned agent reached its budget of {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} compactions in one turn. It will report what it covered and the unread scope so its parent can split the remaining work."
         ),
     };
     sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
@@ -1883,6 +1899,44 @@ fn unattributed_changes_advisory(paths: &[String]) -> Option<String> {
     (!paths.is_empty()).then(|| {
         format!(
             "Workspace changes observed during this turn were not attributed to it (another writer, or an undeclared command effect): {}.",
+            crate::session::turn_execution::bounded_path_list(paths)
+        )
+    })
+}
+
+/// Test files by common convention: a test directory or a test-named file.
+/// This only selects paths for the advisory below; it discovers no tests.
+fn conventional_test_path(path: &str) -> bool {
+    const TEST_DIRECTORIES: [&str; 5] = ["test", "tests", "__tests__", "spec", "specs"];
+    const TEST_SUFFIXES: [&str; 6] = [
+        "_test.py",
+        "_tests.py",
+        "_test.go",
+        "_test.rs",
+        "_tests.rs",
+        "_spec.rb",
+    ];
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let mut components = normalized.split('/').collect::<Vec<_>>();
+    let Some(name) = components.pop() else {
+        return false;
+    };
+    components
+        .iter()
+        .any(|component| TEST_DIRECTORIES.contains(component) || component.ends_with(".tests"))
+        || name.starts_with("test_")
+        || matches!(name, "tests.rs" | "conftest.py")
+        || TEST_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
+/// An edited or removed existing test can change what the suite asserts, and
+/// a final answer need not mention it, so completion names those files.
+fn changed_tests_advisory(paths: &[String]) -> Option<String> {
+    (!paths.is_empty()).then(|| {
+        format!(
+            "This turn modified or deleted existing test files; review any changed expectations: {}.",
             crate::session::turn_execution::bounded_path_list(paths)
         )
     })
@@ -3763,26 +3817,39 @@ const FAILED_COMPACTION_KEPT_GENERATIONS: usize = 1;
 /// `retire_consumed_tool_outputs_for_context_pressure` already retires down to
 /// `limit * 2 / 3` once the limit is reached, so reusing that same fraction
 /// here changes only *when* retirement runs, never which outputs qualify.
-/// Reaching the limit first is what makes a long session oscillate between the
-/// post-retirement level and the limit while re-sending evidence that was
-/// already eligible on every request in between.
 const PROACTIVE_RETIREMENT_TARGET_NUMERATOR: i64 = 2;
 const PROACTIVE_RETIREMENT_TARGET_DENOMINATOR: i64 = 3;
 
-/// Minimum estimated saving that justifies retiring proactively.
+/// Price of a cached input token as a fraction of an uncached one. OpenAI's
+/// published API pricing bills cached input for the GPT-5 family at a tenth of
+/// the uncached rate; the harness has no pricing for the model in use.
 ///
-/// Retirement costs no model request, but it does move consumed evidence to
-/// recovery pins earlier and appends a checkpoint item. Requiring a material
-/// saving keeps it from running repeatedly for a negligible reduction.
-const PROACTIVE_RETIREMENT_MIN_SAVED_TOKENS: i64 = 20_000;
+/// A model with a higher ratio would justify retiring somewhat earlier than
+/// this assumes; the automatic-compaction limit still retires regardless.
+const CACHED_INPUT_COST_NUMERATOR: u128 = 1;
+const CACHED_INPUT_COST_DENOMINATOR: u128 = 10;
 
-/// Retires consumed tool results once the prompt exceeds its steady-state
-/// ceiling, instead of waiting for the automatic-compaction limit.
+/// Retires consumed tool results above the steady-state ceiling once
+/// re-sending them has cost more than the cache miss retiring them causes,
+/// instead of waiting for the automatic-compaction limit.
 ///
 /// This is the same exact, recoverable retirement the compaction path already
 /// performs: `read_tool_output` still returns the original bytes for every
-/// retired output. Only the trigger point differs, so no output is retired
-/// here that the limit-triggered path would have kept.
+/// retired output, and no output is retired here that the limit-triggered
+/// path would have kept. Only the trigger point differs.
+///
+/// Retirement replaces the oldest consumed outputs with pins, so the next
+/// prompt diverges from every earlier one near the start of history. Recorded
+/// sessions show the provider then reuses only the fixed prompt prefix: the
+/// whole remaining history is re-read uncached, which costs `(1 - c)` per
+/// token more than reading it from cache, where `c` is the cached price ratio.
+/// Keeping the outputs instead costs `c` per retirable token on every request
+/// that re-sends them. Each check charges the request that just completed for
+/// what it re-sent, and retirement runs once those charges pay for the re-read:
+/// the break-even rule for a rent-or-buy decision. With steady growth it
+/// retires batches of about `sqrt(2 * (1 - c) * rewritten * growth / c)`
+/// tokens, so a session that would otherwise rewrite its whole history for a
+/// small saving every few requests leaves retirement to the limit instead.
 ///
 /// Returns true when retirement ran, so the caller can refresh the token
 /// status it based later decisions on.
@@ -3799,24 +3866,57 @@ async fn retire_consumed_tool_outputs_before_limit(
     };
     let target = limit.saturating_mul(PROACTIVE_RETIREMENT_TARGET_NUMERATOR)
         / PROACTIVE_RETIREMENT_TARGET_DENOMINATOR;
-    let Ok(excess) = u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)) else {
+    let excess =
+        u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)).unwrap_or(0);
+    let (call_ids, saved, carried, history) = {
+        let mut state = sess.state.lock().await;
+        let (call_ids, saved) = if excess == 0 {
+            (Vec::new(), 0)
+        } else {
+            state
+                .history
+                .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, excess)
+        };
+        if call_ids.is_empty() || saved == 0 {
+            // No request is re-sending retirable outputs, so no charge accrues.
+            state.proactive_retirement_carried_tokens = 0;
+            return false;
+        }
+        // The request that just completed re-sent these outputs.
+        let carried = state
+            .proactive_retirement_carried_tokens
+            .saturating_add(saved);
+        state.proactive_retirement_carried_tokens = carried;
+        (call_ids, saved, carried, state.history.clone())
+    };
+    // Instructions and tool schemas stay cached across the rewrite; the clone
+    // shares item storage, so estimating outside the lock copies nothing.
+    let Some(history_tokens) = history.estimate_prepared_token_count_with_base_instructions(
+        &turn_context.model_info.input_modalities,
+        &BaseInstructions {
+            text: String::new(),
+        },
+    ) else {
         return false;
     };
-    if excess == 0 {
+    let rewritten = u64::try_from(history_tokens)
+        .unwrap_or(0)
+        .saturating_sub(saved);
+    if u128::from(carried) * CACHED_INPUT_COST_NUMERATOR
+        < u128::from(rewritten) * (CACHED_INPUT_COST_DENOMINATOR - CACHED_INPUT_COST_NUMERATOR)
+    {
+        trace!(
+            carried_tokens = carried,
+            estimated_saved_tokens = saved,
+            rewritten_tokens = rewritten,
+            "deferring proactive context retirement until re-sending the outputs costs more than the cache miss"
+        );
         return false;
     }
-    let (call_ids, saved) = sess
-        .state
-        .lock()
-        .await
-        .history
-        .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, excess);
-    let saved_tokens = i64::try_from(saved).unwrap_or(i64::MAX);
-    // Do not spend a checkpoint item on a negligible reduction.
-    if call_ids.is_empty() || saved_tokens < PROACTIVE_RETIREMENT_MIN_SAVED_TOKENS {
-        return false;
-    }
-    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(&call_ids);
+    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
+        &call_ids,
+        crate::tool_history::PressureRetirementTrigger::Proactive,
+    );
     if let Err(error) = sess
         .record_conversation_items(turn_context, &[checkpoint])
         .await
@@ -3825,11 +3925,15 @@ async fn retire_consumed_tool_outputs_before_limit(
         warn!(%error, "proactive context retirement was not recorded; leaving history unchanged");
         return false;
     }
+    sess.state.lock().await.proactive_retirement_carried_tokens = 0;
+    let saved_tokens = i64::try_from(saved).unwrap_or(i64::MAX);
     sess.discount_retired_context_tokens(saved_tokens).await;
     sess.send_token_count_event(turn_context).await;
     info!(
         retired_outputs = call_ids.len(),
         estimated_saved_tokens = saved_tokens,
+        carried_tokens = carried,
+        rewritten_tokens = rewritten,
         auto_compact_scope_tokens = status.auto_compact_scope_tokens,
         target,
         "retired consumed tool outputs before reaching the compaction limit"
@@ -3852,6 +3956,18 @@ enum ConsumedOutputRetirement {
     Eligible {
         projected_pressure: Option<ProjectedPromptPressure>,
     },
+}
+
+/// How `run_auto_compact` brought the context back under its limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextPressureRelief {
+    /// Retired consumed results to exact recovery pins at the usual kept
+    /// generations: the operation proactive retirement performs before the
+    /// limit, which a spawned agent's compaction budget does not count.
+    RoutineRetirement,
+    /// Summarized or replaced history, or retired past the kept generations
+    /// after a summary failed.
+    Compaction,
 }
 
 /// Retires consumed tool results to their recovery pins; read_tool_output
@@ -3915,7 +4031,10 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     if call_ids.is_empty() || !fits {
         return false;
     }
-    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(&call_ids);
+    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
+        &call_ids,
+        crate::tool_history::PressureRetirementTrigger::ContextLimit,
+    );
     if let Err(error) = sess
         .record_conversation_items(turn_context, &[checkpoint])
         .await
@@ -3923,6 +4042,8 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         warn!(%error, "context-pressure retirement was not recorded; compacting instead");
         return false;
     }
+    // The rewrite starts a new prefix, so proactive carrying restarts too.
+    sess.state.lock().await.proactive_retirement_carried_tokens = 0;
     sess.discount_retired_context_tokens(saved).await;
     sess.send_token_count_event(turn_context).await;
     info!(
@@ -3952,7 +4073,7 @@ fn run_auto_compact<'a>(
     phase: CompactionPhase,
     retire_consumed_outputs: ConsumedOutputRetirement,
     cancellation_token: &'a CancellationToken,
-) -> BoxFuture<'a, CodexResult<()>> {
+) -> BoxFuture<'a, CodexResult<ContextPressureRelief>> {
     // Bound the compaction future at the shared dispatch boundary. Otherwise
     // each pre-sampling/planning frame embeds every compaction implementation.
     Box::pin(async move {
@@ -3973,7 +4094,7 @@ fn run_auto_compact<'a>(
             )
             .await
         {
-            return Ok(());
+            return Ok(ContextPressureRelief::RoutineRetirement);
         }
         // Automatic compaction restores initial context. Reuse a snapshot already
         // captured by the caller, or capture one before dispatching compaction.
@@ -4044,7 +4165,7 @@ fn run_auto_compact<'a>(
                         }),
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ContextPressureRelief::Compaction);
                 }
                 sess.send_event(
                     turn_context,
@@ -4150,7 +4271,7 @@ fn run_auto_compact<'a>(
                 return Err(error);
             }
         }
-        Ok(())
+        Ok(ContextPressureRelief::Compaction)
     })
 }
 

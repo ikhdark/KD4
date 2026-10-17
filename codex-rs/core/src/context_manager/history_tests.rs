@@ -3955,6 +3955,7 @@ fn pressure_retirement_checkpoint_lowers_the_estimate_before_the_next_request() 
     history.record_items(
         [&crate::tool_history::pressure_retirement_checkpoint(
             &retired,
+            crate::tool_history::PressureRetirementTrigger::Proactive,
         )],
         TruncationPolicy::Tokens(10_000),
     );

@@ -3358,6 +3358,132 @@ fn spawned_agent_context_budget_forces_one_final_synthesis() {
 }
 
 #[test]
+fn spawned_agent_limit_retirements_leave_the_compaction_budget() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "spawned_agent_limit_retirements_leave_the_compaction_budget",
+        spawned_agent_limit_retirements_leave_the_compaction_budget_impl,
+    )
+}
+
+/// A spawned agent is told its budget is compactions, which lose detail.
+/// Retirement at the limit keeps every output exactly recoverable, like the
+/// uncounted proactive retirement it now usually replaces, so two of them in
+/// one turn must not force the agent to stop and report unfinished coverage.
+async fn spawned_agent_limit_retirements_leave_the_compaction_budget_impl() -> Result<()> {
+    use codex_protocol::protocol::SubAgentSource;
+
+    crate::test_harness::require_network!();
+    let server = responses::start_mock_server().await;
+    let over_limit_continuation = |id: &str| {
+        responses::sse(vec![
+            responses::ev_response_created(id),
+            responses::ev_function_call(&format!("{id}-call"), "unknown_test_tool", "{}"),
+            responses::ev_completed_with_tokens(id, 100_500),
+        ])
+    };
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            over_limit_continuation("first"),
+            over_limit_continuation("second"),
+            responses::sse(vec![
+                responses::ev_response_created("final"),
+                responses::ev_assistant_message("final-message", "assigned scope covered"),
+                responses::ev_completed_with_tokens("final", 1_000),
+            ]),
+        ],
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let provider = non_openai_model_provider(&server);
+    let (session, mut turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            move |config| {
+                config.model_provider = provider;
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+                config.model_auto_compact_token_limit = Some(100_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                config.features.disable(Feature::CodeModeHost).unwrap();
+            },
+        )
+        .await;
+    Arc::get_mut(&mut turn)
+        .expect("turn context fixture is uniquely owned")
+        .session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: codex_protocol::ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    // Enough consumed results for both limit retirements, while the projected
+    // first prompt stays under the limit so nothing retires before the turn.
+    seed_retirable_consumed_outputs(&session, 50).await;
+
+    let mut budget = LogicalGenerationBudget::default();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_turn(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            Arc::new(ExtensionData::new(turn.sub_id.clone())),
+            vec![TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "read the assigned files".into(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+            None,
+            &mut budget,
+            CancellationToken::new(),
+        ),
+    )
+    .await??;
+
+    let retirements = session
+        .state
+        .lock()
+        .await
+        .history
+        .raw_items()
+        .iter()
+        .filter(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().any(|part| {
+                    matches!(
+                        part,
+                        codex_protocol::models::ContentItem::InputText { text }
+                            if crate::tool_history::is_pressure_retirement_checkpoint_text(text)
+                    )
+                })
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        retirements, 2,
+        "each over-limit continuation retires consumed results instead of summarizing"
+    );
+    let sent = requests.requests();
+    assert_eq!(
+        sent.len(),
+        3,
+        "both continuations and the final answer are sampled"
+    );
+    assert!(
+        !sent[2].body_contains_text("reached its context budget"),
+        "retirement at the limit must not force the final synthesis"
+    );
+    Ok(())
+}
+
+#[test]
 fn usage_limit_waits_for_an_account_switch_and_retries_the_same_request() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "usage_limit_waits_for_an_account_switch_and_retries_the_same_request",
@@ -5572,6 +5698,183 @@ async fn projected_pressure_retirement_declines_when_the_projected_prompt_still_
         "the accepted retirement records a checkpoint"
     );
     Ok(())
+}
+
+#[test]
+fn proactive_retirement_waits_until_resending_outputs_pays_for_the_cache_miss() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "proactive_retirement_waits_until_resending_outputs_pays_for_the_cache_miss",
+        proactive_retirement_waits_until_resending_outputs_pays_for_the_cache_miss_impl,
+    )
+}
+
+/// Long sessions sit just above the steady-state ceiling. Retiring there
+/// whenever 20k tokens qualified made each next request re-read the whole
+/// remaining history uncached to save a small batch, every few requests.
+/// Re-sending a cached token costs a tenth of reading an uncached one, so
+/// retirement must wait until the requests that re-sent the batch have paid
+/// for that re-read, and then retire once.
+async fn proactive_retirement_waits_until_resending_outputs_pays_for_the_cache_miss_impl()
+-> Result<()> {
+    let home = tempfile::tempdir()?;
+    let (session, turn_context, _) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| {
+                config.model_auto_compact_token_limit = Some(100_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+            },
+        )
+        .await;
+    seed_retirable_consumed_outputs(&session, 75).await;
+    // The last completed request reported a prompt between the steady-state
+    // ceiling and the limit, where the long sessions sat.
+    let reported = codex_protocol::protocol::TokenUsage {
+        input_tokens: 90_000,
+        total_tokens: 90_000,
+        ..Default::default()
+    };
+    session
+        .state
+        .lock()
+        .await
+        .set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
+            total_token_usage: reported.clone(),
+            last_token_usage: reported,
+            model_context_window: None,
+        }));
+
+    let limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .expect("fixture configures an automatic-compaction limit");
+    let target = limit * 2 / 3;
+    let scope =
+        crate::session::context_window::context_window_token_status(&session, &turn_context)
+            .await
+            .auto_compact_scope_tokens;
+    assert!(
+        scope > target && scope < limit,
+        "fixture must sit between the steady-state ceiling and the limit, got {scope} of {limit}"
+    );
+    let (selected, saved) = session
+        .state
+        .lock()
+        .await
+        .history
+        .pressure_retirement_selection(
+            CONTEXT_PRESSURE_KEPT_GENERATIONS,
+            u64::try_from(scope - target)?,
+        );
+    assert!(
+        !selected.is_empty() && saved >= 20_000,
+        "the former rule retired any batch of at least 20k tokens, got {saved}"
+    );
+    let history_tokens = session
+        .state
+        .lock()
+        .await
+        .history
+        .estimate_prepared_token_count_with_base_instructions(
+            &turn_context.model_info.input_modalities,
+            &BaseInstructions {
+                text: String::new(),
+            },
+        )
+        .expect("history estimate");
+    // Each request that re-sends the batch pays saved / 10; retiring makes the
+    // next request re-read the remaining history at the 9 / 10 difference.
+    let rewritten = u64::try_from(history_tokens)? - saved;
+    let break_even = (9 * rewritten).div_ceil(saved);
+    assert!(
+        break_even > 1,
+        "fixture must make an immediate retirement uneconomic"
+    );
+
+    for request in 1..break_even {
+        assert!(
+            !retire_consumed_tool_outputs_before_limit(&session, &turn_context).await,
+            "request {request} of {break_even} has not yet paid for the cache miss"
+        );
+    }
+    assert!(
+        !crate::tool_history::ToolHistoryState::has_phase_checkpoint(
+            session.state.lock().await.history.raw_items()
+        ),
+        "a deferred retirement must leave history unchanged"
+    );
+    assert!(
+        retire_consumed_tool_outputs_before_limit(&session, &turn_context).await,
+        "the request whose charge covers the cache miss retires the batch"
+    );
+    let state = session.state.lock().await;
+    let checkpoint = state
+        .history
+        .raw_items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().find_map(|part| match part {
+                    codex_protocol::models::ContentItem::InputText { text }
+                        if crate::tool_history::is_pressure_retirement_checkpoint_text(text) =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("the retirement records a checkpoint");
+    assert!(
+        checkpoint.contains(r#""trigger":"proactive""#),
+        "the checkpoint labels its trigger: {checkpoint}"
+    );
+    assert_eq!(
+        state.proactive_retirement_carried_tokens, 0,
+        "carrying restarts after the rewrite"
+    );
+    Ok(())
+}
+
+/// A session rewrote an existing test's expectation without mentioning it in
+/// its summary. Completion names edited existing tests by common convention.
+#[test]
+fn completion_advisory_names_changed_existing_tests() {
+    for path in [
+        "scripts/benchmark_scripts/test_rollout_audit_cache.py",
+        "tests/integration.py",
+        "core/src/session/turn_tests.rs",
+        "core/src/tests.rs",
+        "web/src/__tests__/app.tsx",
+        "web/src/app.test.ts",
+        "pkg/server_test.go",
+        "spec/models/user_spec.rb",
+        "src/Foo.Tests/Parser.cs",
+        "conftest.py",
+    ] {
+        assert!(conventional_test_path(path), "{path} is a test file");
+    }
+    for path in [
+        "core/src/session/turn.rs",
+        "docs/testing.md",
+        "scripts/latest.py",
+        "attestation/verify.py",
+    ] {
+        assert!(!conventional_test_path(path), "{path} is not a test file");
+    }
+    assert_eq!(changed_tests_advisory(&[]), None);
+    assert_eq!(
+        changed_tests_advisory(&["tests/test_cli.py".to_string(), "a_test.go".to_string()])
+            .as_deref(),
+        Some(
+            "This turn modified or deleted existing test files; review any changed expectations: tests/test_cli.py, a_test.go."
+        )
+    );
 }
 
 fn write_one_shot_stop_hook(home: &Path) -> Result<()> {

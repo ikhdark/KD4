@@ -821,12 +821,12 @@ class SemanticContractCounterexamples(unittest.TestCase):
     def test_benchmark_changes_select_the_authored_accuracy_oracles(self):
         from scripts.maintenance.root_maintenance import test_modules_for_changed_path
 
-        for script, owner in (("contracts", "SemanticContractCounterexamples"),
-                              ("evidence", "SemanticEvidenceTests")):
-            # This is a minimum route, not permission to drop adjacent CLI tests.
-            self.assertIn(f"scripts.maintenance.test_python_test_oracles.{owner}",
-                          test_modules_for_changed_path(
-                              f"scripts/benchmark_scripts/benchmark_semantic_{script}.py"))
+        # Authored fixtures remain; the retired worker benchmark has no route.
+        self.assertIn("scripts.maintenance.test_python_test_oracles.SemanticContractCounterexamples",
+                      test_modules_for_changed_path(
+                          "scripts/benchmark_scripts/benchmark_semantic_contracts.py"))
+        self.assertEqual(test_modules_for_changed_path(
+            "scripts/benchmark_scripts/benchmark_semantic_evidence.py"), ())
 
     def test_semantic_fixtures_through_real_analyzer(self):
         from scripts.benchmark_scripts.benchmark_semantic_contracts import cases, checks

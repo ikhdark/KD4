@@ -1899,7 +1899,8 @@ fn pressure_retirement_pins_oldest_consumed_outputs_and_keeps_the_working_set() 
     );
     assert!(saved > 0 && saved < all_saved);
 
-    let checkpoint = pressure_retirement_checkpoint(&retired);
+    let checkpoint =
+        pressure_retirement_checkpoint(&retired, PressureRetirementTrigger::ContextLimit);
     let ResponseItem::Message { content, .. } = &checkpoint else {
         unreachable!("the retirement checkpoint is a developer message");
     };
@@ -1941,9 +1942,28 @@ fn pressure_retirement_pins_oldest_consumed_outputs_and_keeps_the_working_set() 
     );
 }
 
+/// Rollout audits tell a proactive retirement from one at the limit by the
+/// checkpoint's trigger; the request after a proactive one is an ordinary
+/// tool continuation. Either trigger must still retire its receipts.
+#[test]
+fn pressure_retirement_checkpoint_records_its_trigger() {
+    let retired = vec!["read-0".to_string(), "read-1".to_string()];
+    for (trigger, label) in [
+        (PressureRetirementTrigger::Proactive, "proactive"),
+        (PressureRetirementTrigger::ContextLimit, "context_limit"),
+    ] {
+        let checkpoint = pressure_retirement_checkpoint(&retired, trigger);
+        let payload = phase_checkpoint_payload(&checkpoint).expect("checkpoint payload");
+        assert_eq!(payload["source"], "context_pressure");
+        assert_eq!(payload["trigger"], label);
+        assert_eq!(phase_checkpoint_ids(&checkpoint).unwrap(), retired);
+    }
+}
+
 /// Proactive retirement (see `retire_consumed_tool_outputs_before_limit`)
-/// retires consumed evidence once the prompt passes its steady-state ceiling
-/// rather than at the compaction limit. It reuses this selection and pinning
+/// retires consumed evidence above the prompt's steady-state ceiling, before
+/// the compaction limit, once re-sending it has cost more than the cache miss
+/// retiring causes. It reuses this selection and pinning
 /// path, so the properties that make retiring earlier safe are asserted here
 /// against real artifact bytes:
 ///
@@ -2018,7 +2038,7 @@ async fn proactive_retirement_pins_are_recoverable_and_do_not_repeat() {
     );
     assert!(saved >= target, "the reported saving must meet the target");
 
-    let checkpoint = pressure_retirement_checkpoint(&retired);
+    let checkpoint = pressure_retirement_checkpoint(&retired, PressureRetirementTrigger::Proactive);
     items.push(checkpoint);
     let items: Arc<[ResponseItem]> = Arc::from(items);
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
@@ -2099,7 +2119,10 @@ async fn proactive_retirement_pins_are_recoverable_and_do_not_repeat() {
         "retired outputs and the working set are not selected again"
     );
     let mut items = items.to_vec();
-    items.push(pressure_retirement_checkpoint(&remaining));
+    items.push(pressure_retirement_checkpoint(
+        &remaining,
+        PressureRetirementTrigger::Proactive,
+    ));
     assert!(
         state
             .pressure_retirement_selection(&items, 3, u64::MAX)

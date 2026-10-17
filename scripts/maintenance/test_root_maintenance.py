@@ -140,9 +140,6 @@ class RootMaintenanceTest(unittest.TestCase):
                 ],
             ),
             [
-                "scripts.benchmark_scripts.test_kd4_model_inference",
-                "scripts.benchmark_scripts.test_kd4_perf_snapshot",
-                "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_model_usage_requires_integer_counts_and_exact_reconciliation",
                 "scripts.maintenance.test_dev_environment",
                 "scripts.maintenance.test_report_script_regressions.Report26ValidationRegressions.test_lock_waiter_never_writes_to_an_empty_owned_file",
                 "scripts.maintenance.test_report_script_regressions.Report26ValidationRegressions.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
@@ -152,7 +149,7 @@ class RootMaintenanceTest(unittest.TestCase):
             root_maintenance.python_test_targets(
                 [], ["scripts/benchmark_scripts/kd4_perf_snapshot.py"]
             ),
-            ["scripts.benchmark_scripts.test_kd4_model_inference", "scripts.benchmark_scripts.test_kd4_perf_snapshot"],
+            [],  # Retired benchmark and migrated analyzer no longer route KD4 tests.
         )
 
     def test_script_test_entrypoints_have_explicit_validation_declarations(self):
@@ -227,9 +224,6 @@ class RootMaintenanceTest(unittest.TestCase):
                 "scripts.build.test_build_tooling_policy"
             ),
             "codex-rs/scripts/setup-windows.ps1": "scripts.build.test_build_tooling",
-            "scripts/benchmark_scripts/benchmark_code_mode_handoffs.mjs": (
-                "scripts.benchmark_scripts.test_benchmark_code_mode_handoffs"
-            ),
             "scripts/build/cargo-lane-patterns.ps1": "scripts.build.test_cargo_lane",
             "scripts/build/cargo-workspace-analyzer.ps1": "scripts.build.test_build_tooling_policy",
             "scripts/maintenance/run-python.js": "scripts.build.test_build_tooling_policy",
@@ -250,6 +244,7 @@ class RootMaintenanceTest(unittest.TestCase):
 
         # Retiring a script and its test leaves nothing to verify or import.
         retired = [
+            "scripts/benchmark_scripts/benchmark_code_mode_handoffs.mjs",
             "scripts/retired_example_tool.py",
             "scripts/test_retired_example_tool.py",
         ]

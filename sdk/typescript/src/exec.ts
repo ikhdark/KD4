@@ -330,10 +330,15 @@ class StderrTail {
 function resolvesBeforeDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => resolve(false), timeoutMs);
-    void promise.then(() => {
+    const settle = (resolved: boolean) => {
       clearTimeout(timeout);
-      resolve(true);
-    });
+      resolve(resolved);
+    };
+    // A rejection is not a resolution; consume it so it cannot escape as unhandled.
+    void promise.then(
+      () => settle(true),
+      () => settle(false),
+    );
   });
 }
 

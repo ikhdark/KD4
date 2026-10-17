@@ -76,27 +76,6 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertFalse(benchmark.correctness_checks(actual, wrong)["paths"])
         incomplete = {key: value for key, value in actual.items() if key != "unresolved"}
         self.assertFalse(benchmark.correctness_checks(actual, incomplete)["unresolved"])
-        query_path = Path(self.temp.name) / "query.json"
-        query_path.write_text(json.dumps(query), encoding="utf-8")
-        output = Path(self.temp.name) / "benchmark"
-        shadow = Path(self.temp.name) / "unrelated" / "scripts"
-        shadow.mkdir(parents=True)
-        (shadow / "__init__.py").write_text(
-            "raise RuntimeError('unrelated scripts package loaded')\n", encoding="utf-8",
-        )
-        with mock.patch.object(sys, "argv", [
-            "benchmark", "--root", str(self.root), "--scope", "templates",
-            "--query", str(query_path), "--runs", "2",
-            "--expected", result["canonical_paths"], "--output", str(output),
-        ]), mock.patch.dict(os.environ, {"PYTHONPATH": str(shadow.parent)}), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(benchmark.main(), 0)
-        report = json.loads((output / "report.json").read_bytes())
-        self.assertTrue(report["correctness_verified"])
-        self.assertFalse(report["requirement_adherence_verified"])
-        self.assertIn("paired real-task", report["semantic_evaluation"])
-        self.assertTrue(all(report["checks"].values()))
-        self.assertEqual(len(report["runs"]), 2)
-        self.assertEqual(len(report["replays"]), 2)
 
     def test_stdin_utf8_matches_file_query_and_preserves_explicit_paths(self):
         self.file("src/café.md", "日本語")

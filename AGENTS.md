@@ -37,8 +37,9 @@ This file supplements the active agent instructions with KD4-specific facts, com
 
 ## Codex performance and session analysis
 
+* Use KDR when auditing or benchmarking Codex sessions.
 * Compare matched Codex tasks by correct outcomes, total wall-clock time, input/output tokens, requests, tool calls, validation, retries, output recovery, and compactions. Separate model workflow choices from runtime changes; moving a wait into request normalization is not itself evidence of a slowdown. Microbenchmarks alone do not establish end-to-end gains.
 * Rollout JSONL lives under the fork home's `sessions` directory (archived threads use `archived_sessions`); `rollout_payload_artifact` stub records resolve to the same home's `rollout-payloads/<sha256>.json`. Large records can live in these artifacts instead of inline JSONL; a stub is a reference, not the complete record.
 * Put all audit documentation in `.codex/audits` under the active repository root.
-* Put all benchmark/audit scripts in `scripts/benchmark_scripts` under the active repository root.
+* Audit/session-analysis scripts live in KDR. Live/build experiment launchers were retired; `scripts/benchmark_scripts` retains only compatibility helpers and non-audit regression fixtures required by KD4 tooling.
 * "C:\Users\kuh\Documents\ChatGPT\rolloutdetect" provides extra tools for auditing and benchmarking.

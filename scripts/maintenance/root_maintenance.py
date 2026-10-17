@@ -362,14 +362,8 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/common/atomic_json.py": (
         f"{REPORT_REGRESSIONS}.test_atomic_output_preserves_hardlinked_source_and_checkpoint_on_failure",
     ),
-    "scripts/benchmark_scripts/benchmark_code_mode_handoffs.mjs": (
-        "scripts.benchmark_scripts.test_benchmark_code_mode_handoffs",
-    ),
     "scripts/benchmark_scripts/benchmark_semantic_contracts.py": (
         "scripts.maintenance.test_python_test_oracles.SemanticContractCounterexamples",
-    ),
-    "scripts/benchmark_scripts/benchmark_semantic_evidence.py": (
-        "scripts.maintenance.test_python_test_oracles.SemanticEvidenceTests",
     ),
     "scripts/build/build_tooling_test_support.py": (
         "scripts.build.test_build_tooling",
@@ -419,39 +413,11 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/build/invoke-rust-perf-env.ps1": ("scripts.build.test_build_tooling_performance",),
     "scripts/install/install.ps1": ("scripts.build.test_build_tooling_policy",),
     "scripts/build/just-shell.py": ("scripts.build.test_build_tooling",),
-    "scripts/benchmark_scripts/kd4_model_attempt_analysis.py": (
-        "scripts.benchmark_scripts.test_kd4_perf_snapshot",
-        "scripts.benchmark_scripts.test_kd4_model_inference",
-        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_model_usage_requires_integer_counts_and_exact_reconciliation",
-    ),
-    "scripts/benchmark_scripts/kd4_first_useful_action_analysis.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_invalid_wall_clock_keeps_canonical_lifecycle_and_schema_31",
-    ),
-    "scripts/benchmark_scripts/kd4_timing_analysis.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports",
-    ),
-    "scripts/benchmark_scripts/kd4_session_diagnostics.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_quality_counts_improve_upward_while_costs_improve_downward",
-        "scripts.benchmark_scripts.test_subscription_turns",
-    ),
-    "scripts/benchmark_scripts/restore_rollout_artifact.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_restore_storage_failure_never_publishes_a_partial_destination",
-    ),
-    "scripts/benchmark_scripts/tool_result_audit.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports",
-    ),
     "scripts/benchmark_scripts/rollout_snapshot.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports",
+        "scripts.build.test_validation_metrics",
     ),
     "scripts/build/validation_metrics.py": (
         "scripts.benchmark_scripts.test_rolloutdetect_ports.RolloutDetectPortsTest.test_missing_proof_status_preserves_work_without_claiming_current_proof",
-    ),
-    "scripts/benchmark_scripts/kd4_perf_snapshot.py": ("scripts.benchmark_scripts.test_kd4_model_inference",),
-    "scripts/benchmark_scripts/kd4_turn_latency_audit.py": (
-        "scripts.benchmark_scripts.test_rolloutdetect_ports",
-        "scripts.benchmark_scripts.test_subscription_turns",
-        f"{REPORT_REGRESSIONS}.test_terminal_conflicts_are_order_independent_and_malformed_is_local",
-        "scripts.benchmark_scripts.test_kd4_timing_analysis.SharedTimingAnalysisTest.test_rollout_status_prefers_structured_execution_results",
     ),
     "scripts/install/publish-local-codex.ps1": (
         "scripts.install.test_publish_local_codex",
@@ -467,7 +433,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.install.test_publish_local_codex_freshness",
     ),
     "scripts/common/process_owner.py": ("scripts.maintenance.test_report_script_regressions",),
-    "scripts/benchmark_scripts/rollout_reports.py": ("scripts.benchmark_scripts.test_rollout_complete",),
     "scripts/maintenance/root_maintenance.py": (
         f"{REPORT_REGRESSIONS}.test_changed_tests_and_adjacent_production_across_owned_roots",
         f"{REPORT_REGRESSIONS}.test_report_regressions_follow_their_changed_owners_once",

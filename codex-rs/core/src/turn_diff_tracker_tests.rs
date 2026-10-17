@@ -988,6 +988,30 @@ index {ZERO_OID}..{right_oid}
     assert_eq!(tracker.get_unified_diff(), Some(expected));
 }
 
+/// Editing or removing an existing test can change what it asserts; adding a
+/// test cannot. Completion reporting names only files that had a baseline and
+/// end the turn different from it.
+#[tokio::test]
+async fn changed_existing_paths_exclude_added_and_restored_files() {
+    let dir = tempdir().unwrap();
+    for name in ["edited.txt", "deleted.txt", "renamed.txt", "restored.txt"] {
+        fs::write(dir.path().join(name), "old\n").unwrap();
+    }
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: added.txt\n+new\n*** Update File: edited.txt\n@@\n-old\n+new\n*** Delete File: deleted.txt\n*** Update File: renamed.txt\n*** Move to: destination.txt\n@@\n-old\n+new\n*** Update File: restored.txt\n@@\n-old\n+new\n*** End Patch").await;
+    tracker.track_delta("", &delta);
+    let restore = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Update File: restored.txt\n@@\n-new\n+old\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &restore);
+    assert_eq!(
+        tracker.changed_existing_display_paths(),
+        ["deleted.txt", "edited.txt", "renamed.txt"]
+    );
+}
+
 #[tokio::test]
 async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings() {
     let dir = tempdir().unwrap();

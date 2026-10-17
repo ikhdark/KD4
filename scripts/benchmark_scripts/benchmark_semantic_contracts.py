@@ -1,18 +1,4 @@
-"""Offline, narrow semantic counterexamples through the real oracle worker.
-
-Measures complete subprocess requests, including startup and JSON transport;
-not model latency, semantic equivalence, or repository-wide dependency recall.
-Fixtures and expected relationships are authored independently of worker output.
-"""
-
-import argparse
-import hashlib
-import json
-from pathlib import Path
-import statistics
-import subprocess
-import sys
-import time
+"""Authored oracle regression fixtures; standalone benchmarking retired."""
 
 
 def patched_boundary_cases():
@@ -159,47 +145,5 @@ def checks(name, report):
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    if not 1 <= args.runs <= 20:
-        parser.error("runs must be 1..20")
-    if args.output.exists():
-        parser.error("output must be a new file")
-    worker = (Path(__file__).resolve().parents[1] / "maintenance" / "python_test_oracles.py")
-    worker_hash = hashlib.sha256(worker.read_bytes()).hexdigest()
-    rows = []
-    for iteration in range(args.runs):
-        for name, sources in cases().items():
-            request = json.dumps({"sources": sources}).encode()
-            start = time.perf_counter()
-            process = subprocess.run([sys.executable, "-I", "-B", str(worker)],
-                                     input=request, capture_output=True, timeout=15)
-            elapsed = (time.perf_counter() - start) * 1000
-            if process.returncode:
-                raise RuntimeError(process.stderr.decode(errors="replace"))
-            report = json.loads(process.stdout)
-            rows.append({"case": name, "iteration": iteration, "wall_ms": elapsed,
-                         "output_bytes": len(process.stdout), "checks": checks(name, report),
-                         "report": report})
-    if hashlib.sha256(worker.read_bytes()).hexdigest() != worker_hash:
-        raise RuntimeError("worker changed during measurement")
-    summary = {
-        "worker_sha256": worker_hash, "python": sys.version,
-        "checks_passed": sum(sum(row["checks"].values()) for row in rows),
-        "checks_total": sum(len(row["checks"]) for row in rows),
-        "median_case_ms": {name: statistics.median(row["wall_ms"] for row in rows if row["case"] == name) for name in cases()},
-        "median_task_ms": statistics.median(sum(row["wall_ms"] for row in rows if row["iteration"] == iteration) for iteration in range(args.runs)),
-        "worker_requests_per_task": len(cases()), "model_requests": 0,
-        "scope": "authored counterexamples through isolated worker subprocesses; no live-model, workspace-wide, or concurrency speedup claim",
-    }
-    with args.output.open("x", encoding="utf-8") as output:
-        json.dump({"summary": summary, "fixtures": cases(), "observations": rows}, output, indent=2)
-    print(json.dumps({**summary, "report": str(args.output.resolve())}, indent=2))
-    return 0 if summary["checks_passed"] == summary["checks_total"] else 1
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit("Semantic benchmark retired; fixtures remain for KD4 oracle tests.")

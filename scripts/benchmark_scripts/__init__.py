@@ -1,1 +1,1 @@
-"""Benchmarks, audit fixtures, and session analysis."""
+"""Compatibility helpers and non-audit tests; saved-session audits live in KDR."""

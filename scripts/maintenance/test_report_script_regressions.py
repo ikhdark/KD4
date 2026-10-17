@@ -19,9 +19,7 @@ from scripts.maintenance import source_inventory
 from scripts.common import process_owner
 from scripts.build import rust_build_status
 from scripts.codex_package import stage_npm_packages
-from scripts.benchmark_scripts import kd4_turn_latency_audit as audit
 from scripts.codex_package import cli, cargo
-from scripts.benchmark_scripts.test_kd4_timing_analysis import timing_profile
 from scripts.schemas import app_server_schema_runtime_check as schema
 from scripts.common import generated_output_lock
 import threading
@@ -511,35 +509,7 @@ class ScriptReportRegressions(unittest.TestCase):
             self.assertIsNotNone(processes[0].poll(), "cancelled sibling kept running")
             self.assertNotEqual(processes[0].returncode, 0)
 
-    def test_terminal_conflicts_are_order_independent_and_malformed_is_local(self):
-        first = timing_profile()
-        second = copy.deepcopy(first)
-        second["inclusiveDurationNs"] *= 9
-        malformed = copy.deepcopy(first)
-        malformed["inclusiveDurationNs"] = None
-        for profiles in ((first, second), (second, first)):
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "rollout.jsonl"
-                rows = []
-                for turn, value in [("conflict", p) for p in profiles] + [
-                    ("bad", malformed),
-                    ("good", first),
-                ]:
-                    rows.append(
-                        {
-                            "type": "event_msg",
-                            "payload": {
-                                "type": "task_complete",
-                                "turn_id": turn,
-                                "timing": value,
-                            },
-                        }
-                    )
-                path.write_text("\n".join(json.dumps(row) for row in rows))
-                report = audit.analyze_session_path(path, Path(directory))
-                self.assertEqual(report["coverage"]["validCompleteProfiles"], 1)
-                self.assertEqual(report["coverage"]["conflictingTerminalProfiles"], 1)
-                self.assertFalse(report["auditDecision"]["readyToFinalize"])
+
 
     def test_npm_cancellation_restores_all_outputs_and_clears_journal(self):
         with tempfile.TemporaryDirectory() as directory:

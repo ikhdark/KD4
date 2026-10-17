@@ -94,6 +94,9 @@ pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) prompt_token_calibration: PromptTokenCalibration,
+    /// Estimated retirable tokens re-sent by each request checked since history
+    /// was last rewritten; see `retire_consumed_tool_outputs_before_limit`.
+    pub(crate) proactive_retirement_carried_tokens: u64,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
@@ -138,6 +141,7 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
+            proactive_retirement_carried_tokens: 0,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
@@ -227,6 +231,8 @@ impl SessionState {
         // Compaction and rollback change the prompt composition. Ratios measured
         // against discarded history must not inflate the replacement checkpoint.
         self.prompt_token_calibration = PromptTokenCalibration::default();
+        // The replacement already rewrote the prompt, so carrying restarts.
+        self.proactive_retirement_carried_tokens = 0;
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {

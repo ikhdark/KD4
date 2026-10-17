@@ -545,6 +545,25 @@ impl TurnDiffTracker {
             .collect()
     }
 
+    /// Display paths of files that existed before this turn and that it
+    /// modified or deleted, following a rename to its destination. Unlike an
+    /// added file, such an edit can change what an existing check asserts.
+    pub(crate) fn changed_existing_display_paths(&self) -> Vec<String> {
+        self.baseline_by_path
+            .iter()
+            .filter(|(path, before)| {
+                let after = self.current_by_path.get(*path).or_else(|| {
+                    self.rename_destination(path)
+                        .and_then(|destination| self.current_by_path.get(destination))
+                });
+                after.is_none_or(|after| after.content != before.content)
+            })
+            .map(|(path, _)| self.display_path(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
     }

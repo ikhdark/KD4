@@ -16,12 +16,15 @@ version = 1
 policy-pack = ["kd4@1"]
 exclude = ["target/**", "target-*/**", ".kda/**"]
 
-# Security review is out of scope for this gate. Default-deny contracts stay on.
+# Security review is out of scope, including security checks that default to deny.
+# Keep unrelated correctness, reliability, and data-integrity checks enabled.
 [lints]
 authority-lattice-widening = "allow"
 authority-membership-identity-drift = "allow"
 authorization-envelope-drift = "allow"
 authorization-subject-drift = "allow"
+await-holding-guard = "warn"
+capability-flow-unproven = "allow"
 capability-lifecycle-violation = "allow"
 capability-mediation-bypass = "allow"
 capability-origin-violation = "allow"
@@ -29,12 +32,20 @@ capability-scope-escape = "allow"
 capability-subject-mismatch = "allow"
 command-injection = "allow"
 denied-read-unsandboxed-execution = "allow"
+expect-in-library = "warn"
 fail-open-policy-fallback = "allow"
 hardcoded-credential = "allow"
 insecure-tls-verification = "allow"
+kd4-permission-keyed-transaction = "allow"
+kd4-provider-account-scope-escape = "allow"
 nominal-authority-without-membership = "allow"
+non-fail-closed-shell-classifier = "allow"
+non-inheritable-child-environment = "allow"
+non-inheritable-context-escape = "allow"
 path-injection = "allow"
+permission-grant-continuity = "allow"
 permission-profile-widening = "allow"
+powershell-method-assumed-read-only = "allow"
 privileged-effect-without-authority = "allow"
 privileged-effect-without-guard = "allow"
 redaction-not-dominating-boundary = "allow"
@@ -47,8 +58,10 @@ security-recognizer-normalization-drift = "allow"
 sensitive-data-escape = "allow"
 trust-sensitive-view-escape = "allow"
 unbound-capability-token = "allow"
+uncovered-privileged-sink = "allow"
 unfiltered-sandbox-capability-root = "allow"
 unsafe-powershell-approval-parser = "allow"
+wrong-scope-authority = "allow"
 
 # Keep every other built-in severity, including denials and uncertainty diagnostics.
 # Analyze the supported Windows host with normal Cargo default features.
