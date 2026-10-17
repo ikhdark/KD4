@@ -3707,7 +3707,7 @@ async fn reducer_ingests_skill_invoked_fact() {
         let raw_id = format!("personal_{}_doc", expected_absolute_path(&skill_path));
         let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
         sha1::Digest::update(&mut hasher, raw_id.as_bytes());
-        format!("{:x}", sha1::Digest::finalize(hasher))
+        hex::encode(sha1::Digest::finalize(hasher))
     };
     assert_eq!(
         skill_id_for_local_skill(

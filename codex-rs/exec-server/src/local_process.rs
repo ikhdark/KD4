@@ -778,6 +778,12 @@ impl ExecProcess for LocalExecProcess {
         Box::pin(LocalExecProcess::write(self, chunk))
     }
 
+    // `exec_write` finishes every await before its synchronous send, so a
+    // dropped write never reaches the stdin queue.
+    fn cancelled_write_is_unsent(&self) -> bool {
+        true
+    }
+
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
         Box::pin(LocalExecProcess::signal(self, signal))
     }
@@ -1251,6 +1257,56 @@ mod tests {
         assert_eq!(writer_rx.recv().await.unwrap(), b"occupied");
         assert!(pending.await.unwrap_err().message.contains("expired"));
         assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        drop(process);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stdin_write_on_a_full_queue_is_never_enqueued() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "stdin-cancelled-full-queue").await;
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        writer_tx.send(b"occupied".to_vec()).await.unwrap();
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(running) =
+                processes.get_mut(&process.process_id).unwrap()
+            else {
+                panic!("running process");
+            };
+            running.tty = true;
+            running.session = dummy_session_with_writer(writer_tx);
+        }
+        let handle = LocalExecProcess {
+            process_id: process.process_id.clone(),
+            backend: backend.clone(),
+            wake_tx: watch::channel(0).0,
+            events: ExecProcessEventLog::new(
+                PROCESS_EVENT_CHANNEL_CAPACITY,
+                RETAINED_OUTPUT_BYTES_PER_PROCESS,
+            ),
+        };
+        assert!(handle.cancelled_write_is_unsent());
+
+        let mut cancelled = ExecProcess::write(&handle, b"cancelled".to_vec());
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        // Freed capacity cannot let the abandoned write land later.
+        assert_eq!(writer_rx.recv().await.unwrap(), b"occupied");
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let retried = ExecProcess::write(&handle, b"retried".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(retried.status, WriteStatus::Accepted);
+        assert_eq!(writer_rx.recv().await.unwrap(), b"retried");
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         drop(process);
         backend.shutdown().await;
     }

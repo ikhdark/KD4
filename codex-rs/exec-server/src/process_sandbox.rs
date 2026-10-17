@@ -156,6 +156,7 @@ async fn spawn_windows_sandbox(
             proxy_settings_mode: codex_windows_sandbox::WindowsSandboxProxySettingsMode::Reconcile,
             timeout_ms: None,
             read_roots_override,
+            additional_read_roots: empty_paths,
             read_roots_include_platform_defaults,
             write_roots_override,
             deny_read_paths_override,

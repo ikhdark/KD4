@@ -81,7 +81,7 @@ impl OutgoingMessageSender {
     ) -> Result<PendingRequest, ErrorData> {
         let id = RequestId::Number(
             self.next_request_id
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| ErrorData::internal_error("MCP request IDs are exhausted", None))?,
         );
         let (tx_approve, rx_approve) = oneshot::channel();
@@ -138,7 +138,7 @@ impl OutgoingMessageSender {
     }
 
     pub(crate) async fn send_response<T: Serialize>(&self, id: RequestId, response: T) {
-        let result = match serde_json::to_value(response) {
+        let mut result = match serde_json::to_value(response) {
             Ok(result) => result,
             Err(err) => {
                 self.send_error(
@@ -149,6 +149,16 @@ impl OutgoingMessageSender {
                 return;
             }
         };
+
+        // rmcp result constructors include the 2026-07-28 discriminator by default.
+        // This server serializes responses directly, bypassing rmcp's protocol-aware
+        // response handling, so keep the legacy wire shape:
+        // https://github.com/modelcontextprotocol/rust-sdk/issues/1036
+        if let Value::Object(object) = &mut result
+            && object.get("resultType").and_then(Value::as_str) == Some("complete")
+        {
+            object.remove("resultType");
+        }
 
         let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
         let _ = self.sender.send(outgoing_message).await;
@@ -331,6 +341,25 @@ mod tests {
             obj.get("notification").is_none(),
             "rmcp notification must flatten to JSON-RPC method/params"
         );
+    }
+
+    #[tokio::test]
+    async fn outgoing_tool_response_preserves_legacy_wire_format() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
+
+        outgoing_message_sender
+            .send_response(
+                RequestId::Number(1),
+                rmcp::model::CallToolResult::success(Vec::new()),
+            )
+            .await;
+
+        let Some(OutgoingMessage::Response(response)) = outgoing_rx.recv().await else {
+            panic!("expected a tool-call response");
+        };
+        assert_eq!(response.id, RequestId::Number(1));
+        assert_eq!(response.result, json!({ "content": [], "isError": false }));
     }
 
 

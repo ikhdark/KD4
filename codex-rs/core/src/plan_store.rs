@@ -125,7 +125,7 @@ impl PlanLineage {
     pub(crate) fn step_id(&self, text: &str) -> String {
         let key = plan_step_id(text);
         // Preserve IDs published by older builds, including renamed steps.
-        let legacy = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let legacy = hex::encode(Sha256::digest(text.as_bytes()));
         self.step_identities
             .get(&key)
             .or_else(|| self.step_identities.get(&legacy))
@@ -553,7 +553,7 @@ pub(crate) fn plan_revision(plan: Option<&UpdatePlanArgs>) -> String {
         reason = "plan serialization contains only strings, vectors, options and unit enums"
     )]
     let bytes = serde_json::to_vec(&plan).expect("plan serializes");
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub(crate) fn plan_revision_with_lineage(
@@ -568,11 +568,11 @@ pub(crate) fn plan_revision_with_lineage(
         reason = "plan and lineage use derived JSON-compatible fields and string-keyed maps"
     )]
     let bytes = serde_json::to_vec(&(plan, lineage)).expect("plan serializes");
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub(crate) fn plan_step_id(step: &str) -> String {
-    format!("{:x}", Sha256::digest(step.as_bytes()))[..16].to_string()
+    hex::encode(Sha256::digest(step.as_bytes()))[..16].to_string()
 }
 
 pub(crate) fn plan_response_from_tool_output(
@@ -678,7 +678,7 @@ impl PlanStore {
     ) {
         let hashes = texts
             .filter(|text| !text.trim().is_empty())
-            .map(|text| format!("{:x}", Sha256::digest(text.as_bytes())))
+            .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
             .collect();
         *self.accepted_input.lock().await = Some((turn_id.to_string(), hashes));
     }
@@ -956,7 +956,7 @@ impl PlanStore {
                         .into(),
                 );
             }
-            let sha256 = format!("{:x}", Sha256::digest(instruction.as_bytes()));
+            let sha256 = hex::encode(Sha256::digest(instruction.as_bytes()));
             let Some((turn_id, _)) = accepted_input
                 .as_ref()
                 .filter(|(_, hashes)| hashes.contains(&sha256))
@@ -2069,7 +2069,7 @@ mod tests {
         assert!(compact.is_empty());
         assert_eq!(compact.reconcile_restored(Some(&current)), full);
 
-        let legacy_id = format!("{:x}", Sha256::digest(b"inspect"));
+        let legacy_id = hex::encode(Sha256::digest(b"inspect"));
         let mut legacy = PlanLineage::default();
         legacy.requirements.insert(
             legacy_id.clone(),

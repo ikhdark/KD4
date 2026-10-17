@@ -114,7 +114,7 @@ pub(super) fn unsettled_tool_recovery_page(
             "environment": field(&["environment_id"]).map(bounded),
             "cwd": redacted_path(field(&["workdir", "cwd"]).unwrap_or(&cwd)),
             "target": field(&["path", "file_path", "target"]).map(redacted_path),
-            "invocation_sha256": format!("{:x}", sha2::Sha256::digest(arguments.as_bytes())),
+            "invocation_sha256": hex::encode(sha2::Sha256::digest(arguments.as_bytes())),
             "status": "result_not_durably_available_effects_unknown",
         })
     }).collect::<Vec<_>>();

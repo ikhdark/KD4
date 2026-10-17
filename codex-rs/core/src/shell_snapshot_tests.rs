@@ -12,7 +12,7 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
-use core_test_support::PathExt;
+use crate::test_harness::PathExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 

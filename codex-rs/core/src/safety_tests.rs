@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_harness::PathExt;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileSystemAccessMode;
@@ -8,7 +9,6 @@ use codex_protocol::protocol::FileSystemSpecialPath;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 

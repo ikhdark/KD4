@@ -124,9 +124,15 @@ impl WsIngressSender {
             let released = self.capacity_released.notified();
             tokio::pin!(released);
             released.as_mut().enable();
-            if self.queued_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued.checked_add(payload_bytes).filter(|next| *next <= self.max_queued_bytes)
-            }).is_ok() {
+            if self
+                .queued_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    queued
+                        .checked_add(payload_bytes)
+                        .filter(|next| *next <= self.max_queued_bytes)
+                })
+                .is_ok()
+            {
                 // No await after charging the budget: cancellation cannot leak it.
                 permit.send(StagedWsMessage { message: message.clone(), payload_bytes });
                 return Ok(());
@@ -143,7 +149,7 @@ impl WsIngressSender {
         let payload_bytes = message.len();
         if self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued_bytes| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued_bytes| {
                 queued_bytes
                     .checked_add(payload_bytes)
                     .filter(|next| *next <= self.max_queued_bytes)

@@ -11,4 +11,5 @@ doctest = false
 workspace = true
 
 [dependencies]
+hex = { workspace = true }
 sha2 = { workspace = true }

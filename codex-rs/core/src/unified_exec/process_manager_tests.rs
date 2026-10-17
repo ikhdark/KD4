@@ -2108,6 +2108,41 @@ fn exec_server_request_for_env_test() -> ExecRequest {
 }
 
 #[tokio::test]
+async fn windows_sandbox_launch_with_managed_proxy_uses_elevated_backend() -> anyhow::Result<()> {
+    let (_session, turn) = crate::session::tests::make_session_and_context().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let mut request = exec_server_request_for_env_test();
+    request.sandbox = codex_sandboxing::SandboxType::WindowsRestrictedToken;
+    request.windows_sandbox_level =
+        codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken;
+    let cwd = request.windows_sandbox_workspace_roots[0].clone();
+    let snapshot = cwd.join("shell-snapshot.ps1");
+    request.windows_sandbox_additional_read_roots = vec![snapshot.clone()];
+
+    let unproxied = windows_sandbox_session_request(&request, cwd.as_path(), /*tty*/ false);
+    assert!(
+        !codex_windows_sandbox::windows_sandbox_uses_elevated_backend(
+            unproxied.windows_sandbox_level,
+            unproxied.proxy_enforced,
+        )
+    );
+
+    // The restricted-token backend has no firewall identity, so a managed proxy
+    // must select the elevated backend even at the unelevated level.
+    request.network = Some(proxy.proxy());
+    let proxied = windows_sandbox_session_request(&request, cwd.as_path(), /*tty*/ false);
+    assert!(proxied.proxy_enforced);
+    assert!(
+        codex_windows_sandbox::windows_sandbox_uses_elevated_backend(
+            proxied.windows_sandbox_level,
+            proxied.proxy_enforced,
+        )
+    );
+    assert_eq!(proxied.additional_read_roots, [snapshot]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     let mut request = exec_server_request_for_env_test();
     let managed_network = request.exec_server_managed_network.clone().unwrap();
@@ -2188,7 +2223,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
         let proxy_dir = home.join("proxy");
         std::fs::create_dir_all(&proxy_dir).unwrap();
         let certificate_bytes = b"independent generated trust bundle bytes\n";
-        let hash = format!("{:x}", sha2::Sha256::digest(certificate_bytes));
+        let hash = hex::encode(sha2::Sha256::digest(certificate_bytes));
         let bundle = proxy_dir.join(format!("ca-bundle-{hash}.pem"));
         std::fs::write(&bundle, certificate_bytes).unwrap();
         let bundle_text = bundle.to_string_lossy().into_owned();

@@ -172,7 +172,7 @@ impl SamplingRequestBaselines {
             self.revision_key(),
             self.evidence_fingerprint,
         );
-        format!("{:x}", Sha256::digest(state.as_bytes()))
+        hex::encode(Sha256::digest(state.as_bytes()))
     }
 }
 
@@ -1127,7 +1127,7 @@ impl SamplingRequestSignalCollector {
             })
             .collect::<BTreeSet<_>>();
         (!evidence.is_empty())
-            .then(|| format!("{:x}", Sha256::digest(format!("{evidence:?}").as_bytes())))
+            .then(|| hex::encode(Sha256::digest(format!("{evidence:?}").as_bytes())))
     }
 
     #[cfg(test)]
@@ -1819,8 +1819,10 @@ impl SamplingRequestSignalCollector {
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(format!(
-            "direct_tool.{:x}",
-            Sha256::digest(crate::tools::context::normalize_tool_failure_text(failure).as_bytes())
+            "direct_tool.{}",
+            hex::encode(Sha256::digest(
+                crate::tools::context::normalize_tool_failure_text(failure).as_bytes()
+            ))
         ));
         outcome.failure_is_terminal = failure_is_terminal;
         let mut state = self
@@ -2205,10 +2207,9 @@ impl SamplingRequestSignalCollector {
                 })
                 .collect::<Option<Vec<_>>>()?;
             failure_action_bindings.sort_unstable();
-            let failure_action_identity = format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&failure_action_bindings).ok()?)
-            );
+            let failure_action_identity = hex::encode(Sha256::digest(
+                serde_json::to_vec(&failure_action_bindings).ok()?,
+            ));
             let (kind, key_prefix) = if nested_only {
                 (
                     DeterministicCycleKind::NestedToolFailure,
@@ -2660,13 +2661,10 @@ fn structured_action_identity_from_canonical(
     if canonical.identity_payload.is_none() {
         // Retain invalid bytes only for argument-error diagnosis. Do not give
         // malformed input a successful replay or wait identity.
-        let identity = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&(tool_name, "invalid_function_arguments", &canonical.value))
-                    .ok()?
-            )
-        );
+        let identity = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(tool_name, "invalid_function_arguments", &canonical.value))
+                .ok()?,
+        ));
         return Some(StructuredActionIdentity {
             evidence_identity: identity.clone(),
             identity,
@@ -2698,7 +2696,7 @@ fn structured_action_identity_from_canonical(
             .or(canonical.identity_payload.as_deref())?,
     ))
     .ok()?;
-    let identity = format!("{:x}", Sha256::digest(action.as_bytes()));
+    let identity = hex::encode(Sha256::digest(action.as_bytes()));
     let mut evidence_arguments = normalized_read.unwrap_or_else(|| canonical.value.clone());
     if ["exec_command", "shell_command", "write_stdin"]
         .iter()
@@ -2708,10 +2706,9 @@ fn structured_action_identity_from_canonical(
         arguments.remove("max_output_tokens");
         arguments.remove("yield_time_ms");
     }
-    let evidence_identity = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(tool_name, evidence_arguments)).ok()?)
-    );
+    let evidence_identity = hex::encode(Sha256::digest(
+        serde_json::to_vec(&(tool_name, evidence_arguments)).ok()?,
+    ));
     Some(StructuredActionIdentity {
         identity,
         evidence_identity,
@@ -2735,7 +2732,7 @@ impl std::io::Write for Sha256Writer {
 fn serialized_evidence_identity(value: &impl Serialize) -> Option<String> {
     let mut writer = Sha256Writer(Sha256::new());
     serde_json::to_writer(&mut writer, value).ok()?;
-    Some(format!("{:x}", writer.0.finalize()))
+    Some(hex::encode(writer.0.finalize()))
 }
 
 fn response_evidence_identity(response: &ResponseInputItem) -> Option<String> {
@@ -2836,8 +2833,8 @@ fn code_mode_result_failure_fingerprint(
     }))
     .unwrap_or_default();
     format!(
-        "code_mode.nested_tool.{:x}",
-        Sha256::digest(canonical.as_bytes())
+        "code_mode.nested_tool.{}",
+        hex::encode(Sha256::digest(canonical.as_bytes()))
     )
 }
 
@@ -2960,7 +2957,7 @@ fn authoritative_wait_observation(
         .collect();
     Some(AuthoritativeWaitObservation {
         disposition,
-        identity: format!("{:x}", Sha256::digest(identity)),
+        identity: hex::encode(Sha256::digest(identity)),
         owner: owner.to_string(),
         state_revision: state_revision.to_string(),
         action_identity,
@@ -4045,10 +4042,7 @@ impl TurnExecutionControl {
                     &self.delivered_coverage,
                 ))
                 .expect("ordered evidence contains only JSON-serializable values");
-                format!(
-                    "{:x}",
-                    Sha256::digest(evidence),
-                )
+                hex::encode(Sha256::digest(evidence))
             }).clone(),
         }
     }

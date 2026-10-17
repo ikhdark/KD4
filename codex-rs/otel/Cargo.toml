@@ -32,7 +32,7 @@ opentelemetry-otlp = { workspace = true, features = [
     "logs",
     "metrics",
     "trace",
-    "tls",
+    "tls-ring",
     "tls-roots",
 ]}
 opentelemetry-semantic-conventions = { workspace = true }

@@ -306,6 +306,8 @@ impl From<rmcp::model::ElicitationAction> for McpServerElicitationAction {
             rmcp::model::ElicitationAction::Accept => Self::Accept,
             rmcp::model::ElicitationAction::Decline => Self::Decline,
             rmcp::model::ElicitationAction::Cancel => Self::Cancel,
+            // An action this protocol cannot represent is not a user acceptance.
+            _ => Self::Cancel,
         }
     }
 }
@@ -725,7 +727,7 @@ impl TryFrom<CoreElicitationRequest> for McpServerElicitationRequest {
 #[ts(export_to = "v2/")]
 pub struct McpServerElicitationRequestResponse {
     pub action: McpServerElicitationAction,
-    /// Structured user input for accepted elicitations, mirroring RMCP `CreateElicitationResult`.
+    /// Structured user input for accepted elicitations, mirroring RMCP `ElicitResult`.
     ///
     /// This is nullable because decline/cancel responses have no content.
     pub content: Option<JsonValue>,
@@ -735,23 +737,22 @@ pub struct McpServerElicitationRequestResponse {
     pub meta: Option<JsonValue>,
 }
 
-impl From<McpServerElicitationRequestResponse> for rmcp::model::CreateElicitationResult {
+impl From<McpServerElicitationRequestResponse> for rmcp::model::ElicitResult {
     /// Preserves object metadata supported by RMCP. Non-object metadata is omitted;
     /// the runtime's custom response serializer supports arbitrary JSON metadata.
     fn from(value: McpServerElicitationRequestResponse) -> Self {
-        Self {
-            action: value.action.into(),
-            content: value.content,
-            meta: value.meta.and_then(|meta| match meta {
-                JsonValue::Object(meta) => Some(rmcp::model::Meta(meta)),
-                _ => None,
-            }),
-        }
+        let mut result = Self::new(value.action.into());
+        result.content = value.content;
+        result.meta = value.meta.and_then(|meta| match meta {
+            JsonValue::Object(meta) => Some(rmcp::model::MetaObject(meta)),
+            _ => None,
+        });
+        result
     }
 }
 
-impl From<rmcp::model::CreateElicitationResult> for McpServerElicitationRequestResponse {
-    fn from(value: rmcp::model::CreateElicitationResult) -> Self {
+impl From<rmcp::model::ElicitResult> for McpServerElicitationRequestResponse {
+    fn from(value: rmcp::model::ElicitResult) -> Self {
         Self {
             action: value.action.into(),
             content: value.content,

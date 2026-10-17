@@ -25,8 +25,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
 use codex_code_mode::CodeModeSessionProvider;
-use codex_code_mode::FallbackCodeModeSessionProvider;
-use codex_code_mode::InProcessCodeModeSessionProvider;
+use codex_code_mode::DisabledCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_core_plugins::PluginsManager;
@@ -650,12 +649,9 @@ impl ThreadManager {
                 plugins_manager,
                 mcp_manager,
                 code_mode_session_provider: if config.features.enabled(Feature::CodeModeHost) {
-                    Arc::new(FallbackCodeModeSessionProvider::new(
-                        Arc::new(ProcessOwnedCodeModeSessionProvider::default()),
-                        Arc::new(InProcessCodeModeSessionProvider),
-                    ))
+                    Arc::new(ProcessOwnedCodeModeSessionProvider::default())
                 } else {
-                    Arc::new(InProcessCodeModeSessionProvider)
+                    Arc::new(DisabledCodeModeSessionProvider)
                 },
                 extensions,
                 user_instructions_provider,
@@ -678,12 +674,9 @@ impl ThreadManager {
         let Some(state) = Arc::get_mut(&mut self.state) else {
             unreachable!("new thread manager state should not be shared");
         };
-        state.code_mode_session_provider = Arc::new(FallbackCodeModeSessionProvider::new(
-            Arc::new(ProcessOwnedCodeModeSessionProvider::with_host_program(
-                host_program,
-            )),
-            Arc::new(InProcessCodeModeSessionProvider),
-        ));
+        state.code_mode_session_provider = Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(host_program),
+        );
         self
     }
 
@@ -801,7 +794,7 @@ impl ThreadManager {
                 skills_service,
                 plugins_manager,
                 mcp_manager,
-                code_mode_session_provider: Arc::new(InProcessCodeModeSessionProvider),
+                code_mode_session_provider: Arc::new(DisabledCodeModeSessionProvider),
                 extensions: empty_extension_registry(),
                 user_instructions_provider,
                 thread_store,

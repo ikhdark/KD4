@@ -20,6 +20,7 @@ use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use codex_command_analysis::git_dirs::resolve_git_dirs;
 use codex_config::ProjectDiscoveryContext;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_watcher::DebouncedWatchReceiver;
@@ -707,7 +708,7 @@ async fn capture_remote_workspace_evidence(
             {
                 return None;
             }
-            manifest.extend_from_slice(format!("{:x}", Sha256::digest(&contents)).as_bytes());
+            manifest.extend_from_slice(hex::encode(Sha256::digest(&contents)).as_bytes());
         }
         manifest.push(b'\n');
     }
@@ -726,8 +727,8 @@ async fn capture_remote_workspace_evidence(
         unavailable: false,
         repository_root: Some(format!("{}:{root}", environment.approval_scope_id())),
         head_identity,
-        index_identity: Some(format!("{:x}", index.finalize())),
-        worktree_identity: Some(format!("{:x}", worktree.finalize())),
+        index_identity: Some(hex::encode(index.finalize())),
+        worktree_identity: Some(hex::encode(worktree.finalize())),
         path_fingerprints: None,
     }))
 }
@@ -741,6 +742,17 @@ where
 {
     timeout(deadline, capture).await
 }
+
+// Git for Windows reports a file's creation time as its ctime. Copying or
+// restoring a checkout resets it without touching content, and this read-only
+// status (GIT_OPTIONAL_LOCKS=0) cannot persist the refreshed index, so every
+// capture would re-read every tracked file (seconds per capture on a copied
+// checkout). In-place rewrites never change the creation time; size, mtime and
+// Git's racy-entry checks remain the content signals.
+#[cfg(windows)]
+const LOCAL_WORKSPACE_STATUS_CONFIG: &[&str] = &["-c", "core.trustctime=false"];
+#[cfg(not(windows))]
+const LOCAL_WORKSPACE_STATUS_CONFIG: &[&str] = &[];
 
 fn workspace_generation_status_args() -> &'static [&'static str] {
     &[
@@ -791,8 +803,8 @@ async fn capture_workspace_generation_marker(
         // blocking discovery worker. Reuse that same captured repository.
         repository_root: Some(repo_root.to_string_lossy().into_owned()),
         head_identity,
-        index_identity: Some(format!("{:x}", index_hasher.finalize())),
-        worktree_identity: Some(format!("{:x}", worktree_hasher.finalize())),
+        index_identity: Some(hex::encode(index_hasher.finalize())),
+        worktree_identity: Some(hex::encode(worktree_hasher.finalize())),
         path_fingerprints: Some(path_fingerprints),
     })
 }
@@ -879,7 +891,7 @@ impl WorkspaceStatusReader {
                 return None;
             }
             self.path_status
-                .insert(path.to_owned(), format!("{:x}", Sha256::digest(record)));
+                .insert(path.to_owned(), hex::encode(Sha256::digest(record)));
             if let Some(previous) = self.paths.insert(path.to_owned(), deleted)
                 && previous != deleted
             {
@@ -912,6 +924,7 @@ async fn workspace_generation_status(
         .arg("-c")
         .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
         .args(["-c", "core.fsmonitor=false"])
+        .args(LOCAL_WORKSPACE_STATUS_CONFIG)
         .args(workspace_generation_status_args())
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
@@ -1041,7 +1054,7 @@ fn hash_workspace_content(
         }
         hasher.update(&buffer[..count]);
     }
-    Some((format!("{:x}", hasher.finalize()), bytes_read))
+    Some((hex::encode(hasher.finalize()), bytes_read))
 }
 
 async fn capture_workspace_metadata(
@@ -1087,7 +1100,7 @@ async fn capture_workspace_metadata(
                     0
                 };
                 observed_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |total| {
                         total
                             .checked_add(declared_bytes)
                             .filter(|total| *total <= WORKSPACE_GENERATION_MAX_DECLARED_BYTES)
@@ -1111,8 +1124,7 @@ async fn capture_workspace_metadata(
                 if metadata.file_type().is_symlink() {
                     let target = std::fs::read_link(&absolute).ok()?;
                     manifest.extend_from_slice(
-                        format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes()))
-                            .as_bytes(),
+                        hex::encode(Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes(),
                     );
                 } else if metadata.is_file() {
                     let mut file = File::open(&absolute).ok()?;
@@ -1148,7 +1160,7 @@ async fn capture_workspace_metadata(
         let path = std::str::from_utf8(entry.split(|byte| *byte == 0).next()?)
             .ok()?
             .to_owned();
-        path_fingerprints.insert(path, format!("{:x}", Sha256::digest(&entry)));
+        path_fingerprints.insert(path, hex::encode(Sha256::digest(&entry)));
         manifest.extend(entry);
         deletions.extend(deletion);
     }
@@ -1169,6 +1181,7 @@ async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Opt
         .arg("-c")
         .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
         .args(["-c", "core.fsmonitor=false"])
+        .args(LOCAL_WORKSPACE_STATUS_CONFIG)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
@@ -3391,44 +3404,6 @@ where
     F: FnOnce() -> Option<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(capture).await.ok().flatten()
-}
-
-pub(crate) fn resolve_git_dirs(
-    repo_root: &AbsolutePathBuf,
-) -> Option<(PathBuf, PathBuf, Option<PathBuf>)> {
-    let marker = repo_root.join(".git");
-    let git_dir = if marker.is_dir() {
-        marker.into_path_buf()
-    } else {
-        let pointer = std::fs::read_to_string(marker.as_path()).ok()?;
-        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
-        let target = PathBuf::from(target);
-        if target.is_absolute() {
-            target
-        } else {
-            repo_root.join(target).into_path_buf()
-        }
-    };
-    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
-        .ok()
-        .map(|path| PathBuf::from(path.trim()))
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                git_dir.join(path)
-            }
-        })
-        .unwrap_or_else(|| git_dir.clone());
-    let head_ref = std::fs::read_to_string(git_dir.join("HEAD"))
-        .ok()
-        .and_then(|head| {
-            head.trim()
-                .strip_prefix("ref:")
-                .map(str::trim)
-                .map(PathBuf::from)
-        });
-    Some((git_dir, common_dir, head_ref))
 }
 
 async fn git_config_signature(executable: &Path, cwd: &Path) -> Option<[u8; 32]> {

@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::digest_writer::DigestWriter;
 use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ReadToolOutputResult;
@@ -1074,10 +1075,10 @@ async fn handle_read_tool_output(
         resolved_max_bytes(args.max_bytes)?
     };
     let mut action_bounds_digest = Sha256::new();
-    serde_json::to_writer(&mut action_bounds_digest, &selectors).map_err(|err| {
+    serde_json::to_writer(DigestWriter(&mut action_bounds_digest), &selectors).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
     })?;
-    let action_bounds_hash = format!("{:x}", action_bounds_digest.finalize());
+    let action_bounds_hash = hex::encode(action_bounds_digest.finalize());
     // JavaScript consumes exact data before choosing what to print. Coupling
     // this selection to its display budget makes a small summary require extra
     // recovery calls. Larger exact script selections are explicit opt-ins;

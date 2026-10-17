@@ -33,7 +33,7 @@ if (args[0] === '--emit') {
     else throw Error('unknown or missing argument: ' + args[i]);
   }
   assert(baseline && output && Number.isInteger(runs) && runs >= 1 && runs <= 100);
-  const sourcePath = new URL('../../codex-rs/code-mode/src/runtime/output_projection.rs', import.meta.url);
+  const sourcePath = new URL('../../codex-rs/code-mode-runtime/src/runtime/output_projection.rs', import.meta.url);
   const sources = await Promise.all([readFile(baseline,'utf8'), readFile(sourcePath,'utf8')]);
   const codecs = sources.map(source => {
     const match = source.match(/const PROJECTOR: &str = r#"(.*?)"#;/s);

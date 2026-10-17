@@ -662,8 +662,11 @@ pub(crate) fn max_retained_artifacts_per_thread() -> usize {
     128
 }
 
+/// The 2 GiB byte limit bounds disk use; at the ~195 KiB mean unprotected
+/// artifact this count binds near 1.5 GiB. At 1,024 a shared root sat at the
+/// count limit, so every commit evicted and near-limit rescans recurred.
 fn max_retained_artifacts_total() -> usize {
-    1_024
+    8_192
 }
 
 fn retention_registry() -> &'static StdMutex<RetentionRegistry> {
@@ -687,7 +690,7 @@ fn next_index_generation() -> Option<u64> {
     if indexing_disabled().load(Ordering::Acquire) {
         return None;
     }
-    match NEXT_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+    match NEXT_GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
         generation.checked_add(1)
     }) {
         Ok(generation) => Some(generation),
@@ -1088,10 +1091,131 @@ fn logical_artifact_stem(name: &str) -> Option<&str> {
         .then_some(stem)
 }
 
+/// One thread directory's retention records, read from its listing.
+struct ThreadRetentionListing {
+    records: Vec<ArtifactRetentionRecord>,
+    /// Artifacts whose transaction markers were listed.
+    transactions: Vec<PathBuf>,
+    candidates: u64,
+    /// More logs were listed than the record budget allowed.
+    over_budget: bool,
+}
+
+/// Lists one thread directory. Listing metadata carries size, times, and link
+/// attributes, so this opens no files; per-artifact opens took ~6 s at 14.5K
+/// records. Records are collected only while at most `record_budget` logs have
+/// been listed. Listings can run without the shared lock, so an entry may
+/// vanish mid-listing. Returns `None` when the directory no longer exists.
+fn list_thread_retention_directory_blocking(
+    directory: &Path,
+    record_budget: Option<usize>,
+) -> std::io::Result<Option<ThreadRetentionListing>> {
+    let mut entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut listing = ThreadRetentionListing {
+        records: Vec::new(),
+        transactions: Vec::new(),
+        candidates: 0,
+        over_budget: false,
+    };
+    let mut collect = record_budget.is_some();
+    let mut artifacts_by_stem =
+        BTreeMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
+    let mut markers = BTreeMap::<String, (PathBuf, std::fs::Metadata)>::new();
+    while let Some(entry) = entries.next().transpose()? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if extension == Some(LOGICAL_ARTIFACT_TRANSACTION_EXTENSION) {
+            listing.transactions.push(path.with_extension("log"));
+            continue;
+        }
+        let is_log = extension == Some("log");
+        if is_log {
+            listing.candidates = listing.candidates.saturating_add(1);
+            if collect
+                && record_budget.is_some_and(|budget| listing.candidates as usize > budget)
+            {
+                collect = false;
+                listing.over_budget = true;
+                artifacts_by_stem.clear();
+            }
+        }
+        if !collect {
+            continue;
+        }
+        let marker_stem = name
+            .strip_suffix(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
+            .and_then(|name| name.strip_suffix('.'));
+        let Some(stem) = marker_stem.or_else(|| logical_artifact_stem(name)) else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if marker_stem.is_some() {
+            markers.insert(stem.to_string(), (path, metadata));
+            continue;
+        }
+        let bytes = metadata.len();
+        let (entry_bytes, log_path) = if let Some(entry) = artifacts_by_stem.get_mut(stem) {
+            entry
+        } else {
+            artifacts_by_stem.entry(stem.to_string()).or_default()
+        };
+        *entry_bytes = entry_bytes.checked_add(bytes).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "logical artifact byte total overflowed",
+            )
+        })?;
+        if is_log {
+            *log_path = Some((path, metadata));
+        }
+    }
+    if collect {
+        for (stem, (bytes, log)) in artifacts_by_stem {
+            let Some((path, metadata)) = log else {
+                continue;
+            };
+            listing.records.push(listed_retention_record(
+                &path,
+                bytes,
+                &metadata,
+                markers.get(&stem),
+            )?);
+        }
+    }
+    Ok(Some(listing))
+}
+
+/// The thread directories that a listing of `root` reaches.
+fn retention_thread_directories_blocking(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => directories.push(entry.path()),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(directories)
+}
+
+/// Also returns the artifacts whose transaction markers were listed.
 fn scan_retention_root_blocking(
     root: &Path,
     capacity: usize,
-) -> std::io::Result<(RetentionScanCandidate, u64, u64)> {
+) -> std::io::Result<(RetentionScanCandidate, u64, u64, Vec<PathBuf>)> {
     #[cfg(test)]
     // Test barriers wait only on their peer; they schedule no filesystem work.
     tokio::runtime::Handle::current().block_on(wait_at_reconciliation_barrier(root));
@@ -1099,77 +1223,26 @@ fn scan_retention_root_blocking(
     let mut index = Some(RetentionIndex::default());
     let mut directories_visited = 0_u64;
     let mut candidates_visited = 0_u64;
-    let mut oversized = false;
-    let mut thread_directories = std::fs::read_dir(root)?;
-    while let Some(thread_entry) = thread_directories.next().transpose()? {
-        if !thread_entry.file_type()?.is_dir() {
+    let mut transactions = Vec::new();
+    for directory in retention_thread_directories_blocking(root)? {
+        let record_budget = index
+            .as_ref()
+            .map(|_| capacity.saturating_sub(candidates_visited as usize));
+        let Some(listing) = list_thread_retention_directory_blocking(&directory, record_budget)?
+        else {
             continue;
-        }
+        };
         directories_visited = directories_visited.saturating_add(1);
-        let mut entries = std::fs::read_dir(thread_entry.path())?;
-        // Listing metadata carries size, times, and link attributes, so a full
-        // scan opens no files; per-artifact opens took ~6 s at 14.5K records.
-        let mut artifacts_by_stem =
-            BTreeMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
-        let mut markers = BTreeMap::<String, (PathBuf, std::fs::Metadata)>::new();
-        while let Some(entry) = entries.next().transpose()? {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let is_log = path.extension().and_then(|extension| extension.to_str()) == Some("log");
-            if is_log {
-                candidates_visited = candidates_visited.saturating_add(1);
-                if candidates_visited as usize > capacity {
-                    oversized = true;
-                    index = None;
-                    artifacts_by_stem.clear();
-                }
-            }
-            if oversized {
-                continue;
-            }
-            if let Some(stem) = name
-                .strip_suffix(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
-                .and_then(|name| name.strip_suffix('.'))
-            {
-                markers.insert(stem.to_string(), (path, entry.metadata()?));
-                continue;
-            }
-            let Some(stem) = logical_artifact_stem(name) else {
-                continue;
-            };
-            let metadata = entry.metadata()?;
-            let bytes = metadata.len();
-            let (entry_bytes, log_path) = if let Some(entry) = artifacts_by_stem.get_mut(stem) {
-                entry
-            } else {
-                artifacts_by_stem.entry(stem.to_string()).or_default()
-            };
-            *entry_bytes = entry_bytes.checked_add(bytes).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "logical artifact byte total overflowed",
-                )
-            })?;
-            if is_log {
-                *log_path = Some((path, metadata));
-            }
+        candidates_visited = candidates_visited.saturating_add(listing.candidates);
+        let room = capacity.saturating_sub(transactions.len());
+        transactions.extend(listing.transactions.into_iter().take(room));
+        if listing.over_budget {
+            index = None;
         }
-        if oversized {
+        let Some(candidate_index) = index.as_mut() else {
             continue;
-        }
-        for (stem, (bytes, log)) in artifacts_by_stem {
-            let Some((path, metadata)) = log else {
-                continue;
-            };
-            let record = listed_retention_record(&path, bytes, &metadata, markers.get(&stem))?;
-            let Some(candidate_index) = index.as_mut() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "retention candidate was discarded before reconciliation completed",
-                ));
-            };
+        };
+        for record in listing.records {
             if !candidate_index.insert(record) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1178,26 +1251,19 @@ fn scan_retention_root_blocking(
             }
         }
     }
-    if oversized {
-        Ok((
-            RetentionScanCandidate::Oversized,
-            directories_visited,
-            candidates_visited,
-        ))
-    } else {
-        let Some(mut index) = index else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "in-capacity retention scan has no index",
-            ));
-        };
-        index.near_limit_reconciled = index.is_near_limit();
-        Ok((
-            RetentionScanCandidate::Indexed(index),
-            directories_visited,
-            candidates_visited,
-        ))
-    }
+    let candidate = match index {
+        Some(mut index) => {
+            index.near_limit_reconciled = index.is_near_limit();
+            RetentionScanCandidate::Indexed(index)
+        }
+        None => RetentionScanCandidate::Oversized,
+    };
+    Ok((
+        candidate,
+        directories_visited,
+        candidates_visited,
+        transactions,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2408,22 +2474,6 @@ fn reconcile_logical_artifact_transactions(directory: &Path) -> std::io::Result<
     Ok(())
 }
 
-fn reconcile_logical_artifact_transactions_in_root(root: &Path) -> std::io::Result<()> {
-    let directories = match std::fs::read_dir(root) {
-        Ok(directories) => directories,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    for directory in directories {
-        let directory = directory?;
-        let metadata = directory.metadata()?;
-        if metadata.is_dir() && !metadata_is_reparse_point(&metadata) {
-            reconcile_logical_artifact_transactions(&directory.path())?;
-        }
-    }
-    Ok(())
-}
-
 fn normalized_unavailable_ranges(
     canonical_bytes: u64,
     canonical_ranges: &[CanonicalByteRange],
@@ -3105,6 +3155,15 @@ fn commit_create_canonical_output_artifact(
     }
     enforce_retention_locked_blocking(&directory, &path, canonical.exact_bytes, 1);
     let usage = retention_usage_locked_blocking(&directory);
+    if !retention_shared_lock_held(&root) {
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: 0,
+            complete: false,
+            unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+            error: Some("lost the canonical artifact retention lock".to_string()),
+        };
+    }
     let available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
@@ -3150,7 +3209,7 @@ fn commit_create_canonical_output_artifact(
         artifact_id: id.to_string(),
         canonical_kind: canonical.kind,
         canonical_sha256: canonical.sha256.clone(),
-        retained_sha256: Some(format!("{:x}", Sha256::digest(retained))),
+        retained_sha256: Some(hex::encode(Sha256::digest(retained))),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
         capture_complete: true,
@@ -3502,6 +3561,19 @@ fn commit_attach_canonical_output_artifact(
         0,
     );
     let usage = retention_usage_locked_blocking(&directory);
+    if !retention_shared_lock_held(&root) {
+        return CanonicalOutputArtifact {
+            id: Some(id),
+            retained_bytes: existing.len() as u64,
+            complete: false,
+            unavailable_ranges: normalized_unavailable_ranges(
+                canonical.exact_bytes,
+                &canonical.unavailable_ranges,
+                existing.len() as u64,
+            ),
+            error: Some("lost the canonical artifact retention lock".to_string()),
+        };
+    }
     let additional_available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
@@ -3559,10 +3631,9 @@ fn commit_attach_canonical_output_artifact(
         artifact_id: id.to_string(),
         canonical_kind: canonical.kind,
         canonical_sha256: canonical.sha256.clone(),
-        retained_sha256: Some(format!(
-            "{:x}",
-            Sha256::digest(&canonical.bytes[..retained_bytes as usize])
-        )),
+        retained_sha256: Some(hex::encode(Sha256::digest(
+            &canonical.bytes[..retained_bytes as usize],
+        ))),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
         capture_complete: true,
@@ -3678,7 +3749,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
             CanonicalByteRange::new(0, expected_bytes),
         )
         .map_err(|err| format!("failed to read source artifact: {}", err.for_model()))?;
-        if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256_for_check {
+        if hex::encode(Sha256::digest(&bytes)) != expected_sha256_for_check {
             return Err("source artifact digest does not match tool-history metadata".to_string());
         }
         Ok((metadata, bytes))
@@ -3715,7 +3786,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
             CanonicalByteRange::new(0, expected_bytes),
         )
         .map_err(|err| format!("failed to verify target artifact: {}", err.for_model()))?;
-        if format!("{:x}", Sha256::digest(&target_bytes)) != expected_sha256_for_target {
+        if hex::encode(Sha256::digest(&target_bytes)) != expected_sha256_for_target {
             return Err("target artifact collision has different bytes".to_string());
         }
         Ok(true)
@@ -4227,7 +4298,12 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
             reject_stale_delta(&retention_token);
             return live;
         }
-        let installed_mode = reconcile_retention_root_blocking(&retention_token.root);
+        // Only this thread's markers changed, so its directory's listing
+        // corrects the index. A full-root rebuild here held the shared lock.
+        let installed_mode = refresh_retention_thread_directory_blocking(
+            &retention_token.root,
+            &normalized_retention_path(&directory),
+        );
         note_completed_protection_reconciliation(&retention_token.root, installed_mode);
         live
     })
@@ -4583,7 +4659,7 @@ fn load_logical_metadata_with_snapshot(
             "raw capture size does not match metadata".to_string(),
         ));
     }
-    let sha256 = format!("{:x}", Sha256::digest(&contents));
+    let sha256 = hex::encode(Sha256::digest(&contents));
     let metadata = LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
         artifact_id: id.to_string(),
@@ -4694,7 +4770,7 @@ fn load_validated_logical_snapshot(
             "incomplete artifact metadata has no retained SHA identity".to_string(),
         ));
     };
-    if format!("{:x}", Sha256::digest(&snapshot)) != expected_sha256 {
+    if hex::encode(Sha256::digest(&snapshot)) != expected_sha256 {
         return Err(ReadToolOutputError::Io(
             "artifact SHA identity does not match metadata".to_string(),
         ));
@@ -6806,7 +6882,17 @@ async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> Rete
     .unwrap_or(RetentionModeKind::Dirty)
 }
 
+#[cfg(test)]
 fn reconcile_retention_root_blocking(root: &Path) -> RetentionModeKind {
+    reconcile_retention_root_listing_transactions_blocking(root, &mut Vec::new())
+}
+
+/// Rebuilds the root's index from a full scan, and reports the artifacts
+/// whose transaction markers the scan listed.
+fn reconcile_retention_root_listing_transactions_blocking(
+    root: &Path,
+    transactions: &mut Vec<PathBuf>,
+) -> RetentionModeKind {
     if indexing_disabled().load(Ordering::Acquire) {
         return RetentionModeKind::Disabled;
     }
@@ -6854,7 +6940,12 @@ fn reconcile_retention_root_blocking(root: &Path) -> RetentionModeKind {
 
     #[cfg(test)]
     let started = Instant::now();
-    let scan = scan_retention_root_blocking(&root, capacity);
+    let scan = scan_retention_root_blocking(&root, capacity).map(
+        |(candidate, directories, candidates, listed)| {
+            *transactions = listed;
+            (candidate, directories, candidates)
+        },
+    );
     #[cfg(test)]
     let elapsed_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let mut registry = lock_retention_registry();
@@ -6993,7 +7084,15 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
     if mode != RetentionModeKind::Dirty {
         return mode;
     }
-    let reconciled = reconcile_retention_root_blocking(&root);
+    // A permit holder rebuilds without the shared lock, then recovers the
+    // interrupted transactions the scan listed once the lock is back.
+    let mut transactions = Vec::new();
+    let reconciled = without_shared_retention_lock(&root, || {
+        reconcile_retention_root_listing_transactions_blocking(&root, &mut transactions)
+    });
+    if !transactions.is_empty() && retention_shared_lock_held(&root) {
+        recover_listed_logical_artifact_transactions_blocking(&root, &transactions);
+    }
     if reconciled != RetentionModeKind::Indexed {
         if reconciled == RetentionModeKind::ScanOnly {
             #[cfg(test)]
@@ -7010,50 +7109,347 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
 }
 
 /// Periodic reconciliation only corrects drift in an index that deltas keep
-/// current, so the triggering commit keeps that index and the full-root scan
-/// runs afterwards under its own permit. Returns false without a runtime.
+/// current, so the triggering commit keeps that index and the rescan runs
+/// afterwards. Returns false without a runtime.
 fn schedule_background_retention_reconciliation(root: &Path) -> bool {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return false;
     };
-    let root = root.to_path_buf();
-    runtime.spawn(async move {
-        let permit = retention_sweep_permit(&root).await;
-        let _ = tokio::task::spawn_blocking(move || {
-            // A reconciliation that replaced the index since scheduling also cleared this.
-            let due = {
-                let mut registry = lock_retention_registry();
-                match registry.roots.get_mut(&root).map(|state| &mut state.mode) {
-                    Some(RetentionRootMode::Indexed(index)) => {
-                        std::mem::take(&mut index.background_reconciliation_pending)
-                    }
-                    _ => false,
-                }
-            };
-            if due && permit.is_some() {
-                reconcile_external_retention_changes_blocking(&root, false);
-            }
-            drop(permit);
-        })
-        .await;
-    });
+    runtime.spawn(refresh_indexed_retention_root(root.to_path_buf()));
     true
 }
 
-/// Rebuilds the index under the caller's permit, first recovering other
-/// threads' interrupted transactions when another process wrote to the root.
-fn reconcile_external_retention_changes_blocking(root: &Path, only_if_unindexed: bool) {
+fn retention_index_capacity(state: &RetentionRootState) -> usize {
+    #[cfg(test)]
+    {
+        state
+            .index_capacity_override
+            .unwrap_or(MAX_RETENTION_INDEX_RECORDS)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        MAX_RETENTION_INDEX_RECORDS
+    }
+}
+
+/// Rescans an indexed root one thread directory at a time while the index
+/// stays in use. A whole-root rebuild held this process's admission for the
+/// full scan, so the process's own artifact writes waited seconds behind it.
+/// Each directory is now listed and applied under that admission alone, so a
+/// write waits for at most one directory listing, and another process's write
+/// not at all. Deltas keep applying between directories, and generation and
+/// mode stay unchanged, so tokens captured before the rescan remain valid.
+async fn refresh_indexed_retention_root(root: PathBuf) {
+    let (root, semaphore) = match retention_sweep_admission(&root).await {
+        Ok(admission) => admission,
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return;
+        }
+    };
+    let Ok(admission) = Arc::clone(&semaphore).acquire_owned().await else {
+        return;
+    };
+    let begin_root = root.clone();
+    let Ok(Some((generation, capacity, directories))) = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        begin_retention_refresh_blocking(&begin_root)
+    })
+    .await
+    else {
+        return;
+    };
+    #[cfg(test)]
+    wait_at_reconciliation_barrier(&root).await;
+    let mut candidates = 0_u64;
+    let mut transactions = Vec::new();
+    let directory_count = directories.len() as u64;
+    for directory in directories {
+        let Ok(admission) = Arc::clone(&semaphore).acquire_owned().await else {
+            return;
+        };
+        let step_root = root.clone();
+        let step = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            refresh_retention_directory_step_blocking(&step_root, generation, &directory, capacity)
+        })
+        .await;
+        let Ok(Some((listed_candidates, listed_transactions))) = step else {
+            return;
+        };
+        candidates = candidates.saturating_add(listed_candidates);
+        let room = capacity.saturating_sub(transactions.len());
+        transactions.extend(listed_transactions.into_iter().take(room));
+    }
+    let finish_root = root.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        finish_retention_refresh_blocking(&finish_root, generation, directory_count, candidates);
+    })
+    .await;
+    if transactions.is_empty() {
+        return;
+    }
+    let Some(permit) = retention_sweep_permit(&root).await else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        recover_listed_logical_artifact_transactions_blocking(&root, &transactions);
+    })
+    .await;
+}
+
+/// Starts a due refresh: observes the shared generation it starts from and
+/// lists the root. Returns the generation, capacity, and directories to list,
+/// including indexed directories that have since been removed.
+fn begin_retention_refresh_blocking(root: &Path) -> Option<(u64, usize, Vec<PathBuf>)> {
+    let (generation, capacity) = {
+        let registry = lock_retention_registry();
+        let state = registry.roots.get(root)?;
+        // A rebuild that replaced the index since scheduling also cleared this.
+        let RetentionRootMode::Indexed(index) = &state.mode else {
+            return None;
+        };
+        if !index.background_reconciliation_pending {
+            return None;
+        }
+        (state.generation, retention_index_capacity(state))
+    };
+    if let Err(error) = observe_retention_interprocess_generation(root) {
+        // The stale mark stays set, so a later pass rescans.
+        tracing::debug!(%error, "artifact retention generation is unavailable");
+    }
+    let listed = retention_thread_directories_blocking(root);
+    let mut registry = lock_retention_registry();
+    let state = registry.roots.get_mut(root)?;
+    if state.generation != generation {
+        return None;
+    }
+    let Ok(listed) = listed else {
+        // Like a failed rebuild, an unreadable root leaves no usable index.
+        transition_current_root_to_dirty(&mut registry, root);
+        return None;
+    };
+    let RetentionRootMode::Indexed(index) = &state.mode else {
+        return None;
+    };
+    let mut directories = listed.into_iter().collect::<BTreeSet<_>>();
+    directories.extend(index.threads.keys().cloned());
+    Some((generation, capacity, directories.into_iter().collect()))
+}
+
+/// Lists one directory and applies it to the live index, unless a rebuild has
+/// replaced that index since the refresh began. Returns the listed log count
+/// and transactions, or `None` when the refresh must stop.
+fn refresh_retention_directory_step_blocking(
+    root: &Path,
+    generation: u64,
+    directory: &Path,
+    capacity: usize,
+) -> Option<(u64, Vec<PathBuf>)> {
+    let listing = list_thread_retention_directory_blocking(directory, Some(capacity));
+    let mut registry = lock_retention_registry();
+    let state = registry.roots.get_mut(root)?;
+    if state.generation != generation {
+        return None;
+    }
+    let RetentionRootMode::Indexed(index) = &mut state.mode else {
+        return None;
+    };
+    let listing = match listing {
+        Ok(Some(listing)) if !listing.over_budget => Some(listing),
+        Ok(None) => Some(ThreadRetentionListing {
+            records: Vec::new(),
+            transactions: Vec::new(),
+            candidates: 0,
+            over_budget: false,
+        }),
+        Ok(Some(_)) | Err(_) => None,
+    };
+    if let Some(listing) = listing
+        && apply_thread_retention_listing(index, directory, listing.records)
+        && index.records.len() <= capacity
+    {
+        return Some((listing.candidates, listing.transactions));
+    }
+    // Like a failed or oversized rebuild, this leaves no usable index.
+    transition_current_root_to_dirty(&mut registry, root);
+    None
+}
+
+fn finish_retention_refresh_blocking(
+    root: &Path,
+    generation: u64,
+    #[cfg_attr(not(test), allow(unused_variables))] directories: u64,
+    #[cfg_attr(not(test), allow(unused_variables))] candidates: u64,
+) {
+    let mut registry = lock_retention_registry();
+    let Some(state) = registry.roots.get_mut(root) else {
+        return;
+    };
+    if state.generation != generation {
+        return;
+    }
+    let RetentionRootMode::Indexed(index) = &mut state.mode else {
+        return;
+    };
+    index.logical_mutations_since_reconciliation = 0;
+    index.near_limit_reconciled = index.is_near_limit();
+    index.near_limit_pending = false;
+    index.background_reconciliation_pending = false;
+    record_retention_diagnostics! {
+        state.diagnostics.reconciliations = state.diagnostics.reconciliations.saturating_add(1);
+        state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
+        state.diagnostics.directories_visited =
+            state.diagnostics.directories_visited.saturating_add(directories);
+        state.diagnostics.candidates_visited =
+            state.diagnostics.candidates_visited.saturating_add(candidates);
+    }
+}
+
+/// Replaces one thread directory's records with its listing. A record that a
+/// streaming write published after the listing was taken keeps that state.
+fn apply_thread_retention_listing(
+    index: &mut RetentionIndex,
+    directory: &Path,
+    records: Vec<ArtifactRetentionRecord>,
+) -> bool {
+    let listed = records
+        .into_iter()
+        .map(|record| (record.path.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let vanished = index
+        .threads
+        .get(directory)
+        .map_or_else(Vec::new, |thread| {
+            thread
+                .paths
+                .iter()
+                .filter(|path| !listed.contains_key(*path))
+                .cloned()
+                .collect()
+        });
+    for path in vanished {
+        index.remove(&path);
+    }
+    for (path, record) in listed {
+        if index
+            .records
+            .get(&path)
+            .is_some_and(|indexed| indexed.modified > record.modified)
+        {
+            continue;
+        }
+        if !index.insert(record) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Corrects one thread directory's records after its protection markers
+/// changed. Only an indexed root has records to correct.
+fn refresh_retention_thread_directory_blocking(root: &Path, directory: &Path) -> RetentionModeKind {
+    let (generation, capacity) = {
+        let registry = lock_retention_registry();
+        let Some(state) = registry.roots.get(root) else {
+            return RetentionModeKind::Dirty;
+        };
+        if !matches!(state.mode, RetentionRootMode::Indexed(_)) {
+            return root_mode_kind(&state.mode);
+        }
+        (state.generation, retention_index_capacity(state))
+    };
+    let listing = list_thread_retention_directory_blocking(directory, Some(capacity));
+    let mut registry = lock_retention_registry();
+    let Some(state) = registry.roots.get_mut(root) else {
+        return RetentionModeKind::Dirty;
+    };
+    let mode = root_mode_kind(&state.mode);
+    if state.generation != generation {
+        return mode;
+    }
+    let RetentionRootMode::Indexed(index) = &mut state.mode else {
+        return mode;
+    };
+    let records = match listing {
+        Ok(Some(listing)) if !listing.over_budget => Some(listing.records),
+        Ok(None) => Some(Vec::new()),
+        Ok(Some(_)) | Err(_) => None,
+    };
+    if let Some(records) = records
+        && apply_thread_retention_listing(index, directory, records)
+        && index.records.len() <= capacity
+    {
+        if !index.is_near_limit() {
+            index.near_limit_reconciled = false;
+        } else if !index.near_limit_reconciled {
+            index.near_limit_pending = true;
+        }
+        return RetentionModeKind::Indexed;
+    }
+    transition_current_root_to_dirty(&mut registry, root);
+    RetentionModeKind::Dirty
+}
+
+/// Rebuilds the index under this process's admission only. Holding the shared
+/// lock for the scan queued every other process's artifact commit behind it:
+/// on a root of ~100K files, for seconds at each process start and rescan.
+/// The scan instead starts from an observed shared generation; a commit by
+/// another process during or after it advances that generation and marks the
+/// index stale, which leaves it incomplete rather than wrong, as after any
+/// external write. A listed transaction marker may belong to a commit still
+/// holding the lock, so it is recovered only afterwards, under that lock.
+fn reconcile_external_retention_changes_blocking(
+    root: &Path,
+    process_permit: OwnedSemaphorePermit,
+    only_if_unindexed: bool,
+) {
     if only_if_unindexed && lock_retention_registry().roots.contains_key(root) {
         return;
     }
-    if take_retention_interprocess_index_stale(root)
-        && reconcile_logical_artifact_transactions_in_root(root).is_err()
-    {
-        let mut registry = lock_retention_registry();
-        transition_current_root_to_dirty(&mut registry, root);
+    if let Err(error) = observe_retention_interprocess_generation(root) {
+        // The stale mark stays set, so a later pass rescans.
+        tracing::debug!(%error, "artifact retention generation is unavailable");
+    }
+    let mut transactions = Vec::new();
+    reconcile_retention_root_listing_transactions_blocking(root, &mut transactions);
+    if transactions.is_empty() {
         return;
     }
-    reconcile_retention_root_blocking(root);
+    let _permit = match retention_sweep_permit_blocking(root, process_permit) {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_retention_sweep_permit_failure(root, &error);
+            return;
+        }
+    };
+    recover_listed_logical_artifact_transactions_blocking(root, &transactions);
+}
+
+/// Recovers transactions that a scan without the shared lock listed. The caller
+/// now holds that lock, so a marker still present belongs to no running commit.
+/// The scan may have indexed such a family mid-commit or before recovery
+/// changed it, so each family is observed again.
+fn recover_listed_logical_artifact_transactions_blocking(root: &Path, artifacts: &[PathBuf]) {
+    for path in artifacts {
+        let token = capture_retention_token(path.parent().unwrap_or_else(|| Path::new(".")));
+        if reconcile_logical_artifact_transaction(path).is_err() {
+            let mut registry = lock_retention_registry();
+            transition_current_root_to_dirty(&mut registry, root);
+            return;
+        }
+        match artifact_retention_record_blocking(path) {
+            Ok(Some(record)) => {
+                publish_known_record(&token, record, LogicalRetentionMutation::AppendReplace);
+            }
+            Ok(None) => {
+                publish_known_remove(&token, path, LogicalRetentionMutation::Cleanup, false);
+            }
+            Err(_) => reject_stale_delta(&token),
+        }
+    }
 }
 
 /// Another process's writes leave this process's index incomplete rather than
@@ -7063,10 +7459,9 @@ fn reconcile_external_retention_changes_blocking(root: &Path, only_if_unindexed:
 ///
 /// Every permit acquisition, in any process, marks the other processes'
 /// indexes stale. Rescanning after each such change kept a full-root scan
-/// holding the shared lock whenever several processes were active, and every
-/// commit queued behind it. These rescans therefore run at most once per
-/// interval; until then the stale mark stays set and the index only
-/// undercounts other processes' evictable bytes.
+/// running whenever several processes were active. These rescans therefore run
+/// at most once per interval; until then the stale mark stays set and the index
+/// only undercounts other processes' evictable bytes.
 fn defer_external_retention_reconciliation(root: &Path) -> bool {
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
@@ -7099,8 +7494,7 @@ pub(crate) fn spawn_retention_index_prewarm(codex_home: &Path) {
     };
     let root = codex_home.join("tool-output");
     runtime.spawn(async move {
-        // Taking the permit invalidates other processes' indexes, so only a
-        // root this process has not indexed yet is worth it.
+        // Only a root this process has not indexed yet needs the scan.
         let unindexed = tokio::task::spawn_blocking(move || {
             let root = normalized_tool_output_root(&root);
             (root.is_dir() && !lock_retention_registry().roots.contains_key(&root)).then_some(root)
@@ -7109,12 +7503,13 @@ pub(crate) fn spawn_retention_index_prewarm(codex_home: &Path) {
         let Ok(Some(root)) = unindexed else {
             return;
         };
-        let permit = retention_sweep_permit(&root).await;
+        // Holding this process's admission makes its first commit wait for
+        // the index instead of scanning the root itself.
+        let Some((root, process_permit)) = retention_process_admission(&root).await else {
+            return;
+        };
         let _ = tokio::task::spawn_blocking(move || {
-            if permit.is_some() {
-                reconcile_external_retention_changes_blocking(&root, true);
-            }
-            drop(permit);
+            reconcile_external_retention_changes_blocking(&root, process_permit, true);
         })
         .await;
     });
@@ -7548,6 +7943,7 @@ fn enforce_retention_locked_blocking(
     reserved_artifacts: usize,
 ) {
     let root = tool_output_root_for_directory(directory);
+    let shared_lock_held = retention_shared_lock_held(&root);
     if reconcile_logical_artifact_transactions(directory).is_err() {
         let mut registry = lock_retention_registry();
         transition_current_root_to_dirty(&mut registry, &root);
@@ -7555,18 +7951,16 @@ fn enforce_retention_locked_blocking(
     }
     let mut external_generation_changed = take_retention_interprocess_index_stale(&root);
     if external_generation_changed && defer_external_retention_reconciliation(&root) {
-        // The scheduled pass consumes the flag under its own permit.
+        // The scheduled pass consumes the flag.
         mark_retention_interprocess_index_stale(&root);
         external_generation_changed = false;
     }
-    if external_generation_changed
-        && reconcile_logical_artifact_transactions_in_root(&root).is_err()
-    {
-        let mut registry = lock_retention_registry();
-        transition_current_root_to_dirty(&mut registry, &root);
+    // A forced rebuild also recovers other threads' interrupted transactions.
+    let mode = prepare_retention_mode_blocking(&root, external_generation_changed);
+    if shared_lock_held && !retention_shared_lock_held(&root) {
         return;
     }
-    match prepare_retention_mode_blocking(&root, external_generation_changed) {
+    match mode {
         RetentionModeKind::Indexed => {
             if !enforce_indexed_thread_retention_blocking(
                 &root,
@@ -7853,8 +8247,8 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
                 }),
                 // An unavailable index is not evidence of an exhausted quota.
                 // The caller holds the retention permit; scan outside the
-                // registry mutex, just as for scan-only roots. Real scan errors
-                // still fail closed below.
+                // registry mutex and the shared lock, just as for scan-only
+                // roots. Real scan errors still fail closed below.
                 RetentionRootMode::Dirty
                 | RetentionRootMode::Reconciling { .. }
                 | RetentionRootMode::ScanOnly { .. } => None,
@@ -7865,7 +8259,10 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
     }
     RetentionUsage {
         thread_bytes: log_bytes_in_directory_blocking(&directory, true).unwrap_or(u64::MAX),
-        global_bytes: log_bytes_in_tool_output_root_blocking(&root).unwrap_or(u64::MAX),
+        global_bytes: without_shared_retention_lock(&root, || {
+            log_bytes_in_tool_output_root_blocking(&root)
+        })
+        .unwrap_or(u64::MAX),
     }
 }
 
@@ -7919,9 +8316,59 @@ fn log_bytes_in_tool_output_root_blocking(root: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
+/// This process's admission for a root plus the shared lock, which
+/// `held_retention_locks` owns so a full-root pass can release it meanwhile.
 struct RetentionSweepPermit {
+    root: PathBuf,
     _process_permit: OwnedSemaphorePermit,
-    _interprocess_lock: AtomicWriteLock,
+}
+
+impl Drop for RetentionSweepPermit {
+    fn drop(&mut self) {
+        // Release the shared lock before the admission that guards it.
+        let lock = held_retention_locks().remove(&self.root);
+        drop(lock);
+    }
+}
+
+/// Shared locks held by this process's retention permits. Admission makes a
+/// root's entry exclusive to its one permit holder in this process.
+fn held_retention_locks() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, AtomicWriteLock>> {
+    static LOCKS: StdMutex<BTreeMap<PathBuf, AtomicWriteLock>> = StdMutex::new(BTreeMap::new());
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn retention_shared_lock_held(root: &Path) -> bool {
+    held_retention_locks().contains_key(&normalized_tool_output_root(root))
+}
+
+/// Runs a full-root pass without the shared lock that this process's permit
+/// for `root` holds, then takes the lock back. A scan under that lock queued
+/// every other process's artifact commit behind it for seconds. Commits that
+/// land meanwhile leave the pass incomplete rather than wrong, and retaking
+/// the lock advances the generation, which marks this index stale for them.
+/// If the lock cannot be retaken, `retention_shared_lock_held` turns false and
+/// the holder must not mutate the root. Without a held permit, just runs.
+fn without_shared_retention_lock<R>(root: &Path, pass: impl FnOnce() -> R) -> R {
+    let root = normalized_tool_output_root(root);
+    let released = held_retention_locks().remove(&root);
+    let Some(lock) = released else {
+        return pass();
+    };
+    drop(lock);
+    let result = pass();
+    let lock_target = retention_interprocess_lock_target(&root);
+    match acquire_atomic_write_lock(&lock_target).and_then(|lock| {
+        advance_retention_interprocess_generation(&root, &lock_target).map(|()| lock)
+    }) {
+        Ok(lock) => {
+            held_retention_locks().insert(root, lock);
+        }
+        Err(error) => record_retention_sweep_permit_failure(&root, &error),
+    }
+    result
 }
 
 static RETENTION_SWEEP_PERMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -7946,10 +8393,8 @@ struct RetentionInterprocessRootState {
 
 fn retention_interprocess_lock_target(root: &Path) -> PathBuf {
     let normalized_root = normalized_tool_output_root(root);
-    let identity = Sha256::digest(normalized_root.to_string_lossy().as_bytes());
-    std::env::temp_dir().join(format!(
-        "openai-codex-tool-output-retention-v2-{identity:x}"
-    ))
+    let identity = hex::encode(Sha256::digest(normalized_root.to_string_lossy().as_bytes()));
+    std::env::temp_dir().join(format!("openai-codex-tool-output-retention-v2-{identity}"))
 }
 
 fn retention_interprocess_states()
@@ -8020,18 +8465,7 @@ fn advance_retention_interprocess_generation(
     let mut states = retention_interprocess_states()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !states.contains_key(&root)
-        && states.len() >= MAX_RETENTION_INDEX_ROOTS
-        && let Some(evicted) = states.keys().next().cloned()
-    {
-        states.remove(&evicted);
-    }
-    let state = states
-        .entry(root)
-        .or_insert_with(|| RetentionInterprocessRootState {
-            generation: None,
-            index_stale: true,
-        });
+    let state = retention_interprocess_state(&mut states, root);
     if recovered || state.generation.is_none_or(|observed| observed != previous) {
         state.index_stale = true;
     }
@@ -8039,7 +8473,49 @@ fn advance_retention_interprocess_generation(
     Ok(())
 }
 
-async fn retention_sweep_permit(root: &Path) -> Option<RetentionSweepPermit> {
+/// Records the shared generation that a scan without the shared lock starts
+/// from. The lock is held only to read it, so no commit is mid-flight, and the
+/// generation is left unchanged, so other processes keep their indexes. Any
+/// later permit, in any process, advances past it.
+fn observe_retention_interprocess_generation(root: &Path) -> std::io::Result<()> {
+    let lock_target = retention_interprocess_lock_target(root);
+    let _lock = acquire_atomic_write_lock(&lock_target)?;
+    let observed = match std::fs::read_to_string(&lock_target) {
+        Ok(value) => value.trim().parse::<u64>().ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(err) => return Err(err),
+    };
+    let root = normalized_tool_output_root(root);
+    let mut states = retention_interprocess_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = retention_interprocess_state(&mut states, root);
+    // A malformed generation stays stale until the next permit repairs it.
+    state.index_stale = observed.is_none();
+    state.generation = observed;
+    Ok(())
+}
+
+fn retention_interprocess_state(
+    states: &mut BTreeMap<PathBuf, RetentionInterprocessRootState>,
+    root: PathBuf,
+) -> &mut RetentionInterprocessRootState {
+    if !states.contains_key(&root)
+        && states.len() >= MAX_RETENTION_INDEX_ROOTS
+        && let Some(evicted) = states.keys().next().cloned()
+    {
+        states.remove(&evicted);
+    }
+    states
+        .entry(root)
+        .or_insert_with(|| RetentionInterprocessRootState {
+            generation: None,
+            index_stale: true,
+        })
+}
+
+/// This process's retention admission, without the shared lock.
+async fn retention_process_admission(root: &Path) -> Option<(PathBuf, OwnedSemaphorePermit)> {
     let (root, semaphore) = match retention_sweep_admission(root).await {
         Ok(admission) => admission,
         Err(error) => {
@@ -8047,13 +8523,17 @@ async fn retention_sweep_permit(root: &Path) -> Option<RetentionSweepPermit> {
             return None;
         }
     };
-    let process_permit = match semaphore.acquire_owned().await {
-        Ok(permit) => permit,
+    match semaphore.acquire_owned().await {
+        Ok(permit) => Some((root, permit)),
         Err(error) => {
             record_retention_sweep_permit_failure(&root, &error);
-            return None;
+            None
         }
-    };
+    }
+}
+
+async fn retention_sweep_permit(root: &Path) -> Option<RetentionSweepPermit> {
+    let (root, process_permit) = retention_process_admission(root).await?;
     let lock_root = root.clone();
     match tokio::task::spawn_blocking(move || {
         retention_sweep_permit_blocking(&lock_root, process_permit)
@@ -8092,9 +8572,11 @@ fn retention_sweep_permit_blocking(
     let lock_target = retention_interprocess_lock_target(root);
     let interprocess_lock = acquire_atomic_write_lock(&lock_target)?;
     advance_retention_interprocess_generation(root, &lock_target)?;
+    let root = normalized_tool_output_root(root);
+    held_retention_locks().insert(root.clone(), interprocess_lock);
     Ok(RetentionSweepPermit {
+        root,
         _process_permit: process_permit,
-        _interprocess_lock: interprocess_lock,
     })
 }
 

@@ -367,12 +367,12 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
             let history = compacted
                 .replacement_history
                 .as_mut()
-                .ok_or_else(&cannot_bound_checkpoint)?;
+                .ok_or_else(cannot_bound_checkpoint)?;
             let mut matches = history
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| matches_boundary(item).then_some(index));
-            let start = matches.next().ok_or_else(&cannot_bound_checkpoint)?;
+            let start = matches.next().ok_or_else(cannot_bound_checkpoint)?;
             if matches.next().is_some() {
                 return Err(cannot_bound_checkpoint());
             }

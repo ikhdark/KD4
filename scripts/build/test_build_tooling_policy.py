@@ -227,7 +227,7 @@ console.log(JSON.stringify(results));
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 2)
         self.assertEqual(
-            calls[0]["args"][-4:], ["--exclude", "codex-code-mode", "--", "-Dwarnings"]
+            calls[0]["args"][-4:], ["--exclude", "codex-code-mode-runtime", "--", "-Dwarnings"]
         )
         self.assertEqual(calls[1]["args"][-2:], ["--", "-Dwarnings"])
 
@@ -241,7 +241,7 @@ console.log(JSON.stringify(results));
             )
             for directory, package, filename, code in (
                 ("cli", "codex", "main.rs", "fn main() {}\n"),
-                ("mode", "codex-code-mode", "lib.rs", "pub fn used() {}\n"),
+                ("mode", "codex-code-mode-runtime", "lib.rs", "pub fn used() {}\n"),
             ):
                 member = root / directory
                 (member / "src").mkdir(parents=True)
@@ -307,8 +307,8 @@ console.log(JSON.stringify(results));
 
     def test_analyzer_respects_explicit_sandbox_exclusion(self):
         for exclusion in (
-            ("--exclude", "codex-code-mode"),
-            ("--exclude=codex-code-mode",),
+            ("--exclude", "codex-code-mode-runtime"),
+            ("--exclude=codex-code-mode-runtime",),
         ):
             result, calls = self.run_workspace_analyzer(
                 "clippy",
@@ -2027,7 +2027,7 @@ function Get-Command($Name) {
             encoding="utf-8"
         )
 
-        self.assertIn('$v8SandboxPackage = "codex-code-mode"', analyzer)
+        self.assertIn('$v8SandboxPackage = "codex-code-mode-runtime"', analyzer)
         self.assertNotIn("codex-v8-poc", analyzer)
         self.assertIn('$packageArgs += @("--package", $v8SandboxPackage)', analyzer)
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

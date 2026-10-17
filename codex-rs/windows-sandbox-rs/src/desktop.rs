@@ -4,8 +4,7 @@ use crate::token::get_logon_sid_bytes;
 use crate::winutil::format_last_error;
 use crate::winutil::to_wide;
 use anyhow::Result;
-use rand::Rng;
-use rand::SeedableRng;
+use rand::RngExt;
 use rand::rngs::SmallRng;
 use std::ffi::c_void;
 use std::path::Path;
@@ -91,7 +90,7 @@ struct PrivateDesktop {
 
 impl PrivateDesktop {
     fn create(logs_base_dir: Option<&Path>) -> Result<Self> {
-        let mut rng = SmallRng::from_os_rng();
+        let mut rng: SmallRng = rand::make_rng();
         let name = format!("CodexSandboxDesktop-{:x}", rng.random::<u128>());
         let name_wide = to_wide(&name);
         // SAFETY: name_wide is a live NUL-terminated buffer; null device, mode and security

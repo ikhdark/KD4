@@ -2471,7 +2471,7 @@ async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Resul
 }
 
 /// Dispatches one turn against a Lite/parallel capability pair and returns the
-/// recorded request body, so the two capabilities can be asserted independently.
+/// recorded request body to check the Lite transport constraint.
 async fn responses_lite_request_body(
     use_responses_lite: bool,
     supports_parallel_tool_calls: bool,
@@ -2507,12 +2507,17 @@ async fn responses_lite_request_body(
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    Ok(resp_mock.single_request().body_json())
+    let request = resp_mock.single_request();
+    pretty_assertions::assert_eq!(
+        request.header("x-openai-internal-codex-responses-lite"),
+        use_responses_lite.then(|| "true".to_string()),
+    );
+    Ok(request.body_json())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_lite_sets_all_turns_context_and_keeps_parallel_tool_calls() -> anyhow::Result<()>
-{
+async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls()
+-> anyhow::Result<()> {
     require_network!();
 
     let request_body = responses_lite_request_body(
@@ -2527,17 +2532,14 @@ async fn responses_lite_sets_all_turns_context_and_keeps_parallel_tool_calls() -
             .and_then(|value| value.as_str()),
         Some("all_turns")
     );
-    // Responses Lite relocates tools, pins reasoning context and adds a
-    // transport header. It does not restrict tool-call arity, so it must not
-    // override the model's advertised parallel-tool-call capability.
-    pretty_assertions::assert_eq!(request_body.get("parallel_tool_calls"), Some(&json!(true)));
+    // The Lite transport constraint overrides the model's advertised capability.
+    pretty_assertions::assert_eq!(request_body.get("parallel_tool_calls"), Some(&json!(false)));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parallel_tool_calls_follow_model_capability_independent_of_responses_lite()
--> anyhow::Result<()> {
+async fn parallel_tool_calls_follow_model_capability_unless_responses_lite() -> anyhow::Result<()> {
     require_network!();
 
     for use_responses_lite in [false, true] {
@@ -2545,12 +2547,11 @@ async fn parallel_tool_calls_follow_model_capability_independent_of_responses_li
             let request_body =
                 responses_lite_request_body(use_responses_lite, supports_parallel_tool_calls)
                     .await?;
-            // The dispatched flag tracks the capability alone; Lite only
-            // decides whether reasoning context is pinned to all_turns.
+            // Standard requests preserve the model capability; Lite requires false.
             pretty_assertions::assert_eq!(
                 request_body.get("parallel_tool_calls"),
-                Some(&json!(supports_parallel_tool_calls)),
-                "parallel_tool_calls must follow supports_parallel_tool_calls \
+                Some(&json!(supports_parallel_tool_calls && !use_responses_lite)),
+                "parallel_tool_calls must respect the Lite transport constraint \
                  (use_responses_lite={use_responses_lite})"
             );
             pretty_assertions::assert_eq!(

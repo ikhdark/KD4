@@ -166,6 +166,20 @@ async fn identifies_expired_unrefreshable_token_startup_error() -> anyhow::Resul
         .expect(1)
         .mount(&server)
         .await;
+    // With no usable token, rmcp sends initialize unauthenticated; the protected
+    // server's 401 challenge is what fails startup.
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let codex_home = TempDir::new()?;
     let status = Command::new(std::env::current_exe()?)

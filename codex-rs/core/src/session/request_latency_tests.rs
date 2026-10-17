@@ -10,7 +10,7 @@ use pretty_assertions::assert_eq;
 )]
 fn completed_poll_lifecycle_wall_clock() -> Result<()> {
     run_turn_multi_thread_test_with_stack("completed_poll_lifecycle", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for sample in 0..3 {
             let server = responses::start_mock_server().await;
             let home = tempfile::tempdir()?;
@@ -205,7 +205,7 @@ fn completed_poll_lifecycle_wall_clock() -> Result<()> {
 )]
 fn request_lifecycle_wall_clock() -> Result<()> {
     run_turn_multi_thread_test_with_stack("request_lifecycle_wall_clock", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for (workspace_evidence, path_watches) in [(false, false), (true, false), (true, true)] {
             for sources_changed in [false, true] {
                 for sample in 0..3 {
@@ -434,7 +434,7 @@ fn request_lifecycle_wall_clock() -> Result<()> {
 #[test]
 fn request_preparation_cancellation_retires_blocked_capture() -> Result<()> {
     run_turn_multi_thread_test_with_stack("request_preparation_cancellation", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let home = tempfile::tempdir()?;
         let workspace = tempfile::tempdir()?;
@@ -522,7 +522,7 @@ fn request_preparation_cancellation_retires_blocked_capture() -> Result<()> {
 )]
 fn request_preparation_large_failure_history_wall_clock() -> Result<()> {
     run_turn_multi_thread_test_with_stack("request_preparation_large_failure_history", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let payload = "retained diagnostic: α → β\n".repeat(1024);
         for sample in 0..3 {
             let server = responses::start_mock_server().await;

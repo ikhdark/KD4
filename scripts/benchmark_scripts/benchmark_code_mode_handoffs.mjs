@@ -23,7 +23,7 @@ for (let i = 0; i < args.length; i += 2) {
 if (!Number.isInteger(runs) || runs < 1 || runs > 100) throw Error('--runs must be 1–100');
 if (!['orchestration', 'critical-path'].includes(profile)) throw Error('unknown benchmark profile');
 if (sourceSnapshot && profile !== 'critical-path') throw Error('--source-snapshot requires --profile critical-path');
-const root = new URL('../../codex-rs/code-mode/src/runtime/', import.meta.url);
+const root = new URL('../../codex-rs/code-mode-runtime/src/runtime/', import.meta.url);
 let files = ['dependency_graph.js', 'orchestration.js', 'orchestration_tests.js'];
 let sources, scenarios;
 const wallMs = [];

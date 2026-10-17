@@ -185,6 +185,7 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
             proxy_settings_mode: request.proxy_settings_mode,
             timeout_ms: None,
             read_roots_override: request.read_roots_override.as_deref(),
+            additional_read_roots: &[],
             read_roots_include_platform_defaults: request.read_roots_include_platform_defaults,
             write_roots_override: request.write_roots_override.as_deref(),
             deny_read_paths_override: request.deny_read_paths_override.as_slice(),

@@ -42,7 +42,11 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.common.process_owner import owned_process, CleanupFailed, OwnedThreadPoolExecutor, run_owned
-from scripts.build.rust_tool_env import cargo_package_specs, local_rust_env
+from scripts.build.rust_tool_env import (
+    CORE_TEST_PACKAGES,
+    cargo_package_specs,
+    local_rust_env,
+)
 from scripts.build.cargo_child_diagnostics import diagnostic_command, wait_with_diagnostics
 from scripts.build.validation_metrics import ValidationMetrics
 
@@ -2960,11 +2964,14 @@ def guard_generic_recipe_args(
                 "or name@version (named core targets for codex-core)"
             )
     if any(token in {"--workspace", "--all"} for token in args) or any(
-        fnmatch.fnmatchcase("codex-core", spec.split("@", 1)[0]) for spec in packages
+        fnmatch.fnmatchcase(package, spec.split("@", 1)[0])
+        for spec in packages
+        for package in CORE_TEST_PACKAGES
     ):
         owner = f"{recipe} cannot" if recipe else "generic Rust test recipes cannot"
         raise RunnerError(
-            f"{owner} select codex-core; the package is owned by named targets. "
+            f"{owner} select codex-core or its integration tests; those packages are "
+            "owned by named targets. "
             "Use just core-test <target>, just core-test-fast <target>, or "
             "just core-gate <gate>; just core-test-list prints the names."
         )

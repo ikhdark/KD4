@@ -67,9 +67,9 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains(r#"--glob "**/agents/openai.yaml""#));
         assert!(!description.contains("then `rg -n"));
         assert!(!description.contains("is rejected"));
-        assert!(!description.contains("read the complete enclosing"));
+        assert!(!description.contains("read the complete relevant"));
         assert!(codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.contains(
-            "Read the complete enclosing function, type, or configuration unit before changing it"
+            "Read the complete relevant function or configuration unit before changing it"
         ));
         assert!(
             description.contains(
@@ -901,6 +901,8 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
 
     let schema = unified_exec_output_schema();
     let validator = jsonschema::validator_for(&schema).unwrap();
+    // Exec prompts declare this compact shape for the same runtime results.
+    let eager_validator = jsonschema::validator_for(&unified_exec_eager_output_schema()).unwrap();
     assert!(!validator.is_valid(&json!({"wall_time_seconds": 1.0, "output": "partial"})));
     for (process_id, exit_code, process_exited, search_no_match, expected) in [
         (Some(42), None, false, false, "running"),
@@ -965,6 +967,7 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         assert_eq!(result["execution_state"], expected);
         assert_eq!(result["exit_code"], json!(exit_code));
         assert!(validator.is_valid(&result), "{result}");
+        assert!(eager_validator.is_valid(&result), "{result}");
         assert_eq!(
             result.get("search_no_match"),
             search_no_match.then_some(&json!(true))
@@ -1010,5 +1013,24 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             invalid["exit_code"] = json!(0);
             assert!(!validator.is_valid(&invalid));
         }
+    }
+}
+
+#[test]
+fn eager_command_result_projects_fields_of_the_full_contract() {
+    // The prompt projection may omit fields, but every field it names must keep
+    // the authoritative type; otherwise cells read fields that never arrive.
+    let full = unified_exec_output_schema();
+    let eager = unified_exec_eager_output_schema();
+    let projected = &eager["$defs"]["ExecCommandResult"];
+    for (name, field) in projected["properties"].as_object().unwrap() {
+        let authoritative = full["properties"]
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is not a command result field"));
+        assert_eq!(field.get("type"), authoritative.get("type"), "{name}");
+    }
+    let required = full["required"].as_array().unwrap();
+    for name in projected["required"].as_array().unwrap() {
+        assert!(required.contains(name), "{name} is optional in the full contract");
     }
 }

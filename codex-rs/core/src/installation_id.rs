@@ -53,7 +53,7 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
 mod tests {
     use super::INSTALLATION_ID_FILENAME;
     use super::resolve_installation_id;
-    use core_test_support::PathExt;
+    use crate::test_harness::PathExt;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use uuid::Uuid;

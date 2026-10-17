@@ -15,7 +15,7 @@ use codex_mcp::ToolInfo;
 use codex_protocol::auth::AuthMode;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::Tool;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -155,7 +155,7 @@ async fn connector_discovery_plugins_manager_inherits_auth_mode() {
 #[test]
 fn synthetic_links_are_exposed_to_the_agent_but_not_accessible_in_app_list() {
     let mut synthetic_tool = codex_app_tool("gmail_batch_read_email", "gmail", Some("Gmail"), &[]);
-    synthetic_tool.tool.meta = Some(Meta(
+    synthetic_tool.tool.meta = Some(MetaObject(
         serde_json::json!({
             "resource_name": "gmail.batch_read_email",
             "_codex_apps": {

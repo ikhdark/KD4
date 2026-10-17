@@ -412,10 +412,9 @@ impl Assignment {
         });
         let canonical =
             serde_json::to_vec(&(scopes, claims, self.objective.trim(), criteria)).ok()?;
-        Some(PrimaryInvestigationIdentity(format!(
-            "{:x}",
-            Sha256::digest(&canonical)
-        )))
+        Some(PrimaryInvestigationIdentity(hex::encode(Sha256::digest(
+            &canonical,
+        ))))
     }
 
     pub(crate) fn validate_selective_role_contract(&self) -> StoreResult<()> {

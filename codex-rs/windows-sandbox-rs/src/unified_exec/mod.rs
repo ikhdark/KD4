@@ -34,6 +34,9 @@ pub struct WindowsSandboxSessionRequest<'a> {
     pub proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
     pub timeout_ms: Option<u64>,
     pub read_roots_override: Option<&'a [PathBuf]>,
+    /// Extra readable roots, such as a shell snapshot file. Only the elevated
+    /// backend applies them.
+    pub additional_read_roots: &'a [AbsolutePathBuf],
     pub read_roots_include_platform_defaults: bool,
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
@@ -43,11 +46,20 @@ pub struct WindowsSandboxSessionRequest<'a> {
     pub use_private_desktop: bool,
 }
 
+/// Windows firewall enforcement is tied to the logon-user sandbox identities, so
+/// proxy-enforced sessions must use that backend even when the configured mode is
+/// the default restricted-token sandbox.
+pub fn windows_sandbox_uses_elevated_backend(
+    sandbox_level: WindowsSandboxLevel,
+    proxy_enforced: bool,
+) -> bool {
+    proxy_enforced || matches!(sandbox_level, WindowsSandboxLevel::Elevated)
+}
+
 pub async fn spawn_windows_sandbox_session_for_level(
     request: WindowsSandboxSessionRequest<'_>,
 ) -> Result<SpawnedProcess> {
-    if request.proxy_enforced
-        || matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated)
+    if windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, request.proxy_enforced)
     {
         backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
             request.permission_profile,
@@ -60,7 +72,7 @@ pub async fn spawn_windows_sandbox_session_for_level(
             request.proxy_settings_mode,
             request.timeout_ms,
             request.read_roots_override,
-            &[],
+            request.additional_read_roots,
             request.read_roots_include_platform_defaults,
             request.write_roots_override,
             request.deny_read_paths_override,
@@ -90,7 +102,7 @@ pub async fn spawn_windows_sandbox_session_for_level(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn spawn_windows_sandbox_session_legacy(
+pub(crate) async fn spawn_windows_sandbox_session_legacy(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
@@ -114,49 +126,6 @@ pub async fn spawn_windows_sandbox_session_legacy(
         timeout_ms,
         additional_deny_read_paths,
         additional_deny_write_paths,
-        tty,
-        stdin_open,
-        use_private_desktop,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
-    permission_profile: &PermissionProfile,
-    workspace_roots: &[AbsolutePathBuf],
-    codex_home: &Path,
-    command: Vec<String>,
-    cwd: &Path,
-    env_map: HashMap<String, String>,
-    proxy_enforced: bool,
-    timeout_ms: Option<u64>,
-    read_roots_override: Option<&[PathBuf]>,
-    additional_read_roots: &[AbsolutePathBuf],
-    read_roots_include_platform_defaults: bool,
-    write_roots_override: Option<&[PathBuf]>,
-    deny_read_paths_override: &[AbsolutePathBuf],
-    deny_write_paths_override: &[AbsolutePathBuf],
-    tty: bool,
-    stdin_open: bool,
-    use_private_desktop: bool,
-) -> Result<SpawnedProcess> {
-    backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
-        permission_profile,
-        workspace_roots,
-        codex_home,
-        command,
-        cwd,
-        env_map,
-        proxy_enforced,
-        crate::WindowsSandboxProxySettingsMode::Reconcile,
-        timeout_ms,
-        read_roots_override,
-        additional_read_roots,
-        read_roots_include_platform_defaults,
-        write_roots_override,
-        deny_read_paths_override,
-        deny_write_paths_override,
         tty,
         stdin_open,
         use_private_desktop,

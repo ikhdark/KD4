@@ -139,7 +139,7 @@ impl CanonicalToolResult {
         let exact_bytes = bytes.len() as u64;
         Self {
             kind,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: hex::encode(Sha256::digest(&bytes)),
             approximate_tokens: approx_tokens_from_byte_count(bytes.len()),
             exact_bytes,
             bytes,
@@ -1453,7 +1453,7 @@ mod canonical_tests {
         assert_eq!(canonical.kind, CanonicalToolResultKind::Json);
         assert_eq!(
             canonical.sha256,
-            format!("{:x}", Sha256::digest(&canonical.bytes)),
+            hex::encode(Sha256::digest(&canonical.bytes)),
         );
         let value = canonical.value.expect("typed MCP value");
         assert_eq!(value["content"][1]["type"], "image");

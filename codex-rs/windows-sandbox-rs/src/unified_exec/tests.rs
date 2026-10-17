@@ -565,6 +565,7 @@ fn public_windows_backends_defer_native_preparation_without_launching_on_error()
                     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode::Preserve,
                     timeout_ms: None,
                     read_roots_override: None,
+                    additional_read_roots: &[],
                     read_roots_include_platform_defaults: true,
                     write_roots_override: None,
                     deny_read_paths_override: &[],

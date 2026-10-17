@@ -11,6 +11,7 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -184,6 +185,8 @@ pub struct TurnContext {
     pub(crate) base_instructions: Arc<BaseInstructions>,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
+    /// Whether this session's Code Mode cells can run; see `effective_tool_mode`.
+    pub(crate) code_mode_available: bool,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
     /// The raw per-turn setting before model capability normalization. Policy
@@ -626,6 +629,7 @@ impl TurnContext {
             base_instructions: Arc::clone(&self.base_instructions),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
+            code_mode_available: self.code_mode_available,
             session_telemetry: self
                 .session_telemetry
                 .clone()
@@ -786,7 +790,7 @@ impl TurnContext {
                 let mut writer = super::Sha256Writer(Sha256::new());
                 Digest::update(&mut writer.0, name.as_bytes());
                 serde_json::to_writer(&mut writer, &value)?;
-                identity.insert(name.to_string(), format!("{:x}", writer.0.finalize()));
+                identity.insert(name.to_string(), hex::encode(writer.0.finalize()));
             }
             Ok((identity, Some(codex_rollout::current_harness_build_info())))
         })
@@ -998,6 +1002,7 @@ impl Session {
             base_instructions,
             auth_manager: auth_manager_for_context,
             model_info,
+            code_mode_available: true,
             session_telemetry: session_telemetry_for_context,
             provider: provider_for_context,
             configured_reasoning_effort,
@@ -1271,6 +1276,7 @@ impl Session {
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
+        turn_context.code_mode_available = self.services.code_mode_service.is_available();
         turn_context
             .turn_timing_state
             .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());
@@ -1297,6 +1303,20 @@ impl Session {
                 }),
             )
             .await;
+        }
+
+        if !tc.code_mode_available
+            && matches!(
+                crate::tools::requested_tool_mode(tc),
+                ToolMode::CodeMode | ToolMode::CodeModeOnly
+            )
+            && let Some(message) = self
+                .services
+                .code_mode_service
+                .take_unavailable_warning(crate::tools::effective_tool_mode(tc))
+        {
+            self.send_event(tc, EventMsg::Warning(WarningEvent { message }))
+                .await;
         }
 
         if let Some(message) =

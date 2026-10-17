@@ -22,6 +22,7 @@ codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

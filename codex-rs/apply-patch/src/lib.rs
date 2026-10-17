@@ -1301,7 +1301,7 @@ fn compute_replacements(
                 return Err(invalid(PatchContextMismatchKind::RangeOrderMismatch,
                     "codex-range overlaps or precedes an earlier chunk; ranges must be ordered and nonoverlapping", excerpt()));
             }
-            if hash != format!("{:x}", Sha256::digest(original_contents.as_bytes())) {
+            if hash != hex::encode(Sha256::digest(original_contents.as_bytes())) {
                 return Err(invalid(PatchContextMismatchKind::StaleRange,
                     "codex-range source hash changed; reconcile current source before editing", excerpt()));
             }
@@ -1321,7 +1321,7 @@ fn compute_replacements(
             hunk_ordinal,
         };
         let ambiguous_match = |error: seek_sequence::AmbiguousMatch, pattern_len: usize| {
-            let hash = format!("{:x}", Sha256::digest(original_contents.as_bytes()));
+            let hash = hex::encode(Sha256::digest(original_contents.as_bytes()));
             let mut message = format!("{error} in {path}. Choose a candidate and replace its entire range (including unchanged context) using one of these revision-bound anchors:");
             for start in [error.first_line, error.second_line] {
                 let end = start + pattern_len - 1;
@@ -1403,7 +1403,7 @@ fn compute_replacements(
 
         if let Some(start_idx) = found {
             for operation in
-                similar::capture_diff_slices(similar::Algorithm::Myers, pattern, new_slice)
+                similar::capture_diff_slices(similar::Algorithm::RawMyers, pattern, new_slice)
             {
                 // Context identifies the location; preserve its original bytes even
                 // when it matched only after whitespace or Unicode normalization.
@@ -1526,8 +1526,7 @@ fn located_patch_mismatch(
         return ApplyPatchError::ComputeReplacements(message);
     };
     let (current_line_start, current_line_end, current_excerpt) = excerpt.unwrap_or_default();
-    let current_content_sha256 =
-        format!("{:x}", Sha256::digest(source.original_contents.as_bytes()));
+    let current_content_sha256 = hex::encode(Sha256::digest(source.original_contents.as_bytes()));
     ApplyPatchError::PatchContextMismatch(PatchContextMismatch {
         kind,
         hunk_ordinal,
@@ -1920,7 +1919,7 @@ mod tests {
         let path = dir.path().join("a.rs");
         let original = "same\r\nsame\r\nlast";
         fs::write(&path, original).unwrap();
-        let hash = format!("{:x}", Sha256::digest(original));
+        let hash = hex::encode(Sha256::digest(original));
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let patch = wrap_patch(&format!(
             "*** Update File: a.rs\n@@ codex-range 2:2 sha256:{hash}\n+changed"
@@ -1968,7 +1967,7 @@ mod tests {
             let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
             let original = "one\ntwo\nthree\nfour\n";
             fs::write(dir.path().join("source.txt"), original).unwrap();
-            let hash = format!("{:x}", Sha256::digest(original));
+            let hash = hex::encode(Sha256::digest(original));
             let patch = wrap_patch(&format!(
                 "*** Add File: prefix.txt\n+prefix\n*** Update File: source.txt\n@@ codex-range {first} sha256:{hash}\n+first replacement\n@@ codex-range {second} sha256:{hash}\n+second replacement"
             ));
@@ -1996,7 +1995,7 @@ mod tests {
     fn revision_bound_range_failures_are_distinct_and_located() {
         let original = "first\nsecond\n";
         let lines = original.lines().map(str::to_string).collect::<Vec<_>>();
-        let hash = format!("{:x}", Sha256::digest(original));
+        let hash = hex::encode(Sha256::digest(original));
         let path = PathUri::parse("file:///fixture.rs").unwrap();
         for (handle, old, kind, located) in [
             ("broken".to_string(), Vec::new(), PatchContextMismatchKind::MalformedRange, false),
@@ -2030,7 +2029,7 @@ mod tests {
         assert!(failure.delta().is_empty());
         let (error, _) = failure.into_parts();
         let ApplyPatchError::PatchContextMismatch(mismatch) = error else { panic!("{error:?}"); };
-        let hash = format!("{:x}", Sha256::digest(original));
+        let hash = hex::encode(Sha256::digest(original));
         let anchor = format!("@@ codex-range 5:6 sha256:{hash}");
         assert!(mismatch.message.contains(&format!("@@ codex-range 2:3 sha256:{hash}")));
         assert!(mismatch.message.contains(&anchor));
@@ -2065,7 +2064,7 @@ mod tests {
                         replacement.join(newline),
                         if trailing_newline { newline } else { "" },
                     );
-                    let hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+                    let hash = hex::encode(Sha256::digest(source.as_bytes()));
                     let added = replacement
                         .iter()
                         .map(|line| format!("+{line}"))
@@ -2261,7 +2260,7 @@ mod tests {
             assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (1, 1));
             assert_eq!(
                 mismatch.current_content_sha256,
-                format!("{:x}", Sha256::digest(original.as_bytes()))
+                hex::encode(Sha256::digest(original.as_bytes()))
             );
             assert_eq!(mismatch.current_line_start, 1);
             assert_eq!(mismatch.current_line_end, original.lines().count());
@@ -2450,7 +2449,7 @@ mod tests {
         );
         assert_eq!(
             mismatch.current_content_sha256,
-            format!("{:x}", Sha256::digest(post_prefix_contents.as_bytes()))
+            hex::encode(Sha256::digest(post_prefix_contents.as_bytes()))
         );
         assert!(mismatch.current_excerpt.contains("alpha"));
         assert!(mismatch.current_excerpt.contains("stale-current"));
@@ -2631,7 +2630,7 @@ mod tests {
         );
         assert_eq!(
             mismatch.current_content_sha256,
-            format!("{:x}", Sha256::digest(lines[0].as_bytes()))
+            hex::encode(Sha256::digest(lines[0].as_bytes()))
         );
         assert!(mismatch.to_string().contains("excerpt unavailable"));
     }

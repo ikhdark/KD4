@@ -11,7 +11,7 @@ fn completion_audit_reset_preserves_ready_delivery() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "completion_audit_reset_preserves_ready_delivery",
         || async {
-            core_test_support::require_network!();
+            crate::test_harness::require_network!();
             for recovery_tools in [true, false] {
                 for candidate in [false, true] {
                     let server = responses::start_mock_server().await;
@@ -53,7 +53,6 @@ fn completion_audit_reset_preserves_ready_delivery() -> Result<()> {
                             config.features.enable(Feature::TokenBudget).unwrap();
                             config.features.enable(Feature::CodeMode).unwrap();
                             config.features.enable(Feature::Kd4Runtime).unwrap();
-                            config.features.disable(Feature::CodeModeHost).unwrap();
                             config.model_auto_compact_token_limit = Some(i64::MAX);
                         })
                         .build(&server)
@@ -110,7 +109,7 @@ fn completion_audit_reset_preserves_ready_delivery() -> Result<()> {
 )]
 fn completion_audit_emergency_report_compacts_only_without_headroom() -> Result<()> {
     run_turn_multi_thread_test_with_stack("completion_audit_emergency_report_headroom", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for (usage, must_compact) in [(100_000, false), (199_999, true)] {
             let server = responses::start_mock_server().await;
             let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
@@ -154,7 +153,6 @@ fn completion_audit_emergency_report_compacts_only_without_headroom() -> Result<
                 .with_config(move |config| {
                     config.model_provider = provider;
                     config.features.disable(Feature::Kd4Runtime).unwrap();
-                    config.features.disable(Feature::CodeModeHost).unwrap();
                     config.model_context_window = Some(200_000);
                     config.model_auto_compact_token_limit = Some(90_000);
                 })
@@ -219,7 +217,7 @@ fn completion_audit_final_answer_reserve_boundary() {
 )]
 fn latency_audit_cancel_stalled_prompt_capture() -> Result<()> {
     run_turn_multi_thread_test_with_stack("latency_audit_cancel_stalled_prompt_capture", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let home = tempfile::tempdir()?;
         let provider = non_openai_model_provider(&server);
@@ -337,7 +335,7 @@ fn latency_audit_cancel_stalled_prompt_capture() -> Result<()> {
 )]
 fn latency_audit_remote_retention_preflight_and_recovery() -> Result<()> {
     run_turn_multi_thread_test_with_stack("latency_audit_remote_retention_preflight", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for directory_failure in [false, true] {
             let server = responses::start_mock_server().await;
             let home = tempfile::tempdir()?;

@@ -12,8 +12,7 @@ use crate::helper_materialization::resolve_helper_for_launch;
 use crate::winutil::resolve_sid;
 use crate::winutil::string_from_sid_bytes;
 use crate::winutil::to_wide;
-use rand::Rng;
-use rand::SeedableRng;
+use rand::RngExt;
 use rand::rngs::SmallRng;
 use std::io;
 use std::path::Path;
@@ -46,7 +45,7 @@ pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf {
 
 /// Generates a unique named-pipe path used to communicate with the runner process.
 pub fn pipe_pair() -> (String, String) {
-    let mut rng = SmallRng::from_os_rng();
+    let mut rng: SmallRng = rand::make_rng();
     let nonce: u128 = rng.random();
     let base = format!(r"\\.\pipe\codex-runner-{nonce:x}");
     (format!("{base}-in"), format!("{base}-out"))

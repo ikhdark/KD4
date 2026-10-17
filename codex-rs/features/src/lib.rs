@@ -116,9 +116,11 @@ pub enum Feature {
     AnalyticsPlanHistory,
     ContextManagement,
     TokenBudget,
-    /// Enable JavaScript code mode backed by the in-process V8 runtime.
+    /// Enable JavaScript code mode.
     CodeMode,
-    /// Run JavaScript code mode in the standalone host process.
+    /// Run code mode cells in the standalone `codex-code-mode-host` process.
+    /// Without it, code mode is unavailable: `code_mode` turns use direct tools
+    /// and `code_mode_only` turns fail closed.
     CodeModeHost,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
     CodeModeOnly,

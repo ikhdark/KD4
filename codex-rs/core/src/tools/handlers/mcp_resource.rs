@@ -532,7 +532,7 @@ struct McpResourceServerError {
 
 fn collection_page_errors(
     server: &str,
-    meta: Option<&rmcp::model::Meta>,
+    meta: Option<&rmcp::model::MetaObject>,
 ) -> Vec<McpResourceServerError> {
     meta.and_then(|meta| meta.get("codex/collectionError"))
         .and_then(Value::as_str)
@@ -809,6 +809,18 @@ impl ReadResourcePayload {
                     }
                     break;
                 }
+                // A contents kind this rmcp cannot bound is kept only when it fits whole.
+                other => {
+                    payload
+                        .contents
+                        .push(BoundedResourceContents::Complete(other));
+                    if serialized_payload_fits(&payload, truncation_policy)? {
+                        continue;
+                    }
+                    payload.contents.pop();
+                    payload.omitted_count += 1;
+                    break;
+                }
             }
         }
 
@@ -833,7 +845,7 @@ struct OmittedBlobResourceContents {
     omitted: bool,
     reason: &'static str,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    meta: Option<rmcp::model::Meta>,
+    meta: Option<rmcp::model::MetaObject>,
 }
 
 fn fit_text_resource_content(
@@ -841,7 +853,7 @@ fn fit_text_resource_content(
     uri: String,
     mime_type: Option<String>,
     text: String,
-    meta: Option<rmcp::model::Meta>,
+    meta: Option<rmcp::model::MetaObject>,
     truncation_policy: TruncationPolicy,
 ) -> Result<Option<ResourceContents>, FunctionCallError> {
     let output_policy = truncation_policy * 1.2;

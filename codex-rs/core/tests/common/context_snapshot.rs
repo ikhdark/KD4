@@ -2,7 +2,7 @@ use regex_lite::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;
 
-use crate::responses::ResponsesRequest;
+use super::responses::ResponsesRequest;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;

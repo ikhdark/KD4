@@ -49,9 +49,9 @@ use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -1704,8 +1704,8 @@ impl AppsServerControl {
 }
 
 impl ServerHandler for AppListMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     fn list_tools(
@@ -1725,6 +1725,9 @@ impl ServerHandler for AppListMcpServer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             Ok(ListToolsResult {
+                result_type: None,
+                ttl_ms: None,
+                cache_scope: None,
                 tools,
                 next_cursor: None,
                 meta: None,
@@ -1908,7 +1911,7 @@ pub(super) fn connector_tool(connector_id: &str, connector_name: &str) -> Result
     );
     tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
-    let mut meta = Meta::new();
+    let mut meta = MetaObject::new();
     meta.0
         .insert("connector_id".to_string(), json!(connector_id));
     meta.0

@@ -377,7 +377,7 @@ async fn discover_streamable_http_oauth_with_headers(
     let default_headers = default_headers.clone();
     let http_client =
         tokio::task::spawn_blocking(move || DiscoveryHttpClient::new(default_headers)).await??;
-    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+    let mut authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
         Arc::new(
             OAuthHttpClientAdapter::new(Arc::new(http_client), HeaderMap::new())
@@ -385,6 +385,7 @@ async fn discover_streamable_http_oauth_with_headers(
         ),
     )
     .await?;
+    authorization_manager.set_allow_missing_issuer(true);
     discover_streamable_http_oauth_with_manager(&authorization_manager).await
 }
 
@@ -396,7 +397,7 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     // Discovery probes several well-known URLs in turn, and rmcp suggests 30s
     // for each. Apply the direct discovery client's per-probe bound so a server
     // that accepts connections but never answers cannot stall callers for minutes.
-    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+    let mut authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
         Arc::new(
             OAuthHttpClientAdapter::new(http_client, default_headers)
@@ -404,15 +405,18 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
         ),
     )
     .await?;
+    authorization_manager.set_allow_missing_issuer(true);
     discover_streamable_http_oauth_with_manager(&authorization_manager).await
 }
 
 async fn discover_streamable_http_oauth_with_manager(
     authorization_manager: &AuthorizationManager,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
-    match authorization_manager.discover_metadata().boxed().await {
-        Ok(metadata) => Ok(Some(StreamableHttpOAuthDiscovery {
-            scopes_supported: normalize_scopes(metadata.scopes_supported),
+    match authorization_manager.resolve_metadata().boxed().await {
+        // rmcp 3 synthesizes legacy endpoints when nothing is published; that is not OAuth support.
+        Ok(resolution) if !resolution.source.is_discovered() => Ok(None),
+        Ok(resolution) => Ok(Some(StreamableHttpOAuthDiscovery {
+            scopes_supported: normalize_scopes(resolution.metadata.scopes_supported),
         })),
         Err(AuthError::NoAuthorizationSupport) => Ok(None),
         Err(err) => Err(err.into()),

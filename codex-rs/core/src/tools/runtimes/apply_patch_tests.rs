@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
+use crate::test_harness::PathBufExt;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -15,7 +16,6 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use codex_utils_path_uri::PathUri;
-use core_test_support::PathBufExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {

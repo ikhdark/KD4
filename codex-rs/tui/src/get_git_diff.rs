@@ -376,7 +376,7 @@ fn git_blob_abbreviation(contents: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(format!("blob {}\0", contents.len()).as_bytes());
     hasher.update(contents);
-    format!("{:x}", hasher.finalize())[..7].to_string()
+    hex::encode(hasher.finalize())[..7].to_string()
 }
 
 fn path_needs_separator_tab(path: &str) -> bool {

@@ -1,9 +1,9 @@
 use super::*;
 use crate::config::test_config;
+use crate::test_harness::PathBufExt;
+use crate::test_harness::PathExt;
 use codex_exec_server::EnvironmentManager;
 use codex_protocol::protocol::McpServerRefreshConfig;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 

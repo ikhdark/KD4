@@ -18,6 +18,7 @@ codex-utils-output-truncation = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
+hex = { workspace = true }
 jsonptr = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "base64",

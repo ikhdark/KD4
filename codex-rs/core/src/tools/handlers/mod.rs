@@ -3,14 +3,20 @@ pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_retries;
 pub(crate) mod apply_patch_spec;
-pub(crate) mod command_preflight;
-pub(crate) mod command_search;
-pub(crate) mod command_shape;
+pub(crate) use codex_command_analysis::command_preflight;
+pub(crate) use codex_command_analysis::command_search;
+pub(crate) use codex_command_analysis::command_shape;
+#[cfg(test)]
+mod command_shape_tests;
 #[cfg(test)]
 mod command_windows_corpus_tests;
 mod current_time;
+#[cfg(test)]
+mod full_suite_dispatch_tests;
 mod get_context_remaining;
 mod get_context_remaining_spec;
+#[cfg(test)]
+mod managed_cargo_lane_dispatch_tests;
 mod new_context_window;
 mod new_context_window_spec;
 pub(crate) use get_context_remaining::GetContextRemainingHandler;

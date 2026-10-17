@@ -705,10 +705,10 @@ mod tests {
         };
         assert!(raw_history_item.item.id().is_some());
         assert_eq!(
-            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+            crate::test_harness::responses::strip_response_item_ids(std::slice::from_ref(
                 &raw_history_item.item
             )),
-            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+            crate::test_harness::responses::strip_response_item_ids(std::slice::from_ref(
                 &expected_history_item
             ))
         );
@@ -775,10 +775,10 @@ mod tests {
             expected_sandbox_cwds
         );
         assert_eq!(
-            core_test_support::responses::strip_response_item_ids(
+            crate::test_harness::responses::strip_response_item_ids(
                 captured_call.conversation_history.items()
             ),
-            core_test_support::responses::strip_response_item_ids(std::slice::from_ref(
+            crate::test_harness::responses::strip_response_item_ids(std::slice::from_ref(
                 &expected_history_item
             ))
         );

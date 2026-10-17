@@ -992,6 +992,64 @@ async fn responses_websocket_sends_responses_lite_metadata_per_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_websocket_disables_parallel_tool_calls_for_prewarm_and_turn() {
+    require_network!();
+
+    for use_responses_lite in [false, true] {
+        let server = start_websocket_server(vec![vec![
+            vec![ev_completed("resp-prewarm")],
+            vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+        ]])
+        .await;
+        let test = test_codex()
+            .with_model_info_override(MODEL, move |model_info| {
+                model_info.use_responses_lite = use_responses_lite;
+                model_info.supports_parallel_tool_calls = true;
+            })
+            .build_with_websocket_server(&server)
+            .await
+            .expect("build websocket codex");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            server.wait_for_response_batch(0, 0),
+        )
+        .await
+        .expect("startup warmup response");
+        test.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "hello".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await
+            .expect("submit turn");
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let requests = server.single_connection();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body_json()["generate"], false);
+        for request in requests {
+            let body = request.body_json();
+            assert_eq!(body["parallel_tool_calls"], !use_responses_lite);
+            assert_eq!(
+                body["client_metadata"].get(WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY),
+                use_responses_lite.then_some(&json!("true")),
+            );
+        }
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_preconnect_is_reused_even_with_header_changes() {
     require_network!();
 

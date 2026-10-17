@@ -40,8 +40,8 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
         None => workspace_identity_input.clone(),
     };
     Ok(RepositoryIdentity {
-        id: format!("{:x}", Sha256::digest(&repository_identity_input)),
-        workspace_id: format!("{:x}", Sha256::digest(&workspace_identity_input)),
+        id: hex::encode(Sha256::digest(&repository_identity_input)),
+        workspace_id: hex::encode(Sha256::digest(&workspace_identity_input)),
         canonical_root,
         canonical_path,
     })

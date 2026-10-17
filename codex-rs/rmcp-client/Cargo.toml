@@ -26,6 +26,7 @@ codex-utils-path-uri = { workspace = true }
 codex-utils-pty = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
+hex = { workspace = true }
 http = { workspace = true }
 httpdate = { workspace = true }
 memchr = { workspace = true }

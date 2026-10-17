@@ -29,6 +29,7 @@ use codex_protocol::config_types::TrustLevel;
 use futures::SinkExt;
 use futures::StreamExt;
 use hmac::Hmac;
+use hmac::KeyInit;
 use hmac::Mac;
 use http::StatusCode;
 use serde_json::json;

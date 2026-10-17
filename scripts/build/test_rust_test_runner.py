@@ -2029,6 +2029,19 @@ class GenericRecipeGuardTest(unittest.TestCase):
             ):
                 rust_test_runner.guard_generic_recipe_args(argv)
 
+    def test_codex_core_integration_test_package_is_rejected(self) -> None:
+        # Its tests need the helper binaries that only named targets rebuild.
+        for argv in (
+            ["-p", "codex-core-integration-tests"],
+            ["--package=codex-core-integration-tests"],
+            ["-p", "codex-core-integration-*"],
+        ):
+            with (
+                self.subTest(argv=argv),
+                self.assertRaisesRegex(RunnerError, "cannot select codex-core"),
+            ):
+                rust_test_runner.guard_generic_recipe_args(argv)
+
     def test_other_packages_are_allowed(self) -> None:
         rust_test_runner.guard_generic_recipe_args(["-p", "codex-tui"])
         rust_test_runner.guard_generic_recipe_args(["--package=codex-app-server"])
@@ -4307,7 +4320,14 @@ class RepositoryManifestTest(unittest.TestCase):
                 if target.selector_kind == "lib":
                     binary = root / package.get("lib", {}).get("path", "src/lib.rs")
                 elif target.selector_kind == "test":
-                    binary = root / "tests" / f"{target.selector_value}.rs"
+                    binary = root / next(
+                        (
+                            entry["path"]
+                            for entry in package.get("test", [])
+                            if entry["name"] == target.selector_value
+                        ),
+                        f"tests/{target.selector_value}.rs",
+                    )
                 else:
                     binary = root / next(
                         entry["path"]
@@ -4325,35 +4345,49 @@ class RepositoryManifestTest(unittest.TestCase):
                         )
 
     def test_prevention_and_capability_gates_preserve_combined_coverage(self):
-        preflight = "tools::handlers::command_preflight::command_preflight_tests::"
-        headers = "tools::handlers::request_user_input::tests::"
-        capability = {
-            preflight + "never_repairs_mutating_command_flag_typos",
-            preflight + "leaf_glob_repair_is_bounded_and_preserves_exact_scope",
-            preflight + "kd4_runtime_off_preserves_command_without_repair",
-        }
-        prevention = {
-            preflight + "powershell_leaf_glob_repair_preserves_shell_and_exact_output",
-            preflight + "powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
-            preflight + "leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
-            preflight + "missing_rg_paths_are_advisory_and_use_the_execution_workdir",
-            preflight + "source_paging_advice_preserves_invocation_and_runtime_bypasses",
-            preflight + "source_paging_advice_excludes_transformations_and_unpaged_reads",
-            preflight + "source_paging_advice_keeps_unicode_output_errors_and_exit_status",
-            headers + "header_fallback_preserves_full_question_and_strict_validation",
-            headers + "overlong_header_reaches_user_without_a_repair_round",
-        }
+        # Preflight tests live in codex-command-analysis; header tests stay in codex-core.
+        preflight = ("command_analysis_lib", "command_preflight::command_preflight_tests::")
+        headers = ("core_lib", "tools::handlers::request_user_input::tests::")
+
+        def ids(owner, *names):
+            target, prefix = owner
+            return {(target, prefix + name) for name in names}
+
+        capability = ids(
+            preflight,
+            "never_repairs_mutating_command_flag_typos",
+            "leaf_glob_repair_is_bounded_and_preserves_exact_scope",
+            "kd4_runtime_off_preserves_command_without_repair",
+        )
+        prevention = ids(
+            preflight,
+            "powershell_leaf_glob_repair_preserves_shell_and_exact_output",
+            "powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
+            "leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
+            "missing_rg_paths_are_advisory_and_use_the_execution_workdir",
+            "source_paging_advice_preserves_invocation_and_runtime_bypasses",
+            "source_paging_advice_excludes_transformations_and_unpaged_reads",
+            "source_paging_advice_keeps_unicode_output_errors_and_exit_status",
+        ) | ids(
+            headers,
+            "header_fallback_preserves_full_question_and_strict_validation",
+            "overlong_header_reaches_user_without_a_repair_round",
+        )
         for name, expected in [
             ("capability-command-preflight", capability),
             ("harness-prevention-context", prevention),
         ]:
             with self.subTest(gate=name):
                 steps = self.manifest.gates[name].steps
-                self.assertEqual(len(steps), 1)
-                self.assertEqual(steps[0].target, "core_lib")
-                self.assertEqual(steps[0].helpers, ())
-                self.assertIsNone(steps[0].filterset)
-                self.assertEqual(set(steps[0].tests), expected)
+                self.assertEqual(len({step.target for step in steps}), len(steps))
+                for step in steps:
+                    # core_lib steps opt out of the conservative core helper set;
+                    # command_analysis_lib declares no helpers of its own.
+                    self.assertEqual(step.helpers, () if step.target == "core_lib" else None)
+                    self.assertIsNone(step.filterset)
+                self.assertEqual(
+                    {(step.target, test) for step in steps for test in step.tests}, expected
+                )
 
     def test_manifest_parses_strictly(self) -> None:
         self.assertEqual(self.manifest.version, rust_test_runner.SCHEMA_VERSION)
@@ -4372,16 +4406,26 @@ class RepositoryManifestTest(unittest.TestCase):
         )
 
     def test_core_integration_binaries_are_exactly_the_declared_targets(self) -> None:
-        # Every top-level `core/tests/*.rs` file is its own Cargo test binary.
-        # A declared target without a source fails selection; an undeclared
-        # source links a binary that no named target or gate can run.
+        # Every top-level `core/tests/*.rs` file is its own Cargo test binary of
+        # the codex-core-integration-tests package, which lists them explicitly
+        # (`autotests = false`): an unlisted source is never compiled. A declared
+        # target without a source fails selection; an undeclared binary is one
+        # no named target or gate can run.
         tests_dir = REPO_ROOT / "codex-rs" / "core" / "tests"
+        with (tests_dir / "Cargo.toml").open("rb") as source:
+            package = tomllib.load(source)
+        sources = {path.stem for path in tests_dir.glob("*.rs")}
+        self.assertEqual(
+            {(entry["name"], entry["path"]) for entry in package["test"]},
+            {(stem, f"{stem}.rs") for stem in sources},
+        )
         declared = {
             target.selector_value
             for target in self.manifest.targets.values()
-            if target.package == "codex-core" and target.selector_kind == "test"
+            if target.package == "codex-core-integration-tests"
+            and target.selector_kind == "test"
         }
-        self.assertEqual({path.stem for path in tests_dir.glob("*.rs")}, declared)
+        self.assertEqual(sources, declared)
 
 
     def assert_core_suite_registration(self, tests_dir: Path, targets: list[str]) -> None:
@@ -4418,7 +4462,8 @@ class RepositoryManifestTest(unittest.TestCase):
         self.assert_core_suite_registration(
             REPO_ROOT / "codex-rs" / "core" / "tests",
             [target.selector_value for target in self.manifest.targets.values()
-             if target.package == "codex-core" and target.selector_kind == "test"],
+             if target.package == "codex-core-integration-tests"
+             and target.selector_kind == "test"],
         )
 
     def test_core_suite_inventory_rejects_omissions_duplicates_and_cycles(self) -> None:

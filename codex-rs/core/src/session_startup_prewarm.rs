@@ -384,6 +384,7 @@ impl Session {
     pub(crate) fn schedule_code_mode_prewarm(self: &Arc<Self>, config: &Config) {
         if !(config.features.enabled(Feature::CodeMode)
             || config.features.enabled(Feature::CodeModeOnly))
+            || !self.services.code_mode_service.is_available()
         {
             return;
         }

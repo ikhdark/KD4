@@ -240,7 +240,10 @@ pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
         reason = "ToolName derives Serialize over String and Option<String>; preserve its exact JSON bytes for dispatch identity"
     )]
     let identity = serde_json::to_vec(tool_name).expect("tool identity serializes");
-    format!("{normalized}__{:x}", sha2::Sha256::digest(identity))
+    format!(
+        "{normalized}__{}",
+        hex::encode(sha2::Sha256::digest(identity))
+    )
 }
 
 #[cfg(test)]

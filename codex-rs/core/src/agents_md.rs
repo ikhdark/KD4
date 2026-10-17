@@ -760,7 +760,7 @@ fn project_doc_omission_notice(documents: &[ProjectDocOmission], recovery: &str)
         .map(|document| document.source_bytes)
         .fold(0u64, u64::saturating_add);
     let manifest = serde_json::to_vec(documents).unwrap_or_default();
-    let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest));
+    let manifest_sha256 = hex::encode(Sha256::digest(&manifest));
     let mut notice = format!(
         "Project docs omitted: count={} bytes={} manifest_sha256={}; read these exact paths before relying on their instructions:",
         documents.len(),

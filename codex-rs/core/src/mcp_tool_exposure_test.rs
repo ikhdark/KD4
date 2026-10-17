@@ -20,7 +20,7 @@ use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::Tool;
 
 use super::*;
@@ -100,7 +100,7 @@ fn tool_names(tools: &[ToolInfo]) -> HashSet<ToolName> {
 }
 
 fn with_visibility(mut tool: ToolInfo, visibility: &[&str]) -> ToolInfo {
-    tool.tool.meta = Some(Meta(
+    tool.tool.meta = Some(MetaObject(
         serde_json::json!({ "ui": { "visibility": visibility } })
             .as_object()
             .expect("metadata object")

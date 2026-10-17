@@ -3312,7 +3312,7 @@ async fn callable_alias_executes_same_identity_after_catalog_growth() {
         fn cell_closed(&self, _: &codex_code_mode::CellId) {}
     }
     let service =
-        codex_code_mode::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
+        codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
     let specs = [
         test_spec(&ToolName::plain("read_file")),
         test_spec(&ToolName::plain("read-file")),

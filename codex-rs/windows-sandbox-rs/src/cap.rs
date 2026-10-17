@@ -2,8 +2,7 @@ use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use anyhow::Context;
 use anyhow::Result;
-use rand::RngCore;
-use rand::SeedableRng;
+use rand::Rng;
 use rand::rngs::SmallRng;
 use serde::Deserialize;
 use serde::Serialize;
@@ -51,7 +50,7 @@ pub fn cap_sid_file(codex_home: &Path) -> PathBuf {
 }
 
 fn make_random_cap_sid_string() -> String {
-    let mut rng = SmallRng::from_os_rng();
+    let mut rng: SmallRng = rand::make_rng();
     let a = rng.next_u32();
     let b = rng.next_u32();
     let c = rng.next_u32();

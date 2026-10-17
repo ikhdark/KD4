@@ -17,7 +17,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_exec_server::HttpClient;
 use codex_exec_server::ReqwestHttpClient;
+use rmcp::transport::AuthError;
 use rmcp::transport::AuthorizationManager;
+use rmcp::transport::AuthorizationRequest;
 use rmcp::transport::AuthorizationSession;
 use rmcp::transport::auth::OAuthClientConfig;
 use rmcp::transport::auth::OAuthHttpClient;
@@ -286,19 +288,14 @@ fn spawn_callback_server(
         while let Ok(request) = server.recv() {
             let path = request.url().to_string();
             match parse_oauth_callback(&path, &expected_callback_path) {
-                CallbackOutcome::Success(OauthCallbackResult { code, state })
-                    if state == expected_csrf_state =>
-                {
+                CallbackOutcome::Success(callback) if callback.state == expected_csrf_state => {
                     let response = Response::from_string(
                         "Authentication complete. You may close this window.",
                     );
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
-                    if tx
-                        .send(CallbackResult::Success(OauthCallbackResult { code, state }))
-                        .is_err()
-                    {
+                    if tx.send(CallbackResult::Success(callback)).is_err() {
                         eprintln!("OAuth callback receiver closed");
                     }
                     break;
@@ -331,6 +328,8 @@ fn spawn_callback_server(
 struct OauthCallbackResult {
     code: String,
     state: String,
+    /// RFC 9207 authorization response issuer (`iss`), when the provider sent one.
+    issuer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -361,6 +360,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
     let mut state = None;
     let mut error = None;
     let mut error_description = None;
+    let mut issuer = None;
 
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let slot = match key.as_ref() {
@@ -368,6 +368,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
             "state" => &mut state,
             "error" => &mut error,
             "error_description" => &mut error_description,
+            "iss" => &mut issuer,
             _ => continue,
         };
         if slot.replace(value.into_owned()).is_some() {
@@ -379,7 +380,11 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
     }
 
     if let (Some(code), Some(state)) = (code, state.clone()) {
-        return CallbackOutcome::Success(OauthCallbackResult { code, state });
+        return CallbackOutcome::Success(OauthCallbackResult {
+            code,
+            state,
+            issuer,
+        });
     }
 
     if (error.is_some() || error_description.is_some())
@@ -634,6 +639,7 @@ impl OauthLoginFlow {
             let OauthCallbackResult {
                 code,
                 state: csrf_state,
+                issuer,
             } = match callback {
                 CallbackResult::Success(callback) => callback,
                 CallbackResult::Error(error) => return Err(anyhow!(error)),
@@ -644,7 +650,7 @@ impl OauthLoginFlow {
             }
 
             self.oauth_state
-                .handle_callback(&code, &csrf_state)
+                .handle_callback_with_issuer(&code, &csrf_state, issuer.as_deref())
                 .await
                 .context("failed to handle OAuth callback")?;
 
@@ -714,20 +720,29 @@ async fn start_authorization(
     redirect_uri: &str,
     oauth_client_id: Option<&str>,
 ) -> Result<OAuthState> {
-    let Some(oauth_client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty())
-    else {
-        let mut oauth_state =
-            OAuthState::new_with_oauth_http_client(server_url, http_client).await?;
-        oauth_state
-            .start_authorization(scopes, redirect_uri, Some("Codex"))
-            .await?;
-        return Ok(oauth_state);
-    };
-
     let mut auth_manager =
         AuthorizationManager::new_with_oauth_http_client(server_url, http_client).await?;
-    let metadata = auth_manager.discover_metadata().await?;
-    auth_manager.set_metadata(metadata);
+    // Keep accepting authorization-server metadata that omits `issuer`, as rmcp 1.x did.
+    auth_manager.set_allow_missing_issuer(true);
+    let resolution = auth_manager.resolve_metadata().await?;
+    // rmcp 3 synthesizes legacy endpoints when nothing is discovered; keep requiring
+    // published metadata, matching the status discovery that offers this login.
+    if !resolution.source.is_discovered() {
+        return Err(AuthError::NoAuthorizationSupport.into());
+    }
+    auth_manager.set_metadata(resolution.metadata);
+
+    let Some(oauth_client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty())
+    else {
+        let request = AuthorizationRequest::new(redirect_uri)
+            .with_scopes(scopes.iter().copied())
+            .with_client_name("Codex");
+        let session = AuthorizationSession::new(auth_manager, request)
+            .await
+            .map_err(|(_, error)| error)?;
+        return Ok(OAuthState::Session(session));
+    };
+
     auth_manager.configure_client(
         OAuthClientConfig::new(oauth_client_id, redirect_uri)
             .with_scopes(scopes.iter().map(|scope| (*scope).to_string()).collect()),
@@ -1015,15 +1030,22 @@ mod tests {
     #[test]
     fn parse_oauth_callback_preserves_values_for_supported_paths() {
         for path in ["/callback", "/oauth/callback", "/callback/abc123"] {
-            for (query, code, state) in [
-                ("code=abc&state=xyz", "abc", "xyz"),
-                ("code=a%2Bb&state=x+y", "a+b", "x y"),
+            for (query, code, state, issuer) in [
+                ("code=abc&state=xyz", "abc", "xyz", None),
+                ("code=a%2Bb&state=x+y", "a+b", "x y", None),
+                (
+                    "code=abc&state=xyz&iss=https%3A%2F%2Fauth.example.com%2Ftenant",
+                    "abc",
+                    "xyz",
+                    Some("https://auth.example.com/tenant"),
+                ),
             ] {
                 assert_eq!(
                     parse_oauth_callback(&format!("{path}?{query}"), path),
                     CallbackOutcome::Success(super::OauthCallbackResult {
                         code: code.to_string(),
                         state: state.to_string(),
+                        issuer: issuer.map(str::to_string),
                     }),
                     "callback {path}?{query}"
                 );

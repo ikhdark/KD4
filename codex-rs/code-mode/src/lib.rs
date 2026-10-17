@@ -1,16 +1,9 @@
-mod cell_actor;
-mod remote_session;
-mod runtime;
-mod service;
-mod session_runtime;
-mod v8_init;
+//! Codex's Code Mode client. Cells run in the standalone
+//! `codex-code-mode-host` process; this crate never links V8.
 
-pub(crate) type TaskFailureHandler = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+mod remote_session;
 
 pub use codex_code_mode_protocol::*;
+pub use remote_session::DisabledCodeModeSessionProvider;
 pub use remote_session::ProcessOwnedCodeModeSession;
 pub use remote_session::ProcessOwnedCodeModeSessionProvider;
-pub use service::FallbackCodeModeSessionProvider;
-pub use service::InProcessCodeModeSession;
-pub use service::InProcessCodeModeSessionProvider;
-pub use service::NoopCodeModeSessionDelegate;

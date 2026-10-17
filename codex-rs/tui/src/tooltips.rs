@@ -1,6 +1,7 @@
 use codex_features::FEATURES;
 use codex_protocol::account::PlanType;
 use rand::Rng;
+use rand::RngExt;
 use std::sync::LazyLock;
 
 const ANNOUNCEMENT_TIP_URL: &str =

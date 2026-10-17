@@ -1,3 +1,5 @@
+use crate::test_harness::PathBufExt;
+use crate::test_harness::PathExt;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -19,8 +21,6 @@ use codex_git_utils::recent_commits;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_utils_absolute_path::normalize_for_path_comparison;
 use codex_utils_path_uri::PathUri;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::io;

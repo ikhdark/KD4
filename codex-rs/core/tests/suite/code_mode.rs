@@ -660,32 +660,158 @@ text(JSON.stringify(shape));
     Ok(())
 }
 
+/// Submits one turn and returns the warnings it emitted.
+async fn submit_and_collect_warnings(test: &TestCodex, prompt: &str) -> Result<Vec<String>> {
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: prompt.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut warnings = Vec::new();
+    loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Warning(warning) => warnings.push(warning.message),
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                return Ok(warnings);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn code_mode_unavailable_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|warning| warning.starts_with("Code Mode is unavailable because"))
+        .collect()
+}
+
+#[test_case::test_case(true, "failed to spawn code-mode host"; "missing host program")]
+#[test_case::test_case(false, "code-mode host is disabled"; "host feature disabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()> {
+async fn unavailable_host_uses_direct_tools_and_warns_once(
+    host_enabled: bool,
+    reason: &'static str,
+) -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
-    let builder = test_codex()
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_code_mode_host_program("codex-code-mode-host-does-not-exist".into())
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code mode should be enabled");
+            if !host_enabled {
+                config
+                    .features
+                    .disable(Feature::CodeModeHost)
+                    .expect("code mode host should be configurable");
+            }
+        });
+    let test = builder.build(&server).await?;
+
+    let first = submit_and_collect_warnings(&test, "first turn").await?;
+    let second = submit_and_collect_warnings(&test, "second turn").await?;
+
+    let unavailable = code_mode_unavailable_warnings(&first);
+    assert_eq!(unavailable.len(), 1, "{first:?}");
+    assert!(unavailable[0].contains(reason), "{}", unavailable[0]);
+    assert!(
+        unavailable[0].contains("Falling back to direct tools"),
+        "{}",
+        unavailable[0]
+    );
+    assert!(
+        code_mode_unavailable_warnings(&second).is_empty(),
+        "the warning is emitted once per thread: {second:?}"
+    );
+    let sent = requests.requests();
+    assert_eq!(sent.len(), 2);
+    for request in sent {
+        let names = tool_names(&request.body_json());
+        assert!(
+            !names.iter().any(|name| name == "exec" || name == "wait"),
+            "an unavailable host must not advertise Code Mode tools: {names:?}"
+        );
+        assert!(!names.is_empty(), "direct tools stay available");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_process_host_fails_closed_in_code_mode_only() -> Result<()> {
+    require_network!();
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex()
         .with_model("test-gpt-5.1-codex")
         .with_code_mode_host_program("codex-code-mode-host-does-not-exist".into())
         .with_config(|config| {
             config
                 .features
-                .enable(Feature::CodeMode)
-                .expect("code mode should be enabled");
+                .enable(Feature::CodeModeOnly)
+                .expect("code mode only should be enabled");
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let test = builder.build(&server).await?;
+    responses::mount_sse_once(
         &server,
-        "Run code mode",
-        "text('fallback-ready')",
-        builder,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call("call-1", "exec", "text('must-not-run')"),
+            ev_completed("resp-1"),
+        ]),
     )
-    .await?;
+    .await;
+    let follow_up = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
 
-    let request = follow_up_mock.single_request();
-    let items = custom_tool_output_items(&request, "call-1");
-    assert_eq!(items.len(), 1);
-    assert_eq!(text_item(&items, 0), "fallback-ready");
+    let warnings = submit_and_collect_warnings(&test, "Run code mode").await?;
+
+    let unavailable = code_mode_unavailable_warnings(&warnings);
+    assert_eq!(unavailable.len(), 1, "{warnings:?}");
+    assert!(unavailable[0].contains("fail closed"), "{}", unavailable[0]);
+    let request = follow_up.single_request();
+    assert!(
+        tool_names(&request.body_json()).contains(&"exec".to_string()),
+        "Code Mode only keeps exec advertised"
+    );
+    let output = raw_custom_tool_output_text(&request, "call-1");
+    assert!(output.contains("failed to spawn code-mode host"), "{output}");
+    assert!(!output.contains("must-not-run"), "{output}");
 
     Ok(())
 }
@@ -2194,9 +2320,8 @@ if (!tool) {
             })
         })
         .expect("exec description should be present");
-    assert!(exec_description.contains("Nested tools: use a present schema"));
-    assert!(exec_description.contains("`resolve_tool(name)` to obtain a missing schema"));
-    assert!(exec_description.contains("callable with `.name`/`.description`"));
+    assert!(exec_description.contains("use `resolve_tool(name)` and call it in the same cell"));
+    assert!(exec_description.contains("resolution retains the full contract"));
     assert!(exec_description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
     assert!(!exec_description.contains("### `tool_search`"));
     // Result schemas are resolved on demand; verify the actual search result below.
@@ -4977,6 +5102,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "RegExp",
         "resolve_tool",
         "read_files",
+        "search_files",
         "read_status",
         "await_command",
         "run_graph",
@@ -5040,6 +5166,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "ALL_TOOLS",
         "ALL_TOOL_NAMES",
         "read_files",
+        "search_files",
         "read_status",
         "await_command",
         "run_graph",

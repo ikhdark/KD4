@@ -135,7 +135,7 @@ fn normalized_task_fingerprint(
     });
     let mut writer = Sha256Writer(Sha256::new());
     serde_json::to_writer(&mut writer, &identity).ok()?;
-    Some(format!("{:x}", writer.0.finalize()))
+    Some(hex::encode(writer.0.finalize()))
 }
 
 fn task_workspace_identity(

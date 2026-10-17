@@ -12,6 +12,9 @@ SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
 DEFAULT_SCCACHE_CACHE_SIZE = "80G"
 WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
 _SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
+# codex-core and the package holding its integration tests: named targets own
+# their test runs, and they share the core-tests lanes.
+CORE_TEST_PACKAGES = ("codex-core", "codex-core-integration-tests")
 
 
 def local_rust_env(

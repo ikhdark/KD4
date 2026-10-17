@@ -7,6 +7,10 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+// The shared test harness (`test_harness`) names this crate `codex_core`.
+#[cfg(test)]
+extern crate self as codex_core;
+
 mod apply_patch;
 mod apps;
 mod client;
@@ -40,6 +44,7 @@ pub mod connectors;
 pub mod context;
 mod context_manager;
 mod current_time;
+mod digest_writer;
 mod elicitation;
 mod environment_selection;
 pub mod exec;
@@ -97,6 +102,8 @@ mod stream_events_utils;
 pub use stream_events_utils::image_generation_artifact_path;
 mod stable_context;
 mod startup_timing;
+#[cfg(test)]
+mod test_harness;
 pub mod test_support;
 mod unified_exec;
 pub mod windows_sandbox;
@@ -141,7 +148,7 @@ mod tools;
 pub(crate) mod turn_diff_tracker;
 mod turn_metadata;
 mod turn_timing;
-mod validation;
+use codex_command_analysis::validation;
 mod workspace_operation_gate;
 pub(crate) use codex_tools::FunctionCallError;
 

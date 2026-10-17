@@ -88,7 +88,7 @@ pub fn file_sha256(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// SHA-256 of the running executable, hashed once per process. Commit, dirty

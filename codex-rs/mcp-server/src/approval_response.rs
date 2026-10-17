@@ -36,7 +36,8 @@ pub(crate) fn review_decision_from_elicitation_response(
                 .or(decision)
                 .unwrap_or(ReviewDecision::Approved))
         }
-        Some(ElicitationAction::Decline | ElicitationAction::Cancel) => Ok(ReviewDecision::Denied),
+        // Decline, cancel, and any action this rmcp may add are denials.
+        Some(_) => Ok(ReviewDecision::Denied),
         None => Ok(decision.unwrap_or(ReviewDecision::Denied)),
     }
 }

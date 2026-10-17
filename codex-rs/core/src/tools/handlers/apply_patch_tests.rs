@@ -1,11 +1,11 @@
 use super::*;
+use crate::test_harness::PathBufExt;
+use crate::test_harness::PathExt;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;

@@ -84,8 +84,8 @@ pub(crate) fn inter_agent_completion_communication(
             digest.update(part.as_bytes());
         }
         communication.id = Some(codex_protocol::ResponseItemId::from_server(format!(
-            "agent-error-{:x}",
-            digest.finalize(),
+            "agent-error-{}",
+            hex::encode(digest.finalize()),
         )));
     }
     Some(communication)

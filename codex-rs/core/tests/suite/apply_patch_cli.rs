@@ -313,7 +313,7 @@ async fn apply_patch_cli_move_overwrites_existing_destination() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_cli_move_without_content_change_has_no_turn_diff() -> Result<()> {
+async fn apply_patch_cli_move_without_content_change_reports_rename_only_diff() -> Result<()> {
     require_network!();
 
     let harness = apply_patch_harness().await?;
@@ -328,10 +328,10 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff() -> Resul
 
     submit_without_wait(&harness, "rename without content change").await?;
 
-    let mut saw_turn_diff = false;
+    let mut last_diff: Option<String> = None;
     wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(_) => {
-            saw_turn_diff = true;
+        EventMsg::TurnDiff(ev) => {
+            last_diff = Some(ev.unified_diff.clone());
             false
         }
         EventMsg::TurnComplete(_) => true,
@@ -339,7 +339,23 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff() -> Resul
     })
     .await;
 
-    assert!(!saw_turn_diff, "pure rename should not emit a turn diff");
+    // A pure rename still changes the tree: the diff keeps both paths and has
+    // no content hunk.
+    let diff = last_diff.expect("pure rename should emit a turn diff");
+    for header in [
+        "similarity index 100%",
+        "rename from old/name.txt",
+        "rename to renamed/name.txt",
+    ] {
+        assert!(
+            diff.contains(header),
+            "diff should contain {header:?}: {diff}"
+        );
+    }
+    assert!(
+        !diff.contains("@@"),
+        "pure rename should not report a hunk: {diff}"
+    );
     assert!(!harness.path_exists("old/name.txt").await?);
     assert_eq!(harness.read_file_text("renamed/name.txt").await?, "same\n");
     Ok(())

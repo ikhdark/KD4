@@ -54,7 +54,13 @@ pub(crate) fn parse(
     };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language.into()).ok()?;
-    let mut cancelled = |_: &tree_sitter::ParseState| Instant::now() >= deadline;
+    let mut cancelled = |_: &tree_sitter::ParseState| {
+        if Instant::now() >= deadline {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     let tree = parser.parse_with_options(
         &mut |offset, _| &source.as_bytes()[offset..],
         None,

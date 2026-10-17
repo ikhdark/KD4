@@ -1290,10 +1290,9 @@ impl RegisteredTool {
     pub(crate) fn canonical_spec_sha256(&self) -> &str {
         self.canonical_spec_sha256.get_or_init(|| {
             let canonical_spec = self.spec.callable_contract();
-            format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
-            )
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&canonical_spec).unwrap_or_default(),
+            ))
         })
     }
 

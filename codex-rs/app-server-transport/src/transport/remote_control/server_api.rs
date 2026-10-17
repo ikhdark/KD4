@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use codex_http_client::HttpClient;
 #[cfg(test)]
 use codex_login::default_client::create_client_without_request_logging;
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;

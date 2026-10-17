@@ -327,6 +327,7 @@ fn to_error_event_handles_response_stream_failed() {
         status: Some(StatusCode::TOO_MANY_REQUESTS),
         request_id: Some("req-123".to_string()),
         idle_timeout: false,
+        reconnectable_close: false,
     });
 
     let event = err.to_error_event(Some("prefix".to_string()));

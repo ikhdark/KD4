@@ -648,6 +648,7 @@ mod tests {
     use super::*;
     use crate::client::ModelClient;
     use crate::responses_metadata::CodexResponsesRequestKind;
+    use crate::test_harness::responses;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_model_provider::create_model_provider;
     use codex_protocol::models::AgentMessageInputContent;
@@ -659,7 +660,6 @@ mod tests {
     use codex_rollout_trace::TraceWriter;
     use codex_rollout_trace::replay_bundle;
     use codex_utils_output_truncation::approx_token_count;
-    use core_test_support::responses;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -694,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_compaction_uses_current_supported_service_tier() -> anyhow::Result<()> {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let home = TempDir::new()?;
         let (session, mut turn, _events) =
@@ -802,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_compaction_outlasts_provider_idle_timeout() -> anyhow::Result<()> {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         // The checkpoint arrives only after longer silence than the provider allows.
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -887,10 +887,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_compaction_reattempts_a_progress_timeout_once() -> anyhow::Result<()> {
-        use core_test_support::streaming_sse::StreamingSseChunk;
-        use core_test_support::streaming_sse::start_streaming_sse_server;
+        use crate::test_harness::streaming_sse::StreamingSseChunk;
+        use crate::test_harness::streaming_sse::start_streaming_sse_server;
 
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         // Each response sends headers and then nothing, so every attempt uses its
         // whole progress budget. Holding the gates keeps the streams open.
         let mut gates = Vec::new();
@@ -997,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_compaction_v2_retry_records_distinct_trace_attempts() -> anyhow::Result<()> {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
 
         let server = responses::start_mock_server().await;
         let request_log = responses::mount_sse_sequence(

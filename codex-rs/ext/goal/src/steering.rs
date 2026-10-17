@@ -71,8 +71,8 @@ mod tests {
             updated_at: now,
         };
         let expected = format!(
-            "goal-1:{:x}",
-            sha2::Sha256::digest("finish the stack".as_bytes())
+            "goal-1:{}",
+            hex::encode(sha2::Sha256::digest("finish the stack".as_bytes()))
         );
         // The reference must be the one update_goal validates against.
         assert_eq!(crate::tool::goal_reference(&goal), expected);

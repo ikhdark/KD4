@@ -504,16 +504,13 @@ fn evidence_digest_is_reused_until_observed_evidence_changes() {
         assert!(control.evidence_fingerprint.get().is_none());
         let changed = control.baselines(0);
         assert_ne!(baselines.evidence_fingerprint, changed.evidence_fingerprint);
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&(
-                    &control.budget_progress_evidence,
-                    &control.delivered_coverage,
-                ))
-                .unwrap()
-            )
-        );
+        let expected = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(
+                &control.budget_progress_evidence,
+                &control.delivered_coverage,
+            ))
+            .unwrap(),
+        ));
         assert_eq!(changed.evidence_fingerprint, expected);
         assert_eq!(control.evidence_fingerprint.get(), Some(&expected));
         control.observe_progress(&baselines, &collector, &settled(0));

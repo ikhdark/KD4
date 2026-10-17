@@ -3234,11 +3234,10 @@ impl ModelClient {
                 "auto"
             }
             .to_string(),
-            // Responses Lite changes tool placement, reasoning context and a
-            // transport header; it does not restrict tool-call arity. The
-            // per-model capability is the only source of truth here, so a
-            // Lite model that advertises parallel tool calls still gets them.
-            parallel_tool_calls: prompt.parallel_tool_calls,
+            // Responses Lite requires this field to be false even when the model
+            // advertises parallel tool calls. Apply the constraint here for both
+            // HTTP and WebSocket requests, including fallback requests.
+            parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
             reasoning,
             store: provider.is_azure_responses_endpoint(),
             stream: true,

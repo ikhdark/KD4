@@ -13,7 +13,7 @@ $ForwardedArgs = @($args | Select-Object -Skip ($analyzerIndex + 1))
 # workspace lane reuses a matching warm sibling or refuses a cold duplicate.
 $laneRunner = Join-Path $PSScriptRoot "rust_build_status.py"
 $python = Get-Command python -ErrorAction Stop
-$v8SandboxPackage = "codex-code-mode"
+$v8SandboxPackage = "codex-code-mode-runtime"
 
 function Invoke-CargoLane {
     param(

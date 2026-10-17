@@ -509,6 +509,6 @@ pub(crate) fn goal_reference(goal: &codex_state::ThreadGoal) -> String {
 
 pub(crate) fn goal_reference_for(goal_id: &str, objective: &str) -> String {
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(objective.as_bytes());
-    format!("{goal_id}:{digest:x}")
+    let digest = hex::encode(sha2::Sha256::digest(objective.as_bytes()));
+    format!("{goal_id}:{digest}")
 }

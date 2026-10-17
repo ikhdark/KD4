@@ -62,6 +62,24 @@ pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
 pub(crate) const VALIDATION_COMMAND_TIMEOUT_MS: u64 = 300_000;
 
+impl crate::tools::handlers::command_shape::CommandShell for crate::shell::Shell {
+    fn shell_type(&self) -> ShellType {
+        self.shell_type
+    }
+
+    fn shell_path(&self) -> &std::path::Path {
+        &self.shell_path
+    }
+
+    fn derive_exec_args(
+        &self,
+        command: &str,
+        use_login_shell: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        crate::shell::Shell::derive_exec_args(self, command, use_login_shell)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ShellCommandHookArgs {
     #[serde(default)]
@@ -136,7 +154,7 @@ pub(super) fn shell_failure_sampling_signal(
     }
     let action_fingerprint = attempt_key
         .map(CommandAttemptKey::fingerprint)
-        .unwrap_or_else(|| format!("{:x}", Sha256::digest(command.as_bytes())));
+        .unwrap_or_else(|| hex::encode(Sha256::digest(command.as_bytes())));
     let outcome_fingerprint = exit_code
         .map(|code| format!("exit-{code}"))
         .unwrap_or_else(|| "timeout".to_string());
@@ -490,7 +508,7 @@ pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> Stri
         digest.update(value.as_bytes());
         digest.update([0xff]);
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn restore_retained_validation_attempt(

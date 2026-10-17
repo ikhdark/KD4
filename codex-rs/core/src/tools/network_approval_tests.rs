@@ -1,11 +1,11 @@
 use super::*;
 use crate::sandboxing::SandboxPermissions;
+use crate::test_harness::PathBufExt;
+use crate::test_harness::test_path_buf;
 use codex_network_proxy::BlockedRequestArgs;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
-use core_test_support::PathBufExt;
-use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use tokio_util::sync::CancellationToken;
 

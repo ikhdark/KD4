@@ -2053,28 +2053,26 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     assert!(new.response_id_by_attempt.is_empty());
     assert_eq!(
         old.request_sha256_by_attempt["old-attempt"],
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(br#"{"instructions":"one","input":[]}"#)
-        )
+        hex::encode(sha2::Sha256::digest(
+            br#"{"instructions":"one","input":[]}"#
+        ))
     );
     assert_eq!(
         new.request_sha256_by_attempt["new-attempt"],
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(br#"{"instructions":"two","input":[]}"#)
-        )
+        hex::encode(sha2::Sha256::digest(
+            br#"{"instructions":"two","input":[]}"#
+        ))
     );
     let old_sections = &old.request_section_sha256_by_attempt["old-attempt"];
     let new_sections = &new.request_section_sha256_by_attempt["new-attempt"];
     assert_eq!(old_sections["input"], new_sections["input"]);
     assert_eq!(
         old_sections["input"],
-        format!("{:x}", sha2::Sha256::digest(b"[]"))
+        hex::encode(sha2::Sha256::digest(b"[]"))
     );
     assert_eq!(
         old_sections["instructions"],
-        format!("{:x}", sha2::Sha256::digest(br#""one""#))
+        hex::encode(sha2::Sha256::digest(br#""one""#))
     );
     assert_ne!(old_sections["instructions"], new_sections["instructions"]);
     assert!(new.request_token_categories.is_none());

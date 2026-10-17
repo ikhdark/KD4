@@ -988,10 +988,7 @@ async fn create_isolated_worktree(
 ) -> Result<IsolatedWorkspace, FunctionCallError> {
     let mut initial_overlay =
         capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
-    let repository_key = format!(
-        "{:x}",
-        Sha256::digest(repo_root.to_string_lossy().as_bytes())
-    );
+    let repository_key = hex::encode(Sha256::digest(repo_root.to_string_lossy().as_bytes()));
     let safe_task_name = task_name
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')

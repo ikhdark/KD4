@@ -103,6 +103,10 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     recovery_path: Option<std::path::PathBuf>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
+    availability: Result<(), String>,
+    unavailable_warning_emitted: AtomicBool,
+    /// The model step that received the runtime-replacement notice.
+    replacement_step: Mutex<std::sync::Weak<StepContext>>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     packet_admission: Mutex<CodeModePacketAdmission>,
     cell_parent_call_ids: Mutex<HashMap<String, String>>,
@@ -128,9 +132,6 @@ struct CodeModePacketMetrics {
     delivery_recovery: HashMap<String, DeliveryArtifactCoverage>,
     command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
-    nested_call_count: usize,
-    batchable_observation_count: usize,
-    result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
     nested_recovery: std::collections::BTreeMap<usize, JsonValue>,
@@ -314,9 +315,6 @@ struct CodeModeNestedResultEvidence {
 
 struct CodeModePacketReceipt {
     command_states: Vec<JsonValue>,
-    nested_call_count: usize,
-    batchable_observation_count: usize,
-    result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
     nested_recovery: std::collections::BTreeMap<usize, JsonValue>,
@@ -466,14 +464,19 @@ const MAX_INLINE_PACKET_RECOVERY_BYTES: usize = 1024 * 1024;
 const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
 const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
 const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
+const RUNTIME_REPLACED_EARLIER_IN_STEP: &str = "This cell did not run: an earlier `exec` call in this response reported that the Code Mode runtime was replaced and its stored values were lost. Read that result, then run the cell again.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
             recovery_path: None,
             session_provider,
+            availability,
+            unavailable_warning_emitted: AtomicBool::new(false),
+            replacement_step: Mutex::new(std::sync::Weak::new()),
             dispatch_broker,
             packet_admission: Mutex::new(CodeModePacketAdmission::default()),
             cell_parent_call_ids: Mutex::new(HashMap::new()),
@@ -491,11 +494,58 @@ impl CodeModeService {
         Arc::clone(&self.session_provider)
     }
 
+    /// Whether cells can run at all. Checked once: an unavailable host makes
+    /// ordinary Code Mode turns use direct tools instead.
+    pub(crate) fn is_available(&self) -> bool {
+        self.availability.is_ok()
+    }
+
+    /// Returns the unavailability warning the first time it is requested.
+    pub(crate) fn take_unavailable_warning(&self, tool_mode: ToolMode) -> Option<String> {
+        let error = self.availability.as_ref().err()?;
+        let behavior = match tool_mode {
+            ToolMode::Direct => "Falling back to direct tools",
+            ToolMode::CodeMode | ToolMode::CodeModeOnly => "Code mode will fail closed",
+        };
+        (!self.unavailable_warning_emitted.swap(true, Ordering::Relaxed)).then(|| {
+            format!(
+                "Code Mode is unavailable because {error}. {behavior}; enable `features.code_mode_host` and install `codex-code-mode-host`."
+            )
+        })
+    }
+
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
     ) -> Result<codex_code_mode::StartedCell, String> {
         self.session().await?.execute(request).await
+    }
+
+    /// Runs a cell the model requested in `step_context`. Once one cell of a
+    /// step receives the runtime-replacement notice, the step's later cells
+    /// were written without seeing it, so they do not run either.
+    pub(crate) async fn execute_for_step(
+        &self,
+        request: codex_code_mode::ExecuteRequest,
+        step_context: &Arc<StepContext>,
+    ) -> Result<codex_code_mode::StartedCell, String> {
+        let replaced_earlier_in_step = self
+            .replacement_step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+            .is_some_and(|step| Arc::ptr_eq(&step, step_context));
+        if replaced_earlier_in_step {
+            return Err(RUNTIME_REPLACED_EARLIER_IN_STEP.to_string());
+        }
+        let result = self.execute(request).await;
+        if matches!(&result, Err(error) if error == codex_code_mode::RUNTIME_REPLACED_NOTICE) {
+            *self
+                .replacement_step
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(step_context);
+        }
+        result
     }
 
     pub(crate) async fn wait(
@@ -775,9 +825,9 @@ impl CodeModeService {
                 let text = value.as_str().or_else(|| value["output"].as_str());
                 let parsed = text.and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
                 let exact = text
-                    .is_some_and(|text| format!("{:x}", Sha256::digest(text.as_bytes())) == sha256)
+                    .is_some_and(|text| hex::encode(Sha256::digest(text.as_bytes())) == sha256)
                     || serde_json::to_vec(parsed.as_ref().unwrap_or(value))
-                        .is_ok_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == sha256);
+                        .is_ok_and(|bytes| hex::encode(Sha256::digest(bytes)) == sha256);
                 let coverage = metrics
                     .delivery_recovery
                     .entry(id.clone())
@@ -916,7 +966,6 @@ impl CodeModeService {
         let metrics = admission.cells.get_mut(cell_id.as_str())?;
         let ordinal = metrics.next_nested_ordinal;
         metrics.next_nested_ordinal = metrics.next_nested_ordinal.saturating_add(1);
-        metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
         Some(ordinal)
     }
 
@@ -1008,16 +1057,10 @@ impl CodeModeService {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep the per-call accounting and terminal evidence explicit"
-    )]
     fn complete_packet_call(
         &self,
         cell_id: &CellId,
         ordinal: usize,
-        batchable_observation: bool,
-        result_bytes: usize,
         post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
         nested_result: Option<CodeModeNestedResultEvidence>,
         required_terminal: Option<(RequiredToolTerminalCause, String)>,
@@ -1032,10 +1075,6 @@ impl CodeModeService {
         metrics.delivery_blocked |= required_terminal.is_some()
             || nested_result.as_ref().is_some_and(|result| result.failed)
             || !post_tool_use_feedback.is_empty();
-        metrics.batchable_observation_count = metrics
-            .batchable_observation_count
-            .saturating_add(usize::from(batchable_observation));
-        metrics.result_bytes = metrics.result_bytes.saturating_add(result_bytes);
         metrics
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
@@ -1093,21 +1132,11 @@ impl CodeModeService {
     fn record_packet_call(
         &self,
         cell_id: &CellId,
-        batchable_observation: bool,
-        result_bytes: usize,
         post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     ) {
         self.record_cell_parent_call_id(cell_id, "test-exec");
         let ordinal = self.begin_packet_call(cell_id).expect("registered cell");
-        self.complete_packet_call(
-            cell_id,
-            ordinal,
-            batchable_observation,
-            result_bytes,
-            post_tool_use_feedback,
-            None,
-            None,
-        );
+        self.complete_packet_call(cell_id, ordinal, post_tool_use_feedback, None, None);
     }
 
     fn finish_packet(&self, cell_id: &str, retain_terminal: bool) -> CodeModePacketReceipt {
@@ -1144,9 +1173,6 @@ impl CodeModeService {
             .sort_unstable_by_key(|result| result.ordinal);
         CodeModePacketReceipt {
             command_states: metrics.command_states,
-            nested_call_count: metrics.nested_call_count,
-            batchable_observation_count: metrics.batchable_observation_count,
-            result_bytes: metrics.result_bytes,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
             nested_results: metrics.nested_results,
             nested_recovery: metrics.nested_recovery,
@@ -1256,9 +1282,6 @@ pub(super) fn handle_runtime_response(
     tracing::info!(
         target: "codex.code_mode.packet",
         cell_id,
-        nested_call_count = packet.nested_call_count,
-        batchable_observation_count = packet.batchable_observation_count,
-        result_bytes = packet.result_bytes,
         post_tool_use_feedback_count = packet.post_tool_use_feedback.len(),
         retained_nested_result_count = packet.nested_results.len(),
         omitted_nested_result_count = packet.omitted_nested_result_count,
@@ -2156,8 +2179,6 @@ async fn call_nested_tool(
             .complete_packet_call(
                 &cell_id,
                 packet_ordinal,
-                false,
-                0,
                 Vec::new(),
                 None,
                 Some((RequiredToolTerminalCause::Failure, message.clone())),
@@ -2187,8 +2208,6 @@ async fn call_nested_tool(
                 .complete_packet_call(
                     &cell_id,
                     packet_ordinal,
-                    false,
-                    0,
                     Vec::new(),
                     Some(CodeModeNestedResultEvidence {
                         failed: true,
@@ -2227,8 +2246,6 @@ async fn call_nested_tool(
             .complete_packet_call(
                 &cell_id,
                 packet_ordinal,
-                false,
-                0,
                 Vec::new(),
                 None,
                 Some((RequiredToolTerminalCause::Failure, message.clone())),
@@ -2289,8 +2306,6 @@ async fn call_nested_tool(
                 .complete_packet_call(
                     &cell_id,
                     packet_ordinal,
-                    false,
-                    0,
                     Vec::new(),
                     Some(CodeModeNestedResultEvidence {
                         failed: true,
@@ -2564,9 +2579,6 @@ async fn call_nested_tool(
         .complete_packet_call(
             &cell_id,
             packet_ordinal,
-            is_batchable_observation(&tool_name, &payload)
-                && !result_has_live_exec_session(&result_value),
-            result_bytes,
             post_tool_use_feedback,
             Some(nested_result),
             required_terminal,
@@ -2646,10 +2658,7 @@ fn script_visible_nested_result(
             hash.update((call_id.len() as u64).to_be_bytes());
             hash.update(call_id.as_bytes());
             hash.update((position as u64).to_be_bytes());
-            object.insert(
-                "chunk_id".to_string(),
-                format!("{:x}", hash.finalize()).into(),
-            );
+            object.insert("chunk_id".to_string(), hex::encode(hash.finalize()).into());
         }
     }
     value
@@ -2915,78 +2924,6 @@ fn is_native_apply_patch_invocation(command: &[String]) -> bool {
     }
 }
 
-fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
-    if tool_name.namespace.is_none()
-        && matches!(tool_name.name.as_str(), "read_tool_output" | "tool_search")
-    {
-        return true;
-    }
-    if tool_name.namespace.is_some()
-        || !matches!(
-            tool_name.name.as_str(),
-            "exec_command" | "shell_command" | "unified_exec"
-        )
-    {
-        return false;
-    }
-    let ToolPayload::Function { arguments } = payload else {
-        return false;
-    };
-    let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments) else {
-        return false;
-    };
-    let command = arguments
-        .get("program")
-        .and_then(JsonValue::as_str)
-        .map(|program| {
-            let mut command = vec![program.to_string()];
-            command.extend(
-                arguments
-                    .get("args")
-                    .and_then(JsonValue::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(JsonValue::as_str)
-                    .map(str::to_string),
-            );
-            command
-        })
-        .or_else(|| {
-            ["script_body", "cmd", "command"]
-                .into_iter()
-                .find_map(|field| match arguments.get(field) {
-                    Some(JsonValue::String(command)) => Some(vec![command.clone()]),
-                    Some(JsonValue::Array(command)) => command
-                        .iter()
-                        .map(|part| part.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>(),
-                    _ => None,
-                })
-        });
-    command.is_some_and(|command| !crate::turn_diff_tracker::command_may_mutate(&command))
-}
-
-fn result_has_live_exec_session(result: &JsonValue) -> bool {
-    [
-        (
-            result.get("session_id"),
-            result.get("process_exited"),
-            result.get("exit_code"),
-        ),
-        (
-            result.pointer("/result/essential/session_id"),
-            result.pointer("/result/essential/process_exited"),
-            result.pointer("/result/essential/exit_code"),
-        ),
-    ]
-    .into_iter()
-    .any(|(session_id, process_exited, exit_code)| {
-        session_id.is_some_and(|session_id| !session_id.is_null())
-            && !process_exited.and_then(JsonValue::as_bool).unwrap_or(false)
-            && exit_code.is_none_or(JsonValue::is_null)
-    })
-}
-
 fn nested_command_state(
     tool_name: Option<&ToolName>,
     call_id: &str,
@@ -3092,8 +3029,10 @@ fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
     }
     let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
     format!(
-        "code_mode.nested_tool.{:x}",
-        Sha256::digest(format!("{tool_name}\0{normalized}").as_bytes())
+        "code_mode.nested_tool.{}",
+        hex::encode(Sha256::digest(
+            format!("{tool_name}\0{normalized}").as_bytes()
+        ))
     )
 }
 
@@ -3179,10 +3118,8 @@ mod tests {
     use super::build_nested_tool_payload;
     use super::fold_nested_required_terminal;
     use super::format_runtime_response;
-    use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
     use super::required_nested_tool_terminal_cause;
-    use super::result_has_live_exec_session;
     use super::truncate_code_mode_result;
     use super::wrapped_patch_rejection;
     use crate::tools::context::FunctionToolOutput;
@@ -3655,8 +3592,6 @@ mod tests {
         service.complete_packet_call(
             &cell,
             0,
-            false,
-            0,
             Vec::new(),
             None,
             Some((RequiredToolTerminalCause::Failure, "genuine failure".into())),
@@ -3832,7 +3767,7 @@ mod tests {
     #[tokio::test]
     async fn prewarm_initializes_the_code_mode_session_once() {
         let service =
-            CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
+            CodeModeService::new(Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider));
         assert!(!service.is_initialized());
 
         service.prewarm().await.expect("in-process host prewarm");
@@ -3958,6 +3893,102 @@ mod tests {
         );
         assert_eq!(*provider.creation_calls.lock().unwrap(), 0);
         assert_eq!(*session.shutdown_calls.lock().unwrap(), 0);
+    }
+
+    /// Reports a replaced runtime for its first cell and fails later cells
+    /// with an ordinary error, counting the cells that reached it.
+    struct ReplacedRuntimeSession {
+        executions: std::sync::Mutex<usize>,
+    }
+
+    impl codex_code_mode::CodeModeSession for ReplacedRuntimeSession {
+        fn execute<'a>(
+            &'a self,
+            _request: ExecuteRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell>
+        {
+            Box::pin(async move {
+                let mut executions = self.executions.lock().unwrap();
+                *executions += 1;
+                Err(if *executions == 1 {
+                    codex_code_mode::RUNTIME_REPLACED_NOTICE.to_string()
+                } else {
+                    "reached the runtime".to_string()
+                })
+            })
+        }
+
+        fn wait<'a>(
+            &'a self,
+            _request: codex_code_mode::WaitRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            panic!("the test only runs cells");
+        }
+
+        fn terminate<'a>(
+            &'a self,
+            _cell_id: CellId,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            panic!("the test only runs cells");
+        }
+
+        fn shutdown<'a>(&'a self) -> codex_code_mode::CodeModeSessionResultFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ReplacedRuntimeProvider(Arc<ReplacedRuntimeSession>);
+
+    impl codex_code_mode::CodeModeSessionProvider for ReplacedRuntimeProvider {
+        fn create_session<'a>(
+            &'a self,
+            _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
+            Box::pin(async move {
+                Ok(Arc::clone(&self.0) as Arc<dyn codex_code_mode::CodeModeSession>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_replacement_stops_the_rest_of_its_model_step() {
+        let runtime = Arc::new(ReplacedRuntimeSession {
+            executions: Default::default(),
+        });
+        let service = CodeModeService::new(Arc::new(ReplacedRuntimeProvider(Arc::clone(&runtime))));
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        let turn = Arc::new(turn);
+        let request = || ExecuteRequest {
+            state_path: None,
+            tool_call_id: "call-1".to_string(),
+            enabled_tools: Vec::new().into(),
+            source: "text(String(load('value')))".to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+            default_tool_timeout_ms: None,
+        };
+
+        let step = crate::session::step_context::StepContext::for_test(Arc::clone(&turn));
+        assert_eq!(
+            service.execute_for_step(request(), &step).await.err().as_deref(),
+            Some(codex_code_mode::RUNTIME_REPLACED_NOTICE)
+        );
+        // Written before the model saw the notice, so it must not run on the
+        // empty replacement runtime.
+        assert_eq!(
+            service.execute_for_step(request(), &step).await.err().as_deref(),
+            Some(super::RUNTIME_REPLACED_EARLIER_IN_STEP)
+        );
+        assert_eq!(*runtime.executions.lock().unwrap(), 1);
+
+        let next_step = crate::session::step_context::StepContext::for_test(turn);
+        assert_eq!(
+            service.execute_for_step(request(), &next_step).await.err().as_deref(),
+            Some("reached the runtime")
+        );
+        assert_eq!(*runtime.executions.lock().unwrap(), 2);
     }
 
     #[test]
@@ -4102,7 +4133,6 @@ mod tests {
             .services
             .code_mode_service
             .finish_packet(cell_id.as_str(), false);
-        assert_eq!(packet.nested_call_count, 1);
         let terminal = packet
             .first_required_terminal
             .expect("the rejection is recorded as the cell's required terminal failure");
@@ -4171,7 +4201,6 @@ mod tests {
                 );
             }
             let packet = service.finish_packet(cell_id.as_str(), false);
-            assert_eq!(packet.nested_call_count, 1);
             assert!(packet.first_required_terminal.is_none());
             service.finish_cell_dispatch(&cell_id);
         }
@@ -4216,7 +4245,6 @@ mod tests {
         .expect("printing patch-shaped data must reach ordinary shell dispatch");
         assert!(result.to_string().contains("*** Begin Patch"));
         let packet = service.finish_packet(cell_id.as_str(), false);
-        assert_eq!(packet.nested_call_count, 1);
         assert!(packet.first_required_terminal.is_none());
         service.finish_cell_dispatch(&cell_id);
     }
@@ -4350,23 +4378,11 @@ mod tests {
         let feedback = vec![FunctionCallOutputContentItem::InputText {
             text: "hook feedback".to_string(),
         }];
-        service.record_packet_call(&cell, true, 128, feedback.clone());
+        service.record_packet_call(&cell, feedback.clone());
         let first = service.finish_packet("cell", false);
         assert_eq!(first.post_tool_use_feedback, feedback);
-        assert_eq!(first.nested_call_count, 1);
-        assert_eq!(first.batchable_observation_count, 1);
-        assert_eq!(first.result_bytes, 128);
         let drained = service.finish_packet("cell", false);
         assert!(drained.post_tool_use_feedback.is_empty());
-        assert_eq!(drained.nested_call_count, 0);
-        assert_eq!(drained.batchable_observation_count, 0);
-        assert_eq!(drained.result_bytes, 0);
-        for _ in 0..6 {
-            service.record_packet_call(&cell, true, 128, Vec::new());
-        }
-        let batched = service.finish_packet("cell", false);
-        assert_eq!(batched.nested_call_count, 6);
-        assert_eq!(batched.result_bytes, 768);
     }
 
     #[test]
@@ -4434,8 +4450,6 @@ mod tests {
         service.complete_packet_call(
             &cell,
             0,
-            false,
-            0,
             Vec::new(),
             Some(packet.nested_results[0].clone()),
             None,
@@ -4474,8 +4488,6 @@ mod tests {
             service.complete_packet_call(
                 &cell,
                 ordinal,
-                false,
-                10,
                 Vec::new(),
                 Some(super::CodeModeNestedResultEvidence {
                     failed: index == 9,
@@ -4534,8 +4546,6 @@ mod tests {
         service.complete_packet_call(
             &cell,
             second,
-            false,
-            0,
             Vec::new(),
             None,
             Some((
@@ -4546,8 +4556,6 @@ mod tests {
         service.complete_packet_call(
             &cell,
             first,
-            false,
-            0,
             Vec::new(),
             None,
             Some((
@@ -4608,84 +4616,6 @@ mod tests {
             ),
             None,
         );
-    }
-
-    #[test]
-    fn packet_admission_only_classifies_known_read_only_argv_calls() {
-        let rg = ToolPayload::Function {
-            arguments: json!({"kind": "argv", "program": "rg", "args": ["needle"]}).to_string(),
-        };
-        let git_status = ToolPayload::Function {
-            arguments: json!({"kind": "argv", "program": "git", "args": ["status", "--short"]})
-                .to_string(),
-        };
-        let git_commit = ToolPayload::Function {
-            arguments: json!({"kind": "argv", "program": "git", "args": ["commit"]}).to_string(),
-        };
-        let read_only_shell_script = ToolPayload::Function {
-            arguments: json!({"kind": "script", "cmd": "rg needle"}).to_string(),
-        };
-        let mutating_shell_script = ToolPayload::Function {
-            arguments: json!({"command": "Remove-Item output.txt"}).to_string(),
-        };
-
-        assert!(is_batchable_observation(
-            &ToolName::plain("exec_command"),
-            &rg
-        ));
-        assert!(is_batchable_observation(
-            &ToolName::plain("exec_command"),
-            &git_status
-        ));
-        assert!(!is_batchable_observation(
-            &ToolName::plain("exec_command"),
-            &git_commit
-        ));
-        assert!(!is_batchable_observation(
-            &ToolName::plain("exec_command"),
-            &read_only_shell_script
-        ));
-        assert!(!is_batchable_observation(
-            &ToolName::plain("shell_command"),
-            &mutating_shell_script
-        ));
-    }
-
-    #[test]
-    fn tool_result_correctness_projected_live_exec_session_is_detected() {
-        assert!(result_has_live_exec_session(&json!({"session_id": 7})));
-        assert!(result_has_live_exec_session(&json!({
-            "version": 1,
-            "result": {
-                "essential": {
-                    "session_id": 7,
-                },
-                "selected_text": "",
-            },
-        })));
-        assert!(!result_has_live_exec_session(&json!({
-            "result": {
-                "essential": {
-                    "session_id": null,
-                },
-            },
-        })));
-        assert!(!result_has_live_exec_session(&json!({"exit_code": 0})));
-        assert!(!result_has_live_exec_session(&json!({
-            "session_id": 7,
-            "exit_code": 7,
-            "process_exited": true,
-        })));
-        assert!(!result_has_live_exec_session(&json!({
-            "version": 1,
-            "result": {
-                "essential": {
-                    "session_id": 7,
-                    "exit_code": null,
-                    "process_exited": true,
-                },
-            },
-        })));
     }
 
     #[test]

@@ -61,7 +61,7 @@ max-threads = 2
 
 [[profile.default.overrides]]
 # Opt-in live A/B has two bounded ten-minute turns, not a mock-server test.
-filter = 'package(codex-core) & test(=suite::code_mode::token_cache_e2e::live::integrated_live_model_pair)'
+filter = 'package(codex-core-integration-tests) & test(=suite::code_mode::token_cache_e2e::live::integrated_live_model_pair)'
 slow-timeout = { period = "1m", terminate-after = 22 }
 
 [[profile.default.overrides]]
@@ -80,7 +80,7 @@ test-group = 'login_callback_port'
 # and have been the dominant source of 30s timeouts. core's suite::resume runs
 # in process, so only codex-exec's resume suite belongs here.
 platform = 'cfg(windows)'
-filter = '(package(codex-exec) & (test(suite::resume::) | test(suite::auth_env::))) | (package(codex-core) & test(suite::cli_stream::)) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
+filter = '(package(codex-exec) & (test(suite::resume::) | test(suite::auth_env::))) | (package(codex-core-integration-tests) & test(suite::cli_stream::)) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
 test-group = 'process_heavy'
 slow-timeout = { period = "1m", terminate-after = 2 }
 
@@ -88,7 +88,7 @@ slow-timeout = { period = "1m", terminate-after = 2 }
 # App-server integration tests spawn a fresh app-server subprocess per case, and
 # core apply_patch_cli tests run full Codex turns that launch apply_patch. Both
 # use isolated homes and ephemeral ports. The library unit tests stay ungrouped.
-filter = '(package(codex-app-server) & kind(test) & not test(suite::v2::analytics::app_server_default_analytics_)) | (package(codex-core) & kind(test) & test(suite::apply_patch_cli::))'
+filter = '(package(codex-app-server) & kind(test) & not test(suite::v2::analytics::app_server_default_analytics_)) | (package(codex-core-integration-tests) & kind(test) & test(suite::apply_patch_cli::))'
 test-group = 'process_heavy'
 
 [[profile.default.overrides]]
@@ -107,7 +107,8 @@ test-group = 'windows_sandbox_legacy_sessions'
 # guidance, history, schema and tool-spec tests use the global worker pool.
 platform = 'cfg(windows)'
 filter = '''
-package(codex-core) & (
+(package(codex-command-analysis) & test(command_preflight::))
+| (package(codex-core) | package(codex-core-integration-tests)) & (
     test(unified_exec::)
   | test(/^shell::tests::/)
   | test(shell_snapshot::)
@@ -118,7 +119,8 @@ package(codex-core) & (
   | test(turn_diff_tracker::)
   | test(tools::sandboxing::)
   | test(tools::handlers::shell::tests::) & not test(tools::handlers::shell::tests::pure::)
-  | test(tools::handlers::command_preflight::)
+  | test(tools::handlers::full_suite_dispatch_tests::)
+  | test(tools::handlers::managed_cargo_lane_dispatch_tests::)
   | test(tools::handlers::command_windows_corpus::)
   | test(tools::handlers::agent_jobs::)
   | test(suite::shell_command::)

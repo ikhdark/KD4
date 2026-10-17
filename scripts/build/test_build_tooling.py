@@ -26,7 +26,13 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
     def test_core_package_selections_share_the_named_core_lane(self):
         from scripts.build.rust_build_status import _auto_lane_base
 
-        for selection in (["-p", "codex-core"], ["-pcodex-core"], ["--package=codex-core"], ["-p", "codex-tui", "-p", "codex-core"]):
+        for selection in (
+            ["-p", "codex-core"],
+            ["-pcodex-core"],
+            ["--package=codex-core"],
+            ["-p", "codex-tui", "-p", "codex-core"],
+            ["-p", "codex-core-integration-tests"],
+        ):
             with self.subTest(selection=selection):
                 self.assertEqual(_auto_lane_base(["cargo", "test", *selection]), "core-tests")
                 self.assertEqual(_auto_lane_base(["cargo", "test", "--release", *selection]), "core-tests-release")

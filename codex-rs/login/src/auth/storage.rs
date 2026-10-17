@@ -242,8 +242,7 @@ fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
     let path_str = canonical.to_string_lossy();
     let mut hasher = Sha256::new();
     hasher.update(path_str.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = hex::encode(hasher.finalize());
     let truncated = hex.get(..16).unwrap_or(&hex);
     Ok(format!("cli|{truncated}"))
 }

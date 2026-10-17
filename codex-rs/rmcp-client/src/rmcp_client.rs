@@ -24,10 +24,10 @@ use rmcp::model::CancelledNotification;
 use rmcp::model::CancelledNotificationParam;
 use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
-use rmcp::model::CreateElicitationRequestParams;
-use rmcp::model::CreateElicitationResult;
 use rmcp::model::CustomNotification;
 use rmcp::model::CustomRequest;
+use rmcp::model::ElicitRequestParams;
+use rmcp::model::ElicitResult;
 use rmcp::model::ElicitationAction;
 use rmcp::model::Extensions;
 use rmcp::model::InitializeRequestParams;
@@ -44,9 +44,11 @@ use rmcp::model::ReadResourceRequest;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
+use rmcp::model::RequestMetaObject;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::ServerResult;
 use rmcp::model::Tool;
+use rmcp::service::ClientCacheConfig;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::service::{self};
@@ -377,10 +379,7 @@ impl OperationRequestTracker {
             return;
         };
         let notification = ClientNotification::CancelledNotification(CancelledNotification::new(
-            CancelledNotificationParam {
-                request_id: id,
-                reason: Some(reason.to_string()),
-            },
+            CancelledNotificationParam::new(Some(id), Some(reason.to_string())),
         ));
         if let Err(error) = service.send_notification(notification).await {
             warn!("failed to send MCP request cancellation: {error}");
@@ -444,7 +443,7 @@ async fn send_tracked_request(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Elicitation {
-    Mcp(CreateElicitationRequestParams),
+    Mcp(ElicitRequestParams),
     OpenAiForm {
         meta: Option<serde_json::Value>,
         message: String,
@@ -455,7 +454,7 @@ pub enum Elicitation {
 impl Elicitation {
     pub fn meta(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         match self {
-            Self::Mcp(request) => request.meta().map(|meta| &meta.0),
+            Self::Mcp(request) => request.meta().map(|meta| &meta.0.0),
             Self::OpenAiForm { meta, .. } => meta.as_ref().and_then(serde_json::Value::as_object),
         }
     }
@@ -470,8 +469,8 @@ pub struct ElicitationResponse {
     pub meta: Option<serde_json::Value>,
 }
 
-impl From<CreateElicitationResult> for ElicitationResponse {
-    fn from(value: CreateElicitationResult) -> Self {
+impl From<ElicitResult> for ElicitationResponse {
+    fn from(value: ElicitResult) -> Self {
         Self {
             action: value.action,
             content: value.content,
@@ -480,18 +479,17 @@ impl From<CreateElicitationResult> for ElicitationResponse {
     }
 }
 
-impl From<ElicitationResponse> for CreateElicitationResult {
+impl From<ElicitationResponse> for ElicitResult {
     /// Preserves object metadata supported by RMCP. Non-object metadata is omitted;
     /// the runtime's custom response serializer supports arbitrary JSON metadata.
     fn from(value: ElicitationResponse) -> Self {
-        Self {
-            action: value.action,
-            content: value.content,
-            meta: value.meta.and_then(|meta| match meta {
-                serde_json::Value::Object(meta) => Some(rmcp::model::Meta(meta)),
-                _ => None,
-            }),
-        }
+        let mut result = Self::new(value.action);
+        result.content = value.content;
+        result.meta = value.meta.and_then(|meta| match meta {
+            serde_json::Value::Object(meta) => Some(rmcp::model::MetaObject(meta)),
+            _ => None,
+        });
+        result
     }
 }
 
@@ -702,11 +700,20 @@ impl RmcpClient {
             )
             .await?;
 
-        let initialize_result_rmcp = service
+        let peer_info = service
             .peer()
             .peer_info()
             .ok_or_else(|| anyhow!("handshake succeeded but server info was missing"))?;
-        let initialize_result = initialize_result_rmcp.as_ref().clone();
+        // The `initialize` handshake always reports the server implementation.
+        let server_info = peer_info
+            .server_info
+            .clone()
+            .ok_or_else(|| anyhow!("handshake succeeded but server info was missing"))?;
+        let mut initialize_result = InitializeResult::new(peer_info.capabilities.clone())
+            .with_protocol_version(peer_info.protocol_version.clone())
+            .with_server_info(server_info);
+        initialize_result.instructions = peer_info.instructions.clone();
+        initialize_result.meta = peer_info.meta.clone();
 
         {
             let mut initialize_context = self.initialize_context.lock().await;
@@ -810,7 +817,7 @@ impl RmcpClient {
         }
     }
 
-    fn meta_string(meta: Option<&rmcp::model::Meta>, key: &str) -> Option<String> {
+    fn meta_string(meta: Option<&rmcp::model::MetaObject>, key: &str) -> Option<String> {
         meta.and_then(|meta| meta.get(key))
             .and_then(Value::as_str)
             .map(str::trim)
@@ -929,7 +936,7 @@ impl RmcpClient {
             None => None,
         };
         let meta = match meta {
-            Some(Value::Object(map)) => Some(rmcp::model::Meta(map)),
+            Some(Value::Object(map)) => Some(RequestMetaObject::from(map)),
             Some(other) => {
                 return Err(anyhow!(
                     "MCP tool request _meta must be a JSON object, got {other}"
@@ -1283,6 +1290,13 @@ impl RmcpClient {
             }
         };
 
+        // rmcp 3 caches responses and serves stale ones on errors by default; keep
+        // every request fresh, as with rmcp 1.x.
+        service
+            .peer()
+            .set_response_cache_config(ClientCacheConfig::disabled())
+            .await;
+
         Ok((Arc::new(service), oauth_persistor))
     }
 
@@ -1584,6 +1598,8 @@ async fn create_oauth_transport_and_runtime(
     let OAuthState::Unauthorized(manager) = &mut oauth_state else {
         return Err(anyhow!("unexpected OAuth state before client setup"));
     };
+    // Keep accepting authorization-server metadata that omits `issuer`, as rmcp 1.x did.
+    manager.set_allow_missing_issuer(true);
     manager.set_credential_store(credential_store.clone());
 
     oauth_state
@@ -1701,7 +1717,7 @@ mod tests {
             Cow::Borrowed("Search"),
             Arc::new(serde_json::Map::new()),
         );
-        tool.meta = Some(rmcp::model::Meta(serde_json::Map::from_iter([
+        tool.meta = Some(rmcp::model::MetaObject(serde_json::Map::from_iter([
             (
                 "connector_id".to_string(),
                 Value::String("connector-1".to_string()),
@@ -1716,9 +1732,8 @@ mod tests {
             ),
         ])));
         let result = RmcpClient::tools_with_connector_ids(ListToolsResult {
-            tools: vec![tool],
             next_cursor: Some("next".to_string()),
-            meta: None,
+            ..ListToolsResult::with_all_items(vec![tool])
         });
 
         assert_eq!(result.next_cursor.as_deref(), Some("next"));

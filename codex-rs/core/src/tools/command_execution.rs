@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
+use crate::digest_writer::DigestWriter;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::handlers::command_search::RgSearchBreadth;
 use crate::tools::handlers::command_search::RgSearchNarrowing;
@@ -267,7 +268,7 @@ fn fingerprint_value<T: Serialize + ?Sized>(value: &T) -> String {
     hasher.update(b"kd4-command-fingerprint\0");
     hasher.update(COMMAND_FINGERPRINT_VERSION.as_bytes());
     hasher.update(b"\0");
-    if let Err(error) = serde_json::to_writer(&mut hasher, value) {
+    if let Err(error) = serde_json::to_writer(DigestWriter(&mut hasher), value) {
         tracing::warn!(%error, "command fingerprint unavailable; disabling equivalent-attempt reuse");
         // A unique value fails open for execution without equating two
         // authorization contexts that could not be serialized.
@@ -276,7 +277,11 @@ fn fingerprint_value<T: Serialize + ?Sized>(value: &T) -> String {
             uuid::Uuid::new_v4()
         );
     }
-    format!("{}:{:x}", COMMAND_FINGERPRINT_VERSION, hasher.finalize())
+    format!(
+        "{}:{}",
+        COMMAND_FINGERPRINT_VERSION,
+        hex::encode(hasher.finalize())
+    )
 }
 
 fn workspace_identity_hash(identity: &crate::git_workspace::WorkspaceEvidenceIdentity) -> String {
@@ -284,7 +289,7 @@ fn workspace_identity_hash(identity: &crate::git_workspace::WorkspaceEvidenceIde
         Ok(bytes) => bytes,
         Err(error) => unreachable!("workspace evidence identity must serialize: {error}"),
     };
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

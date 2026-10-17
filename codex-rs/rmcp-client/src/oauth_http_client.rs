@@ -58,7 +58,7 @@ impl OAuthHttpClientAdapter {
             OAuthHttpRedirectPolicy::Follow => HttpRedirectPolicy::Follow,
             OAuthHttpRedirectPolicy::Stop => HttpRedirectPolicy::Stop,
             _ => {
-                return Err(OAuthHttpClientError::new(
+                return Err(OAuthHttpClientError::from(
                     "unsupported OAuth HTTP redirect policy",
                 ));
             }
@@ -76,7 +76,7 @@ impl OAuthHttpClientAdapter {
                     name: name.as_str().to_string(),
                     value: value
                         .to_str()
-                        .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
+                        .map_err(|error| OAuthHttpClientError::from(error.to_string()))?
                         .to_string(),
                 })
             })
@@ -106,7 +106,7 @@ impl OAuthHttpClientAdapter {
                 .http_client
                 .http_request(params)
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
             let body = std::mem::replace(&mut response.body, Vec::new().into()).into_inner();
             (response, body)
         } else {
@@ -114,15 +114,15 @@ impl OAuthHttpClientAdapter {
                 .http_client
                 .http_request_stream(params)
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
             let mut body = Vec::new();
             while let Some(chunk) = body_stream
                 .recv()
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?
             {
                 if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
-                    return Err(OAuthHttpClientError::new(format!(
+                    return Err(OAuthHttpClientError::from(format!(
                         "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
                     )));
                 }
@@ -131,7 +131,7 @@ impl OAuthHttpClientAdapter {
             (response, body)
         };
         if body.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES {
-            return Err(OAuthHttpClientError::new(format!(
+            return Err(OAuthHttpClientError::from(format!(
                 "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
             )));
         }
@@ -141,7 +141,7 @@ impl OAuthHttpClientAdapter {
         }
         builder
             .body(body)
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))
+            .map_err(|error| OAuthHttpClientError::from(error.to_string()))
     }
 }
 

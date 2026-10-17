@@ -2,8 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rand::RngCore;
-use rand::SeedableRng;
+use rand::Rng;
 use rand::rngs::StdRng;
 use serde::Serialize;
 use std::ffi::OsStr;
@@ -398,7 +397,7 @@ fn random_password() -> String {
     const CHARS: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
     // These bytes become persistent Windows account credentials.
-    let mut rng = StdRng::from_os_rng();
+    let mut rng: StdRng = rand::make_rng();
     let mut buf = [0u8; 24];
     rng.fill_bytes(&mut buf);
     buf.iter()

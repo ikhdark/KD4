@@ -8,7 +8,7 @@ import {performance} from 'node:perf_hooks';
 import {types} from 'node:util';
 import vm from 'node:vm';
 
-let runs = 5, output, runtime = new URL('../../codex-rs/code-mode/src/runtime/', import.meta.url);
+let runs = 5, output, runtime = new URL('../../codex-rs/code-mode-runtime/src/runtime/', import.meta.url);
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log('Usage: node scripts/benchmark_scripts/benchmark_critical_path_projection.mjs [--runs N] [--runtime-dir PATH] [--output PATH]\nTen bounded production-helper probes; reports timing, operation counts and content fingerprints. Output is exclusive-create. Timings are not live turn speedups.');

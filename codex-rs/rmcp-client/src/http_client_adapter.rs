@@ -354,7 +354,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -371,12 +371,14 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             EVENT_STREAM_MIME_TYPE.to_string(),
             StreamableHttpClientAdapterError::Header,
         )?;
-        insert_header(
-            &mut headers,
-            HeaderName::from_static("mcp-session-id"),
-            session_id.to_string(),
-            StreamableHttpClientAdapterError::Header,
-        )?;
+        if let Some(session_id) = session_id {
+            insert_header(
+                &mut headers,
+                HeaderName::from_static("mcp-session-id"),
+                session_id.to_string(),
+                StreamableHttpClientAdapterError::Header,
+            )?;
+        }
         if let Some(last_event_id) = last_event_id {
             insert_header(
                 &mut headers,
@@ -495,6 +497,7 @@ fn client_jsonrpc_message_fields(
                 ClientNotification::CustomNotification(notification) => {
                     notification.method.as_str()
                 }
+                _ => return (None, None),
             };
             (Some(method.to_string()), None)
         }
@@ -832,7 +835,7 @@ mod tests {
         let result = adapter
             .get_stream(
                 format!("http://{address}/json-get").into(),
-                "session".into(),
+                Some("session".into()),
                 None,
                 None,
                 HashMap::new(),

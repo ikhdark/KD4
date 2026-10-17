@@ -440,11 +440,9 @@ pub use token::get_current_token_for_restriction;
 
 pub use unified_exec::WindowsSandboxSessionRequest;
 
-pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_profile;
-
 pub use unified_exec::spawn_windows_sandbox_session_for_level;
 
-pub use unified_exec::spawn_windows_sandbox_session_legacy;
+pub use unified_exec::windows_sandbox_uses_elevated_backend;
 
 pub use wfp::install_wfp_filters_for_account;
 

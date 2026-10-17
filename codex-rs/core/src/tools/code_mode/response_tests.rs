@@ -214,7 +214,7 @@ impl PacketRuntime {
                 )];
         }
         session.services.code_mode_service = super::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         ));
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
         let session = Arc::new(session);
@@ -2159,8 +2159,6 @@ async fn terminated_packet_keeps_nested_results_and_omission_notice_after_printe
             service.complete_packet_call(
                 &cell,
                 ordinal,
-                false,
-                0,
                 Vec::new(),
                 Some(nested_result_evidence("RETAINED_BEFORE_TERMINATION")),
                 None,
@@ -2274,8 +2272,6 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
     service.complete_packet_call(
         &cell,
         ordinal,
-        false,
-        0,
         Vec::new(),
         Some(nested_result_evidence("RETAINED_RESULT")),
         Some((RequiredToolTerminalCause::Failure, diagnostic.clone())),
@@ -2391,8 +2387,6 @@ async fn live_packet_drain_preserves_ordinals_for_outstanding_calls() {
         service.complete_packet_call(
             &cell,
             ordinal,
-            false,
-            0,
             Vec::new(),
             None,
             Some((
@@ -2438,7 +2432,7 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
             "polled_session_id": 777, "process_exited": index == 399,
             "chunk_id": format!("POLL_{index}"), "output_complete": index == 399,
         }));
-        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+        service.complete_packet_call(&cell, ordinal, Vec::new(), Some(result), None);
     }
     for index in 0..100 {
         let ordinal = service.begin_packet_call(&cell).unwrap();
@@ -2461,7 +2455,7 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
                 },
             });
         }
-        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+        service.complete_packet_call(&cell, ordinal, Vec::new(), Some(result), None);
     }
     let output = super::handle_runtime_response(
         &exec,
@@ -2569,7 +2563,7 @@ async fn live_session_receipt_is_added_only_when_its_handle_is_not_visible() {
             &serde_json::json!({"session_id": 12, "process_exited": false,
                 "execution_state": "running", "session_capabilities": {"polling": true}}),
         );
-        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+        service.complete_packet_call(&cell, ordinal, Vec::new(), Some(result), None);
         let output = super::handle_runtime_response(
             &exec,
             RuntimeResponse::Result {
@@ -2618,7 +2612,7 @@ async fn command_receipt_fixture(
         },
         &raw,
     );
-    service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+    service.complete_packet_call(&cell, ordinal, Vec::new(), Some(result), None);
     let output = super::handle_runtime_response(
         &exec,
         RuntimeResponse::Result {

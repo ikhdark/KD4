@@ -677,7 +677,7 @@ impl ContextManager {
             // when the new value is unchanged. Retain the first item (including
             // its identity and turn metadata); changed values still retire below.
             normalized_items =
-                crate::stable_context::filter_unchanged_stable_context_items(&[], normalized_items);
+                crate::stable_context::filter_unchanged_sampling_context_items(normalized_items);
             // Retire superseded trusted slots only through the latest real
             // request. Never hoist surviving fragments or rewrite active-tail
             // injections on each continuation. Sent task-state snapshots stay

@@ -44,17 +44,18 @@ use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::BooleanSchema;
 use rmcp::model::CallToolRequestParams;
+use rmcp::model::CallToolResponse;
 use rmcp::model::CallToolResult;
-use rmcp::model::Content;
-use rmcp::model::CreateElicitationRequestParams;
+use rmcp::model::ContentBlock;
+use rmcp::model::ElicitRequestParams;
 use rmcp::model::ElicitationAction;
 use rmcp::model::ElicitationSchema;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
-use rmcp::model::Meta;
-use rmcp::model::PrimitiveSchema;
+use rmcp::model::MetaObject;
+use rmcp::model::PrimitiveSchemaDefinition;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
@@ -376,7 +377,10 @@ url = "{mcp_server_url}/mcp"
     };
     let requested_schema: McpElicitationSchema = serde_json::from_value(serde_json::to_value(
         ElicitationSchema::builder()
-            .required_property("confirmed", PrimitiveSchema::Boolean(BooleanSchema::new()))
+            .required_property(
+                "confirmed",
+                PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+            )
             .build()
             .map_err(anyhow::Error::msg)?,
     )?)?;
@@ -775,8 +779,8 @@ url = "{mcp_server_url}/mcp"
 struct ToolAppsMcpServer;
 
 impl ServerHandler for ToolAppsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -803,6 +807,9 @@ impl ServerHandler for ToolAppsMcpServer {
         tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
         Ok(ListToolsResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             tools: vec![tool],
             next_cursor: None,
             meta: None,
@@ -813,7 +820,7 @@ impl ServerHandler for ToolAppsMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         assert_eq!(request.name.as_ref(), TEST_TOOL_NAME);
         let message = request
             .arguments
@@ -828,7 +835,7 @@ impl ServerHandler for ToolAppsMcpServer {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
 
-        let mut meta = Meta::new();
+        let mut meta = MetaObject::new();
         meta.0.insert("calledBy".to_string(), json!("mcp-app"));
 
         if message == LARGE_RESPONSE_MESSAGE {
@@ -836,19 +843,22 @@ impl ServerHandler for ToolAppsMcpServer {
             let mut result = CallToolResult::structured(json!({
                 "large": "structured-value-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8),
             }));
-            result.content = vec![Content::text(large_text)];
+            result.content = vec![ContentBlock::text(large_text)];
             result.meta = Some(meta);
-            return Ok(result);
+            return Ok(result.into());
         }
 
         if message == ELICITATION_TRIGGER_MESSAGE {
             let requested_schema = ElicitationSchema::builder()
-                .required_property("confirmed", PrimitiveSchema::Boolean(BooleanSchema::new()))
+                .required_property(
+                    "confirmed",
+                    PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+                )
                 .build()
                 .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
             let result = context
                 .peer
-                .create_elicitation(CreateElicitationRequestParams::FormElicitationParams {
+                .create_elicitation(ElicitRequestParams::FormElicitationParams {
                     meta: None,
                     message: ELICITATION_MESSAGE.to_string(),
                     requested_schema,
@@ -867,14 +877,15 @@ impl ServerHandler for ToolAppsMcpServer {
                 }
                 ElicitationAction::Decline => "declined",
                 ElicitationAction::Cancel => "cancelled",
+                _ => "unknown",
             };
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(output)]).into());
         }
 
         if message == URL_ELICITATION_TRIGGER_MESSAGE {
             let result = context
                 .peer
-                .create_elicitation(CreateElicitationRequestParams::UrlElicitationParams {
+                .create_elicitation(ElicitRequestParams::UrlElicitationParams {
                     meta: None,
                     message: URL_ELICITATION_MESSAGE.to_string(),
                     url: URL_ELICITATION_URL.to_string(),
@@ -889,8 +900,9 @@ impl ServerHandler for ToolAppsMcpServer {
                 }
                 ElicitationAction::Decline => "declined",
                 ElicitationAction::Cancel => "cancelled",
+                _ => "unknown",
             };
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(output)]).into());
         }
 
         assert_eq!(context.meta.0.get("source"), Some(&json!("mcp-app")));
@@ -898,9 +910,9 @@ impl ServerHandler for ToolAppsMcpServer {
             "echoed": message,
             "threadId": thread_id,
         }));
-        result.content = vec![Content::text(format!("echo: {message}"))];
+        result.content = vec![ContentBlock::text(format!("echo: {message}"))];
         result.meta = Some(meta);
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -929,8 +941,8 @@ struct BlockingToolAppsMcpServer {
 }
 
 impl ServerHandler for BlockingToolAppsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -950,6 +962,9 @@ impl ServerHandler for BlockingToolAppsMcpServer {
         .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
 
         Ok(ListToolsResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             tools: vec![Tool::new(
                 Cow::Borrowed(TEST_TOOL_NAME),
                 Cow::Borrowed("Block until the test releases this call."),
@@ -964,7 +979,7 @@ impl ServerHandler for BlockingToolAppsMcpServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         assert_eq!(request.name.as_ref(), TEST_TOOL_NAME);
         let call_number = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
         self.started_calls.send(call_number).map_err(|err| {
@@ -975,9 +990,7 @@ impl ServerHandler for BlockingToolAppsMcpServer {
             .await
             .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?
             .forget();
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "call {call_number}"
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("call {call_number}"))]).into())
     }
 }
 

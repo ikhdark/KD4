@@ -344,7 +344,7 @@ impl ToolRouter {
                             "callable_contract": tool.spec().callable_contract(),
                         }))
                         .unwrap_or_default();
-                        (name.clone(), format!("{:x}", Sha256::digest(encoded)))
+                        (name.clone(), hex::encode(Sha256::digest(encoded)))
                     })
                     .collect(),
             )
@@ -494,7 +494,7 @@ impl ToolRouter {
             "tool_exposure_identity": &self.exposure_identity,
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
-        let manifest = ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest);
+        let manifest = ToolManifestItem::full(hex::encode(Sha256::digest(encoded)), manifest);
         #[cfg(test)]
         self.manifest_snapshot_build_count
             .fetch_add(1, Ordering::Relaxed);

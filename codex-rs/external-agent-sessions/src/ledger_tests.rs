@@ -22,7 +22,7 @@ fn completed_imports_do_not_read_source_files() {
         &codex_home,
         vec![CompletedExternalAgentSessionImport {
             source_path: source_path.clone(),
-            source_content_sha256: format!("{:x}", Sha256::digest(contents)),
+            source_content_sha256: hex::encode(Sha256::digest(contents)),
             imported_thread_id,
         }],
     )
@@ -34,7 +34,7 @@ fn completed_imports_do_not_read_source_files() {
     assert_eq!(ledger.records[0].imported_thread_id, imported_thread_id);
     assert_eq!(
         ledger.records[0].content_sha256,
-        format!("{:x}", Sha256::digest(contents))
+        hex::encode(Sha256::digest(contents))
     );
 }
 
@@ -46,7 +46,7 @@ fn completed_import_replaces_existing_record_for_the_same_version() {
     let contents = b"session contents";
     std::fs::write(&source_path, contents).expect("source");
     let source_path = std::fs::canonicalize(source_path).expect("canonical source");
-    let content_sha256 = format!("{:x}", Sha256::digest(contents));
+    let content_sha256 = hex::encode(Sha256::digest(contents));
     let first_thread_id = ThreadId::new();
     let second_thread_id = ThreadId::new();
 
@@ -112,7 +112,7 @@ fn concurrent_completed_imports_preserve_every_ledger_update() {
         let source_path = std::fs::canonicalize(source_path).expect("canonical source");
         let completed_import = CompletedExternalAgentSessionImport {
             source_path,
-            source_content_sha256: format!("{:x}", Sha256::digest(contents)),
+            source_content_sha256: hex::encode(Sha256::digest(contents)),
             imported_thread_id: ThreadId::new(),
         };
         expected.push(completed_import.clone());

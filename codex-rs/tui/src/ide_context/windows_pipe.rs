@@ -366,7 +366,7 @@ impl OperationPermit {
 
     fn acquire_from(active: Arc<AtomicUsize>, limit: usize) -> io::Result<Self> {
         active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < limit).then_some(current + 1)
             })
             .map_err(|_| {

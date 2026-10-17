@@ -97,7 +97,7 @@ impl std::fmt::Display for EscapedText<'_> {
 
 /// Return the lowercase SHA-1 digest for `bytes`.
 pub fn sha1_hex(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha1::digest(bytes.as_ref()))
+    hex::encode(Sha1::digest(bytes.as_ref()))
 }
 
 /// Sanitize a tag value to comply with metric tag validation rules:

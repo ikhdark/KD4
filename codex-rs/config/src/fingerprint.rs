@@ -43,6 +43,6 @@ pub fn version_for_toml(value: &TomlValue) -> String {
     let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(serialized);
-    let hash = hasher.finalize();
-    format!("sha256:{hash:x}")
+    let hash = hex::encode(hasher.finalize());
+    format!("sha256:{hash}")
 }

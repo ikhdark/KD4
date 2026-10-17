@@ -1922,9 +1922,9 @@ async fn goal_ref(
         .await?
         .expect("thread goal should exist");
     Ok(format!(
-        "{}:{:x}",
+        "{}:{}",
         goal.goal_id,
-        sha2::Sha256::digest(goal.objective.as_bytes())
+        hex::encode(sha2::Sha256::digest(goal.objective.as_bytes()))
     ))
 }
 

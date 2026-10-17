@@ -134,6 +134,13 @@ impl Drop for CallerCancellation {
 impl Connection {
     pub(super) async fn spawn(host_program: &Path) -> Result<Self, String> {
         let mut command = Command::new(host_program);
+        // Without a console to inherit, as under a console-less Desktop
+        // app-server, Windows opens a visible console for the host (~250 ms
+        // per spawn). Inheriting one is ~5 ms faster than a hidden console.
+        #[cfg(windows)]
+        if !process_has_console() {
+            command.creation_flags(/*flags*/ 0x0800_0000); // CREATE_NO_WINDOW
+        }
 
         let managed = Arc::new(
             ManagedRootProcess::reserve_with_reclaim()
@@ -579,6 +586,15 @@ async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
 
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// Whether this process is attached to a console, with or without a window.
+#[cfg(windows)]
+fn process_has_console() -> bool {
+    let mut process_id = 0;
+    // SAFETY: the buffer is the one u32 its length declares; the call only
+    // reads this process's console attachment.
+    unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(&mut process_id, 1) != 0 }
 }
 
 #[cfg(test)]

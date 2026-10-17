@@ -11,6 +11,7 @@ use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::test_harness::responses::strip_response_item_ids;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
 use codex_agent_graph_store::AgentGraphStore;
@@ -55,7 +56,6 @@ use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
-use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -2043,12 +2043,12 @@ fn registered_independent_spawns_overlap_before_initial_submission() {
         "registered_independent_spawns_overlap_before_initial_submission",
         || async {
             use crate::session::step_context::StepContext;
+            use crate::test_harness::responses;
             use crate::tools::context::ToolPayload;
             use crate::tools::parallel::ToolCallRuntime;
             use crate::tools::router::ToolCall;
             use crate::tools::router::ToolRouter;
             use crate::tools::router::ToolRouterParams;
-            use core_test_support::responses;
 
             let server = responses::start_mock_server().await;
             let models = responses::mount_sse_sequence(
@@ -2176,15 +2176,15 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
         "registered_cancelled_spawn_retains_usage_until_child_termination",
         || async {
             use crate::session::step_context::StepContext;
+            use crate::test_harness::responses;
+            use crate::test_harness::streaming_sse::StreamingSseChunk;
+            use crate::test_harness::streaming_sse::start_streaming_sse_server;
             use crate::tools::context::ToolPayload;
             use crate::tools::parallel::ToolCallRuntime;
             use crate::tools::router::ToolCall;
             use crate::tools::router::ToolRouter;
             use crate::tools::router::ToolRouterParams;
             use codex_protocol::models::ResponseInputItem;
-            use core_test_support::responses;
-            use core_test_support::streaming_sse::StreamingSseChunk;
-            use core_test_support::streaming_sse::start_streaming_sse_server;
             let (release_model, model_gate) = tokio::sync::oneshot::channel();
             let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
                 gate: Some(model_gate),
@@ -6546,12 +6546,12 @@ fn registered_v2_child_publication_panic_preserves_parent_result() {
     run_current_thread_test_with_stack(
         "registered_v2_child_publication_panic_preserves_parent_result",
         || async {
+            use crate::test_harness::responses;
+            use crate::test_harness::streaming_sse::StreamingSseChunk;
+            use crate::test_harness::streaming_sse::start_streaming_sse_server;
             use codex_app_server_protocol::ThreadHistoryBuilder;
             use codex_app_server_protocol::TurnStatus;
             use codex_protocol::models::AgentMessageInputContent;
-            use core_test_support::responses;
-            use core_test_support::streaming_sse::StreamingSseChunk;
-            use core_test_support::streaming_sse::start_streaming_sse_server;
 
             let (release_child, child_gate) = tokio::sync::oneshot::channel();
             let (server, _streams_sent) = start_streaming_sse_server(vec![

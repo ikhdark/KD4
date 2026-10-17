@@ -71,7 +71,7 @@ const runs = Number(process.argv[2] ?? 5);
 assert(Number.isInteger(runs) && runs >= 1 && runs <= 100);
 const sha = value => createHash('sha256').update(value).digest('hex');
 const sources = Object.fromEntries(['dependency_graph.js', 'orchestration.js'].map(name =>
-  [name, readFileSync(new URL('../../codex-rs/code-mode/src/runtime/' + name, import.meta.url), 'utf8')]));
+  [name, readFileSync(new URL('../../codex-rs/code-mode-runtime/src/runtime/' + name, import.meta.url), 'utf8')]));
 const paths = ['source', 'tests', 'config', 'guide'];
 const contents = Object.fromEntries(paths.map(path => [path, path + '\r\nλ😀\r\n']));
 const source = 'first\r\nλ😀\r\nlast\r\n';

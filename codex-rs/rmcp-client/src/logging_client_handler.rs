@@ -3,12 +3,15 @@ use std::sync::Arc;
 use rmcp::ClientHandler;
 use rmcp::RoleClient;
 use rmcp::model::CancelledNotificationParam;
-use rmcp::model::ClientInfo;
+use rmcp::model::ClientConfig;
 use rmcp::model::ConstString;
-use rmcp::model::CreateElicitationRequestParams;
-use rmcp::model::CreateElicitationResult;
 use rmcp::model::CustomNotification;
+use rmcp::model::ElicitRequestParams;
+use rmcp::model::ElicitResult;
+// MCP logging is deprecated by SEP-2577, but servers still send it.
+#[allow(deprecated)]
 use rmcp::model::LoggingLevel;
+#[allow(deprecated)]
 use rmcp::model::LoggingMessageNotificationParam;
 use rmcp::model::ProgressNotificationMethod;
 use rmcp::model::ProgressNotificationParam;
@@ -27,7 +30,7 @@ use crate::rmcp_client::SendToolListChanged;
 
 #[derive(Clone)]
 pub(crate) struct LoggingClientHandler {
-    client_info: ClientInfo,
+    client_info: ClientConfig,
     send_elicitation: Arc<SendElicitation>,
     send_progress: Arc<SendProgress>,
     send_tool_list_changed: Arc<SendToolListChanged>,
@@ -35,7 +38,7 @@ pub(crate) struct LoggingClientHandler {
 
 impl LoggingClientHandler {
     pub(crate) fn new(
-        client_info: ClientInfo,
+        client_info: ClientConfig,
         send_elicitation: SendElicitation,
         send_progress: SendProgress,
         send_tool_list_changed: SendToolListChanged,
@@ -65,9 +68,9 @@ impl LoggingClientHandler {
 impl ClientHandler for LoggingClientHandler {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
         (self.send_elicitation)(context.id, Elicitation::Mcp(request))
             .await
             .map(Into::into)
@@ -80,7 +83,7 @@ impl ClientHandler for LoggingClientHandler {
         _context: NotificationContext<RoleClient>,
     ) {
         info!(
-            "MCP server cancelled request (request_id: {}, reason: {:?})",
+            "MCP server cancelled request (request_id: {:?}, reason: {:?})",
             params.request_id, params.reason
         );
     }
@@ -131,10 +134,11 @@ impl ClientHandler for LoggingClientHandler {
         }
     }
 
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.client_info.clone()
     }
 
+    #[allow(deprecated)]
     async fn on_logging_message(
         &self,
         params: LoggingMessageNotificationParam,
@@ -144,6 +148,7 @@ impl ClientHandler for LoggingClientHandler {
             level,
             logger,
             data,
+            ..
         } = params;
         let logger = logger.as_deref();
         match level {
@@ -208,7 +213,7 @@ mod tests {
         RunningService<RoleClient, ElicitationClientService>,
     ) {
         let client_service = ElicitationClientService::new(
-            ClientInfo::default(),
+            ClientConfig::default(),
             Box::new(|_, _| Box::pin(async move { unreachable!() })),
             send_progress,
             send_tool_list_changed,
@@ -240,12 +245,12 @@ mod tests {
             Box::new(|| Box::pin(async {})),
         )
         .await;
-        let params = ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String("item-1".into())),
-            progress: 3.0,
-            total: Some(10.0),
-            message: Some("working".to_string()),
-        };
+        let params = ProgressNotificationParam::new(
+            ProgressToken(NumberOrString::String("item-1".into())),
+            3.0,
+        )
+        .with_total(10.0)
+        .with_message("working");
 
         server
             .notify_progress(params.clone())

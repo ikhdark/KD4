@@ -745,8 +745,8 @@ async fn websocket_fallback_counts_concurrent_websocket_failures_only_once_each(
 
 #[tokio::test]
 async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
-    use core_test_support::responses::ev_completed;
-    use core_test_support::responses::start_websocket_server;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::start_websocket_server;
 
     let server = start_websocket_server(vec![vec![
         vec![ev_completed("recovered")],
@@ -1126,9 +1126,9 @@ async fn turn_preconnect_is_single_flight_and_aborted_on_drop() {
 #[test_case::test_case(true; "expiring socket")]
 #[tokio::test]
 async fn turn_preconnect_replaces_unusable_cached_socket(expiring: bool) {
-    use core_test_support::responses::WebSocketConnectionConfig;
-    use core_test_support::responses::ev_completed;
-    use core_test_support::responses::start_websocket_server_with_headers;
+    use crate::test_harness::responses::WebSocketConnectionConfig;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::start_websocket_server_with_headers;
 
     let server = start_websocket_server_with_headers(vec![
         WebSocketConnectionConfig {
@@ -1903,7 +1903,7 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
                 .map(|(key, value)| {
                     (
                         key,
-                        format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
+                        hex::encode(sha2::Sha256::digest(value.to_string().as_bytes())),
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -2428,7 +2428,7 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
     let cache_key = wire_body["prompt_cache_key"]
         .as_str()
         .expect("wire cache key");
-    let fingerprint = format!("{:x}", sha2::Sha256::digest(cache_key.as_bytes()));
+    let fingerprint = hex::encode(sha2::Sha256::digest(cache_key.as_bytes()));
     for request in &protocol.model_requests {
         assert_eq!(
             request.prompt_cache_key_fingerprint.as_deref(),
@@ -3072,7 +3072,7 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
 
 #[tokio::test]
 async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacements() {
-    use core_test_support::responses::{ev_completed, ev_response_created, start_websocket_server};
+    use crate::test_harness::responses::{ev_completed, ev_response_created, start_websocket_server};
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("first"), ev_completed("first")],
         vec![ev_response_created("second"), ev_completed("second")],
@@ -5586,9 +5586,9 @@ fn cache_coverage_warning_accounts_for_new_history() {
 
 #[tokio::test]
 async fn startup_claim_rebuilds_changed_inputs_and_warmup_never_records_model_dispatch() {
-    use core_test_support::responses::ev_completed;
-    use core_test_support::responses::ev_response_created;
-    use core_test_support::responses::start_websocket_server;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::ev_response_created;
+    use crate::test_harness::responses::start_websocket_server;
     for invalidate in [false, true] {
         let server = start_websocket_server(vec![vec![
             vec![ev_response_created("warm"), ev_completed("warm")],

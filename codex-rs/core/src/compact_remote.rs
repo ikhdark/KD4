@@ -308,7 +308,7 @@ fn remote_tool_search_receipt_group(
     }
     let result_set_sha256 = match prior_receipt.as_ref() {
         Some(receipt) => receipt.result_set_sha256.clone(),
-        None => format!("{:x}", Sha256::digest(serde_json::to_vec(tools).ok()?)),
+        None => hex::encode(Sha256::digest(serde_json::to_vec(tools).ok()?)),
     };
     let ordered_tool_identities = prior_receipt.as_ref().map_or_else(
         || {
@@ -446,10 +446,7 @@ fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::V
             if approx_token_count(&serialized) > TOOL_SEARCH_ARGUMENT_VALUE_MAX_TOKENS {
                 compact.insert(
                     format!("{key}_sha256"),
-                    serde_json::Value::String(format!(
-                        "{:x}",
-                        Sha256::digest(serialized.as_bytes())
-                    )),
+                    serde_json::Value::String(hex::encode(Sha256::digest(serialized.as_bytes()))),
                 );
             } else {
                 compact.insert(key.to_string(), value.clone());
@@ -458,7 +455,7 @@ fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::V
     }
     if compact.is_empty() {
         serde_json::json!({
-            "arguments_sha256": format!("{:x}", Sha256::digest(arguments.to_string().as_bytes()))
+            "arguments_sha256": hex::encode(Sha256::digest(arguments.to_string().as_bytes()))
         })
     } else {
         serde_json::Value::Object(compact)

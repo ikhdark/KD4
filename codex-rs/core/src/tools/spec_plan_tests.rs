@@ -1052,6 +1052,15 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     );
     for exec in [mixed_exec, nested_exec] {
         assert_eq!(exec.description.matches("declare const tools").count(), 1);
+        // Command results are declared once by name instead of `unknown`.
+        assert!(exec.description.contains("type CodeModeExecCommandResult = {"));
+        assert_eq!(
+            exec.description
+                .matches("Promise<CodeModeExecCommandResult>")
+                .count(),
+            2,
+            "exec_command and write_stdin share the result type"
+        );
         assert!(!exec.description.contains("canonical_sha256"));
         assert!(
             !exec

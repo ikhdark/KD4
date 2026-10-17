@@ -9,27 +9,20 @@ doctest = false
 name = "codex_code_mode"
 path = "src/lib.rs"
 
-[features]
-sandbox = ["v8/v8_enable_sandbox"]
-
 [lints]
 workspace = true
 
 [dependencies]
 codex-code-mode-protocol = { workspace = true }
-codex-protocol = { workspace = true }
 codex-utils-pty = { workspace = true }
-deno_core_icudata = { workspace = true }
-fs2 = { workspace = true }
 futures = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
-v8 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+codex-protocol = { workspace = true }
 pretty_assertions = { workspace = true }

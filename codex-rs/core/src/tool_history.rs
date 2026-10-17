@@ -2832,7 +2832,7 @@ impl ToolHistoryState {
         };
         !requirements.is_empty()
             && requirements.iter().all(|(call_id, origin)| {
-                self.workspace_evidence.get(origin).is_some_and(&covered)
+                self.workspace_evidence.get(origin).is_some_and(covered)
                     && self
                         .code_mode_nested_evidence
                         .get(call_id)
@@ -5272,15 +5272,12 @@ fn receipt_id_for(
 ) -> String {
     format!(
         "thr1-{}",
-        &format!(
-            "{:x}",
-            Sha256::digest(
-                format!(
-                    "{call_id}:{artifact_sha256}:{tool_identity}:{semantic_class}:{artifact_bytes}"
-                )
-                .as_bytes()
+        &hex::encode(Sha256::digest(
+            format!(
+                "{call_id}:{artifact_sha256}:{tool_identity}:{semantic_class}:{artifact_bytes}"
             )
-        )[..16]
+            .as_bytes()
+        ))[..16]
     )
 }
 
@@ -7144,7 +7141,7 @@ fn command_basename(value: &str) -> String {
 }
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

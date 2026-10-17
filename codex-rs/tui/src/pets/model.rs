@@ -107,9 +107,9 @@ impl Pet {
     }
 
     pub(super) fn frame_cache_key(&self, bytes: &[u8]) -> String {
-        let digest = Sha256::digest(bytes);
+        let digest = hex::encode(Sha256::digest(bytes));
         format!(
-            "v2-sha256-{digest:x}-{}x{}-{}x{}",
+            "v2-sha256-{digest}-{}x{}-{}x{}",
             self.frame_width, self.frame_height, self.columns, self.rows
         )
     }

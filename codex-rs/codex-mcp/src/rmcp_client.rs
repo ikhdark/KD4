@@ -601,7 +601,7 @@ impl AsyncManagedClient {
 
     fn release_manager(&self) -> bool {
         self.manager_owners
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
                 owners.checked_sub(1)
             })
             .is_ok_and(|previous| previous == 1)
@@ -1439,7 +1439,7 @@ mod tests {
     use codex_protocol::mcp::with_tool_call_progress_token_meta;
     use pretty_assertions::assert_eq;
     use rmcp::model::JsonObject;
-    use rmcp::model::Meta;
+    use rmcp::model::MetaObject;
     use rmcp::model::ProgressToken;
     use rmcp::transport::auth::AuthError;
     use std::collections::VecDeque;
@@ -1481,13 +1481,13 @@ mod tests {
         let send_progress = make_progress_sender(tx_event);
 
         for (progress, total) in [(2.0, Some(5.0)), (3.0, Some(5.0)), (4.0, None)] {
-        send_progress(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(token.clone().into())),
-            progress,
-            total,
-            message: Some("working".to_string()),
-        })
-        .await;
+            let mut params = ProgressNotificationParam::new(
+                ProgressToken(NumberOrString::String(token.clone().into())),
+                progress,
+            )
+            .with_message("working");
+            params.total = total;
+            send_progress(params).await;
 
         let event = rx_event.recv().await.expect("forwarded progress event");
         assert_eq!(event.id, "turn-1");
@@ -1797,10 +1797,9 @@ mod tests {
         for (capability, expected_wire) in [
             (ElicitationCapability::default(), serde_json::json!({})),
             (
-                ElicitationCapability {
-                    form: Some(rmcp::model::FormElicitationCapability::default()),
-                    url: Some(rmcp::model::UrlElicitationCapability::default()),
-                },
+                ElicitationCapability::new()
+                    .with_form(rmcp::model::FormElicitationCapability::default())
+                    .with_url(rmcp::model::UrlElicitationCapability::default()),
                 serde_json::json!({ "form": {}, "url": {} }),
             ),
         ] {
@@ -1821,7 +1820,7 @@ mod tests {
             "test tool",
             Arc::new(JsonObject::default()),
         )
-        .with_meta(Meta(
+        .with_meta(MetaObject(
             serde_json::json!({
                 "connector_id": "connector_gmail",
                 "connector_name": "Gmail",

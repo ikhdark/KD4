@@ -2897,7 +2897,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         .await;
 
     assert_eq!(
-        core_test_support::responses::strip_response_item_ids(&reconstructed.history),
+        crate::test_harness::responses::strip_response_item_ids(&reconstructed.history),
         vec![
             user_message("before compact"),
             user_message("legacy summary"),

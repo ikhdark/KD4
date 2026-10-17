@@ -1,11 +1,11 @@
 use super::*;
 
+use crate::test_harness::PathBufExt;
+use crate::test_harness::PathExt;
 use base64::Engine;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxType;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::VecDeque;

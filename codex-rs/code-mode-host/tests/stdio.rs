@@ -14,7 +14,6 @@ use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ExecuteRequest;
 use codex_code_mode::FunctionCallOutputContentItem;
-use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
@@ -25,6 +24,7 @@ use codex_code_mode::WaitRequest;
 use codex_code_mode::host::MAX_FRAME_BYTES;
 use codex_code_mode_protocol::NestedCancellation;
 use codex_code_mode_protocol::OutputLoss;
+use codex_code_mode_runtime::InProcessCodeModeSessionProvider;
 
 #[tokio::test]
 async fn host_process_exits_on_broken_output_while_stdin_remains_open() {

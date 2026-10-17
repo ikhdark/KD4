@@ -45,7 +45,7 @@ use chrono::Utc;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::auth::AuthMode;
 use codex_utils_template::Template;
-use rand::RngCore;
+use rand::Rng;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
 use tiny_http::Request;

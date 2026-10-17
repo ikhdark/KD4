@@ -500,10 +500,9 @@ fn unchanged_wait_receipt(
     cell_id: &codex_code_mode::CellId,
     suppressed_continuation_count: u32,
 ) -> TurnTimingDeterministicContinuationReceipt {
-    let resource_identity_hash = format!(
-        "{:x}",
-        Sha256::digest(format!("code-mode-cell\0{}", cell_id.as_str()).as_bytes())
-    );
+    let resource_identity_hash = hex::encode(Sha256::digest(
+        format!("code-mode-cell\0{}", cell_id.as_str()).as_bytes(),
+    ));
     TurnTimingDeterministicContinuationReceipt {
         class: DeterministicContinuationClass::UnchangedWait,
         wire_identity: String::new(),
@@ -511,18 +510,14 @@ fn unchanged_wait_receipt(
         // Cell ids are allocated from a never-reused lifecycle namespace by
         // the code-mode owner. Pair that lifecycle identity with its running
         // phase instead of reporting one constant revision for every cell.
-        state_revision: format!(
-            "{:x}",
-            Sha256::digest(format!(
-                "code-mode-cell-lifecycle\0{}\0running",
-                cell_id.as_str()
-            ))
-        ),
+        state_revision: hex::encode(Sha256::digest(format!(
+            "code-mode-cell-lifecycle\0{}\0running",
+            cell_id.as_str()
+        ))),
         host_action: DeterministicContinuationHostAction::AwaitStateChange,
-        action_bounds_hash: format!(
-            "{:x}",
-            Sha256::digest(b"operation-lifetime:cell-terminal-or-turn-cancellation")
-        ),
+        action_bounds_hash: hex::encode(Sha256::digest(
+            b"operation-lifetime:cell-terminal-or-turn-cancellation",
+        )),
         suppressed_continuation_count,
     }
 }
@@ -645,7 +640,7 @@ mod tests {
         ] {
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
             session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-                codex_code_mode::InProcessCodeModeSessionProvider,
+                codex_code_mode_runtime::InProcessCodeModeSessionProvider,
             ));
             let session = Arc::new(session);
             let turn = Arc::new(turn);
@@ -673,8 +668,6 @@ mod tests {
             service.complete_packet_call(
                 &cell,
                 ordinal,
-                false,
-                0,
                 Vec::new(),
                 None,
                 Some((cause, "REQUIRED_DIAGNOSTIC".to_string())),
@@ -738,7 +731,7 @@ mod tests {
 
         let (mut session, turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         ));
         let session = Arc::new(session);
         let timing = Arc::clone(&turn.turn_timing_state);
@@ -854,7 +847,7 @@ mod tests {
     async fn missing_cell_wait_preserves_unknown_state_without_terminal_attestation() {
         let (mut session, turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         ));
         let session = Arc::new(session);
         let output = CodeModeWaitHandler
@@ -1359,7 +1352,7 @@ mod tests {
         // Runtime initialization runs on a native thread, outside Tokio's paused clock.
         tokio::time::resume();
         let service = Arc::new(crate::tools::code_mode::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         )));
         let started_cell = service
             .execute(codex_code_mode::ExecuteRequest {

@@ -60,6 +60,7 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 codex-windows-sandbox = { workspace = true }
 crossterm = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 os_info = { workspace = true }
 owo-colors = { workspace = true }

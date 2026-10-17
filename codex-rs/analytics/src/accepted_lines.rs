@@ -53,7 +53,7 @@ pub fn fingerprint_hash(domain: &str, value: &str) -> String {
     hasher.update(domain.as_bytes());
     hasher.update(b"\0");
     hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub(crate) fn accepted_line_fingerprint_event_requests(

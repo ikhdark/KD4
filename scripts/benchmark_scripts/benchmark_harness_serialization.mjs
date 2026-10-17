@@ -21,7 +21,7 @@ for (let i = 0; i < args.length; i += 2) {
   else throw Error('unknown/missing argument: ' + args[i]);
 }
 assert(Number.isInteger(runs) && runs >= 1 && runs <= 100, 'runs must be 1–100');
-const runtime = fileURLToPath(new URL('../../codex-rs/code-mode/src/runtime/', import.meta.url));
+const runtime = fileURLToPath(new URL('../../codex-rs/code-mode-runtime/src/runtime/', import.meta.url));
 const names = ['dependency_graph.js', 'orchestration.js', 'output_projection.rs'];
 const sources = await Promise.all(names.map(name =>
   readFile(path.join(baseline || runtime, baseline ? 'baseline-' + name : name), 'utf8')));

@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_code_mode::InProcessCodeModeSession;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::FramedReader;
@@ -26,6 +25,7 @@ use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_runtime::InProcessCodeModeSession;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::Semaphore;
@@ -47,8 +47,12 @@ const MAX_ACTIVE_CELLS: usize = 128;
 const OUTGOING_FRAME_CAPACITY: usize =
     2 * MAX_IN_FLIGHT_REQUESTS + 2 * MAX_PENDING_DELEGATE_REQUESTS + MAX_ACTIVE_CELLS;
 // Bound retained session storage independently of transient request/cell
-// permits: 64 sessions can retain up to 512 MiB of serialized stored values.
-const MAX_OPEN_SESSIONS: usize = 64;
+// permits: 256 sessions can retain up to 2 GiB of serialized stored values.
+// Every loaded Code Mode thread of the owning process holds one session, and a
+// rejected open is a hard Code Mode failure for that thread. One Desktop
+// process reached 49 concurrently active threads (23 user, 26 subagents), and
+// finished subagents stay loaded until closed, so 64 left too little headroom.
+const MAX_OPEN_SESSIONS: usize = 256;
 const MAX_RECENT_REQUEST_IDS: usize = 4096;
 const MAX_RECENT_SESSION_IDS: usize = 4096;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

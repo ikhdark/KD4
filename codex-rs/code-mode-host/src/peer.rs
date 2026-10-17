@@ -237,7 +237,7 @@ impl HostPeer {
         };
         let id = DelegateRequestId::new(
             self.next_request_id
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| "code-mode delegate request ID space exhausted".to_string())?,
         );
         let cell_id = match &request {

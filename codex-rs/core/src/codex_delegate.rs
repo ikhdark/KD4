@@ -692,6 +692,8 @@ async fn handle_elicitation_request(
                 codex_rmcp_client::ElicitationAction::Accept => ProtocolElicitationAction::Accept,
                 codex_rmcp_client::ElicitationAction::Decline => ProtocolElicitationAction::Decline,
                 codex_rmcp_client::ElicitationAction::Cancel => ProtocolElicitationAction::Cancel,
+                // An action Codex cannot represent is not a user acceptance.
+                _ => ProtocolElicitationAction::Cancel,
             };
             (decision, response.content, response.meta)
         },

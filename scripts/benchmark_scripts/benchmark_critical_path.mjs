@@ -10,7 +10,7 @@ import vm from 'node:vm';
 const [mode, directory] = process.argv.slice(2);
 assert(!mode || (['--capture', '--baseline'].includes(mode) && directory));
 const files = ['dependency_graph.js', 'orchestration.js'];
-const current = files.map(name => readFileSync(new URL('../../codex-rs/code-mode/src/runtime/' + name, import.meta.url), 'utf8'));
+const current = files.map(name => readFileSync(new URL('../../codex-rs/code-mode-runtime/src/runtime/' + name, import.meta.url), 'utf8'));
 if (mode === '--capture') {
   mkdirSync(directory, { recursive: true });
   files.forEach((name, i) => writeFileSync(join(directory, name), current[i], { flag: 'wx' }));

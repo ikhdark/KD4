@@ -721,7 +721,7 @@ mod tests {
         for use_wait in [false, true] {
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
             session.services.code_mode_service =
-                CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
+                CodeModeService::new(Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider));
             let session = Arc::new(session);
             let step = StepContext::for_test(Arc::new(turn));
             let execute = CodeModeExecuteHandler::new(
@@ -800,7 +800,7 @@ mod tests {
             })
             .await?;
             let ordinal = service.begin_packet_call(cell_id).unwrap();
-            service.complete_packet_call(cell_id, ordinal, false, 0, Vec::new(), Some(CodeModeNestedResultEvidence {
+            service.complete_packet_call(cell_id, ordinal, Vec::new(), Some(CodeModeNestedResultEvidence {
                 failed: false, ordinal, call_id: "completed-nested".into(), parent_call_id: Some("outer".into()),
                 parent_cell_id: cell_id.to_string(), runtime_tool_call_id: "nested-1".into(), tool_name: "exec_command".into(),
                 output: json!({"output": "completed nested result", "session_id": 60964, "process_exited": false}).to_string(),

@@ -384,25 +384,28 @@ impl CodeModeExecuteHandler {
             .session
             .services
             .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                state_path: args.persist.then(|| {
-                    exec.turn
-                        .config
-                        .codex_home
-                        .join("code-mode-state")
-                        .join(format!("{}.json", exec.session.thread_id))
-                        .to_path_buf()
-                }),
-                tool_call_id: call_id.clone(),
-                enabled_tools,
-                source: args.code.to_owned(),
-                // Hand observation to the steerable owner immediately. Output
-                // from an awaited script is buffered until its next decision
-                // boundary, rather than turning a timer into a model call.
-                yield_time_ms: Some(0),
-                max_output_tokens: args.max_output_tokens,
-                default_tool_timeout_ms: Some(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS),
-            })
+            .execute_for_step(
+                codex_code_mode::ExecuteRequest {
+                    state_path: args.persist.then(|| {
+                        exec.turn
+                            .config
+                            .codex_home
+                            .join("code-mode-state")
+                            .join(format!("{}.json", exec.session.thread_id))
+                            .to_path_buf()
+                    }),
+                    tool_call_id: call_id.clone(),
+                    enabled_tools,
+                    source: args.code.to_owned(),
+                    // Hand observation to the steerable owner immediately. Output
+                    // from an awaited script is buffered until its next decision
+                    // boundary, rather than turning a timer into a model call.
+                    yield_time_ms: Some(0),
+                    max_output_tokens: args.max_output_tokens,
+                    default_tool_timeout_ms: Some(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS),
+                },
+                &step_context,
+            )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
@@ -692,7 +695,7 @@ mod tests {
         for use_wait in [false, true] {
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
             session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-                codex_code_mode::InProcessCodeModeSessionProvider,
+                codex_code_mode_runtime::InProcessCodeModeSessionProvider,
             ));
             let session = Arc::new(session);
             let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
@@ -1009,8 +1012,6 @@ mod tests {
         let pending = service.begin_packet_call(&cell_id).unwrap();
         service.record_packet_call(
             &cell_id,
-            false,
-            42,
             vec![
                 codex_protocol::models::FunctionCallOutputContentItem::InputText {
                     text: "abandoned feedback".to_string(),
@@ -1028,8 +1029,6 @@ mod tests {
         service.complete_packet_call(
             &cell_id,
             pending,
-            false,
-            10,
             Vec::new(),
             None,
             Some((
@@ -1085,7 +1084,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         ));
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
         session.services.rollout_thread_trace =

@@ -3095,7 +3095,7 @@ pub(crate) fn skill_id_for_local_skill(
     let raw_id = format!("{prefix}_{path}_{skill_name}");
     let mut hasher = sha1::Sha1::new();
     sha1::Digest::update(&mut hasher, raw_id.as_bytes());
-    format!("{:x}", sha1::Digest::finalize(hasher))
+    hex::encode(sha1::Digest::finalize(hasher))
 }
 
 /// Returns a normalized path for skill ID construction.

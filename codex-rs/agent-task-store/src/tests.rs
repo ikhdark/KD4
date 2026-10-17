@@ -1547,7 +1547,9 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
     assert_eq!(sealed.contract, expected_contract);
     assert_eq!(
         sealed.contract_sha256,
-        format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&expected_contract).unwrap()))
+        hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&expected_contract).unwrap()
+        ))
     );
 
     let reference = ArchitectureContractRef {
@@ -2921,7 +2923,7 @@ async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
         validation_worker_draft("inspection", "src/lib.rs", "inspect:src/lib.rs"),
     ).await.unwrap();
     let bytes = std::fs::read(&path).unwrap();
-    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
     let fresh = fixture.store.prepare_source_inspection(
         attempt.attempt_id, path.to_string_lossy().into_owned(),
     ).await.unwrap().unwrap();
@@ -2955,7 +2957,7 @@ async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
     ).await.unwrap().unwrap();
     std::fs::write(&stale_path, "pub fn changed() {}\n").unwrap();
     let bytes = std::fs::read(&stale_path).unwrap();
-    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
     let reference = stale_fixture.store.record_source_inspection(
         stale, "stale-read".into(), hash, bytes.len() as u64,
     ).await.expect("source inspection no longer scans workspace changes");
@@ -2969,7 +2971,7 @@ async fn source_inspections_namespace_session_local_call_ids_by_attempt() {
     initialize_validation_repository(fixture.repo.path());
     let path = fixture.repo.path().join("src/lib.rs");
     let bytes = std::fs::read(&path).unwrap();
-    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
     let mut inspections = Vec::new();
     for root in ["first-session", "second-session"] {
         let (_, attempt) = fixture.store.create_assignment(

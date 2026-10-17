@@ -25,7 +25,7 @@ use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use rmcp::model::CallToolResult;
-use rmcp::model::Content;
+use rmcp::model::ContentBlock;
 use rmcp::model::RequestId;
 use serde::Deserialize;
 use serde_json::json;
@@ -58,7 +58,7 @@ fn create_call_tool_result_with_thread_id_and_surfaced_result(
     surfaced_result: Option<SurfacedToolResult>,
 ) -> CallToolResult {
     let content_text = text;
-    let content = vec![Content::text(content_text.clone())];
+    let content = vec![ContentBlock::text(content_text.clone())];
     let mut structured_content = json!({
         "threadId": thread_id,
         "content": content_text,
@@ -171,7 +171,7 @@ pub async fn run_codex_tool_session(
     } = match thread_manager.start_thread(config).await {
         Ok(res) => res,
         Err(e) => {
-            let result = CallToolResult::error(vec![Content::text(format!(
+            let result = CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to start Codex session: {e}"
             ))]);
             outgoing.send_response(id.clone(), result).await;
@@ -600,7 +600,7 @@ mod tests {
                 "done".to_string(),
                 is_error,
             );
-            assert_eq!(result.content, vec![rmcp::model::Content::text("done")]);
+            assert_eq!(result.content, vec![rmcp::model::ContentBlock::text("done")]);
             assert_eq!(result.is_error, is_error);
             assert_eq!(
                 result.structured_content,
@@ -627,7 +627,7 @@ mod tests {
             Some(surfaced_result.clone()),
         );
 
-        assert_eq!(result.content, vec![rmcp::model::Content::text("")]);
+        assert_eq!(result.content, vec![rmcp::model::ContentBlock::text("")]);
         assert_eq!(result.is_error, None);
         assert_eq!(
             result.structured_content,

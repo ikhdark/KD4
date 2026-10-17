@@ -571,7 +571,7 @@ fn summarize_json(value: &Value) -> (String, String) {
     if truncated {
         summary.push_str("...");
     }
-    (summary, format!("{:x}", writer.digest.finalize()))
+    (summary, hex::encode(writer.digest.finalize()))
 }
 
 fn u64_field(value: &Value, field: &str) -> Option<u64> {

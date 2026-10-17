@@ -32,7 +32,7 @@ use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::ListToolsResult;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::transport::StreamableHttpServerConfig;
 use rmcp::transport::StreamableHttpService;
@@ -429,8 +429,8 @@ struct InstalledAppsMcpServer {
 }
 
 impl ServerHandler for InstalledAppsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     fn list_tools(
@@ -451,6 +451,9 @@ impl ServerHandler for InstalledAppsMcpServer {
             }
 
             Ok(ListToolsResult {
+                result_type: None,
+                ttl_ms: None,
+                cache_scope: None,
                 meta: None,
                 next_cursor: None,
                 tools: state

@@ -144,14 +144,13 @@ impl McpResourceClient {
             .contents
             .into_iter()
             .map(resource_content_from_rmcp)
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(McpResourceReadResult { contents })
     }
 }
 
 pub(crate) fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
-    let rmcp::model::Annotated { raw, annotations } = resource;
-    let rmcp::model::RawResource {
+    let rmcp::model::Resource {
         uri,
         name,
         title,
@@ -160,7 +159,9 @@ pub(crate) fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Reso
         size,
         icons,
         meta,
-    } = raw;
+        annotations,
+        ..
+    } = resource;
 
     let annotations = annotations
         .map(serde_json::to_value)
@@ -181,7 +182,10 @@ pub(crate) fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Reso
         description,
         mime_type,
         name,
-        size: size.map(i64::from),
+        size: size
+            .map(i64::try_from)
+            .transpose()
+            .context("MCP resource size exceeds the supported range")?,
         title,
         uri,
         icons,
@@ -189,8 +193,8 @@ pub(crate) fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Reso
     })
 }
 
-fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> ResourceContent {
-    match content {
+fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
+    Ok(match content {
         rmcp::model::ResourceContents::TextResourceContents {
             uri,
             mime_type,
@@ -213,18 +217,17 @@ fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Resourc
             blob,
             meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
         },
-    }
+        _ => anyhow::bail!("unsupported MCP resource contents"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use rmcp::model::Annotated;
     use rmcp::model::Annotations;
     use rmcp::model::Icon;
-    use rmcp::model::Meta;
-    use rmcp::model::RawResource;
+    use rmcp::model::MetaObject;
     use rmcp::model::ResourceContents;
     use rmcp::model::Role;
 
@@ -234,18 +237,19 @@ mod tests {
         annotations.audience = Some(vec![Role::User]);
         annotations.priority = Some(0.75);
 
-        let mut meta = Meta::new();
+        let mut meta = MetaObject::new();
         meta.insert("source".to_string(), serde_json::json!("calendar"));
-        let raw = RawResource::new("resource://calendar/today", "today")
+        let resource = rmcp::model::Resource::new("resource://calendar/today", "today")
             .with_title("Today's calendar")
             .with_description("Calendar entries for today")
             .with_mime_type("application/json")
             .with_size(42)
             .with_icons(vec![Icon::new("https://example.com/calendar.png")])
-            .with_meta(meta);
+            .with_meta(meta)
+            .with_annotations(annotations);
 
         assert_eq!(
-            resource_from_rmcp(Annotated::new(raw, Some(annotations))).expect("convert resource"),
+            resource_from_rmcp(resource).expect("convert resource"),
             Resource {
                 annotations: Some(serde_json::json!({
                     "audience": ["user"],
@@ -267,7 +271,7 @@ mod tests {
 
     #[test]
     fn resource_content_conversion_moves_text_blob_and_metadata_directly() {
-        let mut text_meta = Meta::new();
+        let mut text_meta = MetaObject::new();
         text_meta.insert("page".to_string(), serde_json::json!(1));
         let text = ResourceContents::TextResourceContents {
             uri: "resource://docs/readme".to_string(),
@@ -276,7 +280,7 @@ mod tests {
             meta: Some(text_meta),
         };
 
-        let mut blob_meta = Meta::new();
+        let mut blob_meta = MetaObject::new();
         blob_meta.insert("encoding".to_string(), serde_json::json!("base64"));
         let blob = ResourceContents::BlobResourceContents {
             uri: "resource://images/logo".to_string(),
@@ -286,7 +290,7 @@ mod tests {
         };
 
         assert_eq!(
-            resource_content_from_rmcp(text),
+            resource_content_from_rmcp(text).expect("convert text contents"),
             ResourceContent::Text {
                 uri: "resource://docs/readme".to_string(),
                 mime_type: Some("text/markdown".to_string()),
@@ -295,7 +299,7 @@ mod tests {
             }
         );
         assert_eq!(
-            resource_content_from_rmcp(blob),
+            resource_content_from_rmcp(blob).expect("convert blob contents"),
             ResourceContent::Blob {
                 uri: "resource://images/logo".to_string(),
                 mime_type: Some("image/png".to_string()),

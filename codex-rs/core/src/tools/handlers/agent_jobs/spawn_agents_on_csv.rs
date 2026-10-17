@@ -401,7 +401,7 @@ pub async fn handle(
     })?;
     let mut output = FunctionToolOutput::from_text(content.clone(), Some(true));
     if deliver {
-        let revision = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let revision = hex::encode(sha2::Sha256::digest(content.as_bytes()));
         output.sampling_request_signal = Some(serde_json::json!({
             "authoritative_wait_owner_v1": {
                 "adapter": "agent_job_csv_export",

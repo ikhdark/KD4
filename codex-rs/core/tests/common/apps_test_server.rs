@@ -1,5 +1,5 @@
-use crate::test_codex::TestCodexBuilder;
-use crate::test_codex::test_codex;
+use super::test_codex::TestCodexBuilder;
+use super::test_codex::test_codex;
 use anyhow::Result;
 use codex_core::config::Config;
 use codex_features::Feature;
@@ -397,7 +397,7 @@ impl Respond for CodexAppsJsonRpcResponder {
                     .as_ref()
                     .is_some_and(|remaining| {
                         remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                                 remaining.checked_sub(1)
                             })
                             .is_ok()

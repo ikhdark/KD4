@@ -126,12 +126,9 @@ fn tool_history_receipt(call_id: &str) -> String {
     let artifact_sha256 = "a".repeat(64);
     let receipt_id = format!(
         "thr1-{}",
-        &format!(
-            "{:x}",
-            Sha256::digest(
-                format!("{call_id}:{artifact_sha256}:read_tool_output:read:123").as_bytes()
-            )
-        )[..16]
+        &hex::encode(Sha256::digest(
+            format!("{call_id}:{artifact_sha256}:read_tool_output:read:123").as_bytes()
+        ))[..16]
     );
     serde_json::json!({
         "version": 1,
@@ -198,7 +195,7 @@ fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
             .iter()
             .map(|name| serde_json::json!({"name": name}))
             .collect();
-        let expected_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(tools).unwrap()));
+        let expected_hash = hex::encode(Sha256::digest(serde_json::to_vec(tools).unwrap()));
         let (_, call, output) = remote_tool_search_receipt_group(&items, &[0, 1], true).unwrap();
         let ResponseItem::ToolSearchOutput { tools, .. } = &output else {
             unreachable!()

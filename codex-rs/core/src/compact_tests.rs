@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
-    use core_test_support::responses::{
+    use crate::test_harness::responses::{
         ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
     };
     let anchor = format!(
@@ -95,7 +95,7 @@ async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
 #[tokio::test]
 async fn uncertainty_first_compaction_retains_unplanned_source_with_one_request() {
     use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
-    use core_test_support::responses::{
+    use crate::test_harness::responses::{
         ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
     };
     for custom in [false, true] {
@@ -3120,7 +3120,7 @@ async fn compaction_recovery_survives_retention_resume_and_fork() {
 
 #[tokio::test]
 async fn valid_local_summary_is_not_published_when_replacement_preparation_fails() {
-    use core_test_support::responses::{
+    use crate::test_harness::responses::{
         ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
     };
 
@@ -3408,8 +3408,8 @@ fn survivability_literal_markers_are_data_but_structural_truncation_is_rejected(
 }
 #[tokio::test]
 async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Result<()> {
-    use core_test_support::responses;
-    core_test_support::require_network!();
+    use crate::test_harness::responses;
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let home = tempfile::tempdir()?;
     let (session, mut turn, _events) =
@@ -3526,8 +3526,8 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
 #[tokio::test]
 async fn local_compaction_request_records_usage_and_completion_in_turn_timing() -> anyhow::Result<()>
 {
-    use core_test_support::responses;
-    core_test_support::require_network!();
+    use crate::test_harness::responses;
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let home = tempfile::tempdir()?;
     let (session, turn, _events) =

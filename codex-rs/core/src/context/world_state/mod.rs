@@ -649,7 +649,7 @@ impl WorldState {
 }
 
 fn delivery_digest(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 fn retained_texts<'a>(

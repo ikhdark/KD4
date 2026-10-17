@@ -36,7 +36,7 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
-use rand::Rng;
+use rand::RngExt;
 use rand::rng;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;

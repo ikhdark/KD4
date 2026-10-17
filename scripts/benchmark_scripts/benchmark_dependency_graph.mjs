@@ -8,7 +8,7 @@ import vm from 'node:vm';
 
 const runs = Number(process.argv[2] ?? 5);
 assert(Number.isInteger(runs) && runs >= 1 && runs <= 100, 'runs must be 1..100');
-const owner = new URL('../../codex-rs/code-mode/src/runtime/dependency_graph.js', import.meta.url);
+const owner = new URL('../../codex-rs/code-mode-runtime/src/runtime/dependency_graph.js', import.meta.url);
 const source = readFileSync(owner, 'utf8');
 const context = vm.createContext({ ALL_TOOL_NAMES: [] });
 vm.runInContext(source, context, { filename: owner.pathname });

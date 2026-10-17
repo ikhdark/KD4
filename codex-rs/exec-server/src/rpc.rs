@@ -480,7 +480,7 @@ impl RpcClient {
         // Keep the exhausted counter unchanged so no later call can reuse an ID.
         let request_id = RequestId::Integer(
             self.next_request_id
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
                 .map_err(|_| RpcCallError::RequestIdExhausted)?,
         );
         let (response_tx, response_rx) = oneshot::channel();

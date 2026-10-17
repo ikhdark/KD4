@@ -1292,7 +1292,9 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
         let Some(relative_path) = entry.enclosed_name() else {
             return Err(format!(
                 "curated plugins zip entry `{}` escapes extraction root",
-                entry.name()
+                entry
+                    .name()
+                    .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()))
             ));
         };
 
@@ -1358,7 +1360,7 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
 }
 
 fn apply_zip_permissions(
-    _entry: &zip::read::ZipFile<'_>,
+    _entry: &zip::read::ZipFile<'_, std::io::Cursor<&[u8]>>,
     _output_path: &Path,
 ) -> Result<(), String> {
     #[cfg(unix)]

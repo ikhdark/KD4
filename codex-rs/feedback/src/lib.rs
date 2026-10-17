@@ -529,7 +529,7 @@ impl FeedbackSnapshot {
                 .extra
                 .insert("omitted_attachments".to_string(), Value::from(omitted));
         }
-        envelope.add_item(EnvelopeItem::Event(event));
+        envelope.add_item(EnvelopeItem::Event(Box::new(event)));
 
         let mut body_capacity = ENVELOPE_OVERHEAD_BYTES;
         for attachment in attachments {

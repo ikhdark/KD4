@@ -187,7 +187,7 @@ impl AgentExecutionLimiter {
     fn try_guard(self: Arc<Self>) -> CodexResult<AgentExecutionGuard> {
         let max_threads = self.max_threads();
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 if active < max_threads {
                     Some(active + 1)
                 } else {

@@ -699,7 +699,7 @@ fn durable_receipt_pointer(assignment_id: String, available: bool) -> JsonValue 
 }
 
 fn sha256_text(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 #[derive(Clone, Default)]
@@ -953,7 +953,7 @@ async fn hydrate_assignments(
 }
 
 fn agent_task_revision(task: &AgentTask) -> Result<String, serde_json::Error> {
-    serde_json::to_vec(task).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    serde_json::to_vec(task).map(|bytes| hex::encode(Sha256::digest(bytes)))
 }
 
 async fn hydrate_wait_owner_assignments(

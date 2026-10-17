@@ -4,6 +4,7 @@ use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_openai_curated_marketplace;
 use crate::plugins::test_support::write_plugins_feature_config;
 use crate::session::tests::make_session_and_context_with_rx;
+use crate::test_harness::PathExt;
 use anyhow::Context as _;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginAvailability;
@@ -24,7 +25,6 @@ use codex_core_plugins::startup_sync::curated_plugins_repo_path;
 use codex_rmcp_client::ElicitationResponse;
 use codex_tools::DiscoverablePluginInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use rmcp::model::ElicitationAction;
 use serde_json::json;
@@ -184,7 +184,7 @@ fn local_plugin_completion_requires_requested_mcp_servers() {
 
 #[tokio::test]
 async fn requested_mcp_servers_are_refreshed_before_install_completion() -> anyhow::Result<()> {
-    let command = core_test_support::stdio_server_bin()
+    let command = crate::test_harness::stdio_server_bin()
         .context("test_stdio_server is required by the plugin MCP refresh regression")?;
     let (session, mut turn, _events) = make_session_and_context_with_rx().await;
     let turn_context = Arc::get_mut(&mut turn).expect("test turn should be uniquely owned");

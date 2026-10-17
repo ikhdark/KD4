@@ -1,0 +1,1801 @@
+#![allow(clippy::unwrap_used)]
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use anyhow::Result;
+use base64::Engine;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelsResponse;
+use futures::SinkExt;
+use futures::StreamExt;
+use serde_json::Value;
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::sync::oneshot;
+use tokio_tungstenite::accept_hdr_async_with_config;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+use tokio_tungstenite::tungstenite::handshake::server::Request;
+use tokio_tungstenite::tungstenite::handshake::server::Response;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use wiremock::BodyPrintLimit;
+use wiremock::Match;
+use wiremock::Mock;
+use wiremock::MockBuilder;
+use wiremock::MockServer;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::http::HeaderName;
+use wiremock::http::HeaderValue;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
+
+#[derive(Debug, Clone)]
+pub struct ResponseMock {
+    requests: Arc<Mutex<Vec<ResponsesRequest>>>,
+}
+
+impl ResponseMock {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn single_request(&self) -> ResponsesRequest {
+        let requests = self.requests.lock().unwrap();
+        if requests.len() != 1 {
+            panic!("expected 1 request, got {}", requests.len());
+        }
+        requests.first().unwrap().clone()
+    }
+
+    pub fn requests(&self) -> Vec<ResponsesRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    pub fn last_request(&self) -> Option<ResponsesRequest> {
+        self.requests.lock().unwrap().last().cloned()
+    }
+
+    /// Returns the `output` string for a matching `function_call_output` with
+    /// the provided `call_id`, searching across all captured requests.
+    pub fn function_call_output_text(&self, call_id: &str) -> Option<String> {
+        self.requests()
+            .iter()
+            .find_map(|req| req.function_call_output_text(call_id))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponsesRequest(wiremock::Request);
+
+fn is_zstd_encoding(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+}
+
+fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
+    if content_encoding.is_some_and(is_zstd_encoding) {
+        zstd::stream::decode_all(std::io::Cursor::new(body))
+            .expect("failed to decode zstd request body")
+    } else {
+        body.to_vec()
+    }
+}
+
+/// Returns a response item without internal transport metadata for semantic assertions.
+pub fn strip_metadata(mut item: ResponseItem) -> ResponseItem {
+    item.clear_internal_chat_message_metadata_passthrough();
+    item
+}
+
+/// Returns response items without internal transport metadata for semantic assertions.
+pub fn strip_metadata_from_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items.iter().cloned().map(strip_metadata).collect()
+}
+
+/// Returns response items without generated item IDs for semantic assertions.
+pub fn strip_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.set_id(None);
+            item
+        })
+        .collect()
+}
+
+/// Returns JSON without generated response-item IDs for semantic assertions.
+pub fn strip_response_item_ids_from_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(strip_response_item_ids_from_json)
+                .collect(),
+        ),
+        Value::Object(mut map) => {
+            let is_response_item = map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "message"
+                        | "reasoning"
+                        | "local_shell_call"
+                        | "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                        | "web_search_call"
+                        | "compaction"
+                )
+            });
+            if is_response_item {
+                map.remove("id");
+            }
+            Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, strip_response_item_ids_from_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+/// Returns JSON without internal transport metadata for semantic assertions.
+pub fn strip_metadata_from_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(strip_metadata_from_json).collect())
+        }
+        Value::Object(mut map) => {
+            map.remove("internal_chat_message_metadata_passthrough");
+            Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, strip_metadata_from_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+impl ResponsesRequest {
+    pub fn body_json(&self) -> Value {
+        let body = decode_body_bytes(
+            &self.0.body,
+            self.0
+                .headers
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+        );
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    pub fn body_bytes(&self) -> Vec<u8> {
+        self.0.body.clone()
+    }
+
+    pub fn body_contains_text(&self, text: &str) -> bool {
+        body_contains_text(&self.body_json().to_string(), text)
+    }
+
+    pub fn tool_by_name(&self, namespace: &str, tool_name: &str) -> Option<Value> {
+        namespace_child_tool(&self.body_json(), namespace, tool_name).cloned()
+    }
+
+    pub fn instructions_text(&self) -> String {
+        self.body_json()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Returns all `input_text` spans from `message` inputs for the provided role.
+    pub fn message_input_texts(&self, role: &str) -> Vec<String> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+            .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    /// Returns `input_text` spans grouped by `message` input for the provided role.
+    pub fn message_input_text_groups(&self, role: &str) -> Vec<Vec<String>> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .map(|content| {
+                content
+                    .into_iter()
+                    .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+                    .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn has_message_with_input_texts(
+        &self,
+        role: &str,
+        predicate: impl Fn(&[String]) -> bool,
+    ) -> bool {
+        self.message_input_text_groups(role)
+            .iter()
+            .any(|texts| predicate(texts))
+    }
+
+    /// Returns whether the latest message for `role` has an `input_text` span
+    /// whose value exactly matches `text`.
+    pub fn has_last_message_input_text(&self, role: &str, text: &str) -> bool {
+        self.message_input_text_groups(role)
+            .last()
+            .is_some_and(|texts| texts.iter().any(|candidate| candidate == text))
+    }
+
+    /// Returns all `input_image` `image_url` spans from `message` inputs for the provided role.
+    pub fn message_input_image_urls(&self, role: &str) -> Vec<String> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_image"))
+            .filter_map(|span| {
+                span.get("image_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    pub fn input(&self) -> Vec<Value> {
+        self.body_json()["input"]
+            .as_array()
+            .expect("input array not found in request")
+            .clone()
+    }
+
+    pub fn inputs_of_type(&self, ty: &str) -> Vec<Value> {
+        self.input()
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some(ty))
+            .cloned()
+            .collect()
+    }
+
+    pub fn function_call_output(&self, call_id: &str) -> Value {
+        self.call_output(call_id, "function_call_output")
+    }
+
+    pub fn custom_tool_call_output(&self, call_id: &str) -> Value {
+        self.call_output(call_id, "custom_tool_call_output")
+    }
+
+    pub fn tool_search_output(&self, call_id: &str) -> Value {
+        self.call_output(call_id, "tool_search_output")
+    }
+
+    pub fn call_output(&self, call_id: &str, call_type: &str) -> Value {
+        self.input()
+            .iter()
+            .find(|item| {
+                item.get("type").unwrap() == call_type && item.get("call_id").unwrap() == call_id
+            })
+            .cloned()
+            .expect("function call output item not found in request")
+    }
+
+    /// If present, returns the `output` string of the `function_call_output`
+    /// entry matching `call_id` in this request's `input`.
+    pub fn function_call_output_text(&self, call_id: &str) -> Option<String> {
+        let binding = self.input();
+        let item = binding.iter().find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })?;
+        item.get("output")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    pub fn function_call_output_content_and_success(
+        &self,
+        call_id: &str,
+    ) -> Option<(Option<String>, Option<bool>)> {
+        self.call_output_content_and_success(call_id, "function_call_output")
+    }
+
+    pub fn custom_tool_call_output_content_and_success(
+        &self,
+        call_id: &str,
+    ) -> Option<(Option<String>, Option<bool>)> {
+        self.call_output_content_and_success(call_id, "custom_tool_call_output")
+    }
+
+    fn call_output_content_and_success(
+        &self,
+        call_id: &str,
+        call_type: &str,
+    ) -> Option<(Option<String>, Option<bool>)> {
+        let output = self
+            .call_output(call_id, call_type)
+            .get("output")
+            .cloned()
+            .unwrap_or(Value::Null);
+        match output {
+            Value::String(_) | Value::Array(_) => Some((output_value_to_text(&output), None)),
+            Value::Object(obj) => Some((
+                obj.get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                obj.get("success").and_then(Value::as_bool),
+            )),
+            _ => Some((None, None)),
+        }
+    }
+
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.0
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    pub fn path(&self) -> String {
+        self.0.url.path().to_string()
+    }
+
+    pub fn query_param(&self, name: &str) -> Option<String> {
+        self.0
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.to_string())
+    }
+}
+
+/// Returns whether a serialized JSON body contains `text` as it appears inside a
+/// JSON string, so quotes and newlines in `text` still match.
+pub fn body_contains_text(body: &str, text: &str) -> bool {
+    let json_fragment = serde_json::to_string(text).expect("serialize text to JSON");
+    // Remove only the enclosing JSON quotes, not an escaped quote in the text.
+    body.contains(&json_fragment[1..json_fragment.len() - 1])
+}
+
+pub fn output_value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => match items.as_slice() {
+            [item] if item.get("type").and_then(Value::as_str) == Some("input_text") => {
+                item.get("text").and_then(Value::as_str).map(str::to_string)
+            }
+            [_] | [] | [_, _, ..] => None,
+        },
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) | Value::Null => None,
+    }
+}
+
+pub fn namespace_child_tool<'a>(
+    body: &'a Value,
+    namespace: &str,
+    tool_name: &str,
+) -> Option<&'a Value> {
+    let tools = body.get("tools")?.as_array()?;
+    for tool in tools {
+        if tool.get("name").and_then(Value::as_str) != Some(namespace)
+            || tool.get("type").and_then(Value::as_str) != Some("namespace")
+        {
+            continue;
+        }
+
+        let child_tools = tool.get("tools")?.as_array()?;
+        if let Some(child_tool) = child_tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        {
+            return Some(child_tool);
+        }
+    }
+
+    None
+}
+
+/// Matches an exact `input_text` value on the latest message for `role`.
+///
+/// This is intended for mock routing: it does not match text in earlier turns,
+/// other roles, tool arguments, metadata, or unrelated JSON fields.
+pub fn request_has_last_message_input_text(
+    request: &wiremock::Request,
+    role: &str,
+    text: &str,
+) -> bool {
+    ResponsesRequest(request.clone()).has_last_message_input_text(role, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use wiremock::http::HeaderMap;
+    use wiremock::http::Method;
+
+    fn request_with_input(input: Value) -> ResponsesRequest {
+        ResponsesRequest(wiremock::Request {
+            url: "http://localhost/v1/responses"
+                .parse()
+                .expect("valid request url"),
+            method: Method::POST,
+            headers: HeaderMap::new(),
+            body: serde_json::to_vec(&serde_json::json!({ "input": input }))
+                .expect("serialize request body"),
+        })
+    }
+
+    #[tokio::test]
+    async fn matched_response_mocks_record_only_accepted_requests() {
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("build HTTP client");
+        for use_sse in [false, true] {
+            let server = start_mock_server().await;
+            let matcher = |request: &wiremock::Request| {
+                request_has_last_message_input_text(request, "user", "accepted")
+            };
+            let body = if use_sse {
+                sse(vec![ev_completed("accepted-response")])
+            } else {
+                "configured response".to_string()
+            };
+            let captured = if use_sse {
+                mount_sse_once_match(&server, matcher, body.clone()).await
+            } else {
+                mount_response_once_match(
+                    &server,
+                    matcher,
+                    ResponseTemplate::new(202).set_body_string(body.clone()),
+                )
+                .await
+            };
+            let url = format!("{}/v1/responses", server.uri());
+            for (text, status, expected_count) in [
+                ("rejected", 404, 0),
+                ("accepted", if use_sse { 200 } else { 202 }, 1),
+                ("accepted", 404, 1),
+            ] {
+                let payload = serde_json::json!({"input": [{
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }]});
+                let response = client.post(&url).json(&payload).send().await.unwrap();
+                assert_eq!(response.status().as_u16(), status);
+                if status != 404 {
+                    assert_eq!(response.bytes().await.unwrap(), body.as_bytes());
+                }
+                assert_eq!(captured.requests().len(), expected_count);
+            }
+            assert_eq!(
+                captured.single_request().message_input_texts("user"),
+                vec!["accepted".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn body_text_matching_preserves_escaped_trailing_quotes() {
+        // JSON's escaped quote is two bytes (backslash + quote), distinct from
+        // the backslash + n encoding of a newline. Neither may match the other.
+        assert!(body_contains_text(r#"{"text":"quoted\""}"#, "quoted\""));
+        assert!(!body_contains_text(r#"{"text":"quoted\n"}"#, "quoted\""));
+        assert!(!body_contains_text(r#"{"text":"line\n"}"#, "\""));
+        assert!(body_contains_text(r#"{"text":"🦀\""}"#, "🦀\""));
+    }
+
+    #[test]
+    fn captured_outputs_require_a_prior_matching_call() {
+        // The request-invariant contract requires chronological call/output
+        // pairing. Equal ID sets alone cannot establish that ordering.
+        for (call_kind, output_kind) in [
+            ("function_call", "function_call_output"),
+            ("local_shell_call", "function_call_output"),
+            ("custom_tool_call", "custom_tool_call_output"),
+            ("tool_search_call", "tool_search_output"),
+        ] {
+            let call = serde_json::json!({ "type": call_kind, "call_id": "call-1" });
+            let output = serde_json::json!({ "type": output_kind, "call_id": "call-1" });
+            let ordered = request_with_input(serde_json::json!([call, output]));
+            assert!(ResponseMock::new().matches(&ordered.0));
+            let reversed = request_with_input(serde_json::json!([output, call]));
+            assert!(
+                std::panic::catch_unwind(|| ResponseMock::new().matches(&reversed.0)).is_err(),
+                "{output_kind} must not be accepted before {call_kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_server_drop_closes_an_idle_connection() {
+        let server = start_websocket_server(vec![vec![vec![]]]).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.uri())
+            .await
+            .expect("connect websocket fixture");
+        let task = server.task.abort_handle();
+        // Keep the client and runtime alive while dropping a server waiting for
+        // its first request. Dropping a JoinHandle alone must not detach that wait.
+        drop(server);
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+        // Clean up even when this regression fails against a detached server.
+        task.abort();
+        assert!(
+            matches!(closed, Ok(None) | Ok(Some(Err(_)))),
+            "dropping the fixture must close its idle socket: {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_request_waiters_observe_requested_index_and_recorded_requests() {
+        let server = start_websocket_server(vec![vec![vec![], vec![]]]).await;
+        let (missed_tx, missed_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *server.request_log_miss.lock().unwrap() = Some((missed_tx, resume_rx));
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.uri())
+            .await
+            .expect("connect websocket fixture");
+        let first = server.wait_for_request(0, 0);
+        let another_first = server.wait_for_request(0, 0);
+        let second = server.wait_for_request(0, 1);
+        tokio::pin!(first, another_first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        missed_rx.await.expect("first observer read an empty log");
+        assert!(futures::poll!(&mut another_first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        let first_body = serde_json::json!({"type": "response.create", "input": "first"});
+        socket
+            .send(Message::Text(first_body.to_string().into()))
+            .await
+            .expect("send first request");
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_response_batch(0, 0))
+            .await
+            .expect("server logged and notified before observer resumes");
+        resume_tx
+            .send(())
+            .expect("resume first observer after notification");
+        let (observed, also_observed) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(&mut first, &mut another_first)
+        })
+        .await
+        .expect("both request observers wake");
+        assert_eq!(observed.body_json(), first_body);
+        assert_eq!(also_observed.body_json(), first_body);
+        assert!(futures::poll!(&mut second).is_pending());
+
+        let second_body = serde_json::json!({"type": "response.create", "input": "second"});
+        socket
+            .send(Message::Text(second_body.to_string().into()))
+            .await
+            .expect("send second request");
+        let observed = tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("second request observer wakes");
+        assert_eq!(observed.body_json(), second_body);
+        assert_eq!(server.wait_for_request(0, 0).await.body_json(), first_body);
+        drop(socket);
+    }
+
+    #[test]
+    fn body_matches_typed_text_items() {
+        let stale_or_untyped = request_with_input(serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            },
+            { "type": "fixture_metadata", "text": "route me" },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "different current turn" }]
+            }
+        ]));
+        assert!(!stale_or_untyped.has_last_message_input_text("user", "route me"));
+
+        let current = request_with_input(serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me earlier" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "route me" }]
+            }
+        ]));
+        assert!(current.has_last_message_input_text("user", "route me"));
+        assert!(!current.has_last_message_input_text("user", "route"));
+    }
+
+    #[test]
+    fn call_output_content_and_success_returns_only_single_text_content_item() {
+        let single_text = request_with_input(serde_json::json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [{ "type": "input_text", "text": "hello" }]
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-2",
+                "output": [{ "type": "input_text", "text": "world" }]
+            }
+        ]));
+        assert_eq!(
+            single_text.function_call_output_content_and_success("call-1"),
+            Some((Some("hello".to_string()), None))
+        );
+        assert_eq!(
+            single_text.custom_tool_call_output_content_and_success("call-2"),
+            Some((Some("world".to_string()), None))
+        );
+
+        let mixed_content = request_with_input(serde_json::json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call-3",
+                "output": [
+                    { "type": "input_text", "text": "hello" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" }
+                ]
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-4",
+                "output": [{ "type": "input_image", "image_url": "data:image/png;base64,abc" }]
+            }
+        ]));
+        assert_eq!(
+            mixed_content.function_call_output_content_and_success("call-3"),
+            Some((None, None))
+        );
+        assert_eq!(
+            mixed_content.custom_tool_call_output_content_and_success("call-4"),
+            Some((None, None))
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebSocketRequest {
+    body: Value,
+}
+
+impl WebSocketRequest {
+    pub fn body_json(&self) -> Value {
+        self.body.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebSocketHandshake {
+    uri: String,
+    headers: Vec<(String, String)>,
+}
+
+impl WebSocketHandshake {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebSocketConnectionConfig {
+    pub requests: Vec<Vec<Value>>,
+    pub response_headers: Vec<(String, String)>,
+    /// Optional delay inserted before accepting the websocket handshake.
+    ///
+    /// Tests use this to force websocket setup into an in-flight state so first-turn warmup paths
+    /// can be exercised deterministically.
+    pub accept_delay: Option<Duration>,
+    /// Whether the server should send a websocket close frame after all scripted responses.
+    ///
+    /// Tests can disable this to simulate a peer that surfaces a terminal event but never
+    /// completes the close handshake.
+    pub close_after_requests: bool,
+}
+
+pub struct WebSocketTestServer {
+    uri: String,
+    connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
+    response_batches_sent: Arc<Mutex<Vec<usize>>>,
+    handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
+    request_log_updated: Arc<Notify>,
+    #[cfg(test)]
+    request_log_miss: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    response_batch_sent: Arc<Notify>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebSocketTestServer {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches it. Cancel active socket I/O as well as
+        // the accept loop when a test exits without explicit graceful shutdown.
+        self.task.abort();
+    }
+}
+
+impl WebSocketTestServer {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn connections(&self) -> Vec<Vec<WebSocketRequest>> {
+        self.connections.lock().unwrap().clone()
+    }
+
+    pub fn single_connection(&self) -> Vec<WebSocketRequest> {
+        let connections = self.connections.lock().unwrap();
+        if connections.len() != 1 {
+            panic!("expected 1 connection, got {}", connections.len());
+        }
+        connections.first().cloned().unwrap_or_default()
+    }
+
+    pub async fn wait_for_request(
+        &self,
+        connection_index: usize,
+        request_index: usize,
+    ) -> WebSocketRequest {
+        loop {
+            let notified = self.request_log_updated.notified();
+            if let Some(request) = self
+                .connections
+                .lock()
+                .unwrap()
+                .get(connection_index)
+                .and_then(|connection| connection.get(request_index))
+                .cloned()
+            {
+                return request;
+            }
+            // A test may pause after the log miss while the real socket writer publishes.
+            #[cfg(test)]
+            {
+                let pause = self.request_log_miss.lock().unwrap().take();
+                if let Some((observed, resume)) = pause {
+                    observed.send(()).expect("observe missing request");
+                    resume.await.expect("resume request observer");
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Waits until the scripted response batch for a request has been written to the socket.
+    pub async fn wait_for_response_batch(&self, connection_index: usize, request_index: usize) {
+        loop {
+            let notified = self.response_batch_sent.notified();
+            if self
+                .response_batches_sent
+                .lock()
+                .unwrap()
+                .get(connection_index)
+                .is_some_and(|sent| *sent > request_index)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn handshakes(&self) -> Vec<WebSocketHandshake> {
+        self.handshakes.lock().unwrap().clone()
+    }
+
+    /// Waits until at least `expected` websocket handshakes have been observed or timeout elapses.
+    ///
+    /// Uses a short bounded polling interval so tests can deterministically wait for background
+    /// websocket activity without busy-spinning.
+    pub async fn wait_for_handshakes(&self, expected: usize, timeout: Duration) -> bool {
+        if self.handshakes.lock().unwrap().len() >= expected {
+            return true;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(10);
+        loop {
+            if self.handshakes.lock().unwrap().len() >= expected {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let sleep_for = std::cmp::min(poll_interval, deadline.saturating_duration_since(now));
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+    pub fn single_handshake(&self) -> WebSocketHandshake {
+        let handshakes = self.handshakes.lock().unwrap();
+        if handshakes.len() != 1 {
+            panic!("expected 1 handshake, got {}", handshakes.len());
+        }
+        handshakes.first().cloned().unwrap()
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelsMock {
+    requests: Arc<Mutex<Vec<wiremock::Request>>>,
+}
+
+impl ModelsMock {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn requests(&self) -> Vec<wiremock::Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Match for ModelsMock {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        self.requests.lock().unwrap().push(request.clone());
+        true
+    }
+}
+
+impl Match for ResponseMock {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(ResponsesRequest(request.clone()));
+
+        // Enforce invariant checks on every request body captured by the mock.
+        // Panic on orphan tool outputs or calls to catch regressions early.
+        validate_request_body_invariants(request);
+        true
+    }
+}
+
+/// Build an SSE stream body from a list of JSON events.
+pub fn sse(events: Vec<Value>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for ev in events {
+        let kind = ev.get("type").and_then(|v| v.as_str()).unwrap();
+        writeln!(&mut out, "event: {kind}").unwrap();
+        if !ev.as_object().map(|o| o.len() == 1).unwrap_or(false) {
+            write!(&mut out, "data: {ev}\n\n").unwrap();
+        } else {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+pub fn sse_completed(id: &str) -> String {
+    sse(vec![ev_response_created(id), ev_completed(id)])
+}
+
+/// Convenience: SSE event for a completed response with a specific id.
+pub fn ev_completed(id: &str) -> Value {
+    serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": id,
+            "usage": {"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}
+        }
+    })
+}
+
+/// Convenience: SSE event for a created response with a specific id.
+pub fn ev_response_created(id: &str) -> Value {
+    serde_json::json!({
+        "type": "response.created",
+        "response": {
+            "id": id,
+        }
+    })
+}
+
+pub fn ev_model_verification_metadata(id: &str, verifications: Vec<&str>) -> Value {
+    serde_json::json!({
+        "type": "response.metadata",
+        "sequence_number": 1,
+        "response_id": id,
+        "metadata": {
+            "openai_verification_recommendation": verifications,
+        }
+    })
+}
+
+pub fn ev_completed_with_tokens(id: &str, total_tokens: i64) -> Value {
+    serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": id,
+            "usage": {
+                "input_tokens": total_tokens,
+                "input_tokens_details": null,
+                "output_tokens": 0,
+                "output_tokens_details": null,
+                "total_tokens": total_tokens
+            }
+        }
+    })
+}
+
+/// Convenience: SSE event for a single assistant message output item.
+pub fn ev_assistant_message(id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": id,
+            "content": [{"type": "output_text", "text": text}]
+        }
+    })
+}
+
+pub fn user_message_item(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+pub fn ev_message_item_added(id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": id,
+            "content": [{"type": "output_text", "text": text}]
+        }
+    })
+}
+
+pub fn ev_output_text_delta(delta: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": delta,
+    })
+}
+
+pub fn ev_reasoning_item(id: &str, summary: &[&str], raw_content: &[&str]) -> Value {
+    let summary_entries: Vec<Value> = summary
+        .iter()
+        .map(|text| serde_json::json!({"type": "summary_text", "text": text}))
+        .collect();
+
+    let overhead = "b".repeat(550);
+    let raw_content_joined = raw_content.join("");
+    let encrypted_content =
+        base64::engine::general_purpose::STANDARD.encode(overhead + raw_content_joined.as_str());
+
+    let mut event = serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "id": id,
+            "summary": summary_entries,
+            "encrypted_content": encrypted_content,
+        }
+    });
+
+    if !raw_content.is_empty() {
+        let content_entries: Vec<Value> = raw_content
+            .iter()
+            .map(|text| serde_json::json!({"type": "reasoning_text", "text": text}))
+            .collect();
+        event["item"]["content"] = Value::Array(content_entries);
+    }
+
+    event
+}
+
+pub fn ev_reasoning_item_added(id: &str, summary: &[&str]) -> Value {
+    let summary_entries: Vec<Value> = summary
+        .iter()
+        .map(|text| serde_json::json!({"type": "summary_text", "text": text}))
+        .collect();
+
+    serde_json::json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "reasoning",
+            "id": id,
+            "summary": summary_entries,
+        }
+    })
+}
+
+pub fn ev_reasoning_summary_text_delta(delta: &str) -> Value {
+    serde_json::json!({
+        "type": "response.reasoning_summary_text.delta",
+        "delta": delta,
+        "summary_index": 0,
+    })
+}
+
+pub fn ev_reasoning_text_delta(delta: &str) -> Value {
+    serde_json::json!({
+        "type": "response.reasoning_text.delta",
+        "delta": delta,
+        "content_index": 0,
+    })
+}
+
+pub fn ev_image_generation_call(
+    id: &str,
+    status: &str,
+    revised_prompt: &str,
+    result: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "image_generation_call",
+            "id": id,
+            "status": status,
+            "revised_prompt": revised_prompt,
+            "result": result,
+        }
+    })
+}
+
+pub fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments
+        }
+    })
+}
+
+pub fn ev_function_call_with_namespace(
+    call_id: &str,
+    namespace: &str,
+    name: &str,
+    arguments: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "namespace": namespace,
+            "name": name,
+            "arguments": arguments
+        }
+    })
+}
+
+pub fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "tool_search_call",
+            "call_id": call_id,
+            "execution": "client",
+            "arguments": arguments,
+        }
+    })
+}
+
+pub fn ev_custom_tool_call(call_id: &str, name: &str, input: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": name,
+            "input": input
+        }
+    })
+}
+
+/// Convenience: SSE event for an `apply_patch` custom tool call with raw patch
+/// text. This mirrors the payload produced by the Responses API when the model
+/// invokes `apply_patch` directly.
+pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "input": patch,
+            "call_id": call_id
+        }
+    })
+}
+
+pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
+    let args = serde_json::json!({ "command": command });
+    ev_shell_command_call_with_args(call_id, &args)
+}
+
+pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
+    let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
+    ev_function_call(call_id, "shell_command", &arguments)
+}
+
+/// A complete response whose only output is one `shell_command` call.
+pub fn create_shell_command_sse_response(
+    command: Vec<String>,
+    workdir: Option<&Path>,
+    timeout_ms: Option<u64>,
+    call_id: &str,
+) -> Result<String> {
+    let command = shlex::try_join(command.iter().map(String::as_str))?;
+    let args = serde_json::json!({
+        "command": command,
+        "workdir": workdir.map(|workdir| workdir.to_string_lossy()),
+        "timeout_ms": timeout_ms,
+    });
+    Ok(sse(vec![
+        ev_response_created("resp-1"),
+        ev_shell_command_call_with_args(call_id, &args),
+        ev_completed("resp-1"),
+    ]))
+}
+
+/// A complete response whose only output is one assistant message.
+pub fn create_final_assistant_message_sse_response(message: &str) -> Result<String> {
+    Ok(sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", message),
+        ev_completed("resp-1"),
+    ]))
+}
+
+pub fn sse_failed(id: &str, code: &str, message: &str) -> String {
+    sse(vec![serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": id,
+            "error": {"code": code, "message": message}
+        }
+    })])
+}
+
+pub fn sse_response(body: String) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(body, "text/event-stream")
+}
+
+pub async fn mount_response_once(server: &MockServer, response: ResponseTemplate) -> ResponseMock {
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(response)
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+pub async fn mount_response_once_match<M>(
+    server: &MockServer,
+    matcher: M,
+    response: ResponseTemplate,
+) -> ResponseMock
+where
+    M: wiremock::Match + Send + Sync + 'static,
+{
+    let response_mock = ResponseMock::new();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(matcher)
+        // Record only accepted candidates, not requests routed to another mock.
+        .and(response_mock.clone())
+        .respond_with(response)
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+fn base_mock() -> (MockBuilder, ResponseMock) {
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(response_mock.clone());
+    (mock, response_mock)
+}
+
+fn models_mock() -> (MockBuilder, ModelsMock) {
+    let models_mock = ModelsMock::new();
+    let mock = Mock::given(method("GET"))
+        .and(path_regex(".*/models$"))
+        .and(models_mock.clone());
+    (mock, models_mock)
+}
+
+pub async fn mount_sse_once_match<M>(server: &MockServer, matcher: M, body: String) -> ResponseMock
+where
+    M: wiremock::Match + Send + Sync + 'static,
+{
+    mount_response_once_match(server, matcher, sse_response(body)).await
+}
+
+pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(sse_response(body))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+pub async fn mount_models_once(server: &MockServer, body: ModelsResponse) -> ModelsMock {
+    let (mock, models_mock) = models_mock();
+    mock.respond_with(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .set_body_json(body.clone()),
+    )
+    .up_to_n_times(1)
+    .mount(server)
+    .await;
+    models_mock
+}
+
+pub async fn mount_models_once_with_etag(
+    server: &MockServer,
+    body: ModelsResponse,
+    etag: &str,
+) -> ModelsMock {
+    let (mock, models_mock) = models_mock();
+    mock.respond_with(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            // ModelsClient reads the ETag header, not a JSON field.
+            .insert_header("ETag", etag)
+            .set_body_json(body.clone()),
+    )
+    .up_to_n_times(1)
+    .mount(server)
+    .await;
+    models_mock
+}
+
+pub async fn start_mock_server() -> MockServer {
+    let server = MockServer::builder()
+        .body_print_limit(BodyPrintLimit::Limited(80_000))
+        .start()
+        .await;
+
+    // Provide a default `/models` response so tests remain hermetic when the client queries it.
+    let _ = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
+
+    server
+}
+
+/// Starts a server that scripts a whole conversation for a Codex child process:
+/// `/responses` POSTs get `bodies` in order, and any request beyond them fails
+/// the test instead of falling through.
+pub async fn create_mock_responses_server_sequence(bodies: Vec<String>) -> MockServer {
+    let server = start_mock_server().await;
+    let num_calls = bodies.len() as u64;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(SequenceResponder::sse(bodies))
+        .expect(num_calls)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Starts a lightweight WebSocket server for `/v1/responses` tests.
+///
+/// Each connection consumes a queue of request/event sequences. For each
+/// request message, the server records the payload and streams the matching
+/// events as WebSocket text frames before moving to the next request.
+pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSocketTestServer {
+    let connections = connections
+        .into_iter()
+        .map(|requests| WebSocketConnectionConfig {
+            requests,
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: true,
+        })
+        .collect();
+    start_websocket_server_with_headers(connections).await
+}
+
+pub async fn start_websocket_server_with_headers(
+    connections: Vec<WebSocketConnectionConfig>,
+) -> WebSocketTestServer {
+    let start = std::time::Instant::now();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket server");
+    let addr = listener.local_addr().expect("websocket server address");
+    let uri = format!("ws://{addr}");
+    let connections_log = Arc::new(Mutex::new(Vec::new()));
+    let response_batches_sent_log = Arc::new(Mutex::new(Vec::new()));
+    let handshakes_log = Arc::new(Mutex::new(Vec::new()));
+    let request_log_updated = Arc::new(Notify::new());
+    let response_batch_sent = Arc::new(Notify::new());
+    let requests = Arc::clone(&connections_log);
+    let response_batches_sent = Arc::clone(&response_batches_sent_log);
+    let handshakes = Arc::clone(&handshakes_log);
+    let request_log = Arc::clone(&request_log_updated);
+    let response_batch_log = Arc::clone(&response_batch_sent);
+    let connections = Arc::new(Mutex::new(VecDeque::from(connections)));
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let accept_res = tokio::select! {
+                _ = &mut shutdown_rx => return,
+                accept_res = listener.accept() => accept_res,
+            };
+            let (stream, _) = match accept_res {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            // Ordinary HTTP probes can share this listener with websocket tests. Only a
+            // successful websocket handshake should consume a scripted connection.
+            let connection = {
+                let pending = connections.lock().unwrap();
+                pending.front().cloned()
+            };
+
+            let Some(connection) = connection else {
+                continue;
+            };
+
+            if let Some(delay) = connection.accept_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            let response_headers = connection.response_headers.clone();
+            let handshake_log = Arc::clone(&handshakes);
+            let callback = move |req: &Request, mut response: Response| {
+                let headers = req
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
+                    .collect();
+                handshake_log.lock().unwrap().push(WebSocketHandshake {
+                    uri: req.uri().to_string(),
+                    headers,
+                });
+
+                let headers_mut = response.headers_mut();
+                for (name, value) in &response_headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        headers_mut.insert(name, value);
+                    }
+                }
+
+                Ok(response)
+            };
+
+            let mut ws_stream = match accept_hdr_async_with_config(
+                stream,
+                callback,
+                Some(websocket_accept_config()),
+            )
+            .await
+            {
+                Ok(ws) => ws,
+                Err(_) => continue,
+            };
+            connections.lock().unwrap().pop_front();
+
+            let connection_index = {
+                let mut log = requests.lock().unwrap();
+                log.push(Vec::new());
+                log.len() - 1
+            };
+            response_batches_sent.lock().unwrap().push(0);
+            let close_after_requests = connection.close_after_requests;
+            for request_events in connection.requests {
+                let Some(Ok(message)) = ws_stream.next().await else {
+                    break;
+                };
+                if let Some(body) = parse_ws_request_body(message) {
+                    let mut log = requests.lock().unwrap();
+                    if let Some(connection_log) = log.get_mut(connection_index) {
+                        connection_log.push(WebSocketRequest { body });
+                        let request_index = connection_log.len() - 1;
+                        let request = &connection_log[request_index];
+                        let request_body = request.body_json();
+                        eprintln!(
+                            "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
+                            start.elapsed().as_millis(),
+                            connection_index,
+                            request_index,
+                            request_body.get("type").and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("role"))
+                                .and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("content"))
+                                .and_then(Value::as_array)
+                                .and_then(|content| content.first())
+                                .and_then(|content| content.get("text"))
+                                .and_then(Value::as_str),
+                            request_body
+                                .get("item")
+                                .and_then(|item| item.get("content"))
+                                .and_then(Value::as_array)
+                                .and_then(|content| content.first())
+                                .and_then(|content| content.get("data"))
+                                .and_then(Value::as_str),
+                        );
+                    }
+                    request_log.notify_waiters();
+                }
+
+                eprintln!(
+                    "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
+                    start.elapsed().as_millis(),
+                    connection_index,
+                    request_events.len(),
+                    request_events
+                        .iter()
+                        .map(|event| event.get("type").and_then(Value::as_str))
+                        .collect::<Vec<_>>(),
+                    request_events
+                        .iter()
+                        .find_map(|event| event.get("delta").and_then(Value::as_str)),
+                );
+                let mut sent_entire_batch = true;
+                for event in &request_events {
+                    let Ok(payload) = serde_json::to_string(event) else {
+                        sent_entire_batch = false;
+                        break;
+                    };
+                    if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                        sent_entire_batch = false;
+                        break;
+                    }
+                }
+                if sent_entire_batch {
+                    if let Some(sent) = response_batches_sent
+                        .lock()
+                        .unwrap()
+                        .get_mut(connection_index)
+                    {
+                        *sent += 1;
+                    }
+                    response_batch_log.notify_waiters();
+                }
+            }
+
+            if close_after_requests {
+                let _ = ws_stream.close(None).await;
+            } else {
+                let _ = shutdown_rx.await;
+                return;
+            }
+
+            if connections.lock().unwrap().is_empty() {
+                return;
+            }
+        }
+    });
+
+    WebSocketTestServer {
+        #[cfg(test)]
+        request_log_miss: Mutex::new(None),
+        uri,
+        connections: connections_log,
+        response_batches_sent: response_batches_sent_log,
+        handshakes: handshakes_log,
+        request_log_updated,
+        response_batch_sent,
+        shutdown: Some(shutdown_tx),
+        task,
+    }
+}
+
+fn parse_ws_request_body(message: Message) -> Option<Value> {
+    match message {
+        Message::Text(text) => serde_json::from_str(&text).ok(),
+        Message::Binary(bytes) => serde_json::from_slice(&bytes).ok(),
+        _ => None,
+    }
+}
+
+fn websocket_accept_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
+}
+
+/// Answers each matched request with the next response in order and panics once
+/// the sequence is exhausted.
+pub struct SequenceResponder {
+    num_calls: AtomicUsize,
+    responses: Vec<ResponseTemplate>,
+}
+
+impl SequenceResponder {
+    pub fn new(responses: Vec<ResponseTemplate>) -> Self {
+        Self {
+            num_calls: AtomicUsize::new(0),
+            responses,
+        }
+    }
+
+    /// Serves each body as a `text/event-stream` response.
+    pub fn sse(bodies: Vec<String>) -> Self {
+        Self::new(bodies.into_iter().map(sse_response).collect())
+    }
+}
+
+impl Respond for SequenceResponder {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
+        self.responses
+            .get(call_num)
+            .unwrap_or_else(|| panic!("no mock response for call {call_num}"))
+            .clone()
+    }
+}
+
+/// Serves SSE bodies in order for POSTs to `/v1/responses` and expects exactly
+/// that many calls. Once the bodies are used, requests fall through to any
+/// later-mounted mock.
+pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    let num_calls = bodies.len() as u64;
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(SequenceResponder::sse(bodies))
+        .up_to_n_times(num_calls)
+        .expect(num_calls)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+/// Scripted responses that consume actual prior tool outputs (for example,
+/// creation identities which must not be predicted by a test fixture).
+pub async fn mount_sse_sequence_with_request(
+    server: &MockServer,
+    bodies: Vec<String>,
+    adapt: impl Fn(&Value, String) -> String + Send + Sync + 'static,
+) -> ResponseMock {
+    let count = bodies.len() as u64;
+    let next = AtomicUsize::new(0);
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(move |request: &wiremock::Request| {
+        let index = next.fetch_add(1, Ordering::SeqCst);
+        let body = bodies.get(index).expect("unexpected model request").clone();
+        sse_response(adapt(&ResponsesRequest(request.clone()).body_json(), body))
+    }).up_to_n_times(count).expect(count).mount(server).await;
+    response_mock
+}
+
+/// Serves `responses` in order for POSTs to `/v1/responses` and expects exactly
+/// that many calls. Once the responses are used, requests fall through to any
+/// later-mounted mock.
+pub async fn mount_response_sequence(
+    server: &MockServer,
+    responses: Vec<ResponseTemplate>,
+) -> ResponseMock {
+    let num_calls = responses.len() as u64;
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(SequenceResponder::new(responses))
+        .up_to_n_times(num_calls)
+        .expect(num_calls)
+        .mount(server)
+        .await;
+    response_mock
+}
+
+/// Validate invariants on the request body sent to `/v1/responses`.
+///
+/// - No `function_call_output`/`custom_tool_call_output` with missing/empty `call_id`.
+/// - `tool_search_output` must have a `call_id` unless it is a server-executed legacy item.
+/// - Every `function_call_output` must match a prior `function_call` or
+///   `local_shell_call` with the same `call_id` in the same `input`.
+/// - Every `custom_tool_call_output` must match a prior `custom_tool_call`.
+/// - Every `tool_search_output` must match a prior `tool_search_call`.
+/// - Additionally, enforce symmetry: every `function_call`/`custom_tool_call`/
+///   `tool_search_call` in the `input` must have a matching output entry.
+fn validate_request_body_invariants(request: &wiremock::Request) {
+    // Skip GET requests (e.g., /models)
+    if request.method != "POST" || !request.url.path().ends_with("/responses") {
+        return;
+    }
+    let body_bytes = decode_body_bytes(
+        &request.body,
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let Ok(body): Result<Value, _> = serde_json::from_slice(&body_bytes) else {
+        return;
+    };
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("input array not found in request");
+
+    use std::collections::HashSet;
+
+    fn get_call_id(item: &Value) -> Option<&str> {
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+    }
+
+    fn gather_ids(items: &[Value], kind: &str) -> HashSet<String> {
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
+            .filter_map(get_call_id)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn gather_output_ids(items: &[Value], kind: &str, missing_msg: &str) -> HashSet<String> {
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
+            .map(|item| {
+                let id = get_call_id(item).expect(missing_msg);
+                id.to_string()
+            })
+            .collect()
+    }
+
+    fn gather_tool_search_output_ids(items: &[Value]) -> HashSet<String> {
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
+            .filter_map(|item| {
+                if let Some(id) = get_call_id(item) {
+                    return Some(id.to_string());
+                }
+                if item.get("execution").and_then(Value::as_str) == Some("server") {
+                    return None;
+                }
+                panic!("orphan tool_search_output with empty call_id should be dropped");
+            })
+            .collect()
+    }
+
+    let function_calls = gather_ids(items, "function_call");
+    let tool_search_calls = gather_ids(items, "tool_search_call");
+    let custom_tool_calls = gather_ids(items, "custom_tool_call");
+    let function_call_outputs = gather_output_ids(
+        items,
+        "function_call_output",
+        "orphan function_call_output with empty call_id should be dropped",
+    );
+    let tool_search_outputs = gather_tool_search_output_ids(items);
+    let custom_tool_call_outputs = gather_output_ids(
+        items,
+        "custom_tool_call_output",
+        "orphan custom_tool_call_output with empty call_id should be dropped",
+    );
+
+    let mut prior_function_calls = HashSet::new();
+    let mut prior_custom_calls = HashSet::new();
+    let mut prior_search_calls = HashSet::new();
+    for item in items {
+        let Some(cid) = get_call_id(item) else {
+            continue; // Missing output IDs were checked above, including legacy search items.
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "local_shell_call") => {
+                prior_function_calls.insert(cid);
+            }
+            Some("custom_tool_call") => {
+                prior_custom_calls.insert(cid);
+            }
+            Some("tool_search_call") => {
+                prior_search_calls.insert(cid);
+            }
+            Some("function_call_output") => assert!(
+                prior_function_calls.contains(cid),
+                "function_call_output without prior matching call in input: {cid}",
+            ),
+            Some("custom_tool_call_output") => assert!(
+                prior_custom_calls.contains(cid),
+                "custom_tool_call_output without prior matching call in input: {cid}",
+            ),
+            Some("tool_search_output") => assert!(
+                prior_search_calls.contains(cid),
+                "tool_search_output without prior matching call in input: {cid}",
+            ),
+            _ => {}
+        }
+    }
+
+    for cid in &function_calls {
+        assert!(
+            function_call_outputs.contains(cid),
+            "Function call output is missing for call id: {cid}",
+        );
+    }
+    for cid in &custom_tool_calls {
+        assert!(
+            custom_tool_call_outputs.contains(cid),
+            "Custom tool call output is missing for call id: {cid}",
+        );
+    }
+    for cid in &tool_search_calls {
+        assert!(
+            tool_search_outputs.contains(cid),
+            "Tool search output is missing for call id: {cid}",
+        );
+    }
+}

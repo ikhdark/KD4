@@ -570,6 +570,10 @@ tui-large-widget-check:
 deps-duplicates-check *args:
     {{ python }} "{{ justfile_directory() }}/scripts/maintenance/check_duplicate_deps.py" {args}
 
+# V8 belongs only to the standalone Code Mode host process.
+deps-v8-boundary-check *args:
+    {{ python }} "{{ justfile_directory() }}/scripts/maintenance/check_v8_boundary.py" {args}
+
 # Refresh the advisory database and audit the locked dependency graph.
 deps-audit:
     just deps-advisories-check
@@ -587,6 +591,7 @@ deps-policy-check *args:
     just deps-advisories-check
     just _cargo-deny-installed
     just deps-duplicates-check {args}
+    just deps-v8-boundary-check {args}
     cargo deny check bans sources licenses
 
 [windows]

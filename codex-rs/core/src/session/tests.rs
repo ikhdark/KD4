@@ -324,23 +324,23 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rmcp_client::ElicitationAction;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
-use core_test_support::context_snapshot;
-use core_test_support::context_snapshot::ContextSnapshotOptions;
-use core_test_support::context_snapshot::ContextSnapshotRenderMode;
-use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_once;
-use core_test_support::responses::sse;
-use core_test_support::responses::start_mock_server;
-use core_test_support::responses::strip_metadata_from_items;
-use core_test_support::responses::strip_response_item_ids;
-use core_test_support::test_codex::local;
-use core_test_support::test_codex::test_codex;
-use core_test_support::test_path_buf;
-use core_test_support::tracing::install_test_tracing;
-use core_test_support::wait_for_event;
+use crate::test_harness::PathBufExt;
+use crate::test_harness::PathExt;
+use crate::test_harness::context_snapshot;
+use crate::test_harness::context_snapshot::ContextSnapshotOptions;
+use crate::test_harness::context_snapshot::ContextSnapshotRenderMode;
+use crate::test_harness::responses::ev_completed;
+use crate::test_harness::responses::ev_response_created;
+use crate::test_harness::responses::mount_sse_once;
+use crate::test_harness::responses::sse;
+use crate::test_harness::responses::start_mock_server;
+use crate::test_harness::responses::strip_metadata_from_items;
+use crate::test_harness::responses::strip_response_item_ids;
+use crate::test_harness::test_codex::local;
+use crate::test_harness::test_codex::test_codex;
+use crate::test_harness::test_path_buf;
+use crate::test_harness::tracing::install_test_tracing;
+use crate::test_harness::wait_for_event;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -9928,7 +9928,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -10181,7 +10181,7 @@ where
             config.http_client_factory(),
         ),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
         )),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
@@ -15850,7 +15850,7 @@ async fn ephemeral_durable_history_is_visible_once_without_creating_rollout() ->
         &server,
         sse(vec![
             ev_response_created("ephemeral-response"),
-            core_test_support::responses::ev_assistant_message(
+            crate::test_harness::responses::ev_assistant_message(
                 "ephemeral-message",
                 "ephemeral answer",
             ),
@@ -16359,8 +16359,10 @@ fn durable_history_commit_key_matches_the_existing_compact_json_identity() {
         internal_chat_message_metadata_passthrough: None,
     }];
     let expected = format!(
-        "turn-id:{:x}",
-        Sha256::digest(serde_json::to_vec(&items).expect("serialize comparison history"))
+        "turn-id:{}",
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&items).expect("serialize comparison history")
+        ))
     );
 
     assert_eq!(

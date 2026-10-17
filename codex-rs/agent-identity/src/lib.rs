@@ -27,8 +27,8 @@ use jsonwebtoken::Validation;
 use jsonwebtoken::decode;
 use jsonwebtoken::decode_header;
 use jsonwebtoken::jwk::JwkSet;
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use rand::TryRng;
+use rand::rngs::SysRng;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest as _;
@@ -424,7 +424,7 @@ pub fn decrypt_task_id_response(
 
 pub fn generate_agent_key_material() -> Result<GeneratedAgentKeyMaterial> {
     let mut seed_material = [0u8; AGENT_IDENTITY_KEY_SEED_BYTES];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut seed_material)
         .context("failed to generate agent identity private key seed material")?;
     // Ed25519 stores a 32-byte seed, so derive it from all sampled seed material.

@@ -169,7 +169,7 @@ fn proxy_key_representation_benchmark() {
                 hash.update(b"system-proxy-cache-v1\0");
                 hash.update(black_box(url).as_bytes());
                 if hex {
-                    black_box(format!("{:x}", hash.finalize()));
+                    black_box(hex::encode(hash.finalize()));
                 } else {
                     let key: [u8; 32] = hash.finalize().into();
                     black_box(key);

@@ -154,15 +154,52 @@ pub trait CodeModeSession: Send + Sync {
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()>;
 }
 
+/// Returned instead of running a cell when the host that ran a session's
+/// earlier cells exited. Its stored values died with it; running the cell on
+/// the empty replacement runtime would present them as never stored.
+pub const RUNTIME_REPLACED_NOTICE: &str = "The Code Mode host process exited, so its runtime was replaced and this cell did not run. Values that earlier cells stored with `store` are lost; values committed by completed `// @exec: {\"persist\":true}` cells return when the next persist cell runs. A cell that was running when the host exited may have stopped part-way after some of its tool calls took effect. Rebuild the state you need, then run the cell again.";
+
 /// Creates code-mode sessions for Codex threads.
 ///
 /// Implementations may share a remote host process across all sessions created
 /// by one provider.
 pub trait CodeModeSessionProvider: Send + Sync {
+    /// Reports whether this provider can execute code without starting its host.
+    fn availability(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn create_session<'a>(
         &'a self,
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a>;
+}
+
+pub struct NoopCodeModeSessionDelegate;
+
+impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        cancellation: NestedCancellation,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            Err("code mode nested tools are unavailable".to_string())
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
 #[cfg(test)]

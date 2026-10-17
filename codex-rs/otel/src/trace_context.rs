@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env;
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -170,34 +171,39 @@ fn merge_tracestate_entries(
     tracestate: &TraceState,
     configured_entries: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Option<String> {
-    let mut trace_state = tracestate.clone();
+    // Merge into a plain list: `TraceState::insert` drops the rightmost member of
+    // a full list, so a valid member could lose its slot to an invalid one that
+    // the final filter discards.
+    let mut members: VecDeque<(String, String)> = tracestate
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
 
-    // TraceState::insert places members at the front. Reverse iteration keeps
-    // deterministic map order while upserting fields inside configured members.
+    // Configured members go in front. Reverse iteration keeps deterministic map
+    // order while upserting fields inside configured members.
     for (key, fields) in configured_entries.iter().rev() {
-        let value = merge_tracestate_member_fields(trace_state.get(key), fields);
+        let existing = members.iter().position(|(member_key, _)| member_key == key);
+        let value =
+            merge_tracestate_member_fields(existing.map(|index| members[index].1.as_str()), fields);
         if !is_tracestate_member_key(key) || !is_header_safe_tracestate_member_value(&value) {
             warn!("ignoring invalid configured tracestate member update");
             continue;
         }
-        trace_state = match trace_state.insert(key.clone(), value) {
-            Ok(trace_state) => trace_state,
-            Err(err) => {
-                warn!("ignoring configured tracestate while propagating trace context: {err}");
-                continue;
-            }
-        };
+        if let Some(index) = existing {
+            members.remove(index);
+        }
+        members.push_front((key.clone(), value));
     }
 
     // The pinned SDK does not enforce all W3C constraints. Preserve valid
     // members in priority order, dropping rightmost entries beyond the limit.
     let mut seen = BTreeSet::new();
-    let tracestate = trace_state
-        .into_iter()
+    let tracestate = members
+        .iter()
         .filter(|(key, value)| {
             is_tracestate_member_key(key)
                 && is_header_safe_tracestate_member_value(value)
-                && seen.insert(*key)
+                && seen.insert(key.as_str())
         })
         .take(32)
         .map(|(key, value)| format!("{key}={value}"))
@@ -576,19 +582,26 @@ mod tests {
     fn tracestate_merge_caps_final_members_and_discards_invalid_native_members() {
         use opentelemetry::trace::TraceState;
         use std::collections::BTreeMap;
-        let mut pairs: Vec<_> = (0..32)
+        // A full native list (the SDK keeps at most 32) with two members W3C rejects.
+        let mut pairs: Vec<_> = (0..30)
             .map(|i| (format!("v{i}"), "value".to_string()))
             .collect();
         pairs.insert(0, ("".to_string(), "value".to_string()));
         pairs.insert(0, ("empty".to_string(), "".to_string()));
         let state = TraceState::from_key_value(pairs).unwrap();
-        let entries = BTreeMap::from([(
-            "first".to_string(),
-            BTreeMap::from([("f".to_string(), "ok".to_string())]),
-        )]);
+        assert_eq!((&state).into_iter().count(), 32);
+        let fields = BTreeMap::from([("f".to_string(), "ok".to_string())]);
+        let entries = BTreeMap::from([
+            ("first".to_string(), fields.clone()),
+            ("second".to_string(), fields.clone()),
+            ("third".to_string(), fields),
+        ]);
         let merged = super::merge_tracestate_entries(&state, &entries).unwrap();
-        let expected = std::iter::once("first=f:ok".to_string())
-            .chain((0..31).map(|i| format!("v{i}=value")))
+        // The invalid members take no slot, so the cap drops only `v29`.
+        let expected = ["first", "second", "third"]
+            .into_iter()
+            .map(|key| format!("{key}=f:ok"))
+            .chain((0..29).map(|i| format!("v{i}=value")))
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(merged, expected);

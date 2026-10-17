@@ -613,6 +613,50 @@ fn unified_exec_output_schema() -> Value {
     })
 }
 
+/// Eager code-mode projection of the command result fields cells commonly read.
+/// The named shape replaces an `unknown` result in every exec prompt; the
+/// registered specs keep the complete lifecycle contract above for resolve_tool.
+pub(crate) fn unified_exec_eager_output_schema() -> Value {
+    json!({
+        "$ref": "#/$defs/ExecCommandResult",
+        "$defs": {
+            "ExecCommandResult": {
+                "type": "object",
+                "properties": {
+                    "output": {
+                        "type": "string",
+                        "description": "Combined display text; may be truncated."
+                    },
+                    "exit_code": {
+                        "type": ["integer", "null"],
+                        "description": "Exit status; null while running or when unavailable."
+                    },
+                    "stdout": {
+                        "type": "string",
+                        "description": "Exact stdout, present when streams_complete is true."
+                    },
+                    "stderr": {
+                        "type": "string",
+                        "description": "Exact stderr, present when streams_complete is true."
+                    },
+                    "streams_complete": {"type": "boolean"},
+                    "session_id": {
+                        "type": "integer",
+                        "description": "Present while the process runs, or after exit while output remains unread: pass the whole result to await_command, or use it with write_stdin."
+                    },
+                    "recovery": {
+                        "type": "object",
+                        "description": "Ready read_tool_output call for omitted output, present when output was truncated.",
+                        "properties": {"tool": {"const": "read_tool_output"}, "arguments": {"type": "object"}},
+                        "required": ["tool", "arguments"]
+                    }
+                },
+                "required": ["output", "exit_code"]
+            }
+        }
+    })
+}
+
 fn create_approval_parameters(
     exec_permission_approvals_enabled: bool,
     allow_escalated_sandbox_permissions: bool,

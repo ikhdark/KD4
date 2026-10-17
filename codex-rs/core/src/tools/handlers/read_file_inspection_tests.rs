@@ -69,7 +69,7 @@ async fn paged_native_source_acquisition_round_trip() -> std::time::Duration {
     assert!(initial.get("criterion_evidence").is_none());
     let artifact = initial["artifact_id"].as_str().unwrap();
     let hash = initial["source_sha256"].as_str().unwrap();
-    assert_eq!(hash, format!("{:x}", sha2::Sha256::digest(contents.as_bytes())));
+    assert_eq!(hash, hex::encode(sha2::Sha256::digest(contents.as_bytes())));
     let mut acquired = initial["results"][0]["text"].as_str().unwrap().to_string();
     assert_eq!(acquired.len() as u64, initial["results"][0]["canonical_range"]["end"].as_u64().unwrap());
     assert!(store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap()

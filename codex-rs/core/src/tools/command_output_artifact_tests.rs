@@ -1049,7 +1049,7 @@ async fn raw_command_json_supports_pointer_recovery_without_rewriting_bytes() {
     assert_eq!(result.canonical_bytes, body.len() as u64);
     assert_eq!(
         result.canonical_sha256,
-        format!("{:x}", Sha256::digest(body.as_bytes()))
+        hex::encode(Sha256::digest(body.as_bytes()))
     );
 }
 
@@ -2957,7 +2957,7 @@ async fn retained_prefix_recovery_reports_the_unavailable_canonical_suffix() {
         serde_json::from_slice(&std::fs::read(&metadata_path).expect("read logical metadata"))
             .expect("decode logical metadata");
     metadata.retained_bytes = retained.len() as u64;
-    metadata.retained_sha256 = Some(format!("{:x}", Sha256::digest(retained)));
+    metadata.retained_sha256 = Some(hex::encode(Sha256::digest(retained)));
     metadata.complete = false;
     metadata.unavailable_ranges = vec![CanonicalByteRange::new(
         retained.len() as u64,
@@ -3276,7 +3276,7 @@ async fn active_tool_history_artifact_survives_per_thread_retention_without_redu
         "thread",
         &id,
         *bytes,
-        &format!("{:x}", Sha256::digest(output)),
+        &hex::encode(Sha256::digest(output)),
     )
     .await
     .expect("protect active tool-history artifact");
@@ -3325,7 +3325,7 @@ async fn global_retention_skips_active_tool_history_without_broadening_generic_l
         "active-thread",
         &id,
         *bytes,
-        &format!("{:x}", Sha256::digest(output)),
+        &hex::encode(Sha256::digest(output)),
     )
     .await
     .expect("protect active tool-history artifact");
@@ -4376,16 +4376,16 @@ async fn periodic_indexed_reconciliation_runs_after_the_triggering_commit() {
     barrier.wait().await;
     assert_eq!(
         retention_mode_for_test(&root),
-        RetentionModeKind::Reconciling
+        RetentionModeKind::Indexed,
+        "the index stays in use while it is rescanned"
     );
     barrier.wait().await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while retention_mode_for_test(&root) != RetentionModeKind::Indexed {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background reconciliation installs a fresh index");
+    wait_for_rescan(
+        &root,
+        before.reconciliations,
+        "background reconciliation refreshes the index",
+    )
+    .await;
     assert_eq!(
         retention_diagnostics_for_test(&root).reconciliations,
         before.reconciliations + 1
@@ -4432,16 +4432,16 @@ async fn external_generation_change_reconciles_after_the_triggering_commit() {
     barrier.wait().await;
     assert_eq!(
         retention_mode_for_test(&root),
-        RetentionModeKind::Reconciling
+        RetentionModeKind::Indexed,
+        "the index stays in use while it is rescanned"
     );
     barrier.wait().await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while retention_mode_for_test(&root) != RetentionModeKind::Indexed {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background reconciliation installs a fresh index");
+    wait_for_rescan(
+        &root,
+        before.reconciliations,
+        "background reconciliation refreshes the index",
+    )
+    .await;
     assert_eq!(
         retention_diagnostics_for_test(&root).reconciliations,
         before.reconciliations + 1
@@ -4569,6 +4569,349 @@ async fn startup_prewarm_indexes_the_root_before_the_first_commit() {
         retention_diagnostics_for_test(&root).reconciliations,
         prewarmed.reconciliations,
         "the first commit must reuse the prewarmed index"
+    );
+}
+
+/// A home with one committed artifact, renamed so that its root is one this
+/// process has never indexed. The returned directory owns the home.
+async fn unindexed_home_for_test() -> (tempfile::TempDir, PathBuf) {
+    let original = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(original.path(), "thread", b"artifact").await);
+    let parent = tempfile::tempdir().expect("tempdir");
+    let home = parent.path().join("home");
+    std::fs::rename(original.path(), &home).expect("move home");
+    (parent, home)
+}
+
+/// Takes the shared lock and advances the generation as another process's
+/// commit does; the commit runs until the returned lock is dropped.
+fn begin_commit_as_another_process(root: &Path) -> AtomicWriteLock {
+    let target = retention_interprocess_lock_target(root);
+    let lock = acquire_atomic_write_lock(&target).expect("shared retention lock");
+    let next = std::fs::read_to_string(&target)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    write_bytes_atomically(&target, next.to_string().as_bytes()).expect("advance generation");
+    lock
+}
+
+async fn wait_for_indexed_root(root: &Path, context: &'static str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retention_mode_for_test(root) != RetentionModeKind::Indexed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(context);
+}
+
+fn indexed_bytes_for_test(root: &Path, path: &Path) -> Option<u64> {
+    match lock_retention_registry()
+        .roots
+        .get(&normalized_tool_output_root(root))
+        .map(|state| &state.mode)
+    {
+        Some(RetentionRootMode::Indexed(index)) => index
+            .records
+            .get(&normalized_retention_path(path))
+            .map(|record| record.bytes),
+        _ => panic!("expected an indexed root"),
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn startup_scan_leaves_the_shared_lock_to_another_processes_commit() {
+    let (_home_owner, home) = unindexed_home_for_test().await;
+    let root = home.join("tool-output");
+    // Another process's create transaction, listed while its commit still runs.
+    let running = root.join("other").join("running.log");
+    std::fs::create_dir_all(running.parent().expect("thread directory"))
+        .expect("thread directory");
+    std::fs::write(&running, b"partial").expect("running artifact");
+    std::fs::write(
+        logical_transaction_path(&running),
+        LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES,
+    )
+    .expect("running transaction");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    spawn_retention_index_prewarm(&home);
+    barrier.wait().await;
+    let lock_root = root.clone();
+    let other_process = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || begin_commit_as_another_process(&lock_root)),
+    )
+    .await
+    .expect("another process must commit while the startup scan runs")
+    .expect("other process");
+    barrier.wait().await;
+    wait_for_indexed_root(&root, "the startup scan installs its index").await;
+    // Recovering the listed transaction must wait for the running commit.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        std::fs::read(&running).expect("running artifact"),
+        b"partial"
+    );
+
+    std::fs::write(&running, b"committed").expect("finish running artifact");
+    std::fs::remove_file(logical_transaction_path(&running)).expect("finish transaction");
+    drop(other_process);
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            retention_sweep_semaphore(&root).acquire_owned(),
+        )
+        .await
+        .expect("the startup pass finishes")
+        .expect("retention admission"),
+    );
+
+    assert_eq!(
+        std::fs::read(&running).expect("committed artifact"),
+        b"committed"
+    );
+    assert_eq!(
+        indexed_bytes_for_test(&root, &running),
+        Some(b"committed".len() as u64),
+        "the family is observed again after its transaction"
+    );
+    let permit = retention_sweep_permit(&root)
+        .await
+        .expect("retention permit");
+    assert!(
+        take_retention_interprocess_index_stale(&root),
+        "a commit by another process during the scan leaves the index stale"
+    );
+    drop(permit);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn startup_scan_recovers_an_abandoned_transaction_under_the_shared_lock() {
+    let (_home_owner, home) = unindexed_home_for_test().await;
+    let root = home.join("tool-output");
+    let abandoned = root.join("other").join("abandoned.log");
+    std::fs::create_dir_all(abandoned.parent().expect("thread directory"))
+        .expect("thread directory");
+    std::fs::write(&abandoned, b"uncommitted").expect("abandoned artifact");
+    std::fs::write(
+        logical_transaction_path(&abandoned),
+        LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES,
+    )
+    .expect("abandoned transaction");
+
+    spawn_retention_index_prewarm(&home);
+    wait_for_indexed_root(&root, "the startup scan installs its index").await;
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            retention_sweep_semaphore(&root).acquire_owned(),
+        )
+        .await
+        .expect("the startup pass finishes")
+        .expect("retention admission"),
+    );
+
+    assert!(!abandoned.exists(), "the uncommitted family is removed");
+    assert!(!logical_transaction_path(&abandoned).exists());
+    assert_eq!(indexed_bytes_for_test(&root, &abandoned), None);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn background_rescan_leaves_the_shared_lock_to_another_processes_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(temp.path(), "thread", b"artifact").await);
+    let root = temp.path().join("tool-output");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    drop(begin_commit_as_another_process(&root));
+    let before = retention_diagnostics_for_test(&root).reconciliations;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    // The other process's commit makes this commit schedule a rescan.
+    drop(create_raw_output_artifact(temp.path(), "thread", b"second").await);
+    barrier.wait().await;
+    let lock_root = root.clone();
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || begin_commit_as_another_process(&lock_root)),
+        )
+        .await
+        .expect("another process must commit while the rescan runs")
+        .expect("other process"),
+    );
+    barrier.wait().await;
+    wait_for_rescan(&root, before, "the rescan finishes").await;
+}
+
+async fn wait_for_rescan(root: &Path, reconciliations_before: u64, context: &'static str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retention_diagnostics_for_test(root).reconciliations == reconciliations_before
+            || retention_mode_for_test(root) != RetentionModeKind::Indexed
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(context);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn background_rescan_does_not_block_this_processes_commits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(temp.path(), "thread", b"artifact").await);
+    let root = temp.path().join("tool-output");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    drop(begin_commit_as_another_process(&root));
+    let before = retention_diagnostics_for_test(&root).reconciliations;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    // The other process's commit makes this commit schedule a rescan.
+    drop(create_raw_output_artifact(temp.path(), "thread", b"second").await);
+    barrier.wait().await;
+    let during = tokio::time::timeout(
+        Duration::from_secs(5),
+        create_raw_output_artifact(temp.path(), "thread", b"during the rescan"),
+    )
+    .await
+    .expect("this process's commit must not wait for its own rescan");
+    let RawOutputArtifact::Stored { path, .. } = &during else {
+        panic!("expected stored artifact");
+    };
+    barrier.wait().await;
+    wait_for_rescan(&root, before, "the rescan finishes").await;
+    assert!(
+        indexed_bytes_for_test(&root, path).is_some(),
+        "the rescanned index keeps the commit made during the rescan"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn inline_rebuild_leaves_the_shared_lock_to_another_processes_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = create_raw_output_artifact(temp.path(), "thread", b"artifact").await;
+    let RawOutputArtifact::Stored { path, .. } = &first else {
+        panic!("expected stored artifact");
+    };
+    let root = temp.path().join("tool-output");
+    // An invalidated index makes the next commit rebuild it inline.
+    reject_stale_delta(&capture_retention_token(
+        path.parent().expect("artifact directory"),
+    ));
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    let home = temp.path().to_path_buf();
+    let commit =
+        tokio::spawn(async move { create_raw_output_artifact(&home, "thread", b"second").await });
+    barrier.wait().await;
+    let lock_root = root.clone();
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || begin_commit_as_another_process(&lock_root)),
+        )
+        .await
+        .expect("another process must commit while the rebuild scans")
+        .expect("other process"),
+    );
+    barrier.wait().await;
+    let second = tokio::time::timeout(Duration::from_secs(10), commit)
+        .await
+        .expect("the commit finishes")
+        .expect("commit task");
+    assert!(matches!(second, RawOutputArtifact::Stored { .. }));
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Indexed);
+    let permit = retention_sweep_permit(&root)
+        .await
+        .expect("retention permit");
+    assert!(
+        take_retention_interprocess_index_stale(&root),
+        "a commit by another process during the rebuild leaves the index stale"
+    );
+    drop(permit);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn protection_reconciliation_relists_its_thread_without_a_full_rescan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kept_output = b"referenced output";
+    let kept = create_raw_output_artifact(temp.path(), "thread", kept_output).await;
+    let dropped = create_raw_output_artifact(temp.path(), "thread", b"unreferenced").await;
+    let (
+        RawOutputArtifact::Stored {
+            id: kept_id,
+            path: kept_path,
+            ..
+        },
+        RawOutputArtifact::Stored {
+            path: dropped_path, ..
+        },
+    ) = (&kept, &dropped)
+    else {
+        panic!("expected stored artifacts");
+    };
+    // An earlier protection that reconciliation must now withdraw.
+    std::fs::write(
+        active_tool_history_protection_path(dropped_path),
+        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+    )
+    .expect("earlier protection marker");
+    let root = temp.path().join("tool-output");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    let before = retention_diagnostics_for_test(&root);
+    let references = BTreeMap::from([(
+        kept_id.to_string(),
+        (
+            kept_output.len() as u64,
+            hex::encode(Sha256::digest(kept_output)),
+        ),
+    )]);
+
+    let live =
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+
+    assert_eq!(live, BTreeSet::from([kept_id.to_string()]));
+    let after = retention_diagnostics_for_test(&root);
+    assert_eq!(after.scans, before.scans, "no full-root rescan");
+    assert_eq!(after.reconciliations, before.reconciliations);
+    let protected = |path: &Path| match lock_retention_registry()
+        .roots
+        .get(&normalized_tool_output_root(&root))
+        .map(|state| &state.mode)
+    {
+        Some(RetentionRootMode::Indexed(index)) => index
+            .records
+            .get(&normalized_retention_path(path))
+            .map(|record| record.protected),
+        _ => None,
+    };
+    assert_eq!(protected(kept_path), Some(true));
+    assert_eq!(
+        protected(dropped_path),
+        Some(false),
+        "the thread's listing withdraws the removed protection from the index"
     );
 }
 
@@ -4738,7 +5081,7 @@ async fn cancelled_history_protection_retains_admission_until_protection_is_visi
         id.clone(),
         (
             body.len() as u64,
-            format!("{:x}", Sha256::digest(body.as_bytes())),
+            hex::encode(Sha256::digest(body.as_bytes())),
         ),
     )]);
     let semaphore = retention_sweep_semaphore(&root);
@@ -5096,7 +5439,7 @@ fn history_protection_finishes_with_one_blocking_thread() {
                 "thread",
                 &id.to_string(),
                 body.len() as u64,
-                &format!("{:x}", Sha256::digest(body)),
+                &hex::encode(Sha256::digest(body)),
             )
             .await
             .expect("normal public protection completes");
@@ -5143,7 +5486,7 @@ fn committed_history_pruning_finishes_with_one_blocking_thread() {
                 let RawOutputArtifact::Stored { id, path, .. } = artifact else {
                     panic!("raw artifact creation should complete");
                 };
-                let digest = format!("{:x}", Sha256::digest(body));
+                let digest = hex::encode(Sha256::digest(body));
                 protect_active_tool_history_artifact(
                     temp.path(),
                     "thread",
@@ -5290,7 +5633,7 @@ fn assert_canonical_operation_finishes_with_one_blocking_thread(attach: bool) {
             assert_eq!(metadata.canonical_bytes, body.len() as u64);
             assert_eq!(
                 metadata.canonical_sha256,
-                format!("{:x}", Sha256::digest(body.as_bytes()))
+                hex::encode(Sha256::digest(body.as_bytes()))
             );
             let mut persisted = std::fs::read(&path).expect("base segment");
             persisted.extend(std::fs::read(logical_segment_path(&path, 1)).expect("tail segment"));
@@ -5676,7 +6019,7 @@ async fn incomplete_remint_cleanup_survives_cancellation_while_registry_is_locke
     .await;
     assert!(source.complete);
     let id = source.artifact_id().expect("source ID");
-    let digest = format!("{:x}", Sha256::digest(body));
+    let digest = hex::encode(Sha256::digest(body));
     let directory = temp.path().join("tool-output/target");
     tokio::fs::create_dir_all(&directory)
         .await
@@ -5851,7 +6194,7 @@ async fn remint_protection_failure_cleans_target_and_preserves_source_for_retry(
     .await;
     assert!(source.complete);
     let id = source.artifact_id().expect("source artifact ID");
-    let digest = format!("{:x}", Sha256::digest(body));
+    let digest = hex::encode(Sha256::digest(body));
     let target_path = temp
         .path()
         .join("tool-output/target")
@@ -6010,7 +6353,7 @@ async fn protected_artifact_for_thread(codex_home: &Path, thread_id: &str) -> Pa
         thread_id,
         &id.to_string(),
         *bytes,
-        &format!("{:x}", Sha256::digest(output.as_bytes())),
+        &hex::encode(Sha256::digest(output.as_bytes())),
     )
     .await
     .expect("protect artifact");
@@ -6726,7 +7069,7 @@ async fn raw_capture_completeness_is_required_for_snapshot_protection_and_remint
         // Even a matching identity for every surviving byte cannot prove that
         // a lost producer tail never existed. Complete is the positive control.
         let retained = std::fs::read(&path).unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(&retained));
+        let sha256 = hex::encode(Sha256::digest(&retained));
         let expected_complete = status == "complete";
         assert_eq!(
             read_complete_canonical_snapshot(home.path(), "source", &id, retained.len())

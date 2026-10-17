@@ -360,7 +360,7 @@ fn digest_context_fragments(items: &[ResponseItem]) -> Vec<ContextFragmentDigest
             }
             ContextFragmentDigest {
                 key,
-                digest: format!("{:x}", hasher.finalize()),
+                digest: hex::encode(hasher.finalize()),
             }
         })
         .collect()
@@ -7173,7 +7173,7 @@ impl std::io::Write for Sha256Writer {
 fn durable_history_commit_key(turn_id: &str, items: &[ResponseItem]) -> std::io::Result<String> {
     let mut writer = Sha256Writer(Sha256::new());
     serde_json::to_writer(&mut writer, items).map_err(std::io::Error::other)?;
-    Ok(format!("{turn_id}:{:x}", writer.0.finalize()))
+    Ok(format!("{turn_id}:{}", hex::encode(writer.0.finalize())))
 }
 
 const HISTORY_IDENTITY_OFFLOAD_MIN_TEXT_BYTES: usize = 48 * 1024;

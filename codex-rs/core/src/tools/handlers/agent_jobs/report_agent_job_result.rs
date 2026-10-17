@@ -114,7 +114,7 @@ pub async fn handle(
     let mut output = FunctionToolOutput::from_text(content, Some(true));
     if args.deliver && accepted {
         let message = args.result.to_string();
-        let revision = format!("{:x}", sha2::Sha256::digest(message.as_bytes()));
+        let revision = hex::encode(sha2::Sha256::digest(message.as_bytes()));
         output.sampling_request_signal = Some(serde_json::json!({
             "authoritative_wait_owner_v1": {
                 "adapter": "agent_job_report",

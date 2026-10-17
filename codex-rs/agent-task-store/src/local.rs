@@ -3869,7 +3869,7 @@ async fn seal_architecture_contract_for_receipt_tx(
     .await?;
     let contract =
         canonicalize_architecture_contract_async(Path::new(&canonical_root), contract).await?;
-    let contract_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&contract)?));
+    let contract_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&contract)?));
     Ok(Some(SealedArchitectureContractV1 {
         contract,
         contract_sha256,
@@ -3952,10 +3952,7 @@ async fn validate_architecture_contract_reference_tx(
     }
     let sealed_contract =
         canonicalize_architecture_contract_async(repo_root, sealed.contract).await?;
-    let sealed_hash = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&sealed_contract)?)
-    );
+    let sealed_hash = hex::encode(Sha256::digest(serde_json::to_vec(&sealed_contract)?));
     if sealed_hash != reference.contract_sha256 {
         return Err(StoreError::InvalidAssignment(
             "sealed architecture contract is not canonical for the worker repository".to_string(),
@@ -4927,7 +4924,7 @@ fn missing_evidence_obligations(
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 

@@ -22,46 +22,30 @@ use codex_mcp::ToolPluginProvenance;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ToolName;
 use pretty_assertions::assert_eq;
-use rmcp::model::AnnotateAble;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::ResourceContents;
 use serde_json::json;
 use tokio::sync::Mutex;
 
 fn resource(uri: &str, name: &str) -> Resource {
-    rmcp::model::RawResource {
-        uri: uri.to_string(),
-        name: name.to_string(),
-        title: None,
-        description: None,
-        mime_type: None,
-        size: None,
-        icons: None,
-        meta: None,
-    }
-    .no_annotation()
+    Resource::new(uri, name)
 }
 
 fn template(uri_template: &str, name: &str) -> ResourceTemplate {
-    rmcp::model::RawResourceTemplate {
-        uri_template: uri_template.to_string(),
-        name: name.to_string(),
-        title: None,
-        description: None,
-        mime_type: None,
-        icons: None,
-    }
-    .no_annotation()
+    ResourceTemplate::new(uri_template, name)
 }
 
 #[test]
 fn incomplete_collection_prefix_preserves_status_and_continuation_in_delivery() {
-    let mut meta = rmcp::model::Meta::new();
+    let mut meta = rmcp::model::MetaObject::new();
     meta.insert(
         "codex/collectionError".into(),
         json!("incomplete collection: later page timed out"),
     );
     let resources = ListResourcesResult {
+        result_type: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: Some(meta.clone()),
         next_cursor: Some("next".into()),
         resources: vec![resource("file:///retained", "retained")],
@@ -84,6 +68,9 @@ fn incomplete_collection_prefix_preserves_status_and_continuation_in_delivery() 
     assert_eq!(payload.next_cursor.as_deref(), Some("next"));
     assert_eq!(payload.errors.len(), 1);
     let templates = ListResourceTemplatesResult {
+        result_type: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: Some(meta),
         next_cursor: Some("next-template".into()),
         resource_templates: vec![template("file:///{id}", "retained")],
@@ -217,6 +204,9 @@ async fn step_context_with_blocked_mcp_server(
 #[test]
 fn list_resources_payload_from_single_server_copies_next_cursor() {
     let result = ListResourcesResult {
+        result_type: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
         next_cursor: Some("cursor-1".to_string()),
         resources: vec![resource("memo://id", "memo")],
@@ -245,6 +235,9 @@ fn list_resources_payload_from_all_servers_is_sorted() {
     map.insert(
         "beta".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: None,
             resources: vec![resource("memo://b-1", "b-1")],
@@ -253,6 +246,9 @@ fn list_resources_payload_from_all_servers_is_sorted() {
     map.insert(
         "alpha".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: None,
             resources: vec![resource("memo://a-1", "a-1"), resource("memo://a-2", "a-2")],
@@ -455,6 +451,9 @@ fn aggregate_resources_keep_whole_pages_and_continuation_metadata() {
     pages.insert(
         "alpha".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("alpha-next".to_string()),
             resources: vec![
@@ -466,6 +465,9 @@ fn aggregate_resources_keep_whole_pages_and_continuation_metadata() {
     pages.insert(
         "beta".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("beta-next".to_string()),
             resources: vec![resource("memo://beta/id", "beta")],
@@ -497,6 +499,9 @@ fn cursorless_single_server_resource_page_is_bounded_to_a_prefix() {
     let payload = ListResourcesPayload::from_single_server(
         "codex_apps".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: None,
             resources: (0..resource_count)
@@ -541,6 +546,9 @@ fn single_server_pages_bound_projection_without_losing_opaque_cursor() {
     let resources = ListResourcesPayload::from_single_server(
         "srv".to_string(),
         ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("opaque-resource-cursor".to_string()),
             resources: (0..4)
@@ -558,6 +566,9 @@ fn single_server_pages_bound_projection_without_losing_opaque_cursor() {
     let templates = ListResourceTemplatesPayload::from_single_server(
         "srv".to_string(),
         ListResourceTemplatesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("opaque-template-cursor".to_string()),
             resource_templates: (0..4)
@@ -599,6 +610,9 @@ fn aggregate_templates_keep_whole_pages_and_continuation_metadata() {
     pages.insert(
         "alpha".to_string(),
         ListResourceTemplatesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("alpha-next".to_string()),
             resource_templates: vec![
@@ -610,6 +624,9 @@ fn aggregate_templates_keep_whole_pages_and_continuation_metadata() {
     pages.insert(
         "beta".to_string(),
         ListResourceTemplatesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
             next_cursor: Some("beta-next".to_string()),
             resource_templates: vec![template("memo://beta/{id}", "beta")],
@@ -641,6 +658,9 @@ fn aggregate_resource_errors_are_disclosed_and_all_failure_is_not_success() {
             results: HashMap::from([(
                 "ready".to_string(),
                 ListResourcesResult {
+                    result_type: None,
+                    ttl_ms: None,
+                    cache_scope: None,
                     meta: None,
                     next_cursor: None,
                     resources: Vec::new(),

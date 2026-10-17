@@ -66,9 +66,9 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
-use core_test_support::hooks::trust_discovered_hooks;
-use core_test_support::responses;
-use core_test_support::test_codex::test_codex;
+use crate::test_harness::hooks::trust_discovered_hooks;
+use crate::test_harness::responses;
+use crate::test_harness::test_codex::test_codex;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
@@ -1475,7 +1475,7 @@ async fn deferred_tool_schema_survives_sampling_error_exit() {
 #[test]
 fn audit_reports_17_19_retry_preserves_accepted_history_and_retry_limit() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit_reports_17_19_retry", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for accepted_output in [false, true] {
             let server = responses::start_mock_server().await;
             let partial = if accepted_output {
@@ -1533,7 +1533,7 @@ fn continuation_prefetch_returns_before_capture_and_overlaps_step_context() -> R
 
 async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl() -> Result<()>
 {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let mut completed = responses::ev_completed("prefetch");
     completed["response"]["end_turn"] = serde_json::json!(false);
@@ -2529,7 +2529,7 @@ fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Resu
 }
 
 async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     // The former 16-generation novelty cutoff must not suppress repair tools.
     let mut sequence = (0..15)
@@ -4204,7 +4204,7 @@ fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
 }
 
 async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     for provider_id in ["", "msg_sctx_provider", "ordinary-provider-id"] {
         assert_streamed_item_id(provider_id).await?;
     }
@@ -4241,7 +4241,7 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
         })
         .await?;
 
-    let started_id = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+    let started_id = crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
         EventMsg::ItemStarted(event) => match &event.item {
             TurnItem::AgentMessage(item) => Some(item.id.clone()),
             _ => None,
@@ -4249,14 +4249,14 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
         _ => None,
     })
     .await;
-    let delta = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+    let delta = crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
         EventMsg::AgentMessageContentDelta(event) => Some(event.clone()),
         _ => None,
     })
     .await;
     assert_eq!(delta.item_id, started_id);
     assert_eq!(delta.delta, "streamed");
-    let completed_id = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+    let completed_id = crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
         EventMsg::ItemCompleted(event) => match &event.item {
             TurnItem::AgentMessage(item) => Some(item.id.clone()),
             _ => None,
@@ -4271,7 +4271,7 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
         id => assert_eq!(started_id, id),
     }
     assert_eq!(started_id, completed_id);
-    let completed = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+    let completed = crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
         EventMsg::TurnComplete(event) => Some(event.clone()),
         _ => None,
     })
@@ -4828,7 +4828,7 @@ fn generation_budget_renews_on_reentry_input_and_persists_terminal_directive() -
 
 async fn generation_budget_renews_on_reentry_input_and_persists_terminal_directive_impl()
 -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
     let mut sequence = (0..limit - 2)
@@ -4960,7 +4960,7 @@ else:
     fs::write(test.codex_home_path().join("reentry.release"), "release")?;
     // The renewed allowance runs another full set of generations, so this wait
     // gets the same budget as the first phase.
-    let completion = core_test_support::wait_for_event_match_with_timeout(
+    let completion = crate::test_harness::wait_for_event_match_with_timeout(
         &test.codex,
         |event| match event {
             EventMsg::TurnComplete(event) => Some(event.clone()),
@@ -5022,7 +5022,7 @@ fn mid_turn_compaction_failure_preserves_completed_message() -> Result<()> {
 }
 
 async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let requests = responses::mount_response_sequence(
         &server,
@@ -5096,7 +5096,7 @@ fn protocol_continuation_runs_required_work_without_new_input() -> Result<()> {
 }
 
 async fn protocol_continuation_runs_required_work_without_new_input_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     for response_kind in ["commentary", "reasoning", "empty"] {
         let server = responses::start_mock_server().await;
         let mut completed = responses::ev_completed("continuing");
@@ -5178,7 +5178,7 @@ fn passing_focused_validation_keeps_the_second_change_executable() -> Result<()>
 }
 
 async fn passing_focused_validation_keeps_the_second_change_executable_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let python = if cfg!(windows) { "python" } else { "python3" };
     let mut sequence = Vec::new();
@@ -5254,7 +5254,7 @@ fn repeated_failed_read_preserves_a_different_required_action() -> Result<()> {
 }
 
 async fn repeated_failed_read_preserves_a_different_required_action_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let mut sequence = Vec::new();
     for index in 1..=3 {
@@ -5338,7 +5338,7 @@ fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error() -> Resul
 }
 
 async fn compaction_that_remains_over_limit_is_not_a_retryable_stream_error_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let requests = responses::mount_sse_sequence(
         &server,
@@ -6912,7 +6912,7 @@ fn initial_response_item_triggers_compaction_before_the_stream_request() -> Resu
 }
 
 async fn initial_response_item_triggers_compaction_before_the_stream_request_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let request_log = responses::mount_sse_sequence(
         &server,
@@ -7038,7 +7038,7 @@ fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_lim
 
 async fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit_impl()
 -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let request_log = responses::mount_sse_sequence(
         &server,
@@ -7159,7 +7159,7 @@ fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Result<()>
 }
 
 async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() -> Result<()> {
-    let command = core_test_support::stdio_server_bin()
+    let command = crate::test_harness::stdio_server_bin()
         .context("test_stdio_server helper is required by the MCP inventory snapshot regression")?;
     let (mut session, mut turn_context, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -8077,7 +8077,7 @@ async fn registered_command_repair_preserves_safety_history_and_post_hook_contex
 }
 
 async fn stop_hook_continuation_reaches_the_final_response_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
         &server,
@@ -8159,7 +8159,7 @@ fn models_etag_refresh_does_not_block_tool_continuation() -> Result<()> {
 }
 
 async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     const REFRESH_ETAG: &str = "\"phase-68-models-2\"";
 
     let server = responses::start_mock_server().await;
@@ -8274,7 +8274,7 @@ async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<(
 
 #[tokio::test]
 async fn unchanged_model_and_comp_hash_skip_previous_model_context_reconstruction() -> Result<()> {
-    core_test_support::require_network!();
+    crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -9625,7 +9625,7 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
 #[test]
 fn audit_stop_hook_unchanged_failure_stops_after_one_repair() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit_stop_hook_unchanged_failure", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let requests = responses::mount_sse_sequence(
             &server,
@@ -9659,7 +9659,7 @@ fn audit_stop_hook_unchanged_failure_stops_after_one_repair() -> Result<()> {
 #[test]
 fn completion_boundary_hook_repairs_compare_the_rejected_answer() -> Result<()> {
     run_turn_multi_thread_test_with_stack("completion_boundary_hook_repairs", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for unrelated_read in [false, true] {
             let server = responses::start_mock_server().await;
             let answer = |id: &str, text: &str| {
@@ -9722,7 +9722,7 @@ fn completion_boundary_hook_repairs_compare_the_rejected_answer() -> Result<()> 
 #[test]
 fn completion_boundary_rejected_direct_answers_are_never_published() -> Result<()> {
     run_turn_multi_thread_test_with_stack("completion_boundary_direct_hooks", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for mode in ["repair-model", "repair-direct", "abort"] {
             let server = responses::start_mock_server().await;
             let direct = |id: &str, text: &str| {
@@ -9817,7 +9817,7 @@ fn completion_boundary_rejected_direct_answers_are_never_published() -> Result<(
 #[test]
 fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit_stop_hook_alternating_feedback", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let requests = responses::mount_sse_sequence(
             &server,
@@ -9851,7 +9851,7 @@ fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<
 #[test]
 fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()> {
     run_turn_multi_thread_test_with_stack("post_validation_finalizer_boundary", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let python = if cfg!(windows) { "python" } else { "python3" };
         let command = serde_json::json!({
@@ -9977,7 +9977,7 @@ fn audit_finalizer_failure_precedes_stop_repair() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "audit_finalizer_failure_precedes_stop_repair",
         || async {
-            core_test_support::require_network!();
+            crate::test_harness::require_network!();
             let server = responses::start_mock_server().await;
             let requests = responses::mount_sse_sequence(
                 &server,
@@ -10015,7 +10015,7 @@ fn audit_finalizer_failure_precedes_stop_repair() -> Result<()> {
 #[test]
 fn audit_provider_overflow_recovers_once_in_the_same_turn() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit_provider_overflow_recovers_once", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         for repeated_overflow in [false, true] {
             let server = responses::start_mock_server().await;
             let overflow = responses::sse_failed(
@@ -10079,7 +10079,7 @@ fn audit_provider_overflow_recovers_once_in_the_same_turn() -> Result<()> {
 #[test]
 fn oversized_required_instructions_stop_after_bounded_compaction() -> Result<()> {
     run_turn_multi_thread_test_with_stack("oversized_required_instructions", || async {
-        core_test_support::require_network!();
+        crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let requests = responses::mount_sse_sequence(
             &server,

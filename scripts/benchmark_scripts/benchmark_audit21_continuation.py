@@ -64,7 +64,7 @@ def assess(case, answer, calls):
 
 def build_packets(root):
     paths = {
-        "runtime": "codex-rs/code-mode/src/runtime/mod.rs",
+        "runtime": "codex-rs/code-mode-runtime/src/runtime/mod.rs",
         "exit_test": "codex-rs/core/src/tools/code_mode/response_tests.rs",
         "spill": "codex-rs/hooks/src/output_spill.rs",
         "hook_test": "codex-rs/hooks/src/output_spill_tests.rs",

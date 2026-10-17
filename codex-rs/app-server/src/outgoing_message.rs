@@ -767,7 +767,7 @@ impl OutgoingMessageSender {
 
     fn next_request_id(&self) -> std::result::Result<RequestId, JSONRPCErrorError> {
         self.next_server_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map(RequestId::Integer)
             .map_err(|_| internal_error("app-server request IDs are exhausted"))
     }

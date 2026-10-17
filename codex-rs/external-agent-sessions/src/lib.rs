@@ -135,7 +135,7 @@ mod tests {
                 .expect("importable before recording");
         assert_eq!(
             pending.source_content_sha256,
-            format!("{:x}", Sha256::digest(&contents))
+            hex::encode(Sha256::digest(&contents))
         );
         ledger::record_imported_session(&codex_home, &source_path, ThreadId::new())
             .expect("record import");
@@ -201,7 +201,7 @@ mod tests {
 
         assert_eq!(
             pending.source_content_sha256,
-            format!("{:x}", Sha256::digest(contents))
+            hex::encode(Sha256::digest(contents))
         );
         assert_eq!(pending.source_path, source_path.canonicalize().unwrap());
         assert_eq!(pending.session.cwd, root.path());

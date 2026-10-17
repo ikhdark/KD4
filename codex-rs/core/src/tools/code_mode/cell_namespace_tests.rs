@@ -15,7 +15,7 @@ fn request(source: &str) -> codex_code_mode::ExecuteRequest {
 #[tokio::test]
 async fn foreign_cell_handles_cannot_observe_or_terminate_another_session() {
     let provider: Arc<dyn CodeModeSessionProvider> =
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider);
+        Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider);
     let parent = CodeModeService::new(Arc::clone(&provider));
     let child = CodeModeService::new(provider);
     let parent_cell = parent

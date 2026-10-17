@@ -2546,7 +2546,7 @@ mod tests {
                 },
             },
         });
-        let runtime = codex_code_mode::InProcessCodeModeSession::with_delegate(delegate.clone());
+        let runtime = codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(delegate.clone());
         let started = std::time::Instant::now();
         let result = runtime.execute(codex_code_mode::ExecuteRequest {
             state_path: None, tool_call_id: "one-cell".into(), enabled_tools,

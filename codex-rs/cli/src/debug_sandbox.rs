@@ -212,6 +212,7 @@ async fn run_command_under_windows_session(
         proxy_enforced: false,
         timeout_ms: None,
         read_roots_override: None,
+        additional_read_roots: empty_paths,
         read_roots_include_platform_defaults: false,
         write_roots_override: None,
         deny_read_paths_override: empty_paths,

@@ -15,13 +15,14 @@ pub(crate) mod registry;
 pub(crate) mod router;
 pub(crate) mod runtimes;
 pub(crate) mod sandboxing;
-pub(crate) mod shell_output_summary;
+pub(crate) use codex_command_analysis::shell_output_summary;
 pub(crate) mod spec_plan;
 pub(crate) mod tool_dispatch_trace;
 
 use std::borrow::Cow;
 
 use crate::session::turn_context::TurnContext;
+pub(crate) use codex_command_analysis::run_blocking_command_analysis;
 use codex_features::Feature;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::openai_models::ToolMode;
@@ -41,16 +42,6 @@ use shell_output_summary::summarize_shell_output_for_model_with_streams;
 
 pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
-
-pub(crate) async fn run_blocking_command_analysis<T, F>(
-    operation: F,
-) -> Result<T, tokio::task::JoinError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    tokio::task::spawn_blocking(operation).await
-}
 
 pub(crate) fn is_shell_family_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none()
@@ -75,7 +66,7 @@ pub(crate) fn flat_tool_name(tool_name: &ToolName) -> Cow<'_, str> {
     }
 }
 
-fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
+pub(crate) fn requested_tool_mode(turn_context: &TurnContext) -> ToolMode {
     turn_context.model_info.tool_mode.unwrap_or_else(|| {
         if turn_context.config.features.enabled(Feature::CodeModeOnly) {
             ToolMode::CodeModeOnly
@@ -85,6 +76,15 @@ fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
             ToolMode::Direct
         }
     })
+}
+
+/// Ordinary Code Mode uses direct tools when cells cannot run; `CodeModeOnly`
+/// keeps its tools and fails closed.
+pub(crate) fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
+    match requested_tool_mode(turn_context) {
+        ToolMode::CodeMode if !turn_context.code_mode_available => ToolMode::Direct,
+        tool_mode => tool_mode,
+    }
 }
 
 pub(crate) fn project_exec_output_for_model_with_budget(
@@ -253,3 +253,7 @@ fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> Cow<'_, str> 
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shell_output_summary_projection_tests.rs"]
+mod shell_output_summary_projection_tests;

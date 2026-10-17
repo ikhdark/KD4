@@ -94,8 +94,10 @@ const MAX_MCP_COLLECTION_ITEMS: usize = 10_000;
 // An exhaustive collection returns a retained prefix with its retry cursor on
 // late failure. Metadata travels with the page so single-server callers cannot
 // accidentally drop the incomplete status when extracting a successful prefix.
-async fn collect_resource_pages<T, F, Fut>(budget: Duration, mut fetch: F)
-    -> Result<(Vec<T>, Option<String>, Option<rmcp::model::Meta>)>
+async fn collect_resource_pages<T, F, Fut>(
+    budget: Duration,
+    mut fetch: F,
+) -> Result<(Vec<T>, Option<String>, Option<rmcp::model::MetaObject>)>
 where
     F: FnMut(Option<String>, Duration) -> Fut,
     Fut: Future<Output = Result<(Vec<T>, Option<String>)>>,
@@ -126,7 +128,7 @@ where
     };
     if completed_pages == 0 { return Err(anyhow!(failure)); }
     let message = format!("incomplete collection after {completed_pages} page(s): {failure}");
-    let mut meta = rmcp::model::Meta::new();
+    let mut meta = rmcp::model::MetaObject::new();
     meta.insert("codex/collectionError".into(), JsonValue::String(message));
     Ok((items, cursor, Some(meta)))
 }
@@ -1217,11 +1219,27 @@ impl McpConnectionManager {
                     return (server_name, Ok(None));
                 }
                 let client = &managed_client.client;
-                let result = collect_resource_pages(managed_client.tool_timeout, |cursor, remaining| async move {
-                    let params = cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-                    let page = client.list_resources(params, Some(remaining)).await?;
-                    Ok((page.resources, page.next_cursor))
-                }).await.map(|(resources, next_cursor, meta)| Some(ListResourcesResult { resources, next_cursor, meta }));
+                let result = collect_resource_pages(
+                    managed_client.tool_timeout,
+                    |cursor, remaining| async move {
+                        let params = cursor.map(|cursor| {
+                            PaginatedRequestParams::default().with_cursor(Some(cursor))
+                        });
+                        let page = client.list_resources(params, Some(remaining)).await?;
+                        Ok((page.resources, page.next_cursor))
+                    },
+                )
+                .await
+                .map(|(resources, next_cursor, meta)| {
+                    Some(ListResourcesResult {
+                        result_type: None,
+                        meta,
+                        next_cursor,
+                        ttl_ms: None,
+                        cache_scope: None,
+                        resources,
+                    })
+                });
                 (server_name, result)
             });
             task_servers.insert(abort_handle.id(), task_server);
@@ -1378,11 +1396,29 @@ impl McpConnectionManager {
                     return (server_name, Ok(None));
                 }
                 let client = &managed_client.client;
-                let result = collect_resource_pages(managed_client.tool_timeout, |cursor, remaining| async move {
-                    let params = cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-                    let page = client.list_resource_templates(params, Some(remaining)).await?;
-                    Ok((page.resource_templates, page.next_cursor))
-                }).await.map(|(resource_templates, next_cursor, meta)| Some(ListResourceTemplatesResult { resource_templates, next_cursor, meta }));
+                let result = collect_resource_pages(
+                    managed_client.tool_timeout,
+                    |cursor, remaining| async move {
+                        let params = cursor.map(|cursor| {
+                            PaginatedRequestParams::default().with_cursor(Some(cursor))
+                        });
+                        let page = client
+                            .list_resource_templates(params, Some(remaining))
+                            .await?;
+                        Ok((page.resource_templates, page.next_cursor))
+                    },
+                )
+                .await
+                .map(|(resource_templates, next_cursor, meta)| {
+                    Some(ListResourceTemplatesResult {
+                        result_type: None,
+                        meta,
+                        next_cursor,
+                        ttl_ms: None,
+                        cache_scope: None,
+                        resource_templates,
+                    })
+                });
                 (server_name, result)
             });
             task_servers.insert(abort_handle.id(), task_server);

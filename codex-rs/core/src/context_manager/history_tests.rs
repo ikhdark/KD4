@@ -3408,6 +3408,100 @@ fn unchanged_context_reinjection_preserves_sampling_prefix_across_turns() {
 }
 
 #[test]
+fn unchanged_volatile_context_reinjection_preserves_sampling_prefix_across_turns() {
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    let context = |role: &str, text: &str, turn: &str| {
+        let mut item = user_input_text_msg(text);
+        if let ResponseItem::Message {
+            role: item_role, ..
+        } = &mut item
+        {
+            *item_role = role.to_string();
+        }
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        item.set_turn_id_if_missing(turn);
+        item
+    };
+    let task = |text: &str, turn: &str| {
+        let mut item = user_input_text_msg(text);
+        item.set_turn_id_if_missing(turn);
+        item
+    };
+    let prepare = |history: &ContextManager| {
+        history
+            .clone()
+            .prepare_for_sampling_prompt_with_completed_tool_projection(
+                &default_input_modalities(),
+                StableContextTarget::Sampling,
+                None,
+                &workspace,
+            )
+    };
+    // A full startup reinjection repeats these sections unchanged, and their
+    // sampling projection keeps only the latest value of each slot.
+    for (role, same, changed) in [
+        (
+            "user",
+            "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+            "<environment_context>\n  <cwd>/other</cwd>\n</environment_context>",
+        ),
+        (
+            "user",
+            "<subagents_context>worker</subagents_context>",
+            "<subagents_context>reviewer</subagents_context>",
+        ),
+        (
+            "developer",
+            "<app-context>editor</app-context>",
+            "<app-context>browser</app-context>",
+        ),
+        (
+            "developer",
+            "<model_switch>from model-a</model_switch>",
+            "<model_switch>from model-b</model_switch>",
+        ),
+    ] {
+        let original = context(role, same, "first");
+        let mut history =
+            create_history_with_items(vec![original.clone(), task("first task", "first")]);
+        let before = prepare(&history);
+        let repeat = context(role, same, "second");
+        history.record_items(
+            [&repeat, &task("second task", "second")],
+            TruncationPolicy::Tokens(10_000),
+        );
+        let after = prepare(&history);
+        assert!(after.items().starts_with(before.items()), "{same}");
+        assert!(after.items().contains(&original), "{same}");
+        assert!(!after.items().contains(&repeat), "{same}");
+
+        // A changed value still supersedes the original.
+        let replacement = context(role, changed, "third");
+        history.record_items(
+            [&replacement, &task("third task", "third")],
+            TruncationPolicy::Tokens(10_000),
+        );
+        let replaced = prepare(&history);
+        assert!(!replaced.items().contains(&original), "{changed}");
+        assert!(replaced.items().contains(&replacement), "{changed}");
+    }
+
+    // Recommended plugins are shown only for the latest user turn, so their
+    // repeat is the occurrence that must remain visible.
+    let plugins = "<recommended_plugins>linter</recommended_plugins>";
+    let mut history = create_history_with_items(vec![
+        context("user", plugins, "first"),
+        task("first task", "first"),
+    ]);
+    let repeat = context("user", plugins, "second");
+    history.record_items(
+        [&repeat, &task("second task", "second")],
+        TruncationPolicy::Tokens(10_000),
+    );
+    assert!(prepare(&history).items().contains(&repeat));
+}
+
+#[test]
 fn sampling_boundary_retires_superseded_slots_without_hoisting_or_touching_user_text() {
     let trusted = |text: &str| {
         let mut item = user_input_text_msg(text);

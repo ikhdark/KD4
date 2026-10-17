@@ -654,7 +654,7 @@ fn is_vcs_metadata(name: &OsStr) -> bool {
 
 fn reserve_walk_slot(counter: &AtomicUsize, limit: usize) -> bool {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < limit).then(|| count.saturating_add(1))
         })
         .is_ok()

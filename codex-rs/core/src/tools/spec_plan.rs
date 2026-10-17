@@ -784,7 +784,12 @@ fn build_code_mode_executors(
                 // Detailed result contracts are available through resolve_tool.
                 // Eager descriptions retain lifecycle/recovery semantics; do not
                 // replay the large transport union on every model generation.
-                definition.output_schema = None;
+                // Command results get one compact named shape instead: with an
+                // `unknown` result, cells reconstruct these fields every turn.
+                definition.output_schema =
+                    matches!(&*definition.name, "exec_command" | "write_stdin").then(
+                        crate::tools::handlers::shell_spec::unified_exec_eager_output_schema,
+                    );
                 // Eager prompt projection only: registration and resolve_tool keep
                 // the full contract, and the handlers still decode these fields.
                 let withdrawn: &[&str] = match &*definition.name {
@@ -1517,10 +1522,7 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
             "annotations": tool.tool.annotations,
         }));
         use sha2::Digest;
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(canonical.to_string().as_bytes())
-        )
+        hex::encode(sha2::Sha256::digest(canonical.to_string().as_bytes()))
     };
     if let Some(mcp_tools) = context.mcp_tools {
         for tool in mcp_tools {

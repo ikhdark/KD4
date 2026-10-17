@@ -1014,6 +1014,212 @@ async fn stalled_stdin_acknowledgement_is_not_replayed_and_preserves_unconfirmed
     }
 }
 
+/// Models the exec-server's in-process backend: a write waits for stdin queue
+/// capacity and queues its bytes only after that wait, so a dropped write
+/// queues nothing.
+struct UnsentOnCancelExecProcess {
+    inner: MockExecProcess,
+    capacity: watch::Sender<bool>,
+    attempts: AtomicUsize,
+    queued: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl ExecProcess for UnsentOnCancelExecProcess {
+    fn process_id(&self) -> &ProcessId {
+        self.inner.process_id()
+    }
+
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        self.inner.subscribe_wake()
+    }
+
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        self.inner.subscribe_events()
+    }
+
+    fn read(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        ExecProcess::read(&self.inner, after_seq, max_bytes, wait_ms)
+    }
+
+    fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async move {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            let _ = self.capacity.subscribe().wait_for(|open| *open).await;
+            self.queued.lock().unwrap().push(chunk);
+            Ok(WriteResponse {
+                status: WriteStatus::Accepted,
+            })
+        })
+    }
+
+    fn cancelled_write_is_unsent(&self) -> bool {
+        true
+    }
+
+    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        ExecProcess::signal(&self.inner, signal)
+    }
+
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        ExecProcess::terminate(&self.inner)
+    }
+}
+
+/// Stores a TTY process whose stdin queue stays full until `capacity` opens.
+async fn store_unsent_on_cancel_process(
+    session: &Arc<Session>,
+    turn: &TurnContext,
+    process_id: u32,
+    termination: &Arc<TerminationControl>,
+) -> (Arc<UnifiedExecProcess>, Arc<UnsentOnCancelExecProcess>) {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let backend = Arc::new(UnsentOnCancelExecProcess {
+        inner: MockExecProcess {
+            process_id: "unsent-stdin".to_string().into(),
+            write_response: WriteResponse {
+                status: WriteStatus::Accepted,
+            },
+            read_responses: Mutex::new(VecDeque::new()),
+            terminate_error: None,
+            termination_control: Some(Arc::clone(termination)),
+            wake_tx,
+        },
+        capacity: watch::channel(false).0,
+        attempts: AtomicUsize::new(0),
+        queued: std::sync::Mutex::new(Vec::new()),
+    });
+    let started = Arc::clone(&backend);
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess { process: started },
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("process starts");
+    let manager = &session.services.unified_exec_manager;
+    store_process_for_test(manager, session, turn, process_id, Arc::clone(&process)).await;
+    (process, backend)
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsent_tty_input_keeps_the_process_and_a_retry_is_queued_once() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process_id = 4_244;
+    let termination = Arc::new(TerminationControl::new());
+    termination.allowed.send_replace(true);
+    let (process, backend) =
+        store_unsent_on_cancel_process(&session, &turn, process_id, &termination).await;
+
+    let began = Instant::now();
+    let error = WriteStdinHandler::default()
+        .handle(write_stdin_invocation_with_chars(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "unsent-write",
+            process_id,
+            "once\n",
+        ))
+        .await
+        .err()
+        .expect("unwritten input cannot report success")
+        .to_string();
+    assert!(
+        error.contains("stdin was not written before the yield deadline"),
+        "{error}"
+    );
+    assert!(error.contains("retrying is safe"), "{error}");
+    assert!(!error.contains("delivery was not confirmed"), "{error}");
+    assert_eq!(Instant::now() - began, Duration::from_secs(30));
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 1);
+    assert!(backend.queued.lock().unwrap().is_empty());
+    assert_eq!(termination.calls.load(Ordering::Acquire), 0);
+    assert!(!process.has_exited());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+    );
+
+    // Once the queue drains, resending the same input writes it exactly once.
+    backend.capacity.send_replace(true);
+    let invocation = write_stdin_invocation_with_chars(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "retried-write",
+        process_id,
+        "once\n",
+    );
+    let output = WriteStdinHandler::default()
+        .handle(invocation.clone())
+        .await
+        .expect("retried input is written");
+    let result = output.code_mode_result(&invocation.payload);
+    assert!(result["error"].is_null(), "{result}");
+    assert_eq!(result["process_exited"], false);
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 2);
+    assert_eq!(*backend.queued.lock().unwrap(), vec![b"once\n".to_vec()]);
+    assert_eq!(termination.calls.load(Ordering::Acquire), 0);
+    assert!(!process.has_exited());
+    manager.terminate_all_processes().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsent_tty_interrupt_still_terminates_the_process() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process_id = 4_245;
+    let termination = Arc::new(TerminationControl::new());
+    termination.allowed.send_replace(true);
+    let (process, backend) =
+        store_unsent_on_cancel_process(&session, &turn, process_id, &termination).await;
+
+    let invocation = write_stdin_invocation_with_chars(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "unsent-interrupt",
+        process_id,
+        "\u{3}",
+    );
+    let output = WriteStdinHandler::default()
+        .handle(invocation.clone())
+        .await
+        .expect("undelivered interrupt returns a structured failure");
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let result = output.code_mode_result(&invocation.payload);
+    let error = result["error"].as_str().expect("failure diagnostic");
+    assert!(
+        error.contains("stdin delivery was not confirmed before the yield deadline"),
+        "{error}"
+    );
+    assert_eq!(result["process_exited"], true);
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 1);
+    assert!(backend.queued.lock().unwrap().is_empty());
+    assert_eq!(termination.calls.load(Ordering::Acquire), 1);
+    assert!(process.has_exited());
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn non_empty_write_stdin_collects_later_output_until_the_interaction_cap() {
     let (session, turn) = make_session_and_context().await;

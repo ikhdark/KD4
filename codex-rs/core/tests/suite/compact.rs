@@ -215,7 +215,7 @@ fn write_matching_compact_hooks(home: &Path) {
 from pathlib import Path
 import sys
 
-payload = json.load(sys.stdin)
+payload = json.load(sys.stdin.buffer)
 with Path(r"{auto_log_path}").open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(payload) + "\n")
 "#,
@@ -226,7 +226,7 @@ with Path(r"{auto_log_path}").open("a", encoding="utf-8") as handle:
 from pathlib import Path
 import sys
 
-payload = json.load(sys.stdin)
+payload = json.load(sys.stdin.buffer)
 with Path(r"{manual_post_log_path}").open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(payload) + "\n")
 "#,

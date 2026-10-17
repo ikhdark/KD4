@@ -24,6 +24,7 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 futures = { workspace = true, features = ["alloc", "std"] }
 gethostname = { workspace = true }
+hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 multimap = { workspace = true }
 prost = { workspace = true }

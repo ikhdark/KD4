@@ -19,7 +19,7 @@ use pretty_assertions::assert_eq;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
-use rmcp::model::CallToolResult;
+use rmcp::model::CallToolResponse;
 use rmcp::model::CancelledNotificationParam;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
@@ -27,7 +27,7 @@ use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::RequestId;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::service::NotificationContext;
 use rmcp::service::RequestContext;
@@ -232,8 +232,8 @@ struct CancellationObserverServer {
 }
 
 impl ServerHandler for CancellationObserverServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -246,22 +246,18 @@ impl ServerHandler for CancellationObserverServer {
             "additionalProperties": false
         }))
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(ListToolsResult {
-            tools: vec![Tool::new(
-                Cow::Borrowed("slow"),
-                Cow::Borrowed("Wait until the request is cancelled."),
-                Arc::new(input_schema),
-            )],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            Cow::Borrowed("slow"),
+            Cow::Borrowed("Wait until the request is cancelled."),
+            Arc::new(input_schema),
+        )]))
     }
 
     async fn call_tool(
         &self,
         _request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let _ = self.started_requests.send(context.id.clone());
         context.ct.cancelled().await;
         Err(McpError::internal_error("request cancelled", None))
@@ -678,7 +674,7 @@ async fn streamable_http_timeout_cancels_the_live_request_id() -> anyhow::Result
     let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
-    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.request_id, Some(started_request_id));
     assert_eq!(cancellation.reason.as_deref(), Some("request timeout"));
 
     assert!(codex_rmcp_client::is_timeout_error(&error));
@@ -734,7 +730,7 @@ async fn dropping_streamable_http_operation_cancels_the_live_request_id() -> any
     let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
-    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.request_id, Some(started_request_id));
     assert_eq!(cancellation.reason.as_deref(), Some("request cancelled"));
 
     server_handle.abort();
@@ -777,7 +773,7 @@ async fn dropping_streamable_http_operation_outside_runtime_cancels_live_request
     let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
         .await?
         .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
-    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.request_id, Some(started_request_id));
     assert_eq!(cancellation.reason.as_deref(), Some("request cancelled"));
     server_handle.abort();
     let _ = server_handle.await;

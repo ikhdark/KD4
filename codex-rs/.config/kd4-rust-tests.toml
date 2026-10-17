@@ -51,7 +51,6 @@ description = "Fork91-specific recovery regressions. Pair with harness-recovery-
 target = "core_lib"
 helpers = []
 tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::fork91_multi_root_glob_repair_preserves_flags_and_other_roots",
   "tools::context::tests::fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contracts",
   "tools::context::tests::fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix",
   "tools::context::tests::fork91_no_match_requires_exact_error_free_terminal_streams",
@@ -63,6 +62,12 @@ tests = [
   "tools::code_mode::response_tests::fork91_live_fallback_preserves_capabilities_without_inventing_them",
   "tools::code_mode::response_tests::fork91_no_match_receipt_is_not_a_failure_but_errors_are",
   "tools::code_mode::response_tests::completion_audit_retained_intent_requires_authoritative_terminal_commands",
+]
+
+[[gates.harness-fork91-recovery.steps]]
+target = "command_analysis_lib"
+tests = [
+  "command_preflight::command_preflight_tests::fork91_multi_root_glob_repair_preserves_flags_and_other_roots",
 ]
 
 [gates.harness-recovery-audit]
@@ -92,15 +97,20 @@ description = "Windows context-audit regressions: literal search repair, bounded
 target = "core_lib"
 helpers = []
 tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::powershell_leaf_glob_repair_preserves_shell_and_exact_output",
-  "tools::handlers::command_preflight::command_preflight_tests::powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
-  "tools::handlers::command_preflight::command_preflight_tests::leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
-  "tools::handlers::command_preflight::command_preflight_tests::missing_rg_paths_are_advisory_and_use_the_execution_workdir",
-  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_preserves_invocation_and_runtime_bypasses",
-  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_excludes_transformations_and_unpaged_reads",
-  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_keeps_unicode_output_errors_and_exit_status",
   "tools::handlers::request_user_input::tests::header_fallback_preserves_full_question_and_strict_validation",
   "tools::handlers::request_user_input::tests::overlong_header_reaches_user_without_a_repair_round",
+]
+
+[[gates.harness-prevention-context.steps]]
+target = "command_analysis_lib"
+tests = [
+  "command_preflight::command_preflight_tests::powershell_leaf_glob_repair_preserves_shell_and_exact_output",
+  "command_preflight::command_preflight_tests::powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
+  "command_preflight::command_preflight_tests::leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
+  "command_preflight::command_preflight_tests::missing_rg_paths_are_advisory_and_use_the_execution_workdir",
+  "command_preflight::command_preflight_tests::source_paging_advice_preserves_invocation_and_runtime_bypasses",
+  "command_preflight::command_preflight_tests::source_paging_advice_excludes_transformations_and_unpaged_reads",
+  "command_preflight::command_preflight_tests::source_paging_advice_keeps_unicode_output_errors_and_exit_status",
 ]
 
 [gates.token-budget-lifecycle]
@@ -214,7 +224,6 @@ helpers = [
 "agent::status::tests::" = []
 "tools::handlers::multi_agents_v2::task::review_policy_tests::" = []
 "client::tests::" = []
-"validation::tests::" = []
 "context_manager::history::tests::" = []
 "tools::handlers::tool_search::tests::" = []
 "tools::handlers::mcp::search_tests::" = []
@@ -258,11 +267,13 @@ helpers = [
 "tools::handlers::request_user_input_spec::tests::" = []
 "tools::router::tests::" = []
 
-# Bounded core integration shards. MCP, CLI, and Windows sandbox helpers are
+# Bounded core integration shards: the codex-core-integration-tests package
+# (core/tests), kept out of codex-core so its unit tests do not build
+# core_test_support. MCP, CLI, and Windows sandbox helpers are
 # added only where the assigned modules need them.
 
 [targets.core_cli_workspace]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_cli_workspace"
 helpers = ["codex", "codex-code-mode-host"]
 
@@ -274,7 +285,7 @@ helpers = ["codex", "codex-code-mode-host"]
 "suite::user_shell_cmd::" = ["codex-code-mode-host"]
 
 [targets.core_code_mode_mcp]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_code_mode_mcp"
 helpers = [
   "codex-code-mode-host",
@@ -285,7 +296,7 @@ helpers = [
 ]
 
 [targets.core_exec_permissions]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_exec_permissions"
 helpers = [
   "codex-code-mode-host",
@@ -294,22 +305,22 @@ helpers = [
 ]
 
 [targets.core_thread_state]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_thread_state"
 helpers = ["codex-code-mode-host"]
 
 [targets.core_transport_telemetry]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_transport_telemetry"
 helpers = ["codex-code-mode-host"]
 
 [targets.core_agents_review]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_agents_review"
 helpers = ["codex-code-mode-host"]
 
 [targets.core_model_prompt_runtime]
-package = "codex-core"
+package = "codex-core-integration-tests"
 test = "core_model_prompt_runtime"
 helpers = ["codex-code-mode-host"]
 
@@ -338,6 +349,11 @@ helpers = []
 
 [targets.shell_command_lib]
 package = "codex-shell-command"
+lib = true
+helpers = []
+
+[targets.command_analysis_lib]
+package = "codex-command-analysis"
 lib = true
 helpers = []
 
@@ -472,9 +488,21 @@ package = "codex-file-system"
 test = "atomic_write"
 helpers = []
 
+# The V8 runtime that the host links; the Codex-side client is `code_mode_client_lib`.
 [targets.code_mode_lib]
+package = "codex-code-mode-runtime"
+lib = true
+helpers = []
+
+[targets.code_mode_client_lib]
 package = "codex-code-mode"
 lib = true
+helpers = []
+
+# Sets process-wide V8 flags, so it keeps its own test binary.
+[targets.code_mode_runtime_array_sort]
+package = "codex-code-mode-runtime"
+test = "array_sort"
 helpers = []
 
 [targets.code_mode_protocol_lib]
@@ -500,6 +528,27 @@ helpers = []
 [targets.code_mode_host_stdio]
 package = "codex-code-mode-host"
 test = "stdio"
+helpers = ["codex-code-mode-host"]
+
+[targets.code_mode_host_failures]
+package = "codex-code-mode-host"
+test = "host_failures"
+helpers = []
+
+[targets.code_mode_host_crash]
+package = "codex-code-mode-host"
+test = "host_crash"
+helpers = ["codex-code-mode-host"]
+
+[targets.code_mode_host_console]
+package = "codex-code-mode-host"
+test = "host_console"
+helpers = ["codex-code-mode-host"]
+
+# Ignored latency benchmark; run with `--run-ignored only --success-output immediate`.
+[targets.code_mode_host_latency]
+package = "codex-code-mode-host"
+test = "latency"
 helpers = ["codex-code-mode-host"]
 
 [targets.code_mode_host_lib]
@@ -674,7 +723,12 @@ tests = [
   "tools::handlers::shell::tests::pure::shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes",
   "tools::handlers::shell::tests::pure::successful_shell_sampling_signal_uses_canonical_output",
   "tools::handlers::shell::tests::pure::validation_diagnostic_ranges_are_exact_and_bounded",
-  "tools::shell_output_summary::tests::passing_validation_is_compact_before_the_generic_threshold",
+]
+
+[[gates.validation-bloat-contracts.steps]]
+target = "command_analysis_lib"
+tests = [
+  "shell_output_summary::tests::passing_validation_is_compact_before_the_generic_threshold",
 ]
 
 [gates.validation-bloat-fixtures]
@@ -761,13 +815,18 @@ description = "Ripgrep argument roles, executable aliases, dependency evidence, 
 target = "core_lib"
 helpers = []
 tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::rg_argument_roles_preserve_flag_like_patterns_and_dependencies",
-  "tools::handlers::command_preflight::command_preflight_tests::rg_supported_executables_share_scope_and_dependency_classification",
-  "tools::handlers::command_preflight::command_preflight_tests::search_operands_respect_option_values_and_terminators",
-  "tools::handlers::command_preflight::command_preflight_tests::classifies_repository_wide_and_owner_scoped_rg",
-  "tools::handlers::command_preflight::command_preflight_tests::search_scope_state_ignores_unrelated_content_and_detects_target_changes",
-  "tools::handlers::command_search::deadline_tests::slow_scope_observation_releases_the_request_and_discards_late_evidence",
   "tools::command_execution::tests::rg_pattern_file_changes_invalidate_cached_misses",
+]
+
+[[gates.search-scope-regressions.steps]]
+target = "command_analysis_lib"
+tests = [
+  "command_preflight::command_preflight_tests::rg_argument_roles_preserve_flag_like_patterns_and_dependencies",
+  "command_preflight::command_preflight_tests::rg_supported_executables_share_scope_and_dependency_classification",
+  "command_preflight::command_preflight_tests::search_operands_respect_option_values_and_terminators",
+  "command_preflight::command_preflight_tests::classifies_repository_wide_and_owner_scoped_rg",
+  "command_preflight::command_preflight_tests::search_scope_state_ignores_unrelated_content_and_detects_target_changes",
+  "command_search::deadline_tests::slow_scope_observation_releases_the_request_and_discards_late_evidence",
 ]
 
 [gates.verified-findings-followup]
@@ -777,34 +836,8 @@ description = "Focused regressions for reviewed catalog, watch, history, schema,
 target = "core_lib"
 helpers = []
 tests = [
-  "tools::shell_output_summary::tests::small_output_is_unchanged",
-  "tools::shell_output_summary::tests::oversized_diagnostic_and_distinct_middle_failure_preserve_final_status",
-  "tools::shell_output_summary::tests::unretained_distinct_diagnostics_are_counted",
-  "tools::shell_output_summary::tests::ordinary_try_prose_does_not_displace_diagnostics",
-  "tools::shell_output_summary::tests::oversized_first_line_reserves_room_for_the_tail",
-  "tools::shell_output_summary::tests::summary_reports_gap_sizes_and_source_line_counts",
-  "tools::shell_output_summary::tests::summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit",
-  "tools::shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
-  "tools::shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
-  "tools::shell_output_summary::tests::selected_errors_do_not_spend_the_final_status_quota",
-  "tools::shell_output_summary::tests::large_success_output_preserves_source_order",
-  "tools::shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
-  "tools::shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
-  "tools::shell_output_summary::tests::over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood",
-  "tools::shell_output_summary::tests::validation_output_keeps_failure_status_and_tail",
-  "tools::shell_output_summary::tests::early_failed_suite_survives_later_passing_suites",
-  "tools::shell_output_summary::tests::validation_output_keeps_the_authoritative_final_status",
-  "tools::shell_output_summary::tests::nextest_failures_and_summary_survive_a_passing_test_flood",
-  "tools::shell_output_summary::tests::passing_validation_retains_status_with_a_short_tail",
-  "tools::shell_output_summary::tests::applied_budget_summarizes_output_below_the_default_threshold",
-  "tools::shell_output_summary::tests::disabled_summarizer_returns_unchanged_signal",
-  "tools::shell_output_summary::tests::oversized_single_line_retains_bounded_head_and_tail",
-  "tools::shell_output_summary::tests::tiny_single_line_budget_stops_before_split_utf8_character",
-  "tools::shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
-  "tools::shell_output_summary::tests::summary_declines_output_that_would_grow",
-  "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
-  "tools::shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
-  "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
+  "tools::shell_output_summary_projection_tests::oversized_diagnostic_and_distinct_middle_failure_preserve_final_status",
+  "tools::shell_output_summary_projection_tests::selected_errors_do_not_spend_the_final_status_quota",
   "context_manager::history::tests::tool_search_acknowledgement_preserves_full_schema_bytes",
   "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
   "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
@@ -818,6 +851,37 @@ tests = [
   "git_workspace::tests::recursive_source_path_observation_detects_descendant_changes",
   "session::step_context::snapshot_deadline_tests::unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools",
   "session::step_context::snapshot_deadline_tests::stable_catalog_keeps_its_identity_and_resource_capability",
+]
+
+[[gates.verified-findings-followup.steps]]
+target = "command_analysis_lib"
+tests = [
+  "shell_output_summary::tests::small_output_is_unchanged",
+  "shell_output_summary::tests::unretained_distinct_diagnostics_are_counted",
+  "shell_output_summary::tests::ordinary_try_prose_does_not_displace_diagnostics",
+  "shell_output_summary::tests::oversized_first_line_reserves_room_for_the_tail",
+  "shell_output_summary::tests::summary_reports_gap_sizes_and_source_line_counts",
+  "shell_output_summary::tests::summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit",
+  "shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
+  "shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
+  "shell_output_summary::tests::large_success_output_preserves_source_order",
+  "shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
+  "shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
+  "shell_output_summary::tests::over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood",
+  "shell_output_summary::tests::validation_output_keeps_failure_status_and_tail",
+  "shell_output_summary::tests::early_failed_suite_survives_later_passing_suites",
+  "shell_output_summary::tests::validation_output_keeps_the_authoritative_final_status",
+  "shell_output_summary::tests::nextest_failures_and_summary_survive_a_passing_test_flood",
+  "shell_output_summary::tests::passing_validation_retains_status_with_a_short_tail",
+  "shell_output_summary::tests::applied_budget_summarizes_output_below_the_default_threshold",
+  "shell_output_summary::tests::disabled_summarizer_returns_unchanged_signal",
+  "shell_output_summary::tests::oversized_single_line_retains_bounded_head_and_tail",
+  "shell_output_summary::tests::tiny_single_line_budget_stops_before_split_utf8_character",
+  "shell_output_summary::tests::validation_summary_keeps_typescript_and_npm_errors_outside_tail",
+  "shell_output_summary::tests::summary_declines_output_that_would_grow",
+  "shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
+  "shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
+  "shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
 ]
 
 [gates.attached-image-runtime-reliability]
@@ -901,7 +965,7 @@ target = "core_lib"
 helpers = []
 # Parser contract plus both handler boundaries: shell argv exec params and exec_command decoding.
 tests = [
-  "tools::handlers::command_shape::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected",
+  "tools::handlers::command_shape_tests::tagged_script_is_canonical_and_tagged_legacy_is_rejected",
   "tools::handlers::shell::tests::shell_command_handler_preserves_structured_argv_shape",
   "tools::handlers::unified_exec::tests::exec_command_boundary_normalizes_unambiguous_legacy_forms",
 ]
@@ -910,13 +974,12 @@ tests = [
 description = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
 
 [[gates.capability-command-preflight.steps]]
-target = "core_lib"
-helpers = []
+target = "command_analysis_lib"
 # The off-state test proves the declared features.kd4_runtime switch controls preflight.
 tests = [
-  "tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
-  "tools::handlers::command_preflight::command_preflight_tests::leaf_glob_repair_is_bounded_and_preserves_exact_scope",
-  "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
+  "command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
+  "command_preflight::command_preflight_tests::leaf_glob_repair_is_bounded_and_preserves_exact_scope",
+  "command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
 ]
 
 [gates.capability-kd4-turn-execution]
@@ -1010,8 +1073,13 @@ target = "core_lib"
 helpers = []
 # The context test proves exec tool output reaches the model through the summarizer.
 tests = [
-  "tools::shell_output_summary::tests::failed_output_keeps_exact_error_lines",
   "tools::context::tests::exec_command_tool_output_summarizes_and_links_retained_raw_output",
+]
+
+[[gates.capability-shell-output-summary.steps]]
+target = "command_analysis_lib"
+tests = [
+  "shell_output_summary::tests::failed_output_keeps_exact_error_lines",
 ]
 
 [gates.capability-command-attempt-ledger]

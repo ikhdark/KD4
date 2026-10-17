@@ -104,26 +104,29 @@ impl McpToolCallCell {
 
     // Validate once on completion and retain the textual representation used by all views.
     fn render_content_block(block: &serde_json::Value) -> String {
-        let content = match <rmcp::model::Content as serde::Deserialize>::deserialize(block) {
+        let content = match <rmcp::model::ContentBlock as serde::Deserialize>::deserialize(block) {
             Ok(content) => content,
             Err(_) => {
                 return block.to_string();
             }
         };
 
-        match content.raw {
-            rmcp::model::RawContent::Text(text) => text.text,
-            rmcp::model::RawContent::Image(_) => "<image content>".to_string(),
-            rmcp::model::RawContent::Audio(_) => "<audio content>".to_string(),
-            rmcp::model::RawContent::Resource(resource) => match resource.resource {
+        match content {
+            rmcp::model::ContentBlock::Text(text) => text.text,
+            rmcp::model::ContentBlock::Image(_) => "<image content>".to_string(),
+            rmcp::model::ContentBlock::Audio(_) => "<audio content>".to_string(),
+            rmcp::model::ContentBlock::Resource(resource) => match resource.resource {
                 rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
                     format!("embedded resource: {uri}\n{text}")
                 }
                 rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
                     format!("embedded resource: {uri}")
                 }
+                // Kinds this rmcp cannot describe keep the raw block, like undecodable ones.
+                _ => block.to_string(),
             },
-            rmcp::model::RawContent::ResourceLink(link) => format!("link: {}", link.uri),
+            rmcp::model::ContentBlock::ResourceLink(link) => format!("link: {}", link.uri),
+            _ => block.to_string(),
         }
     }
 }

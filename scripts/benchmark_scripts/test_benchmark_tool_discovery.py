@@ -31,15 +31,17 @@ class DiscoveryContractTests(unittest.TestCase):
             self.assertEqual(len(values), 1)
             return values[0]
         text = constant("EXEC_DESCRIPTION_TEMPLATE") + "\n\n" + constant("LAZY_NESTED_TOOL_SCHEMA_GUIDANCE")
-        self.assertLess(len(text.encode()), 10_000)
+        # Same budgets as exec_prompt.rs: the ~8 KB rules contract cost more
+        # reasoning per turn than a lean one on matched runs.
+        self.assertLess(len(text.encode()), 4_000)
         helpers = text.index('- `await run_graph(') - text.index('- `await read_files(')
-        self.assertLess(len(text.encode()) - helpers, 8_500)
+        self.assertLess(len(text.encode()) - helpers, 3_600)
         for requirement in (
-            "Only `ALL_TOOL_NAMES` entries are callable", "never fuzzy execution",
-            "not a names-only discovery round", "not to re-enable a known callable",
-            "resolve needed `activated_omitted_tools` contracts in the same cell",
-            "Do not infer arguments from a name", "capability-change notice",
-            "otherwise emit the contract for model review", "current authorization",
+            "filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally",
+            "use `resolve_tool(name)` and call it in the same cell",
+            "resolution retains the full contract",
+            "Do not infer arguments from a name", "Omission is not deactivation",
+            "current authorization",
         ):
             self.assertIn(requirement, text)
         self.assertNotIn("use it to activate tools that are not yet listed", text)

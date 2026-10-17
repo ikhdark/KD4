@@ -168,7 +168,10 @@ fn semantic_install_effect_id(missing: &HashMap<String, McpServerConfig>) -> Str
         }
         hasher.update([0xff]);
     }
-    format!("install_mcp_dependencies:{:x}", hasher.finalize())
+    format!(
+        "install_mcp_dependencies:{}",
+        hex::encode(hasher.finalize())
+    )
 }
 
 async fn install_planned_mcp_dependencies(

@@ -206,6 +206,13 @@ pub trait ExecProcess: Send + Sync {
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>;
 
+    /// Whether dropping an unfinished `write` future guarantees that none of its
+    /// bytes were queued for the process, then or later. Only then may a caller
+    /// report the abandoned input as safely retryable; the default makes no claim.
+    fn cancelled_write_is_unsent(&self) -> bool {
+        false
+    }
+
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;

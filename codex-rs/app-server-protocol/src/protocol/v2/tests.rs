@@ -2061,13 +2061,11 @@ fn client_request_turn_start_granular_approval_policy_is_marked_experimental() {
 
 #[test]
 fn mcp_server_elicitation_response_round_trips_rmcp_result() {
-    let rmcp_result = rmcp::model::CreateElicitationResult {
-        action: rmcp::model::ElicitationAction::Accept,
-        content: Some(json!({
+    let rmcp_result = rmcp::model::ElicitResult::new(rmcp::model::ElicitationAction::Accept)
+        .with_content(json!({
             "confirmed": true,
-        })),
-        meta: Some(serde_json::from_value(json!({"persist": "always"})).unwrap()),
-    };
+        }))
+        .with_meta(serde_json::from_value(json!({"persist": "always"})).unwrap());
 
     let v2_response = McpServerElicitationRequestResponse::from(rmcp_result.clone());
     assert_eq!(
@@ -2085,15 +2083,14 @@ fn mcp_server_elicitation_response_round_trips_rmcp_result() {
         Some(&json!({"persist": "always"})),
     );
     assert_eq!(
-        rmcp::model::CreateElicitationResult::from(v2_response.clone()),
+        rmcp::model::ElicitResult::from(v2_response.clone()),
         rmcp_result,
     );
     for meta in [None, Some(json!("unsupported")), Some(json!([1]))] {
-        let converted =
-            rmcp::model::CreateElicitationResult::from(McpServerElicitationRequestResponse {
-                meta,
-                ..v2_response.clone()
-            });
+        let converted = rmcp::model::ElicitResult::from(McpServerElicitationRequestResponse {
+            meta,
+            ..v2_response.clone()
+        });
         assert_eq!(converted.meta, None);
         assert_eq!(converted.action, rmcp_result.action);
         assert_eq!(converted.content, rmcp_result.content);

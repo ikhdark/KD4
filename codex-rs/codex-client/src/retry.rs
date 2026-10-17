@@ -1,6 +1,6 @@
 use codex_http_client::Request;
 use codex_http_client::TransportError;
-use rand::Rng;
+use rand::RngExt;
 use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;

@@ -35,16 +35,16 @@ use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::ListResourcesResult;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ProtocolVersion;
-use rmcp::model::RawResource;
 use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ReadResourceResponse;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -769,8 +769,8 @@ struct ResourceAppsMcpServer {
 }
 
 impl ServerHandler for ResourceAppsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_resources().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_resources().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
     }
 
@@ -783,6 +783,9 @@ impl ServerHandler for ResourceAppsMcpServer {
         let cursor = request.and_then(|request| request.cursor);
         if cursor.is_none() {
             return Ok(ListResourcesResult {
+                result_type: None,
+                ttl_ms: None,
+                cache_scope: None,
                 resources: vec![skill_resource(
                     "skill://plugin_ignored/ignored",
                     "plugin_ignored/ignored",
@@ -809,6 +812,9 @@ impl ServerHandler for ResourceAppsMcpServer {
         }
 
         Ok(ListResourcesResult {
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             resources: vec![skill_resource(
                 SKILL_RESOURCE_URI,
                 "plugin_demo/deploy",
@@ -826,7 +832,7 @@ impl ServerHandler for ResourceAppsMcpServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
         let uri = request.uri;
         if uri == SKILL_MAIN_PROMPT_URI {
             self.calls.main_prompt_reads.fetch_add(1, Ordering::Relaxed);
@@ -836,8 +842,9 @@ impl ServerHandler for ResourceAppsMcpServer {
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_CONTENTS.to_string(),
                     meta: None,
-                },
-            ]));
+                }])
+                .into(),
+            );
         }
         if uri == SKILL_REFERENCE_URI {
             self.calls.reference_reads.fetch_add(1, Ordering::Relaxed);
@@ -847,8 +854,9 @@ impl ServerHandler for ResourceAppsMcpServer {
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_REFERENCE_CONTENTS.to_string(),
                     meta: None,
-                },
-            ]));
+                }])
+                .into(),
+            );
         }
         if uri != TEST_RESOURCE_URI {
             return Err(rmcp::ErrorData::resource_not_found(
@@ -870,7 +878,8 @@ impl ServerHandler for ResourceAppsMcpServer {
                 blob: TEST_RESOURCE_BLOB.to_string(),
                 meta: None,
             },
-        ]))
+        ])
+        .into())
     }
 }
 
@@ -882,17 +891,14 @@ fn skill_resource(
     plugin_name: &str,
     skill_name: &str,
 ) -> Resource {
-    Resource::new(
-        RawResource::new(uri, name)
-            .with_description(description)
-            .with_mime_type(mime_type)
-            .with_meta(skill_resource_meta(plugin_name, skill_name)),
-        /*annotations*/ None,
-    )
+    Resource::new(uri, name)
+        .with_description(description)
+        .with_mime_type(mime_type)
+        .with_meta(skill_resource_meta(plugin_name, skill_name))
 }
 
-fn skill_resource_meta(plugin_name: &str, skill_name: &str) -> Meta {
-    Meta(serde_json::Map::from_iter([
+fn skill_resource_meta(plugin_name: &str, skill_name: &str) -> MetaObject {
+    MetaObject(serde_json::Map::from_iter([
         ("plugin_name".to_string(), json!(plugin_name)),
         ("skill_name".to_string(), json!(skill_name)),
     ]))

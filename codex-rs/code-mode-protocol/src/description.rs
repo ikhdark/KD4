@@ -315,22 +315,14 @@ mod tests {
             /*has_deferred_tools*/ false,
             &[],
         );
-        assert!(description.contains("Stable built-in tool contracts may be included below"));
+        assert!(description.contains("Stable built-in contracts may follow"));
         assert!(description.contains("external and omitted contracts remain lazy"));
-        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("Omission is not deactivation"));
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
-        assert!(description.contains("callable with `.name`/`.description`"));
-        assert!(description.contains("Search only if local discovery fails"));
-        assert!(description.contains("execute those arguments in the same cell"));
+        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
-        assert!(description.contains("Omission from this description does not require activation"));
-        assert!(description.contains("not to re-enable a known callable"));
-        assert!(description.contains("not a names-only discovery round"));
-        assert!(description.contains("resolve and invoke without printing the schema again"));
-        assert!(description.contains("resolve needed `activated_omitted_tools` contracts in the same cell"));
+        assert!(description.contains("resolution retains the full contract"));
         assert!(description.contains("Do not infer arguments from a name"));
-        assert!(description.contains("capability-change notice"));
-        assert!(description.contains("otherwise emit the contract for model review"));
         assert!(
             description.len() < 10_000,
             "compact exec prompt unexpectedly expanded to {} bytes",
@@ -355,26 +347,20 @@ mod tests {
         assert!(description.contains("raw JavaScript"));
         assert!(description.contains("Nested tools live on the global `tools` object"));
         assert!(description.contains("await tools.exec_command"));
-        assert!(description.contains("await tools.apply_patch(patchText)"));
-        assert!(
-            description
-                .contains("Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`")
-        );
         assert!(description.contains("`console.log(...)` aliases `text(...)`"));
-        assert!(description.contains("Only `ALL_TOOL_NAMES` entries are callable"));
         assert!(description.contains("never pipe a patch through a shell wrapper"));
-        assert!(description.contains("host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions"));
         assert!(!description.contains("yield_time_ms"));
         assert!(description.contains("max_output_tokens"));
+        // The image helper accepts data URIs, view_image results and MCP image
+        // blocks; the runtime has no audio path to advertise.
         assert!(description.contains("type: \"image\""));
-        assert!(description.contains("type: \"audio\""));
+        assert!(!description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("prefer `text(result.output)`"));
-        assert!(description.contains("inspect `result.exit_code`"));
-        assert!(description.contains("`Promise.allSettled` retains independent failures"));
+        assert!(description.contains("text(r.output)"));
+        assert!(description.contains("`r.exit_code` the exit status"));
+        assert!(description.contains("Use `Promise.allSettled` for independent fallible calls"));
         assert!(description.contains("resolution retains the full contract"));
-        assert!(description.contains("Nested tools: use a present schema"));
-        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert!(!description.contains("do not substitute a search or second shell"));
@@ -382,18 +368,11 @@ mod tests {
         assert!(description.contains(
             "Expiry cancels the nested call and may return only an error, without a live handle."
         ));
-        assert!(description.contains("Resume only an actually returned live session/cell ID"));
         assert!(description.contains("check the outcome before retrying uncertain effects"));
-        assert!(description.contains(
-            "Retry only if unstarted, safely repeatable after stopping, or tool-approved"
-        ));
-        assert!(description.contains("buffers output while awaited work continues"));
-        assert!(description.contains("same awaited evaluation"));
-        assert!(description.contains("only for a new model decision"));
         assert!(!description.contains("Parallelize only when tools permit"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(!description.contains("never whole files"));
-        assert!(description.contains("after truncation, select only missing evidence from the retained artifact"));
+        assert!(description.contains("A truncated result names the `read_tool_output` call that returns the rest"));
         assert_eq!(
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
             10_000,
@@ -402,8 +381,6 @@ mod tests {
             "Output defaults to {} tokens",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
-        assert!(description.contains("bounded by the cell budget independently of earlier prints"));
-        assert!(description.contains("explicit smaller per-call caps are honored"));
         assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(&format!(
             r#"first-line `// @exec: {{"max_output_tokens": {}}}`"#,
@@ -472,7 +449,7 @@ mod tests {
         let description = build_exec_tool_description(false, true, &[]);
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
+        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);

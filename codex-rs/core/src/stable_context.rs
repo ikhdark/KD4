@@ -551,6 +551,16 @@ impl StableContextSlot {
         )
     }
 
+    /// Volatile slots whose sampling projection keeps only the latest value,
+    /// with no turn or order gate and no snapshot history. An identical
+    /// earlier occurrence already carries that value.
+    fn keeps_only_latest_value(self) -> bool {
+        matches!(
+            self,
+            Self::AppContext | Self::ModelSwitch | Self::Environment | Self::Subagents
+        )
+    }
+
     fn is_skill_catalog(self) -> bool {
         matches!(
             self,
@@ -650,6 +660,28 @@ pub(crate) fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
+    filter_unchanged_sections(history, candidates, |slot| !slot.is_volatile())
+}
+
+/// Removes identical repeats from a whole sampling history before latest-wins
+/// retirement. History keeps a repeated volatile section with its turn, but in
+/// the request retirement would delete the original occurrence in favor of the
+/// repeat and rewrite the cached prefix. Slots that keep only their latest
+/// value therefore retain the original; turn-gated, order-gated and snapshot
+/// slots keep their repeats.
+pub(crate) fn filter_unchanged_sampling_context_items(
+    items: Vec<ResponseItem>,
+) -> Vec<ResponseItem> {
+    filter_unchanged_sections(&[], items, |slot| {
+        !slot.is_volatile() || slot.keeps_only_latest_value()
+    })
+}
+
+fn filter_unchanged_sections(
+    history: &[ResponseItem],
+    candidates: Vec<ResponseItem>,
+    filterable: impl Fn(StableContextSlot) -> bool,
+) -> Vec<ResponseItem> {
     // Only trusted candidates can be filtered. Avoid walking history for empty
     // injections or ordinary messages, including while the session lock is held.
     if !candidates.iter().any(is_trusted_stable_context_item) {
@@ -673,7 +705,7 @@ pub(crate) fn filter_unchanged_stable_context_items(
             let removed = signature
                 .iter()
                 .filter(|section| {
-                    !section.entry.slot.is_volatile()
+                    filterable(section.entry.slot)
                         && latest.get(&section.entry.slot) == Some(&section.entry)
                 })
                 .map(|section| section.content.clone())

@@ -960,12 +960,16 @@ def _auto_lane_base(command: Sequence[str]) -> str:
         r"(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)",
         signature,
     )
-    from scripts.build.rust_tool_env import cargo_package_specs
+    from scripts.build.rust_tool_env import CORE_TEST_PACKAGES, cargo_package_specs
 
     # Affinity also covers Cargo watch's embedded --exec/-x command strings.
     packages = cargo_package_specs(signature.split())
     if packages:
-        base = "core-tests" if "codex-core" in packages else packages[0]
+        base = (
+            "core-tests"
+            if any(package in packages for package in CORE_TEST_PACKAGES)
+            else packages[0]
+        )
     elif command:
         program = Path(command[0]).stem
         # Normalize only Cargo's own display options, never arguments passed

@@ -15,6 +15,7 @@ use codex_code_mode_protocol::CodeModeSessionProvider;
 use codex_code_mode_protocol::CodeModeSessionProviderFuture;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::RUNTIME_REPLACED_NOTICE;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
@@ -69,6 +70,17 @@ impl Default for ProcessOwnedCodeModeSessionProvider {
 }
 
 impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
+    fn availability(&self) -> Result<(), String> {
+        if self.host_program.is_file() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to spawn code-mode host {}: host executable was not found",
+                self.host_program.display()
+            ))
+        }
+    }
+
     fn create_session<'a>(
         &'a self,
         delegate: Arc<dyn CodeModeSessionDelegate>,
@@ -79,6 +91,23 @@ impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
             let session: Arc<dyn CodeModeSession> = Arc::new(session);
             Ok(session)
         })
+    }
+}
+
+/// Used when `features.code_mode_host` is off: Codex never runs cells in its
+/// own process, so no session can be created.
+pub struct DisabledCodeModeSessionProvider;
+
+impl CodeModeSessionProvider for DisabledCodeModeSessionProvider {
+    fn availability(&self) -> Result<(), String> {
+        Err("code-mode host is disabled".to_string())
+    }
+
+    fn create_session<'a>(
+        &'a self,
+        _delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async { Err("code-mode host is disabled".to_string()) })
     }
 }
 
@@ -93,6 +122,9 @@ struct OwnedProcessHost {
 struct OwnedProcessHostState {
     connection: Option<Arc<Connection>>,
     active_sessions: usize,
+    /// Counts failed spawns so callers queued behind one share its error.
+    failed_spawns: u64,
+    last_spawn_error: Option<String>,
 }
 
 struct HostSessionLease {
@@ -113,6 +145,11 @@ impl OwnedProcessHost {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
+        let observed_failures = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed_spawns;
 
         let _spawn_permit = self
             .spawn_permit
@@ -122,12 +159,38 @@ impl OwnedProcessHost {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
-        let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
-        self.state
+        {
+            // A spawn that failed while this caller waited is its answer too;
+            // retrying would make each queued caller wait out another
+            // handshake timeout. Later callers still retry.
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.failed_spawns != observed_failures
+                && let Some(error) = state.last_spawn_error.as_ref()
+            {
+                return Err(error.clone());
+            }
+        }
+        let spawned = Connection::spawn(&self.host_program).await;
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .connection = Some(Arc::clone(&new_connection));
-        Ok(new_connection)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match spawned {
+            Ok(connection) => {
+                let connection = Arc::new(connection);
+                state.connection = Some(Arc::clone(&connection));
+                state.last_spawn_error = None;
+                Ok(connection)
+            }
+            Err(error) => {
+                state.failed_spawns += 1;
+                state.last_spawn_error = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 
     fn live_connection(&self) -> Option<Arc<Connection>> {
@@ -207,6 +270,11 @@ struct SessionInner {
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
+    /// The generation that last started a cell; 0 before any cell.
+    executed_generation: AtomicU64,
+    /// That generation's host exited, taking its stored values; the next
+    /// `execute` reports this instead of running.
+    lost_state: AtomicBool,
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
     retired_cleanups: StdMutex<Vec<SessionCleanup>>,
@@ -238,6 +306,8 @@ impl ProcessOwnedCodeModeSession {
                 delegate,
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),
+                executed_generation: AtomicU64::new(0),
+                lost_state: AtomicBool::new(false),
                 shutdown_requested: AtomicBool::new(false),
                 shutdown_result: StdMutex::new(None),
                 retired_cleanups: StdMutex::new(Vec::new()),
@@ -251,6 +321,12 @@ impl ProcessOwnedCodeModeSession {
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
         let binding = self.connection().await?;
+        if self.inner.lost_state.swap(false, Ordering::AcqRel) {
+            return Err(RUNTIME_REPLACED_NOTICE.to_string());
+        }
+        self.inner
+            .executed_generation
+            .store(binding.remote.generation, Ordering::Release);
         binding.connection.execute(binding.remote, request).await
     }
 
@@ -300,6 +376,11 @@ impl SessionInner {
                         return Ok(binding.clone());
                     }
                     SessionState::Open(binding) => {
+                        if self.executed_generation.load(Ordering::Acquire)
+                            == binding.remote.generation
+                        {
+                            self.lost_state.store(true, Ordering::Release);
+                        }
                         self.retain_cleanup(binding.cleanup.clone());
                         *state = SessionState::New;
                         continue;

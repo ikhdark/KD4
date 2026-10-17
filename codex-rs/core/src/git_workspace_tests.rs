@@ -915,6 +915,73 @@ async fn assert_workspace_evidence_cleans_filter_tree(cancel_after_spawn: bool) 
 }
 
 #[tokio::test]
+#[cfg(windows)]
+async fn workspace_evidence_does_not_reread_files_whose_creation_time_changed() {
+    use std::os::windows::fs::FileTimesExt;
+
+    let (_temp, repo) = create_clean_git_repo().await;
+    let readme = repo.join("README.md");
+    // Date the file well before the index; Git re-reads racily clean entries.
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    File::options()
+        .write(true)
+        .open(&readme)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    run_git(repo.as_path(), &["update-index", "--refresh"]).await;
+    // Git runs a clean filter only when it must re-read tracked content.
+    let helper = repo.join("count-filter.ps1");
+    let invocations = repo.join("filter-invocations.txt");
+    let invocations_literal = invocations.display().to_string().replace('\'', "''");
+    std::fs::write(
+        &helper,
+        format!(
+            "[IO.File]::AppendAllText('{invocations_literal}', \"invoked`n\")\n[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())\n"
+        ),
+    )
+    .expect("write clean filter");
+    std::fs::write(repo.join(".gitattributes"), "README.md filter=count\n")
+        .expect("write filter attribute");
+    run_git(
+        repo.as_path(),
+        &[
+            "config",
+            "filter.count.clean",
+            &format!(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{}'",
+                helper.display().to_string().replace('\\', "/")
+            ),
+        ],
+    )
+    .await;
+    let before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("initial identity");
+
+    // Copying or restoring a checkout changes creation times, not content.
+    File::options()
+        .write(true)
+        .open(&readme)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_created(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000)),
+        )
+        .unwrap();
+    let after = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("identity after creation-time change");
+
+    assert!(
+        !invocations.exists(),
+        "a creation-time-only change made workspace capture re-read tracked content"
+    );
+    assert!(!after.unavailable);
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
 async fn ordinary_workspace_identity_tracks_changes_beyond_256_dirty_paths() {
     let (_temp, repo) = create_clean_git_repo().await;
     for index in 0..512 {
@@ -1110,9 +1177,9 @@ async fn parallel_workspace_hashes_preserve_manifest_order() {
         std::fs::write(root.path().join(&path), &content).unwrap();
         expected.extend_from_slice(
             format!(
-                "{path}\0file\0{}\0{:x}\n",
+                "{path}\0file\0{}\0{}\n",
                 content.len(),
-                Sha256::digest(&content)
+                hex::encode(Sha256::digest(&content))
             )
             .as_bytes(),
         );
@@ -1166,11 +1233,11 @@ fn workspace_content_capture_stops_between_chunks_and_preserves_sha256() {
     let content = vec![42; 8193];
     assert_eq!(
         hash_workspace_content(&mut content.as_slice(), 8193, &mut buffer, &control),
-        Some((format!("{:x}", Sha256::digest(&content)), 8193))
+        Some((hex::encode(Sha256::digest(&content)), 8193))
     );
     assert_eq!(
         hash_workspace_content(&mut &b""[..], 0, &mut buffer, &control),
-        Some((format!("{:x}", Sha256::digest(b"")), 0))
+        Some((hex::encode(Sha256::digest(b"")), 0))
     );
     assert!(hash_workspace_content(&mut content.as_slice(), 8192, &mut buffer, &control).is_none());
     struct CancelAfterRead<'a> {

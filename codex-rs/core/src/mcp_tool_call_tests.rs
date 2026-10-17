@@ -7,6 +7,12 @@ use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
 use crate::state::ActiveTurn;
+use crate::test_harness::apps_test_server::AppsTestServer;
+use crate::test_harness::apps_test_server::AppsTestToolLoading;
+use crate::test_harness::apps_test_server::CALENDAR_EXTRACT_TEXT_TOOL_NAME;
+use crate::test_harness::apps_test_server::recorded_apps_tool_calls;
+use crate::test_harness::hooks::trusted_config_layer_stack;
+use crate::test_harness::responses::start_mock_server;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::McpHandler;
 use crate::tools::hook_names::HookToolName;
@@ -38,12 +44,6 @@ use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::replay_bundle;
 use codex_utils_path_uri::PathUri;
-use core_test_support::apps_test_server::AppsTestServer;
-use core_test_support::apps_test_server::AppsTestToolLoading;
-use core_test_support::apps_test_server::CALENDAR_EXTRACT_TEXT_TOOL_NAME;
-use core_test_support::apps_test_server::recorded_apps_tool_calls;
-use core_test_support::hooks::trusted_config_layer_stack;
-use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -636,7 +636,7 @@ async fn metadata_derivation_uses_the_supplied_live_tool_info() {
     );
     tool.title = Some("Advertised title".to_string());
     tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
-    tool.meta = Some(rmcp::model::Meta(
+    tool.meta = Some(rmcp::model::MetaObject(
         serde_json::json!({
             "ui": {
                 "resourceUri": "ui://snapshot/widget.html",
@@ -976,7 +976,7 @@ async fn mcp_tool_call_rejects_changed_contract_before_upload_or_execution() {
         .cloned()
         .unwrap_or_default();
     sampled_meta.insert("openai/fileParams".to_string(), serde_json::json!(["file"]));
-    sampled_tool.tool.meta = Some(rmcp::model::Meta(sampled_meta));
+    sampled_tool.tool.meta = Some(rmcp::model::MetaObject(sampled_meta));
     // The sampled contract must admit the file argument so dispatch reaches
     // the live-contract check rather than failing generic schema validation.
     Arc::make_mut(&mut sampled_tool.tool.input_schema)
@@ -1076,7 +1076,7 @@ async fn sampled_mcp_tool_newly_hidden_from_model_skips_before_approval_or_execu
         "ui".to_string(),
         serde_json::json!({ "visibility": ["model"] }),
     );
-    sampled_tool.tool.meta = Some(rmcp::model::Meta(sampled_meta));
+    sampled_tool.tool.meta = Some(rmcp::model::MetaObject(sampled_meta));
     sampled_tool.tool.annotations = Some(annotations(Some(false), Some(true), Some(true)));
     assert!(codex_mcp::tool_is_model_visible(&sampled_tool));
     assert!(requires_mcp_tool_approval(

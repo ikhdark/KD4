@@ -1373,7 +1373,10 @@ impl McpToolApprovalKey {
             reason = "Approval keys derive Serialize over String and Option<String>; preserve durable consent hash bytes"
         )]
         let bytes = serde_json::to_vec(self).expect("approval keys are serializable");
-        format!("__codex_approval_{:x}", sha2::Sha256::digest(bytes))
+        format!(
+            "__codex_approval_{}",
+            hex::encode(sha2::Sha256::digest(bytes))
+        )
     }
 }
 
@@ -1648,7 +1651,7 @@ async fn mcp_tool_metadata_from_tool_info(
             });
             let canonical = codex_config::schema::canonicalize(&contract).to_string();
             (
-                format!("{:x}", sha2::Sha256::digest(canonical.as_bytes())),
+                hex::encode(sha2::Sha256::digest(canonical.as_bytes())),
                 persistent && account.is_some(),
             )
         });
@@ -1959,6 +1962,7 @@ fn parse_mcp_tool_approval_elicitation_response(
         }
         ElicitationAction::Decline => McpToolApprovalDecision::Decline { message: None },
         ElicitationAction::Cancel => McpToolApprovalDecision::Cancel,
+        _ => McpToolApprovalDecision::Cancel,
     }
 }
 

@@ -509,6 +509,14 @@ impl UnifiedExecProcess {
         }
     }
 
+    /// Whether an abandoned `write` is known to have queued nothing.
+    pub(super) fn cancelled_write_is_unsent(&self) -> bool {
+        matches!(
+            &self.process_handle,
+            ProcessHandle::ExecServer(process) if process.cancelled_write_is_unsent()
+        )
+    }
+
     pub(super) fn output_handles(&self) -> OutputHandles {
         OutputHandles {
             output_buffer: Arc::clone(&self.output_buffer),

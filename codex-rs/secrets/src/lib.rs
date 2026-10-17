@@ -173,8 +173,7 @@ pub fn environment_id_from_cwd(cwd: &Path) -> String {
         .into_owned();
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = hex::encode(hasher.finalize());
     let short = hex.get(..12).unwrap_or(hex.as_str());
     format!("cwd-{short}")
 }
@@ -188,8 +187,7 @@ pub fn compute_keyring_account(codex_home: &Path) -> String {
         .into_owned();
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = hex::encode(hasher.finalize());
     let short = hex.get(..16).unwrap_or(hex.as_str());
     format!("secrets|{short}")
 }
@@ -216,8 +214,7 @@ mod tests {
             .into_owned();
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
-        let digest = hasher.finalize();
-        let hex = format!("{digest:x}");
+        let hex = hex::encode(hasher.finalize());
         let short = hex.get(..12).expect("digest has at least 12 chars");
         assert_eq!(env_id, format!("cwd-{short}"));
     }

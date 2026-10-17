@@ -4,6 +4,7 @@ pub mod policy_transforms;
 mod windows;
 
 pub use codex_windows_sandbox::WindowsSandboxProxySettingsMode;
+pub use codex_windows_sandbox::windows_sandbox_uses_elevated_backend;
 pub use denial::is_likely_sandbox_denied;
 pub use manager::SandboxCommand;
 pub use manager::SandboxDirectSpawnTransformRequest;
@@ -24,7 +25,6 @@ pub use windows::permission_profile_supports_windows_restricted_token_sandbox;
 pub use windows::resolve_windows_elevated_filesystem_overrides;
 pub use windows::resolve_windows_restricted_token_filesystem_overrides;
 pub use windows::unsupported_windows_restricted_token_sandbox_reason;
-pub use windows::windows_sandbox_uses_elevated_backend;
 
 use codex_protocol::error::CodexErr;
 

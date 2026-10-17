@@ -116,7 +116,9 @@ pub(crate) fn root(path: &Path) -> PathBuf {
     path.parent().unwrap_or(Path::new(".")).join("rollout-payloads")
 }
 
-fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 
 /// Decide from the canonical item before serializing or scheduling filesystem work.
 pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {

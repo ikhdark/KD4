@@ -199,11 +199,10 @@ pub(crate) struct TurnTimingState {
     process_output_waiter_count: AtomicU32,
     active_tool_count: AtomicU32,
     tool_closure_changed: Notify,
-    /// Content digests of per-request, per-call, and receipt entries already
-    /// written by an earlier sampling checkpoint of this turn. Checkpoints
-    /// persist only new or changed entries, so their size no longer grows with
-    /// every prior request.
-    checkpointed_entries: StdMutex<HashSet<[u8; 32]>>,
+    /// Per-request and receipt entries already written by an earlier sampling
+    /// checkpoint of this turn. Checkpoints persist only new or changed
+    /// entries, so their size no longer grows with every prior request.
+    checkpointed_entries: StdMutex<CheckpointedEntries>,
 }
 
 /// Only current wait counts and the existing event sink, not an execution history.
@@ -272,17 +271,62 @@ impl Default for TurnTimingState {
     }
 }
 
+#[derive(Default)]
+struct CheckpointedEntries {
+    /// Content digests of every entry an earlier checkpoint wrote.
+    digests: HashSet<[u8; 32]>,
+    /// The previous checkpoint's complete lists, before filtering. `None`
+    /// marks an entry that could not be serialized.
+    model_requests: Vec<Option<TurnTimingModelRequest>>,
+    deterministic_continuation_receipts: Vec<Option<TurnTimingDeterministicContinuationReceipt>>,
+}
+
 /// Keeps only entries whose exact serialized content no earlier checkpoint of
 /// this turn recorded. An entry that changed (for example, a request that has
 /// since completed) is written again; unserializable entries are always kept.
-fn retain_new_checkpoint_entries<T: serde::Serialize>(
+///
+/// Equal entries serialize identically, so an entry equal to its counterpart
+/// in `previous` was already recorded and is dropped without serializing it
+/// again. Re-serializing every unchanged entry made each checkpoint cost grow
+/// with the number of prior requests. Counterparts are aligned on the first
+/// entry because a full request list drops its oldest entry.
+fn retain_new_checkpoint_entries<T: serde::Serialize + Clone + PartialEq>(
     entries: &mut Vec<T>,
-    checkpointed: &mut HashSet<[u8; 32]>,
+    previous: &mut Vec<Option<T>>,
+    digests: &mut HashSet<[u8; 32]>,
 ) {
-    entries.retain(|entry| match serde_json::to_vec(entry) {
-        Ok(bytes) => checkpointed.insert(Sha256::digest(&bytes).into()),
-        Err(_) => true,
-    });
+    let current = std::mem::take(entries);
+    let offset = current
+        .first()
+        .and_then(|first| {
+            previous
+                .iter()
+                .position(|entry| entry.as_ref() == Some(first))
+        })
+        .unwrap_or(0);
+    let mut observed = Vec::with_capacity(current.len());
+    for (index, entry) in current.into_iter().enumerate() {
+        if previous
+            .get(index + offset)
+            .is_some_and(|recorded| recorded.as_ref() == Some(&entry))
+        {
+            observed.push(Some(entry));
+            continue;
+        }
+        match serde_json::to_vec(&entry) {
+            Ok(bytes) => {
+                if digests.insert(Sha256::digest(&bytes).into()) {
+                    entries.push(entry.clone());
+                }
+                observed.push(Some(entry));
+            }
+            Err(_) => {
+                entries.push(entry);
+                observed.push(None);
+            }
+        }
+    }
+    *previous = observed;
 }
 
 impl std::fmt::Debug for TurnTimingState {
@@ -1712,7 +1756,7 @@ impl TurnTimingState {
     fn adjust_counter(&self, counter: &AtomicU32, delta: i32) {
         let magnitude = delta.unsigned_abs();
         let previous = counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(if delta >= 0 {
                     value.saturating_add(magnitude)
                 } else {
@@ -1749,7 +1793,7 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
-        let hash = format!("{:x}", Sha256::digest(bytes));
+        let hash = hex::encode(Sha256::digest(bytes));
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
@@ -1781,7 +1825,7 @@ impl TurnTimingState {
                     .map(|(key, value)| {
                         (
                             key,
-                            format!("{:x}", Sha256::digest(value.to_string().as_bytes())),
+                            hex::encode(Sha256::digest(value.to_string().as_bytes())),
                         )
                     })
                     .collect()
@@ -1844,10 +1888,16 @@ impl TurnTimingState {
                 .checkpointed_entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            retain_new_checkpoint_entries(&mut timing.model_requests, &mut checkpointed);
+            let CheckpointedEntries {
+                digests,
+                model_requests,
+                deterministic_continuation_receipts,
+            } = &mut *checkpointed;
+            retain_new_checkpoint_entries(&mut timing.model_requests, model_requests, digests);
             retain_new_checkpoint_entries(
                 &mut timing.deterministic_continuation_receipts,
-                &mut checkpointed,
+                deterministic_continuation_receipts,
+                digests,
             );
         }
         codex_protocol::protocol::SamplingTimingCheckpoint {
@@ -2961,10 +3011,9 @@ impl TurnTimingState {
         let sections = request
             .request_section_sha256_by_attempt
             .get(request.physical_attempt_ids.last()?)?;
-        let expected_model = format!(
-            "{:x}",
-            Sha256::digest(serde_json::json!(model).to_string().as_bytes())
-        );
+        let expected_model = hex::encode(Sha256::digest(
+            serde_json::json!(model).to_string().as_bytes(),
+        ));
         if sections.get("model") != Some(&expected_model)
             || request.token_usage.as_ref()?.input_tokens != usage.input_tokens as u64
         {
@@ -3057,10 +3106,8 @@ impl TurnTimingState {
         if request.request_token_categories.is_some() {
             request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Complete;
         }
-        request.prompt_cache_key_fingerprint = prompt_cache_key.map(|key| {
-            let digest = Sha256::digest(key.as_bytes());
-            format!("{digest:x}")
-        });
+        request.prompt_cache_key_fingerprint =
+            prompt_cache_key.map(|key| hex::encode(Sha256::digest(key.as_bytes())));
         if state.completed_snapshot.is_some()
             && let Some(request) = state
                 .model_requests

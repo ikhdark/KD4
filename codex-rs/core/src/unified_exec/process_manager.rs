@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -312,6 +312,45 @@ async fn exec_server_params_for_request(
         enforce_managed_network: request.exec_server_enforce_managed_network,
         managed_network: request.exec_server_managed_network.clone(),
     })
+}
+
+/// Backend selection stays with the shared Windows launcher, which every other
+/// launcher uses: a managed proxy needs the elevated backend's firewall identity.
+fn windows_sandbox_session_request<'a>(
+    request: &'a ExecRequest,
+    native_cwd: &'a std::path::Path,
+    tty: bool,
+) -> codex_windows_sandbox::WindowsSandboxSessionRequest<'a> {
+    let no_paths: &'a [AbsolutePathBuf] = &[];
+    let overrides = request.windows_sandbox_filesystem_overrides.as_ref();
+    codex_windows_sandbox::WindowsSandboxSessionRequest {
+        permission_profile: &request.permission_profile,
+        workspace_roots: request.windows_sandbox_workspace_roots.as_slice(),
+        codex_home: request.codex_home.as_path(),
+        command: request.command.clone(),
+        cwd: native_cwd,
+        env_map: request.env.clone(),
+        windows_sandbox_level: request.windows_sandbox_level,
+        proxy_enforced: request.network.is_some(),
+        proxy_settings_mode: codex_windows_sandbox::WindowsSandboxProxySettingsMode::Reconcile,
+        timeout_ms: None,
+        read_roots_override: overrides
+            .and_then(|overrides| overrides.read_roots_override.as_deref()),
+        additional_read_roots: request.windows_sandbox_additional_read_roots.as_slice(),
+        read_roots_include_platform_defaults: overrides
+            .is_some_and(|overrides| overrides.read_roots_include_platform_defaults),
+        write_roots_override: overrides
+            .and_then(|overrides| overrides.write_roots_override.as_deref()),
+        deny_read_paths_override: overrides.map_or(no_paths, |overrides| {
+            overrides.additional_deny_read_paths.as_slice()
+        }),
+        deny_write_paths_override: overrides.map_or(no_paths, |overrides| {
+            overrides.additional_deny_write_paths.as_slice()
+        }),
+        tty,
+        stdin_open: tty,
+        use_private_desktop: request.windows_sandbox_private_desktop,
+    }
 }
 
 /// Borrowed process state prepared for a `write_stdin` or poll operation.
@@ -1901,6 +1940,17 @@ impl UnifiedExecProcessManager {
                         .await;
                 let write = match write {
                     Ok(write) => write,
+                    // The backend guarantees the abandoned write queued nothing, so the
+                    // process keeps running. Input carrying Ctrl-C still ends it below,
+                    // because the interrupt it asked for was not delivered.
+                    Err(_)
+                        if process.cancelled_write_is_unsent()
+                            && !request.input.contains(INTERRUPT) =>
+                    {
+                        return Err(UnifiedExecError::process_failed(
+                            "stdin was not written before the yield deadline; nothing was queued, so retrying is safe and the session remains available".to_string(),
+                        ));
+                    }
                     Err(_) => {
                         // Delivery may have reached the executor before its acknowledgement.
                         // Do not replay uncertain bytes. Confirm termination with its separate
@@ -2467,70 +2517,10 @@ impl UnifiedExecProcessManager {
                     .map_err(|_| UnifiedExecError::ForeignPath {
                         path: request.cwd.clone(),
                     })?;
-            let additional_deny_write_paths = request
-                .windows_sandbox_filesystem_overrides
-                .as_ref()
-                .map(|overrides| overrides.additional_deny_write_paths.clone())
-                .unwrap_or_default();
-            let additional_deny_read_paths = request
-                .windows_sandbox_filesystem_overrides
-                .as_ref()
-                .map(|overrides| overrides.additional_deny_read_paths.clone())
-                .unwrap_or_default();
-            let elevated_read_roots_override = request
-                .windows_sandbox_filesystem_overrides
-                .as_ref()
-                .and_then(|overrides| overrides.read_roots_override.clone());
-            let elevated_read_roots_include_platform_defaults = request
-                .windows_sandbox_filesystem_overrides
-                .as_ref()
-                .is_some_and(|overrides| overrides.read_roots_include_platform_defaults);
-            let elevated_write_roots_override = request
-                .windows_sandbox_filesystem_overrides
-                .as_ref()
-                .and_then(|overrides| overrides.write_roots_override.clone());
-            let spawned = match request.windows_sandbox_level {
-                codex_protocol::config_types::WindowsSandboxLevel::Elevated => {
-                    codex_windows_sandbox::spawn_windows_sandbox_session_elevated_for_permission_profile(
-                        &request.permission_profile,
-                        request.windows_sandbox_workspace_roots.as_slice(),
-                        request.codex_home.as_path(),
-                        request.command.clone(),
-                        native_cwd.as_path(),
-                        request.env.clone(),
-                        request.network.is_some(),
-                        None,
-                        elevated_read_roots_override.as_deref(),
-                        &request.windows_sandbox_additional_read_roots,
-                        elevated_read_roots_include_platform_defaults,
-                        elevated_write_roots_override.as_deref(),
-                        &additional_deny_read_paths,
-                        &additional_deny_write_paths,
-                        tty,
-                        tty,
-                        request.windows_sandbox_private_desktop,
-                    )
-                    .await
-                }
-                codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken
-                | codex_protocol::config_types::WindowsSandboxLevel::Disabled => {
-                    codex_windows_sandbox::spawn_windows_sandbox_session_legacy(
-                        &request.permission_profile,
-                        request.windows_sandbox_workspace_roots.as_slice(),
-                        request.codex_home.as_path(),
-                        request.command.clone(),
-                        native_cwd.as_path(),
-                        request.env.clone(),
-                        None,
-                        &additional_deny_read_paths,
-                        &additional_deny_write_paths,
-                        tty,
-                        tty,
-                        request.windows_sandbox_private_desktop,
-                    )
-                    .await
-                }
-            };
+            let spawned = codex_windows_sandbox::spawn_windows_sandbox_session_for_level(
+                windows_sandbox_session_request(request, native_cwd.as_path(), tty),
+            )
+            .await;
             let spawned =
                 spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();

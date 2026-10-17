@@ -1,3 +1,4 @@
+use crate::digest_writer::DigestWriter;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextManifest;
 use codex_protocol::ResponseItemId;
@@ -877,7 +878,7 @@ fn response_item_fingerprint(item: &ResponseItem) -> Option<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(RESPONSE_ITEM_FINGERPRINT_DOMAIN);
     serde_json::to_writer(
-        &mut hasher,
+        DigestWriter(&mut hasher),
         &MessageIdentity {
             kind: "message",
             id: id.as_ref(),
