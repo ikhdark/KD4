@@ -247,11 +247,15 @@ const PROJECTOR: &str = r#"((isProxy) => {
         }
         const {text, ...rest} = item;
         const text_lines = lineCount(text);
-        texts.push({text, source: {path: source.path, artifact_id: source.artifact_id,
-          ...(source !== projected ? {source_sha256: source.source_sha256 || source.canonical_sha256,
+        // A whole result's envelope already shows its path and artifact; a
+        // selected fragment prints without one, so only its label names them.
+        // Only an incomplete body needs its completeness repeated here.
+        texts.push({text, source: {
+          ...(source !== projected ? {path: source.path, artifact_id: source.artifact_id,
+            source_sha256: source.source_sha256 || source.canonical_sha256,
             environment_id: source.environment_id, canonical_uri: source.canonical_uri} : {}),
           selector: item.selector, canonical_range: item.canonical_range,
-          complete: item.complete, text_lines}});
+          complete: item.complete === true ? undefined : item.complete, text_lines}});
         return {...rest, text_lines};
       };
       const results = projected.results.map((result) => {
@@ -726,6 +730,65 @@ mod tests {
         assert_eq!(changed["shared"], true);
         assert!(changed.get("text").is_none());
         assert!(changed.get("recovery").is_none(), "mutation cannot inherit snapshot provenance");
+    }
+
+    /// Recorded audits repeated each whole result's path and artifact in every
+    /// body label, about 4% of all tool output. The printed envelope names them
+    /// once; a selected fragment prints without that envelope and keeps them.
+    #[tokio::test]
+    async fn body_labels_name_only_what_their_printed_envelope_does_not() {
+        let raw = json!({"path":"src/lib.rs","artifact_id":"snapshot","source_sha256":"hash",
+            "complete":false, "results":[
+                {"selector":{"kind":"lines","start":1,"end":1},"status":"ok","complete":true,
+                    "text":"first \"line\"\n"},
+                {"selector":{"kind":"lines","start":2,"end":9},"status":"ok","complete":false,
+                    "text":"second \"line\"\n"}]});
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let request = ExecuteRequest {
+            state_path: None, tool_call_id: "label-provenance".into(),
+            enabled_tools: vec![ToolDefinition {
+                name: "read_file".into(), tool_name: ToolName::plain("read_file"),
+                kind: CodeModeToolKind::Function, description: "".into(),
+                input_schema: None, output_schema: None, default_timeout_ms: None,
+            }].into(),
+            source: "const r = await tools.read_file({}); text(r); text(r.results[0]);".into(),
+            yield_time_ms: None, max_output_tokens: None, default_tool_timeout_ms: None,
+        };
+        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, events,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let mut printed = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                RuntimeEvent::Started => {}
+                RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
+                RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
+                RuntimeEvent::Result { error_text, output_loss, .. } => {
+                    assert_eq!(error_text, None);
+                    assert_eq!(output_loss, None);
+                    break;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        let labels = |printed: &str| printed.lines()
+            .filter_map(|line| line.strip_prefix("[source ")?.strip_suffix(']'))
+            .map(|label| serde_json::from_str::<Value>(label).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(printed.len(), 2);
+        let header: Value = serde_json::from_str(printed[0].lines().next().unwrap()).unwrap();
+        assert_eq!((&header["path"], &header["artifact_id"]), (&raw["path"], &raw["artifact_id"]));
+        let whole = labels(&printed[0]);
+        assert_eq!(whole.len(), 2, "{}", printed[0]);
+        for (label, result) in whole.iter().zip(raw["results"].as_array().unwrap()) {
+            assert!(label.get("path").is_none() && label.get("artifact_id").is_none(), "{label}");
+            assert_eq!(label["selector"], result["selector"]);
+        }
+        assert!(whole[0].get("complete").is_none(), "a complete body needs no flag");
+        assert_eq!(whole[1]["complete"], false, "an incomplete body stays marked");
+        assert!(printed[0].ends_with("second \"line\"\n"));
+        let fragment = labels(&printed[1]);
+        assert_eq!(fragment.len(), 1, "{}", printed[1]);
+        assert_eq!((&fragment[0]["path"], &fragment[0]["artifact_id"]), (&raw["path"], &raw["artifact_id"]));
     }
 
     #[tokio::test]
@@ -1300,10 +1363,17 @@ mod tests {
             if name == "read_tool_output" {
                 let expected = raw["results"][0]["value"]["hydrated_ranges"][0]["text"].as_str().unwrap();
                 assert_eq!(printed.len(), 3);
-                for rendered in printed {
-                    let (_, body) = rendered.split_once('\n').unwrap();
+                for (index, rendered) in printed.iter().enumerate() {
+                    let (envelope, body) = rendered.split_once('\n').unwrap();
                     let (identity, bytes) = body.split_once('\n').unwrap();
-                    assert!(identity.contains("snapshot"));
+                    // The whole result's envelope names its snapshot; a selected
+                    // fragment prints without one, so its body label does.
+                    if index == 0 {
+                        assert!(envelope.contains("snapshot"));
+                        assert!(!identity.contains("snapshot"));
+                    } else {
+                        assert!(identity.contains("snapshot"));
+                    }
                     assert_eq!(bytes, expected);
                 }
             } else {

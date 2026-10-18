@@ -257,6 +257,18 @@ mod tests {
             panic!("web.run must expose a namespace specification");
         };
         assert_eq!(namespace.name, WEB_NAMESPACE);
+        // The deferred source catalog says what this source is for; a bare
+        // `source:web` scope went unused by a session that needed research.
+        let source = tools[0]
+            .search_info()
+            .and_then(|info| info.source_info)
+            .expect("web source metadata");
+        assert_eq!(source.name, "Web");
+        assert!(
+            source
+                .description
+                .is_some_and(|description| description.starts_with("Search the public web"))
+        );
         let [codex_tools::ResponsesApiNamespaceTool::Function(run)] = namespace.tools.as_slice()
         else {
             panic!("web must expose exactly one function");

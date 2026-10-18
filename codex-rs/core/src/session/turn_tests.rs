@@ -3235,27 +3235,44 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         assert!(history.raw_items().starts_with(&before));
         assert_eq!(history.raw_items().len(), before.len() + 1);
     }
+    // A root task that asks for no exhaustive coverage gets no full-read policy.
+    record_sampling_notices(
+        &session, &turn, false, /*forced_terminal*/ None,
+        /*exhaustive_scope_requested*/ false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !serde_json::to_string(session.clone_history().await.raw_items())
+            .unwrap()
+            .contains("<exhaustive_scope_feasibility>")
+    );
     record_sampling_notices(
         &session,
         &turn,
         true,
         Some(ForcedTerminalReason::GenerationBudget),
+        /*exhaustive_scope_requested*/ true,
     )
     .await
     .unwrap();
     let notices = session.clone_history().await.raw_items().to_vec();
-    record_sampling_notices(
-        &session,
-        &turn,
-        true,
-        Some(ForcedTerminalReason::GenerationBudget),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        session.clone_history().await.raw_items(),
-        notices.as_slice()
-    );
+    for exhaustive_scope_requested in [true, false] {
+        // A recorded notice is neither duplicated nor retracted by later steps.
+        record_sampling_notices(
+            &session,
+            &turn,
+            true,
+            Some(ForcedTerminalReason::GenerationBudget),
+            exhaustive_scope_requested,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session.clone_history().await.raw_items(),
+            notices.as_slice()
+        );
+    }
     let rendered = serde_json::to_string(&notices).unwrap();
     assert_eq!(
         rendered.matches("<exhaustive_scope_feasibility>").count(),
@@ -3267,6 +3284,37 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
     assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
     assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
     assert!(rendered.contains("Later user input may resume work"));
+}
+
+#[test]
+fn exhaustive_scope_requests_are_recognized_and_ordinary_tasks_are_not() {
+    for request in [
+        "Read every file in src/ and list the unsafe blocks.",
+        "Do an exhaustive review of the parser.",
+        "Audit the entire codebase for panics.",
+        "Read the rollout in full before answering.",
+        "Compare all of the sessions line by line.",
+        "Review all changed files.",
+        "A full-read audit of each source file, please.",
+        "Go through everything under scripts/.",
+    ] {
+        assert!(request_asks_for_exhaustive_scope(request), "{request}");
+    }
+    // Sentences from three real implementation requests that received the
+    // notice and spent a step inventorying files, plus everyday requests.
+    for request in [
+        "Deeply audit and optimize KDA's total wall-clock time for complete repository scans using 3 representative workloads, then implement exactly 3 verified findings.",
+        "Preserve full scan behavior, deterministic results, and exact source/configuration provenance.",
+        "Deeply audit and optimize KDA's CPU consumption during full repository scans.",
+        "Repeated whole-graph solving and redundant fixpoint iterations.",
+        "Preserve every valid semantic conclusion, diagnostic, witness, and required analysis surface.",
+        "Never reduce RAM by silently discarding semantic facts, suppressing findings, weakening proofs, or sacrificing analysis coverage.",
+        "Fix all",
+        "Run all tests and fix the failures.",
+        "Find up to 25 material things that need to be fixed.",
+    ] {
+        assert!(!request_asks_for_exhaustive_scope(request), "{request}");
+    }
 }
 
 #[tokio::test]
@@ -5874,6 +5922,61 @@ fn completion_advisory_names_changed_existing_tests() {
         Some(
             "This turn modified or deleted existing test files; review any changed expectations: tests/test_cli.py, a_test.go."
         )
+    );
+}
+
+/// Recorded sessions: one rewrote a fixture inside an inline `#[cfg(test)]`
+/// module of `callable_collector.rs` without an advisory, while another only
+/// appended a regression test to `profile_matrix_tests.rs` and was flagged.
+#[test]
+fn completion_advisory_reports_edited_existing_tests_not_added_ones() {
+    let inline = "pub fn run() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    fn fixture() -> u8 {\n        super::run()\n    }\n\n    #[test]\n    fn runs() {\n        assert_eq!(fixture(), 1);\n    }\n}\n";
+    let test_file = "#[test]\nfn first() {\n    assert!(true);\n}\n";
+    let go_test = "func TestA(t *testing.T) {\n\tcheck(t)\n}\n";
+    let changed = |path: &str, before: &str, after: Option<&str>| {
+        changed_existing_tests(vec![(
+            path.to_string(),
+            before.to_string(),
+            after.map(str::to_string),
+        )])
+    };
+    let edited_fixture = inline.replace("super::run()\n", "super::run() + 0\n");
+    assert_eq!(
+        changed("src/callable_collector.rs", inline, Some(&edited_fixture)),
+        ["src/callable_collector.rs"]
+    );
+    let ignored = inline.replace("    #[test]\n", "    #[test]\n    #[ignore]\n");
+    assert_eq!(
+        changed("src/callable_collector.rs", inline, Some(&ignored)),
+        ["src/callable_collector.rs"]
+    );
+    let production_only = inline.replace("    1\n", "    2 - 1\n");
+    assert!(changed("src/callable_collector.rs", inline, Some(&production_only)).is_empty());
+    let added_inline = inline.replace(
+        "        assert_eq!(fixture(), 1);\n    }\n",
+        "        assert_eq!(fixture(), 1);\n    }\n\n    #[test]\n    fn runs_twice() {\n        assert_eq!(fixture() + fixture(), 2);\n    }\n",
+    );
+    assert!(changed("src/callable_collector.rs", inline, Some(&added_inline)).is_empty());
+
+    let appended = format!("{test_file}\n#[test]\nfn second() {{\n    assert!(true);\n}}\n");
+    assert!(changed("src/cli/profile_matrix_tests.rs", test_file, Some(&appended)).is_empty());
+    let weakened = test_file.replace("    assert!(true);\n", "");
+    assert_eq!(
+        changed("src/cli/profile_matrix_tests.rs", test_file, Some(&weakened)),
+        ["src/cli/profile_matrix_tests.rs"]
+    );
+    assert_eq!(
+        changed("src/cli/profile_matrix_tests.rs", test_file, None),
+        ["src/cli/profile_matrix_tests.rs"]
+    );
+
+    // Without an outline, conventional test files report rewritten lines only.
+    let go_appended = format!("{go_test}\nfunc TestB(t *testing.T) {{}}\n");
+    assert!(changed("pkg/server_test.go", go_test, Some(&go_appended)).is_empty());
+    let go_edited = go_test.replace("\tcheck(t)\n", "");
+    assert_eq!(
+        changed("pkg/server_test.go", go_test, Some(&go_edited)),
+        ["pkg/server_test.go"]
     );
 }
 

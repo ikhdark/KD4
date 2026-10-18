@@ -794,6 +794,8 @@ pub struct ApplyPatchToolOutput {
     pub environment_id: Option<String>,
     pub retry: Option<JsonValue>,
     pub diagnostics: Vec<JsonValue>,
+    /// Other sessions running a turn in this checkout that edited these files.
+    pub concurrent_sessions: Option<String>,
 }
 
 /// Text-only projections carry the retry receipt inline. The structured result
@@ -934,11 +936,17 @@ impl ApplyPatchToolOutput {
             environment_id,
             retry: None,
             diagnostics,
+            concurrent_sessions: None,
         }
     }
 
     pub(crate) fn with_retry(mut self, retry: Option<JsonValue>) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub(crate) fn with_concurrent_sessions(mut self, note: Option<String>) -> Self {
+        self.concurrent_sessions = note;
         self
     }
 
@@ -965,6 +973,10 @@ impl ApplyPatchToolOutput {
         } else {
             failed_patch_text(&self.text, self.retry.as_ref())
         };
+        if let Some(note) = &self.concurrent_sessions {
+            text.push('\n');
+            text.push_str(note);
+        }
         if !self.changes.is_empty() {
             text.push_str("\nApplied changes (unified hunk +ranges are post-edit line numbers): ");
             text.push_str(&serde_json::json!(self.changes).to_string());
@@ -983,6 +995,9 @@ impl ApplyPatchToolOutput {
         });
         if let Some(retry) = &self.retry {
             result["retry"] = retry.clone();
+        }
+        if let Some(note) = &self.concurrent_sessions {
+            result["concurrent_sessions"] = note.clone().into();
         }
         result
     }

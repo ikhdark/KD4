@@ -3,6 +3,7 @@ mod cell_namespace_tests;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
+mod repeated_bodies;
 mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
@@ -112,6 +113,10 @@ pub(crate) struct CodeModeService {
     cell_parent_call_ids: Mutex<HashMap<String, String>>,
     trace_tails: Mutex<HashMap<String, tokio::sync::oneshot::Receiver<()>>>,
     shutting_down: AtomicBool,
+    /// Input of the latest sampling request, which issued the running cells.
+    visible_prompt: Mutex<Option<Arc<[codex_protocol::models::ResponseItem]>>>,
+    /// Bodies last printed as a reference; the next print repeats them.
+    elided_bodies: Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 
 #[derive(Default)]
@@ -120,6 +125,17 @@ struct CodeModePacketAdmission {
     // Closed cells release execution state, not unresolved evidence. Keep only
     // exact recovery descriptors; the artifact owner retains the actual bytes.
     closed_recovery: HashMap<String, Vec<HashMap<String, DeliveryArtifactCoverage>>>,
+    // By turn: the latest answer refused only for pending evidence recovery.
+    retained_answers: HashMap<String, RetainedDeliveryAnswer>,
+}
+
+/// A finished answer whose delivery waited only on evidence recovery. Once the
+/// evidence is recovered, a deliver cell that prints nothing delivers it
+/// unchanged, so the model does not compose the same answer twice.
+struct RetainedDeliveryAnswer {
+    text: String,
+    schema: Option<JsonValue>,
+    input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
 }
 
 #[derive(Default)]
@@ -219,18 +235,25 @@ impl DeliveryArtifactCoverage {
         if evidence["identity"]["sha256"].as_str() != Some(self.sha256.as_str()) {
             return;
         }
-        if let Some(ranges) = evidence["identity"]["ranges"].as_array() {
-            for range in ranges {
-                if let (Some(start), Some(end)) = (range[0].as_u64(), range[1].as_u64())
-                    && start <= end
-                    && end <= self.bytes
-                {
-                    self.ranges.push((start, end));
-                }
-            }
-        }
         // Parsed values preserve semantic data, not exact source coverage:
         // duplicate keys, escaping and whitespace may have been discarded.
+        let ranges = evidence["identity"]["ranges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|range| Some((range[0].as_u64()?, range[1].as_u64()?)))
+            .collect::<Vec<_>>();
+        self.cover(ranges);
+    }
+
+    /// Records exact byte ranges already delivered from this artifact.
+    fn cover(&mut self, ranges: impl IntoIterator<Item = (u64, u64)>) {
+        let bytes = self.bytes;
+        self.ranges.extend(
+            ranges
+                .into_iter()
+                .filter(|(start, end)| start <= end && *end <= bytes),
+        );
         self.ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
         for (start, end) in self.ranges.drain(..) {
@@ -482,7 +505,34 @@ impl CodeModeService {
             cell_parent_call_ids: Mutex::new(HashMap::new()),
             trace_tails: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            visible_prompt: Mutex::new(None),
+            elided_bodies: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Records the input of a sampling request before it is sent. Cells it
+    /// issues do not print source bodies again that it holds verbatim.
+    pub(crate) fn note_visible_prompt(&self, items: Arc<[codex_protocol::models::ResponseItem]>) {
+        *self
+            .visible_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(items);
+    }
+
+    pub(super) fn elide_bodies_already_in_context(&self, output: &mut FunctionToolOutput) {
+        let Some(prompt) = self
+            .visible_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let mut elided = self
+            .elided_bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        repeated_bodies::elide_bodies_already_in_context(&mut output.body, &prompt, &mut elided);
     }
 
     pub(crate) fn with_recovery_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
@@ -698,6 +748,7 @@ impl CodeModeService {
         let CodeModePacketAdmission {
             cells,
             closed_recovery,
+            retained_answers,
         } = &mut *admission;
         let prior_recovery_pending = closed_recovery
             .get(&turn.sub_id)
@@ -748,7 +799,7 @@ impl CodeModeService {
             if category == "evidence_recovery_pending" {
                 // Explain the existing gate without weakening it. Include prior
                 // closed cells so a later delivery can recover the actual gap.
-                return Err(delivery_recovery_refusal(
+                let mut refusal = delivery_recovery_refusal(
                     metrics.delivery_recovery.iter().chain(
                         closed_recovery
                             .get(&turn.sub_id)
@@ -756,7 +807,29 @@ impl CodeModeService {
                             .flatten()
                             .flat_map(|cell| cell.iter()),
                     ),
-                ));
+                );
+                let limit = intent
+                    .limit
+                    .min(metrics.output_budget.unwrap_or(intent.limit));
+                if let Ok(text) = execute_handler::schema_validated_delivery(
+                    response,
+                    limit,
+                    intent.schema.as_ref(),
+                ) {
+                    retained_answers.clear();
+                    retained_answers.insert(
+                        turn.sub_id.clone(),
+                        RetainedDeliveryAnswer {
+                            text,
+                            schema: intent.schema.clone(),
+                            input_activity: intent.input_activity.clone(),
+                        },
+                    );
+                }
+                if retained_answers.contains_key(&turn.sub_id) {
+                    refusal["retained_answer"] = "kept; once recovered, a deliver cell that prints nothing delivers it unchanged. Print a new answer instead if the recovered evidence changes it.".into();
+                }
+                return Err(refusal);
             }
             return Err(serde_json::json!({"category":category}));
         }
@@ -788,14 +861,30 @@ impl CodeModeService {
                 "execution_state":state["execution_state"], "exit_code":state["exit_code"]}),
             );
         }
-        execute_handler::schema_validated_delivery(
-            response,
-            intent
-                .limit
-                .min(metrics.output_budget.unwrap_or(intent.limit)),
-            intent.schema.as_ref(),
-        )
-        .map(Some)
+        let limit = intent
+            .limit
+            .min(metrics.output_budget.unwrap_or(intent.limit));
+        let delivery =
+            execute_handler::schema_validated_delivery(response, limit, intent.schema.as_ref());
+        let Some(retained) = retained_answers.remove(&turn.sub_id).filter(|_| {
+            delivery
+                .as_ref()
+                .is_err_and(|refusal| refusal["category"] == "empty_output")
+        }) else {
+            return delivery.map(Some);
+        };
+        // The retry printed nothing: deliver the answer kept at the refusal,
+        // unless new input or a new output schema may have outdated it.
+        if retained.schema != intent.schema
+            || retained.input_activity.has_changed().unwrap_or(true)
+        {
+            return Err(serde_json::json!({"category":"retained_answer_stale",
+                "reason":"input or the output schema changed after the refusal; print the answer"}));
+        }
+        if codex_utils_output_truncation::model_token_count(&retained.text) > limit {
+            return Err(serde_json::json!({"category":"output_budget", "limit":limit}));
+        }
+        Ok(Some(retained.text))
     }
 
     pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
@@ -866,33 +955,48 @@ impl CodeModeService {
                 value["results"].as_array(),
             )
         {
-            let required_ranges = results
-                .iter()
-                .filter_map(|result| {
-                    let start = result["canonical_range"]["start"].as_u64()?;
-                    let end = result["canonical_range"]["end"].as_u64()?;
-                    (start <= end && end <= bytes).then_some((start, end))
-                })
-                .collect::<Vec<_>>();
-            if required_ranges.is_empty() {
+            let range = |result: &JsonValue| {
+                let start = result["canonical_range"]["start"].as_u64()?;
+                let end = result["canonical_range"]["end"].as_u64()?;
+                (start <= end && end <= bytes).then_some((start, end))
+            };
+            // A selector error makes the whole read incomplete without hiding
+            // the selections that were delivered. Only unfinished results owe
+            // recovery; finished ones already delivered their exact ranges.
+            let mut required_ranges = Vec::new();
+            let mut delivered_ranges = Vec::new();
+            let mut unauthenticated = false;
+            for result in results {
+                match (result["complete"] == true, range(result)) {
+                    (true, delivered) => delivered_ranges.extend(delivered),
+                    (false, Some(required)) => required_ranges.push(required),
+                    (false, None) => unauthenticated = true,
+                }
+            }
+            if unauthenticated {
                 // A cursor without authenticated ranges is not proof of exact
                 // coverage. Do not make an incomplete search deliverable.
                 metrics.delivery_blocked = true;
-            } else {
-                match metrics.delivery_recovery.entry(id.to_string()) {
+            } else if !required_ranges.is_empty() {
+                let coverage = match metrics.delivery_recovery.entry(id.to_string()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(DeliveryArtifactCoverage {
                             sha256: sha256.to_string(),
                             bytes,
                             ranges: Vec::new(),
                             required_ranges,
-                        });
+                        })
                     }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if !entry.get().required_ranges.is_empty() {
-                            entry.get_mut().required_ranges.extend(required_ranges);
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        let coverage = entry.into_mut();
+                        if !coverage.required_ranges.is_empty() {
+                            coverage.required_ranges.extend(required_ranges);
                         }
+                        coverage
                     }
+                };
+                if coverage.sha256 == sha256 {
+                    coverage.cover(delivered_ranges);
                 }
             }
         }
@@ -3598,6 +3702,201 @@ mod tests {
         );
         service.record_delivery_evidence(&cell, false, None, None, &json!({"complete":true}));
         assert!(service.packet_admission.lock().unwrap().cells[cell.as_str()].delivery_blocked);
+    }
+
+    #[tokio::test]
+    async fn delivered_selections_beside_selector_errors_owe_no_recovery() {
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        let service = test_service();
+        let prior = CellId::new("selector-error-read".into());
+        service.record_cell_parent_call_id(&prior, "prior");
+        service.record_cell_turn(&prior, &turn.sub_id);
+        // read_file reports complete=false for any invalid selector, even when
+        // every valid selection was delivered in full.
+        service.record_delivery_evidence(
+            &prior,
+            false,
+            None,
+            None,
+            &json!({"complete":false,"artifact_id":"read","canonical_sha256":"hash",
+                "canonical_bytes":100,
+                "selector_errors":[{"selector_index":1,"status":"invalid_selector","complete":false}],
+                "results":[{"status":"ok","complete":true,"canonical_range":{"start":10,"end":60}}]}),
+        );
+        // An oversized selection delivers a prefix and owes only its remainder.
+        service.record_delivery_evidence(
+            &prior,
+            false,
+            None,
+            None,
+            &json!({"complete":false,"artifact_id":"split","canonical_sha256":"split-hash",
+                "canonical_bytes":100,
+                "results":[
+                    {"status":"selector_too_large","complete":false,
+                        "canonical_range":{"start":20,"end":90},
+                        "continuation":{"kind":"bytes","start":70,"end":90}},
+                    {"status":"ok","complete":true,"canonical_range":{"start":20,"end":70}}
+                ]}),
+        );
+        service.finish_cell_dispatch(&prior);
+        let cell = CellId::new("deliver-after-selector-error".into());
+        service.record_cell_parent_call_id(&cell, "current");
+        let (_activity, receiver) =
+            tokio::sync::watch::channel(crate::session::InputQueueActivity::InternalCompletion);
+        let response = RuntimeResponse::Result {
+            cell_id: cell.clone(),
+            error_text: None,
+            output_loss: None,
+            content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
+                text: "answer".into(),
+            }],
+        };
+        service.record_delivery_intent(&cell, &turn, receiver.clone());
+        let refusal = service
+            .delivery_for_response(&cell, &turn, &response)
+            .unwrap_err();
+        assert_eq!(
+            refusal["recovery"],
+            json!([{"artifact_id":"split","canonical_sha256":"split-hash",
+                "canonical_bytes":100,"tool":"read_tool_output",
+                "arguments":{"artifact_id":"split",
+                    "selectors":[{"kind":"bytes","start":70,"end":90}]},
+                "more_missing_ranges":false}])
+        );
+        // The same range read from a different source hash is other evidence.
+        service.record_delivery_evidence(
+            &cell,
+            false,
+            None,
+            Some(&json!({"semantic_evidence":{"source":"artifact","scope":"split",
+                "identity":{"sha256":"other-hash","ranges":[[70,90]]}}})),
+            &json!({}),
+        );
+        service.record_delivery_intent(&cell, &turn, receiver.clone());
+        assert_eq!(
+            service
+                .delivery_for_response(&cell, &turn, &response)
+                .unwrap_err()["category"],
+            "evidence_recovery_pending"
+        );
+        service.record_delivery_evidence(
+            &cell,
+            false,
+            None,
+            Some(&json!({"semantic_evidence":{"source":"artifact","scope":"split",
+                "identity":{"sha256":"split-hash","ranges":[[70,90]]}}})),
+            &json!({}),
+        );
+        service.record_delivery_intent(&cell, &turn, receiver);
+        assert_eq!(
+            service
+                .delivery_for_response(&cell, &turn, &response)
+                .unwrap(),
+            Some("answer".into())
+        );
+        assert!(!service.packet_admission.lock().unwrap().cells[cell.as_str()].delivery_blocked);
+    }
+
+    #[tokio::test]
+    async fn an_answer_refused_for_recovery_is_kept_for_a_retry_that_prints_nothing() {
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        let service = test_service();
+        let truncated_read = |artifact: &str| {
+            let cell = CellId::new(format!("read-{artifact}"));
+            service.record_cell_parent_call_id(&cell, artifact);
+            service.record_cell_turn(&cell, &turn.sub_id);
+            service.record_delivery_evidence(
+                &cell,
+                false,
+                None,
+                None,
+                &json!({"complete":false,"artifact_id":artifact,"canonical_sha256":"hash",
+                    "canonical_bytes":100,
+                    "results":[{"status":"selector_too_large","complete":false,
+                        "canonical_range":{"start":50,"end":100}}]}),
+            );
+            service.finish_cell_dispatch(&cell);
+        };
+        let recover = |artifact: &str| {
+            let cell = CellId::new(format!("recover-{artifact}"));
+            service.record_cell_parent_call_id(&cell, artifact);
+            service.record_delivery_evidence(
+                &cell,
+                false,
+                None,
+                Some(&json!({"semantic_evidence":{"source":"artifact","scope":artifact,
+                    "identity":{"sha256":"hash","ranges":[[50,100]]}}})),
+                &json!({}),
+            );
+            service.finish_cell_dispatch(&cell);
+        };
+        let deliver = |name: &str,
+                       input: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
+                       printed: &str| {
+            let cell = CellId::new(name.into());
+            service.record_cell_parent_call_id(&cell, name);
+            service.record_delivery_intent(&cell, &turn, input);
+            let content_items = if printed.is_empty() {
+                Vec::new()
+            } else {
+                vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
+                    text: printed.into(),
+                }]
+            };
+            let response = RuntimeResponse::Result {
+                cell_id: cell.clone(),
+                error_text: None,
+                output_loss: None,
+                content_items,
+            };
+            let delivery = service.delivery_for_response(&cell, &turn, &response);
+            service.finish_cell_dispatch(&cell);
+            delivery
+        };
+        let (activity, input) =
+            tokio::sync::watch::channel(crate::session::InputQueueActivity::InternalCompletion);
+
+        truncated_read("a");
+        let refusal = deliver("first", input.clone(), "answer").unwrap_err();
+        assert_eq!(refusal["category"], "evidence_recovery_pending");
+        assert!(refusal["retained_answer"].is_string());
+        // A retry before recovery is still refused, and the answer stays kept.
+        let refusal = deliver("early", input.clone(), "").unwrap_err();
+        assert_eq!(refusal["category"], "evidence_recovery_pending");
+        assert!(refusal["retained_answer"].is_string());
+        recover("a");
+        assert_eq!(
+            deliver("retry", input.clone(), "").unwrap(),
+            Some("answer".to_string())
+        );
+        // It is delivered once; nothing printed afterwards is just empty.
+        assert_eq!(
+            deliver("again", input.clone(), "").unwrap_err()["category"],
+            "empty_output"
+        );
+
+        // A new answer printed after recovery replaces the kept one.
+        truncated_read("b");
+        deliver("refused-b", input.clone(), "answer").unwrap_err();
+        recover("b");
+        assert_eq!(
+            deliver("revised", input.clone(), "revised answer").unwrap(),
+            Some("revised answer".to_string())
+        );
+        assert_eq!(
+            deliver("after-revised", input.clone(), "").unwrap_err()["category"],
+            "empty_output"
+        );
+
+        // Input that arrived after the refusal may outdate the kept answer.
+        truncated_read("c");
+        deliver("refused-c", input.clone(), "answer").unwrap_err();
+        recover("c");
+        activity.send_replace(crate::session::InputQueueActivity::Steer);
+        assert_eq!(
+            deliver("stale", activity.subscribe(), "").unwrap_err()["category"],
+            "retained_answer_stale"
+        );
     }
 
     #[test]

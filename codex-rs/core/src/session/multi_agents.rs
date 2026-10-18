@@ -5,7 +5,33 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
+/// Host-owned `read_file` locator for the configured delegation guidance.
+pub(crate) const USAGE_HINT_LOCATOR: &str = "context:multi-agent";
+
+/// Sent instead of the root guidance while delegation needs an explicit
+/// request, so a session that never delegates does not resend it every step.
+const DEFERRED_ROOT_USAGE_HINT_TEXT: &str = "You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals. Agent tools (`spawn_agent`, `followup_task`, `send_message` and the rest of the `agents` namespace) can delegate work when delegation is authorized. Before spawning, messaging or waiting on agents, read the team guidance with `read_file(path=\"context:multi-agent\")`.";
+
 pub(super) fn usage_hint_text<'a>(
+    turn_context: &'a TurnContext,
+    session_source: &SessionSource,
+) -> Option<&'a str> {
+    let text = full_usage_hint_text(turn_context, session_source)?;
+    let root = !matches!(
+        session_source,
+        SessionSource::SubAgent(_) | SessionSource::Internal(_)
+    );
+    if root
+        && effective_multi_agent_mode(turn_context)
+            == Some(EffectiveMultiAgentMode::ExplicitRequestOnly)
+    {
+        return Some(DEFERRED_ROOT_USAGE_HINT_TEXT);
+    }
+    Some(text)
+}
+
+/// The configured guidance, deferred or not, that the locator serves.
+pub(crate) fn full_usage_hint_text<'a>(
     turn_context: &'a TurnContext,
     session_source: &SessionSource,
 ) -> Option<&'a str> {

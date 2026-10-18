@@ -37,6 +37,7 @@ const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 
 #[path = "code_sections.rs"]
 pub(super) mod code_sections;
+pub(crate) use code_sections::existing_tests_changed;
 
 #[path = "read_file_structure.rs"]
 mod structure;
@@ -600,6 +601,37 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         "Desktop guidance exceeds the read_file size limit".to_string(),
                     ));
                 }
+                // The tools this guidance names but the inventory lacks are
+                // listed here, where the names are read, not in every request.
+                let missing = invocation
+                    .step_context
+                    .tool_router()
+                    .map(|router| router.desktop_guidance_unavailable_tools(contents))
+                    .unwrap_or_default();
+                (
+                    if missing.is_empty() {
+                        contents.to_string()
+                    } else {
+                        format!("{contents}\n\n{missing}")
+                    },
+                    args.path.clone(),
+                    None,
+                    "host-context".to_string(),
+                    args.path.clone(),
+                )
+            } else if args.path == crate::session::multi_agents::USAGE_HINT_LOCATOR {
+                if args.environment_id.is_some() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "omit environment_id for host-owned agent team guidance".to_string(),
+                    ));
+                }
+                let contents =
+                    crate::session::multi_agents::full_usage_hint_text(turn, &turn.session_source)
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(
+                                "no agent team guidance is configured for this turn".to_string(),
+                            )
+                        })?;
                 (
                     contents.to_string(),
                     args.path.clone(),
@@ -2559,6 +2591,74 @@ mod tests {
             .expect("unique fixture turn")
             .developer_instructions = None;
         assert!(ReadFileHandler.handle(missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn host_guidance_locators_serve_the_details_requests_no_longer_carry() {
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolRouter;
+
+        let (session, mut turn) = make_session_and_context().await;
+        let guidance = "<app-context>\n# Codex desktop context\n### Thread Coordination\nUse `read_file` and `list_threads`.\n</app-context>";
+        turn.developer_instructions = Some(guidance.to_string());
+        turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .root_agent_usage_hint_text = Some("Full team guidance.".to_string());
+        // Only read_file is registered, so the guidance's other tool is absent.
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>]),
+            Vec::new(),
+        ));
+        let step_context = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let session = Arc::new(session);
+        let read = |path: &str| {
+            let payload = ToolPayload::Function {
+                arguments: json!({ "path": path }).to_string(),
+            };
+            let invocation = ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: Arc::clone(&step_context),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("read-{path}"),
+                tool_name: ToolName::plain("read_file"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            };
+            async move {
+                let output = ReadFileHandler.handle(invocation).await.unwrap();
+                output.code_mode_result(&payload)["results"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+
+        let desktop = read(crate::context::desktop_instructions::LOCATOR).await;
+        assert!(desktop.starts_with(guidance));
+        assert!(desktop.contains("absent from the current inventory"));
+        assert!(desktop.contains("Thread Coordination: list_threads."));
+        assert_eq!(
+            read(crate::session::multi_agents::USAGE_HINT_LOCATOR).await,
+            "Full team guidance."
+        );
+        for locator in [
+            crate::context::desktop_instructions::LOCATOR,
+            crate::session::multi_agents::USAGE_HINT_LOCATOR,
+        ] {
+            assert!(
+                crate::tool_history::source_dependencies_for_tool_call(
+                    "read_file",
+                    &ToolPayload::Function {
+                        arguments: json!({ "path": locator }).to_string(),
+                    },
+                    Path::new("."),
+                )
+                .is_empty(),
+                "{locator} is host context, not a workspace read"
+            );
+        }
     }
 
     #[tokio::test]

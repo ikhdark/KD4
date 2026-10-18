@@ -84,8 +84,8 @@ fn symbol_matches(item: &CodeItem, name: &str) -> bool {
         || item.qualified_name.ends_with(&format!(".{name}"))
 }
 
-// Diagnostic-only repair for Type::method when the parsed owner is a trait
-// implementation. Never make this looser spelling an executable selector.
+// Type::method where the parsed owner is a trait implementation. Like the
+// Rust path, it resolves only when exactly one such method answers.
 fn trait_method_candidate(item: &CodeItem, name: &str) -> bool {
     name.contains("::")
         && item
@@ -94,10 +94,80 @@ fn trait_method_candidate(item: &CodeItem, name: &str) -> bool {
             .is_some_and(|alias| alias == name || alias.ends_with(&format!("::{name}")))
 }
 
+/// The outline names an impl by its header without generic parameters or a
+/// where clause: `impl<T: Ord> Set<T> where T: Copy {` is `impl Set<T>`.
+/// `None` when the request is not such a source header.
+fn outline_impl_spelling(name: &str) -> Option<String> {
+    let mut rest = name.trim().strip_prefix("impl")?;
+    if let Some(parameters) = rest.strip_prefix('<') {
+        let (mut depth, mut previous, mut end) = (1_usize, ' ', None);
+        for (index, ch) in parameters.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                // `->` in a closure bound is not a closing bracket.
+                '>' if previous != '-' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            previous = ch;
+        }
+        rest = &parameters[end? + 1..];
+    } else if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let header = rest
+        .split(" where ")
+        .next()?
+        .trim()
+        .trim_end_matches('{')
+        .trim();
+    let spelled = format!("impl {header}");
+    (!header.is_empty() && spelled != name).then_some(spelled)
+}
+
+fn same_impl_header(qualified_name: &str, header: &str) -> bool {
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let (qualified_name, header) = (compact(qualified_name), compact(header));
+    qualified_name == header || qualified_name.ends_with(&format!("::{header}"))
+}
+
+fn ambiguous_symbol(name: &str) -> ReadToolOutputError {
+    ReadToolOutputError::InvalidRange(format!(
+        "symbol {name:?} is ambiguous; use a qualified name such as Type::method or <Type as Trait>::method (Python: Class.method), or enclosing with a known line"
+    ))
+}
+
+/// A trait method named `Type::method`, or an impl named by its source header,
+/// when exactly one item answers. Several answers are ambiguous.
+fn unique_alias<'a>(
+    items: &'a [CodeItem],
+    name: &str,
+) -> Result<Option<&'a CodeItem>, ReadToolOutputError> {
+    let header = outline_impl_spelling(name);
+    let mut aliases = items.iter().filter(|item| {
+        trait_method_candidate(item, name)
+            || header.as_deref().is_some_and(|header| {
+                item.kind == "impl" && same_impl_header(&item.qualified_name, header)
+            })
+    });
+    match (aliases.next(), aliases.next()) {
+        (Some(item), None) => Ok(Some(item)),
+        (Some(_), Some(_)) => Err(ambiguous_symbol(name)),
+        (None, _) => Ok(None),
+    }
+}
+
 // Diagnostic-only repair for impl and <Type as Trait> requests whose paths or
 // generic arguments differ from the source header, which the caller cannot
 // know before reading the file. Never an executable selector.
 fn header_spelling_candidate(item: &CodeItem, name: &str) -> bool {
+    let header = outline_impl_spelling(name);
+    let name = header.as_deref().unwrap_or(name);
     let impl_request = name.starts_with("impl ") || name.contains("::impl ");
     let trait_request = name.starts_with('<') || name.contains("::<");
     if !(impl_request || trait_request) || impl_request != (item.kind == "impl") {
@@ -251,6 +321,7 @@ pub(super) fn resolve_batch(
                 let mut candidate_count = 0;
                 let mut imported = false;
                 let mut message_suffix: Option<&str> = None;
+                let mut elsewhere = None;
                 if let FileSelector::Structure(StructureSelector::Symbol { name }) = &selector {
                     let mut matches = items
                         .iter()
@@ -299,6 +370,14 @@ pub(super) fn resolve_batch(
                                 "selector":{"kind":"lines", "start":item.start_line, "end":item.end_line}}));
                         }
                     }
+                    // Recorded misses were mostly definitions in a sibling file;
+                    // retrying other spellings here cannot find them.
+                    if candidate_count == 0 && items.is_some() {
+                        let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
+                        elsewhere = Some(format!(
+                            " Nothing in this file is named {leaf:?}; it is defined in another file or generated by a macro. Search other files for its definition (for example `fn {leaf}`, `struct {leaf}` or `def {leaf}`) instead of retrying this file."
+                        ));
+                    }
                 } else if let FileSelector::Structure(StructureSelector::Enclosing { line }) =
                     &selector
                 {
@@ -342,6 +421,9 @@ pub(super) fn resolve_batch(
                 if let Some(suffix) = message_suffix {
                     message.push_str(suffix);
                 }
+                if let Some(elsewhere) = &elsewhere {
+                    message.push_str(elsewhere);
+                }
                 failures.push(
                     serde_json::json!({"selector_index":index, "selector":selector,
                     "status":"invalid_selector", "complete":false, "message":message,
@@ -382,17 +464,18 @@ fn resolve_items(
                 let mut matches = items.iter().filter(|item| {
                     symbol_matches(item, &name) && (!exact || item.qualified_name == name)
                 });
-                let item = matches.next().ok_or_else(|| {
-                    error(format!(
-                        "symbol {name:?} not found (macros are not expanded)"
-                    ))
-                })?;
-                if matches.next().is_some() {
-                    return Err(error(format!(
-                        "symbol {name:?} is ambiguous; use a qualified name such as Type::method or <Type as Trait>::method (Python: Class.method), or enclosing with a known line"
-                    )));
+                let first = matches.next();
+                if first.is_some() && matches.next().is_some() {
+                    return Err(ambiguous_symbol(&name));
                 }
-                item
+                match first {
+                    Some(item) => item,
+                    None => unique_alias(items, &name)?.ok_or_else(|| {
+                        error(format!(
+                            "symbol {name:?} not found (macros are not expanded)"
+                        ))
+                    })?,
+                }
             }
             StructureSelector::Enclosing { line } => enclosing(items, line)?,
             StructureSelector::Search {
@@ -880,5 +963,68 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(bindings[0]["qualified_name"], "A::run");
         assert_eq!(bindings[1]["syntax_error"], true);
+    }
+
+    /// Recorded misses that each cost a retry: a trait method requested by its
+    /// Rust path and an impl requested by its source header. Each has exactly
+    /// one answer; a bare name shared by several items stays ambiguous.
+    #[test]
+    fn unique_paths_and_source_headers_resolve_to_their_item() {
+        let source = "struct RootDatabase;\nimpl Clone for RootDatabase {\n    fn clone(&self) -> Self { RootDatabase }\n}\nstruct FactSet<T>(Vec<T>);\nimpl<T: Ord + Clone> FactSet<T>\nwhere\n    T: Copy,\n{\n    fn insert(&mut self) {}\n}\nfn collect() {}\nstruct Collector;\nimpl Collector {\n    fn collect(&self) {}\n}\n";
+        for (name, start, end, qualified_name) in [
+            ("RootDatabase::clone", 3, 3, "<RootDatabase as Clone>::clone"),
+            ("impl<T: Ord + Clone> FactSet<T>", 6, 11, "impl FactSet<T>"),
+            ("Collector::collect", 15, 15, "Collector::collect"),
+        ] {
+            let mut canonical = CanonicalToolResult::text(source.to_owned());
+            let (resolved, errors, bindings) = resolve_batch(
+                "lib.rs",
+                &mut canonical,
+                Some(vec![FileSelector::Structure(StructureSelector::Symbol {
+                    name: name.into(),
+                })]),
+            );
+            assert!(errors.is_empty(), "{name}: {errors:?}");
+            assert_eq!(
+                resolved,
+                Some(vec![ToolOutputSelector::Lines { start, end }]),
+                "{name}"
+            );
+            assert_eq!(bindings[0]["qualified_name"], qualified_name, "{name}");
+        }
+        assert_eq!(
+            outline_impl_spelling("impl<F: Fn() -> u8> Runner<F> where F: Copy {").as_deref(),
+            Some("impl Runner<F>")
+        );
+
+        // A bare name shared by a function and a method lists both.
+        let mut canonical = CanonicalToolResult::text(source.to_owned());
+        let (resolved, errors, _) = resolve_batch(
+            "lib.rs",
+            &mut canonical,
+            Some(vec![FileSelector::Structure(StructureSelector::Symbol {
+                name: "collect".into(),
+            })]),
+        );
+        assert!(resolved.unwrap().is_empty());
+        assert_eq!(errors[0]["candidates"].as_array().unwrap().len(), 2);
+
+        // A name nothing in the file defines points elsewhere instead.
+        let mut canonical = CanonicalToolResult::text(source.to_owned());
+        let (_, errors, _) = resolve_batch(
+            "lib.rs",
+            &mut canonical,
+            Some(vec![FileSelector::Structure(StructureSelector::Symbol {
+                name: "callable_arguments".into(),
+            })]),
+        );
+        assert!(errors[0]["candidates"].as_array().unwrap().is_empty());
+        assert!(
+            errors[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Search other files for its definition"),
+            "{errors:?}"
+        );
     }
 }

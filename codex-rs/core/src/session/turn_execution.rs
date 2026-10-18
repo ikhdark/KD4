@@ -69,6 +69,26 @@ pub(crate) fn bounded_path_list(paths: &[String]) -> String {
         more => format!("{listed}, and {more} more"),
     }
 }
+
+/// Whether a request explicitly rules out running tests, as in "Do not run
+/// tests or benchmarks." Partial or conditional wording such as "do not run
+/// tests in parallel" or "unless the build passes" does not match.
+pub(crate) fn request_excludes_tests(text: &str) -> bool {
+    #[expect(
+        clippy::expect_used,
+        reason = "the regex is a fixed source literal, not runtime input"
+    )]
+    static EXCLUSION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"(?im)\b(?:(?:do\s+not|don['’]?t|never|no\s+need\s+to)\s+(?:run|execute)|skip(?:\s+running)?|without\s+running)",
+            r"\s+(?:any\s+|the\s+)?(?:unit\s+|integration\s+)?(?:tests?|test\s+suites?)\b",
+            r"(?:\s+(?:or|and|nor|yet)\b|\s*(?:[.,;:!)*]|$))",
+        ))
+        .expect("valid test exclusion regex")
+    });
+    EXCLUSION.is_match(text)
+}
+
 /// Advisory-only policy. Production keeps these defaults; replay fixtures can
 /// compare alternatives without changing completion, recovery or cancellation
 /// invariants. This does not select models or alter reasoning effort.
@@ -3315,6 +3335,8 @@ pub(crate) struct TurnExecutionControl {
     validation_check_orders: BTreeMap<String, (u64, u64)>,
     next_validation_request: AtomicU64,
     pending_validation_coverage: BTreeMap<u64, PendingValidation>,
+    /// The request explicitly ruled out running tests.
+    tests_excluded_by_request: bool,
     session_path_replays: Option<Arc<SessionPathReplays>>,
     session_validation_uncertainty: Option<Arc<Mutex<SessionValidationUncertainty>>>,
 }
@@ -3526,9 +3548,16 @@ impl TurnExecutionControl {
             validation_check_orders: BTreeMap::new(),
             next_validation_request: AtomicU64::new(0),
             pending_validation_coverage: BTreeMap::new(),
+            tests_excluded_by_request: false,
             session_path_replays: None,
             session_validation_uncertainty: None,
         }
+    }
+
+    /// Untested changes are what a request that rules out tests asked for,
+    /// so completion stops reporting them as a verification gap.
+    pub(crate) fn note_request_excludes_tests(&mut self) {
+        self.tests_excluded_by_request = true;
     }
 
     pub(crate) fn with_active_plan(
@@ -3685,7 +3714,7 @@ impl TurnExecutionControl {
                     uncovered.push(changed);
                 }
             }
-            if !uncovered.is_empty() {
+            if !uncovered.is_empty() && !self.tests_excluded_by_request {
                 // With nothing attributed at all, the likeliest cause is a
                 // repository runner the classifier was never told about.
                 let unrecognized = if self.validation_coverage_revision
@@ -11252,6 +11281,42 @@ mod tests {
         assert!(gap.contains("local:src/m9.rs"), "{gap}");
         assert!(!gap.contains("local:src/m10.rs"), "{gap}");
         assert!(gap.contains("and 2 more"), "{gap}");
+    }
+
+    /// Recorded audits said "Do not run tests or benchmarks." and still got a
+    /// verification-gap warning naming every edited file.
+    #[test]
+    fn request_that_rules_out_tests_owes_no_untested_path_gap() {
+        for request in [
+            "Finish implementing all 3 verified findings. **Do not run tests or benchmarks.** Regression cases may be added without execution.",
+            "Don't run tests.",
+            "Implement it without running the tests.",
+            "do not run the test suite, just report",
+            "Fix the bug.\nSkip tests\nThen summarize.",
+        ] {
+            assert!(super::request_excludes_tests(request), "{request}");
+        }
+        for request in [
+            "Run the tests and fix failures.",
+            "Do not run tests in parallel.",
+            "Do not run tests unless the build passes.",
+            "Skip tests that need network access.",
+            "Make sure tests pass; do not skip any assertion.",
+        ] {
+            assert!(!super::request_excludes_tests(request), "{request}");
+        }
+
+        let changed = vec![("local".into(), std::path::PathBuf::from("src/lib.rs"))];
+        let mut control = TurnExecutionControl::new();
+        control.note_request_excludes_tests();
+        let gaps = control.completion_gaps_with_changed_paths(0, Some(&changed), false);
+        assert!(
+            !gaps.iter().any(|gap| gap.starts_with("Changed paths")),
+            "{gaps:?}"
+        );
+        // Other gaps still report: an unavailable change set is not excused.
+        let gaps = control.completion_gaps_with_changed_paths(0, Some(&changed), true);
+        assert!(gaps.iter().any(|gap| gap.contains("Untracked changes exist")));
     }
 
     #[test]

@@ -26,7 +26,8 @@ use codex_protocol::protocol::WebSearchEndEvent;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolExposure;
-use codex_tools::default_namespace_description;
+use codex_tools::ToolSearchInfo;
+use codex_tools::ToolSearchSourceInfo;
 use http::HeaderMap;
 use std::sync::LazyLock;
 use url::Url;
@@ -38,6 +39,10 @@ use crate::schema::commands_schema;
 pub(crate) const WEB_NAMESPACE: &str = "web";
 pub(crate) const RUN_TOOL_NAME: &str = "run";
 const WEB_RUN_DESCRIPTION: &str = include_str!("../web_run_description.md");
+const WEB_SOURCE_NAME: &str = "Web";
+/// The deferred catalog lists this source before its tools load. A bare
+/// `source:web` scope did not tell a research task that it can browse.
+const WEB_SOURCE_DESCRIPTION: &str = "Search the public web and open pages, PDFs and links: current facts, documentation, papers and other projects' source that the workspace does not contain.";
 const WEB_SEARCH_CANCELLED_MESSAGE: &str = "web search cancelled";
 
 pub(crate) struct WebSearchTool {
@@ -62,7 +67,7 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
 
             ToolSpec::Namespace(ResponsesApiNamespace {
                 name: WEB_NAMESPACE.to_string(),
-                description: default_namespace_description(WEB_NAMESPACE),
+                description: WEB_SOURCE_DESCRIPTION.to_string(),
                 tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
                     name: RUN_TOOL_NAME.to_string(),
                     description: WEB_RUN_DESCRIPTION.to_string(),
@@ -78,6 +83,16 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
 
     fn exposure(&self) -> ToolExposure {
         ToolExposure::Deferred
+    }
+
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        ToolSearchInfo::from_tool_spec(
+            &self.spec(),
+            Some(ToolSearchSourceInfo {
+                name: WEB_SOURCE_NAME.to_string(),
+                description: Some(WEB_SOURCE_DESCRIPTION.to_string()),
+            }),
+        )
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {

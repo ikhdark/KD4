@@ -248,27 +248,20 @@ impl ToolRouter {
         self.registry.tool_exposure(name).is_some()
     }
 
-    pub(crate) fn tool_search_sources_for_instructions(
-        &self,
-        instructions: Option<&str>,
-    ) -> std::borrow::Cow<'_, str> {
-        let Some(instructions) = instructions.filter(|text| text.contains("<app-context>")) else {
-            return std::borrow::Cow::Borrowed(&self.tool_search_sources);
-        };
+    pub(crate) fn tool_search_sources(&self) -> &str {
+        &self.tool_search_sources
+    }
+
+    /// Tools the deferred Desktop guidance names that this inventory, including
+    /// deferred tools, lacks. Routers can be reused across turns, so the caller
+    /// passes the current instructions rather than relying on the cache identity.
+    pub(crate) fn desktop_guidance_unavailable_tools(&self, instructions: &str) -> String {
         let entries = self.registry.manifest_entries();
         let available = entries
             .iter()
             .map(|tool| tool.tool_name().name.as_str())
             .collect();
-        let missing =
-            crate::context::desktop_instructions::unavailable_tools(instructions, &available);
-        if missing.is_empty() {
-            std::borrow::Cow::Borrowed(&self.tool_search_sources)
-        } else {
-            // Routers can be reused across turns; the current instructions are
-            // not part of their inventory cache identity.
-            std::borrow::Cow::Owned(format!("{}\n{missing}", self.tool_search_sources))
-        }
+        crate::context::desktop_instructions::unavailable_tools(instructions, &available)
     }
 
     pub(crate) fn exposure_identity(&self) -> &ToolExposureIdentity {

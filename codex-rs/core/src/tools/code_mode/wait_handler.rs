@@ -302,6 +302,10 @@ impl CodeModeWaitHandler {
                 let mut output =
                     handle_runtime_response(&exec, response, effective_max_tokens, started_at)
                         .map_err(FunctionCallError::RespondToModel)?;
+                exec.session
+                    .services
+                    .code_mode_service
+                    .elide_bodies_already_in_context(&mut output);
                 output =
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);
                 if let Some(signal) = authoritative_wait_signal {

@@ -12,12 +12,11 @@ Scenario: Pre-turn auto-compaction with a context override emits the context dif
 04:message/developer:<NO_TEXT>
 05:message/developer:<personality_spec>Use the following communication style for futu...
 06:message/user:USER_ONE
-07:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhausti...
-08:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [s...
-09:message/assistant:FIRST_REPLY
-10:message/user:USER_TWO
-11:message/assistant:SECOND_REPLY
-12:message/user:<SUMMARIZATION_PROMPT>
+07:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [s...
+08:message/assistant:FIRST_REPLY
+09:message/user:USER_TWO
+10:message/assistant:SECOND_REPLY
+11:message/user:<SUMMARIZATION_PROMPT>
 
 ## Local Post-Compaction History Layout
 00:message/developer[3]:
@@ -37,5 +36,4 @@ Scenario: Pre-turn auto-compaction with a context override emits the context dif
 07:message/user[2]:
     [01] <input_image:detail,image_url>
     [02] USER_THREE
-08:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhausti...
-09:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [s...
+08:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [s...

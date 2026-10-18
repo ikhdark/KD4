@@ -17,8 +17,8 @@ fn is_deferred_heading(heading: &str) -> bool {
     )
 }
 
-/// Published with the router's existing inventory notice, not another inventory
-/// lookup or persistent context owner. Include deferred tools as available too.
+/// Appended to the deferred guidance when `read_file` serves it, so only a turn
+/// that reads the guidance pays for it. Include deferred tools as available too.
 pub(crate) fn unavailable_tools(
     instructions: &str,
     available: &std::collections::HashSet<&str>,

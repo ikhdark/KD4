@@ -548,19 +548,40 @@ impl TurnDiffTracker {
     /// Display paths of files that existed before this turn and that it
     /// modified or deleted, following a rename to its destination. Unlike an
     /// added file, such an edit can change what an existing check asserts.
+    #[cfg(test)]
     pub(crate) fn changed_existing_display_paths(&self) -> Vec<String> {
+        self.changed_existing_contents()
+            .into_iter()
+            .map(|(path, ..)| path)
+            .collect()
+    }
+
+    /// Files that existed before this turn and that it modified or deleted,
+    /// sorted by display path, with their text before the turn and after it
+    /// (`None` once deleted), following a rename to its destination.
+    pub(crate) fn changed_existing_contents(&self) -> Vec<(String, String, Option<String>)> {
         self.baseline_by_path
             .iter()
-            .filter(|(path, before)| {
-                let after = self.current_by_path.get(*path).or_else(|| {
+            .filter_map(|(path, before)| {
+                let after = self.current_by_path.get(path).or_else(|| {
                     self.rename_destination(path)
                         .and_then(|destination| self.current_by_path.get(destination))
                 });
-                after.is_none_or(|after| after.content != before.content)
+                after
+                    .is_none_or(|after| after.content != before.content)
+                    .then(|| {
+                        (
+                            self.display_path(path),
+                            (
+                                before.content.clone(),
+                                after.map(|after| after.content.clone()),
+                            ),
+                        )
+                    })
             })
-            .map(|(path, _)| self.display_path(path))
-            .collect::<BTreeSet<_>>()
+            .collect::<BTreeMap<_, _>>()
             .into_iter()
+            .map(|(path, (before, after))| (path, before, after))
             .collect()
     }
 

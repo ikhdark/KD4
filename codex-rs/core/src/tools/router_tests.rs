@@ -68,16 +68,20 @@ async fn desktop_missing_tool_notice_uses_current_instructions_on_a_reused_route
         &Default::default(),
     );
     let instructions = "<app-context>\n# Codex desktop context\n### Thread Coordination\nUse `list_threads` and `send_message_to_thread`.\n</app-context>";
-    let notice = router.tool_search_sources_for_instructions(Some(instructions));
+    let notice = router.desktop_guidance_unavailable_tools(instructions);
     assert!(notice.contains("Thread Coordination: list_threads, send_message_to_thread"));
     assert!(notice.contains("absent from the current inventory"));
-    assert_eq!(
-        router.tool_search_sources_for_instructions(None),
-        router.tool_search_sources
+    assert!(
+        router
+            .desktop_guidance_unavailable_tools("unknown envelope")
+            .is_empty()
     );
-    assert_eq!(
-        router.tool_search_sources_for_instructions(Some("unknown envelope")),
-        router.tool_search_sources
+    // The note travels with the deferred guidance it describes, not with
+    // the source catalog sent on every request.
+    assert!(
+        !router
+            .tool_search_sources()
+            .contains("absent from the current inventory")
     );
 }
 

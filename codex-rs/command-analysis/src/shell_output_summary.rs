@@ -966,19 +966,27 @@ fn powershell_command_segments(script: &str) -> Option<Vec<&str>> {
 }
 
 /// Whether exit 1 can describe an empty search for the whole command.
-/// Compound commands and pipelines may contain earlier matches or failures;
-/// their final search's exit code cannot classify the aggregate output.
+/// A statement sequence takes its exit status from the final statement, so a
+/// standalone final search classifies it; callers still require empty stderr.
+/// Pipelines, conditional chains, blocks and errexit scripts can surface an
+/// earlier command's silent exit 1 and are not classified.
 pub fn ends_with_native_search(command: &str) -> bool {
-    if command.contains("&&") || command.contains("||") {
+    if command.contains("&&") || command.contains("||") || command_sets_errexit(command) {
         return false;
     }
     let Some(last) = powershell_command_segments(command).and_then(|segments| {
-        let mut commands = segments
+        let last = segments
             .into_iter()
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty());
-        let only = commands.next()?;
-        commands.next().is_none().then_some(only)
+            .rev()
+            .find(|segment| !segment.trim().is_empty())?;
+        // Only `;` or a line break may introduce the final statement.
+        let offset = last.as_ptr() as usize - command.as_ptr() as usize;
+        let separated = command[..offset]
+            .trim_end_matches([' ', '\t'])
+            .chars()
+            .last()
+            .is_none_or(|separator| matches!(separator, ';' | '\n' | '\r'));
+        separated.then(|| last.trim())
     }) else {
         return false;
     };
@@ -999,6 +1007,22 @@ pub fn ends_with_native_search(command: &str) -> bool {
         program.strip_suffix(".exe").unwrap_or(&program),
         "rg" | "grep" | "findstr"
     )
+}
+
+/// `set -e` stops a script at the first failing command with that command's
+/// status, so a silent earlier exit 1 would look like the final search's.
+fn command_sets_errexit(command: &str) -> bool {
+    command.contains("errexit")
+        || command
+            .split([';', '\n', '\r', '&', '|'])
+            .any(|statement| {
+                let mut words = statement.split_whitespace();
+                words.next() == Some("set")
+                    && words.any(|word| {
+                        word.strip_prefix('-')
+                            .is_some_and(|flags| !flags.starts_with('-') && flags.contains('e'))
+                    })
+            })
 }
 
 #[derive(Clone, Copy, Default)]

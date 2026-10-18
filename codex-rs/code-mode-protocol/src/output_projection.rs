@@ -5,7 +5,7 @@ use serde_json::Value;
 /// Only known tool envelopes qualify; arbitrary user JSON must not be rewritten.
 pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
     if tool.namespace.is_none() && tool.name == "update_plan" {
-        return plan_without_restated_lineage(raw);
+        return plan_receipt(raw);
     }
     if tool.namespace.is_none() && tool.name == "apply_patch" {
         return patch_without_repeated_summary(raw);
@@ -311,38 +311,26 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     Some(Value::Object(projected))
 }
 
-/// A requirement owned solely by the current step with its ID, text and status
-/// restates `current_plan`. Renamed, merged, split, superseded and retired
-/// requirements, identities and workflow links stay in view.
-fn plan_without_restated_lineage(raw: &Value) -> Option<Value> {
+/// Every plan change is followed in the same request by the task-state
+/// context, which carries the stored plan, its step IDs, revision, obligations
+/// and active lineage. The printed result is therefore a receipt: what this
+/// update did, the revision to pass on, and what remains. Scripts still read
+/// every field from the returned object.
+fn plan_receipt(raw: &Value) -> Option<Value> {
     let object = raw.as_object()?;
-    let mut lineage = object.get("lineage")?.as_object()?.clone();
-    let steps = raw.pointer("/current_plan/plan")?.as_array()?;
-    let step_ids = object.get("step_ids")?.as_array()?;
-    if steps.len() != step_ids.len() {
-        return None;
-    }
-    let mut requirements = lineage.get("requirements")?.as_object()?.clone();
-    let mut step_requirements = lineage.get("step_requirements")?.as_object()?.clone();
-    for (step, id) in steps.iter().zip(step_ids) {
-        let id = id.as_str()?;
-        let (text, status) = (&step["step"], &step["status"]);
-        if step_requirements.get(id) == Some(&serde_json::json!([id]))
-            && requirements.get(id) == Some(&serde_json::json!({"text": text, "status": status}))
-        {
-            step_requirements.remove(id);
-            requirements.remove(id);
-        }
-    }
-    let mut projected = object.clone();
-    if requirements.is_empty() && step_requirements.is_empty() && lineage.len() == 2 {
-        projected.remove("lineage");
-    } else {
-        lineage.insert("requirements".to_string(), Value::Object(requirements));
-        lineage.insert("step_requirements".to_string(), Value::Object(step_requirements));
-        projected.insert("lineage".to_string(), Value::Object(lineage));
-    }
-    (projected != *object).then_some(Value::Object(projected))
+    // Only a successful plan response has this shape; errors print unchanged.
+    object.get("current_plan")?;
+    let projected = object
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "message" | "effect" | "no_progress" | "revision" | "obligations"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    Some(Value::Object(projected))
 }
 
 #[cfg(test)]
@@ -671,44 +659,33 @@ mod tests {
         }
     }
 
+    /// Recorded sessions printed each update's whole plan, step IDs and lineage
+    /// right before the task-state context restated all of them.
     #[test]
-    fn plan_display_omits_only_lineage_restating_current_steps() {
-        let restated = json!({"completion_authority":"checklist_only", "effect":"status_only",
-            "message":"Plan updated", "no_progress":false, "revision":"rev", "step_ids":["a", "b"],
-            "current_plan":{"explanation":null, "plan":[{"step":"Inspect", "status":"completed"},
-                {"step":"Patch the owner", "status":"in_progress"}]},
-            "lineage":{"requirements":{"a":{"text":"Inspect", "status":"completed"},
-                "b":{"text":"Patch the owner", "status":"in_progress"}},
-                "step_requirements":{"a":["a"], "b":["b"]}}});
-        let compact = model_visible_tool_result(&ToolName::plain("update_plan"), &restated).unwrap();
-        let mut expected = restated.clone();
-        expected.as_object_mut().unwrap().remove("lineage");
-        assert_eq!(compact, expected);
-        // Every omitted entry is rebuilt from the step that owns it.
-        let (mut requirements, mut step_requirements) = (json!({}), json!({}));
-        for (id, step) in compact["step_ids"].as_array().unwrap().iter()
-            .zip(compact["current_plan"]["plan"].as_array().unwrap())
-        {
-            let id = id.as_str().unwrap();
-            requirements[id] = json!({"text": step["step"], "status": step["status"]});
-            step_requirements[id] = json!([id]);
+    fn plan_display_is_a_receipt_beside_the_task_state_context() {
+        let receipt = json!({"effect":"status_only", "message":"Plan updated",
+            "no_progress":false, "revision":"rev",
+            "obligations":{"completed":1, "superseded":0, "unresolved":["b"]}});
+        let mut updated = receipt.clone();
+        for (key, value) in [
+            ("completion_authority", json!("checklist_only")),
+            ("lineage_complete", json!(false)),
+            ("step_ids", json!(["a", "b"])),
+            ("current_plan", json!({"explanation":null, "plan":[
+                {"step":"Inspect", "status":"completed"},
+                {"step":"Patch the owner", "status":"in_progress"}]})),
+            ("lineage", json!({"requirements":{"d":{"text":"Drop cache", "status":"pending",
+                "superseded_reason":"not needed"}}, "step_requirements":{}})),
+        ] {
+            updated[key] = value;
         }
-        assert_eq!(json!({"requirements": requirements, "step_requirements": step_requirements}),
-            restated["lineage"]);
-
-        // Original wording, identities and retired obligations stay in view.
-        let mut revised = restated.clone();
-        revised["current_plan"]["plan"][1]["step"] = json!("Patch and test the owner");
-        revised["lineage"]["step_identities"] = json!({"c":"b"});
-        revised["lineage"]["requirements"]["d"] =
-            json!({"text":"Drop cache", "status":"pending", "superseded_reason":"not needed"});
-        let mut expected = revised.clone();
-        expected["lineage"]["requirements"].as_object_mut().unwrap().remove("a");
-        expected["lineage"]["step_requirements"].as_object_mut().unwrap().remove("a");
-        assert_eq!(model_visible_tool_result(&ToolName::plain("update_plan"), &revised), Some(expected));
-        let mut bare = restated;
-        bare.as_object_mut().unwrap().remove("lineage");
-        assert_eq!(model_visible_tool_result(&ToolName::plain("update_plan"), &bare), None);
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("update_plan"), &updated),
+            Some(receipt)
+        );
+        // Anything else, such as a rejected update, prints unchanged.
+        let rejected = json!({"error":"stale plan revision"});
+        assert_eq!(model_visible_tool_result(&ToolName::plain("update_plan"), &rejected), None);
     }
 
     #[test]

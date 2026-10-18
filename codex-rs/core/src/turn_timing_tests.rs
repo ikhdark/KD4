@@ -1272,6 +1272,51 @@ fn exact_tool_closure_pairs_and_persists_direct_and_nested_calls() {
     assert!(closure.complete);
 }
 
+/// Recorded sessions persisted results only at the terminal flush, so each
+/// checkpoint listed every finished call as unresolved (113 at the last one).
+#[test]
+fn sampling_checkpoints_list_only_in_flight_calls_as_unresolved() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    for (call_id, finished) in [("finished-call", true), ("running-call", false)] {
+        let execution_id = ToolExecutionId(format!("{call_id}-execution"));
+        state.record_accepted_tool_call(
+            call_id,
+            &execution_id,
+            TurnTimingToolCallSource::Direct,
+            None,
+        );
+        if finished {
+            state.record_tool_dispatch_timing(
+                call_id,
+                "exec_command",
+                TurnTimingToolCallSource::Direct,
+                ToolCallTimingLineage::default(),
+                ToolDispatchTimingSnapshot {
+                    execution_id,
+                    outcome: Some("success"),
+                    ..ToolDispatchTimingSnapshot::default()
+                },
+            );
+        }
+    }
+
+    let closure = state.sampling_checkpoint().timing.tool_closure;
+    assert_eq!(
+        closure
+            .unresolved_calls
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["running-call"]
+    );
+    assert_eq!(closure.accepted_count, 2);
+    assert_eq!(closure.persisted_count, 0);
+    assert!(!closure.complete);
+    // The live ledger still owes both results their durability attestation.
+    assert_eq!(state.tool_closure_snapshot().unresolved_calls.len(), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn sealed_tool_closure_waits_for_terminal_timing_and_persistence() {
     let (_clock, state) = timing();

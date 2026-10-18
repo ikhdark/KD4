@@ -602,6 +602,31 @@ pub(crate) async fn run_turn(
                 sess.services.plan_store.execution_snapshot().await
             });
     turn_execution.rehydrate_argument_failures(sess.state.lock().await.history.raw_items());
+    if turn_input_text_matches(
+        &input,
+        crate::session::turn_execution::request_excludes_tests,
+    ) {
+        turn_execution.note_request_excludes_tests();
+    }
+    let mut exhaustive_scope_requested =
+        turn_input_text_matches(&input, request_asks_for_exhaustive_scope);
+    // A root session publishes its request and edits while this turn runs, so
+    // concurrent sessions in the checkout do not mistake them for their own.
+    let mut live_session = (!matches!(
+        turn_context.session_source,
+        SessionSource::SubAgent(_) | SessionSource::Internal(_)
+    ))
+    .then(|| turn_input_first_text(&input))
+    .flatten()
+    .map(|intent| {
+        crate::live_sessions::LiveSessionTurn::begin(
+            turn_context.config.codex_home.as_path(),
+            &sess.thread_id.to_string(),
+            turn_context.cwd().as_path(),
+            intent,
+        )
+    });
+    let mut concurrent_sessions_checked = false;
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -648,6 +673,12 @@ pub(crate) async fn run_turn(
             break 'sampling_loop;
         };
 
+        let pending_input_excludes_tests = turn_input_text_matches(
+            &pending_input,
+            crate::session::turn_execution::request_excludes_tests,
+        );
+        let pending_input_exhaustive =
+            turn_input_text_matches(&pending_input, request_asks_for_exhaustive_scope);
         let recorded_input =
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, pending_input).await?;
         if recorded_input.accepted_context_input {
@@ -657,6 +688,10 @@ pub(crate) async fn run_turn(
             completion_evidence = None;
             provider_overflow_recovery_attempted = false;
             turn_execution.accepted_user_input();
+            if pending_input_excludes_tests {
+                turn_execution.note_request_excludes_tests();
+            }
+            exhaustive_scope_requested |= pending_input_exhaustive;
         }
         if recorded_input.renews_generation_budget {
             logical_generation_budget.accepted_user_input();
@@ -773,6 +808,31 @@ pub(crate) async fn run_turn(
             .await?;
         }
         has_started_generation = true;
+        if let Some(live_session) = live_session.as_mut() {
+            let edited = turn_diff_tracker
+                .lock()
+                .await
+                .changed_paths()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            // Show other sessions' work before the first edit, then again
+            // after each change to this turn's own edited files.
+            if live_session.publish(edited).await || !concurrent_sessions_checked {
+                concurrent_sessions_checked = true;
+                let others = live_session.others().await;
+                record_context_notice_if_changed(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    "concurrent_sessions",
+                    &crate::live_sessions::concurrent_sessions_notice(
+                        &others,
+                        live_session.workspace(),
+                    ),
+                )
+                .await?;
+            }
+        }
         let generation_id = ModelGenerationId {
             turn_id: turn_context.sub_id.clone(),
             ordinal: logical_generation_ordinal,
@@ -808,6 +868,7 @@ pub(crate) async fn run_turn(
                     .await
                     .temporarily_unavailable,
                 budget_forced_terminal,
+                exhaustive_scope_requested,
             )
             .await?;
             // Keep this future lazy: the finalized router must record its source
@@ -1325,19 +1386,21 @@ pub(crate) async fn run_turn(
                             defer_pending_input,
                         ));
                     }
-                    let (changed_paths, has_untracked_changes, unattributed_paths, changed_tests) = {
+                    let (changed_paths, has_untracked_changes, unattributed_paths, changed_existing) = {
                         let tracker = turn_diff_tracker.lock().await;
                         (
                             Some(tracker.changed_paths()),
                             tracker.has_untracked_changes(),
                             tracker.unattributed_display_paths(),
-                            tracker
-                                .changed_existing_display_paths()
-                                .into_iter()
-                                .filter(|path| conventional_test_path(path))
-                                .collect::<Vec<_>>(),
+                            tracker.changed_existing_contents(),
                         )
                     };
+                    // Parsing is CPU work bounded by its own deadline.
+                    let changed_tests = tokio::task::spawn_blocking(move || {
+                        changed_existing_tests(changed_existing)
+                    })
+                    .await
+                    .unwrap_or_default();
                     let changed_paths = match changed_paths {
                         Some(paths) => Some(
                             sess.services
@@ -1894,6 +1957,51 @@ async fn record_forced_terminal_budget_boundary(
         .await;
 }
 
+/// Whether user or agent-authored text in `input` satisfies `predicate`.
+fn turn_input_text_matches(input: &[TurnInput], predicate: fn(&str) -> bool) -> bool {
+    input.iter().any(|item| match item {
+        TurnInput::UserInput { content, .. } => content
+            .iter()
+            .any(|content| matches!(content, UserInput::Text { text, .. } if predicate(text))),
+        TurnInput::InterAgentCommunication(communication) => predicate(&communication.content),
+        TurnInput::ResponseItem(_) | TurnInput::InternalResponseItem(_) => false,
+    })
+}
+
+/// The first user-authored text of a turn, which names what it is doing.
+fn turn_input_first_text(input: &[TurnInput]) -> Option<&str> {
+    input.iter().find_map(|item| match item {
+        TurnInput::UserInput { content, .. } => content.iter().find_map(|content| match content {
+            UserInput::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// Whether a request asks for exhaustive coverage or literal full reads, the
+/// requests the exhaustive-scope notice governs. Product wording such as
+/// "full repository scans" or "whole-graph solving" names no reading scope.
+fn request_asks_for_exhaustive_scope(text: &str) -> bool {
+    #[expect(
+        clippy::expect_used,
+        reason = "the regex is a fixed source literal, not runtime input"
+    )]
+    static EXHAUSTIVE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"(?i)\b(?:exhaustive(?:ly)?|in\s+full|line[\s-]+by[\s-]+line",
+            r"|(?:full|complete|comprehensive)[\s-]+(?:reads?|reading|review|audit|coverage)",
+            r"|(?:every|each)\s+(?:\w+\s+)?(?:file|line|module|crate|package|session|rollout|record|log)s?",
+            r"|all\s+(?:of\s+)?(?:the\s+)?(?:\w+\s+)?(?:files|lines|modules|crates|packages|sessions|rollouts|records|logs)",
+            r"|(?:entire|whole)\s+(?:code\s*base|repo|repository|project|workspace|directory|folder|tree|crate|module|file|log|history|transcript)",
+            r"|(?:read|review|audit|inspect|go\s+through)\s+everything",
+            r")\b",
+        ))
+        .expect("valid exhaustive scope regex")
+    });
+    EXHAUSTIVE.is_match(text)
+}
+
 /// Names observed changes the turn did not make, without counting them as its own.
 fn unattributed_changes_advisory(paths: &[String]) -> Option<String> {
     (!paths.is_empty()).then(|| {
@@ -1929,6 +2037,45 @@ fn conventional_test_path(path: &str) -> bool {
         || TEST_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
         || name.contains(".test.")
         || name.contains(".spec.")
+}
+
+/// Display paths of existing files whose existing tests this turn edited or
+/// removed: test items in Rust and Python outlines, including inline
+/// `#[cfg(test)]` modules, or conventional test files. Adding a test changes
+/// no existing assertion and is not reported.
+fn changed_existing_tests(files: Vec<(String, String, Option<String>)>) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    files
+        .into_iter()
+        .filter(|(path, before, after)| {
+            let conventional = conventional_test_path(path);
+            crate::tools::handlers::existing_tests_changed(
+                path,
+                before,
+                after.as_deref(),
+                conventional,
+                deadline,
+            )
+            // Without an outline, only a conventional test file is known to
+            // hold tests; appended lines there rewrite no original line.
+            .unwrap_or_else(|| conventional && rewrites_original_lines(before, after.as_deref()))
+        })
+        .map(|(path, ..)| path)
+        .collect()
+}
+
+fn rewrites_original_lines(before: &str, after: Option<&str>) -> bool {
+    let Some(after) = after else {
+        return true;
+    };
+    let mut config = similar::TextDiff::configure();
+    config.timeout(std::time::Duration::from_millis(100));
+    config.diff_lines(before, after).ops().iter().any(|op| {
+        matches!(
+            op.tag(),
+            similar::DiffTag::Delete | similar::DiffTag::Replace
+        )
+    })
 }
 
 /// An edited or removed existing test can change what the suite asserts, and
@@ -2024,14 +2171,26 @@ async fn record_sampling_notices(
     turn: &TurnContext,
     mcp_unavailable: bool,
     forced_terminal: Option<ForcedTerminalReason>,
+    exhaustive_scope_requested: bool,
 ) -> CodexResult<()> {
-    record_context_notice_if_changed(
-        sess,
-        turn,
-        "exhaustive_scope_feasibility",
-        &exhaustive_scope_feasibility_notice(turn),
-    )
-    .await?;
+    // A spawned agent always carries its compaction budget. A root carries the
+    // full-read policy only once a request asks for exhaustive coverage; it
+    // prompted inventory work on ordinary tasks. A recorded notice is never
+    // retracted, so a later "continue" keeps it.
+    if exhaustive_scope_requested
+        || matches!(
+            turn.session_source,
+            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. })
+        )
+    {
+        record_context_notice_if_changed(
+            sess,
+            turn,
+            "exhaustive_scope_feasibility",
+            &exhaustive_scope_feasibility_notice(turn),
+        )
+        .await?;
+    }
     if mcp_unavailable {
         record_context_notice_if_changed(
             sess,
@@ -4879,8 +5038,7 @@ async fn run_sampling_request(
         sess.as_ref(),
         turn_context.as_ref(),
         "tool_search_sources",
-        &router
-            .tool_search_sources_for_instructions(turn_context.developer_instructions.as_deref()),
+        router.tool_search_sources(),
     )
     .await?;
     let prepared_input = prepare_input.await?;
@@ -4934,6 +5092,9 @@ async fn run_sampling_request(
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut account_wait_deadline = None;
     let mut accepted_attempt_input = prepared_input.shared_items();
+    sess.services
+        .code_mode_service
+        .note_visible_prompt(Arc::clone(&accepted_attempt_input));
     let prompt_construction_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::PromptConstruction);
@@ -5066,9 +5227,7 @@ async fn run_sampling_request(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 "tool_search_sources",
-                &router.tool_search_sources_for_instructions(
-                    turn_context.developer_instructions.as_deref(),
-                ),
+                router.tool_search_sources(),
             )
             .await?;
             let retry_input = prepare_sampling_prompt_for_client(
@@ -5100,6 +5259,9 @@ async fn run_sampling_request(
                 Some(router.tool_manifest_for_rollout(turn_context.as_ref(), previous.as_deref()))
             };
             accepted_attempt_input = retry_input.shared_items();
+            sess.services
+                .code_mode_service
+                .note_visible_prompt(Arc::clone(&accepted_attempt_input));
             prompt = build_projected_prompt_from_scaffold(
                 &retry_input,
                 step_context.as_ref(),

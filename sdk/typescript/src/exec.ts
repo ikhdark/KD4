@@ -327,7 +327,11 @@ class StderrTail {
   }
 }
 
-function resolvesBeforeDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<boolean> {
+/** @internal Shared by process cleanup and its rejection regression tests. */
+export function resolvesBeforeDeadline<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<boolean> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => resolve(false), timeoutMs);
     const settle = (resolved: boolean) => {

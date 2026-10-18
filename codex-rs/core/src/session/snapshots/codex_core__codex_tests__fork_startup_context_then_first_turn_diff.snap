@@ -11,8 +11,7 @@ Scenario: First request after fork when startup preserves the parent baseline, t
 01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
 02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
 03:message/user:fork seed
-04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-05:message/developer[2]:
+04:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-06:message/user:after fork
+05:message/user:after fork

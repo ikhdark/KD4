@@ -878,7 +878,9 @@ impl PlanStore {
                 &guard.lineage,
                 statuses,
                 explanation.clone(),
-                expected_revision.is_some(),
+                // The fence that admits a replacement also proves the indexes
+                // and statuses this sample read are still current.
+                expected_revision.is_some() || unchanged_since_sampling,
                 expected_step_revisions.as_ref(),
                 &revision,
             )?)
@@ -1096,10 +1098,11 @@ impl PlanStore {
             return Err("set must contain at least one status update".to_string());
         }
         // Positions change when the plan is revised; only a checked revision
-        // proves an index refers to the plan the caller read.
+        // or an unchanged sampling fence proves an index refers to the plan
+        // the caller read.
         if !revision_checked && updates.iter().any(|update| update.index.is_some()) {
             return Err(format!(
-                "index-based status updates require expected_revision; current revision is {revision}. Use step_id to address steps without a revision. No changes were made."
+                "index-based status updates require expected_revision once the plan changed since this sampling step began; current revision is {revision}. Use step_id to address steps without a revision. No changes were made."
             ));
         }
         let mut seen = HashSet::new();

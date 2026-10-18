@@ -114,6 +114,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                         environment_id: Some("local".to_string()),
                         retry: None,
                         diagnostics: Vec::new(),
+                        concurrent_sessions: None,
                     },
                 ));
             }

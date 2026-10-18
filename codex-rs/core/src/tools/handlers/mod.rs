@@ -98,6 +98,7 @@ pub use plan::PlanHandler;
 pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
 pub(crate) use read_file::canonical_read_file_arguments;
+pub(crate) use read_file::existing_tests_changed;
 pub(crate) use read_file::reselect_read_file_output;
 pub(crate) use read_file::validate_read_file_arguments;
 pub(crate) use read_file::validate_retained_file_hash;

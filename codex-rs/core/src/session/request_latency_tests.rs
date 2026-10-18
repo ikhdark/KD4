@@ -250,9 +250,7 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                     let cancellation = CancellationToken::new();
                     let step = session.capture_step_context(Arc::clone(&turn)).await?;
                     let router = built_tools(&session, &step, &[], &cancellation).await?;
-                    let sources = router.tool_search_sources_for_instructions(
-                        turn.developer_instructions.as_deref(),
-                    );
+                    let sources = router.tool_search_sources();
                     record_context_notice_if_changed(
                         &session,
                         &turn,
@@ -260,7 +258,7 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                         if sources_changed {
                             "obsolete fixture source"
                         } else {
-                            &sources
+                            sources
                         },
                     )
                     .await?;

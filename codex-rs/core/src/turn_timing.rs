@@ -1883,6 +1883,16 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         let mut timing = observation.complete(sample).protocol_timing();
         timing.tool_calls.clear();
+        // Only the terminal flush attests results durable, so every finished
+        // call would be listed again at each checkpoint. Keep the calls still
+        // in flight; `persistedCount` reports the results awaiting that flush.
+        timing.tool_closure.unresolved_calls.retain(|call| {
+            observation
+                .tool_closure
+                .entries
+                .get(&call.execution_id)
+                .is_none_or(|entry| !(entry.timing_paired && entry.terminal))
+        });
         {
             let mut checkpointed = self
                 .checkpointed_entries

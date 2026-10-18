@@ -92,6 +92,41 @@ function newlineFreeStderrOverCap(): Buffer {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
+  it("consumes a rejected deadline input and releases its timer", async () => {
+    const { resolvesBeforeDeadline } = await import("../src/exec");
+    jest.useFakeTimers();
+    try {
+      await expect(
+        resolvesBeforeDeadline(Promise.reject(new Error("input failed")), 1_000),
+      ).resolves.toBe(false);
+      expect(jest.getTimerCount()).toBe(0);
+      await expect(resolvesBeforeDeadline(Promise.resolve(), 1_000)).resolves.toBe(true);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("continues consuming rejection after the deadline has expired", async () => {
+    const { resolvesBeforeDeadline } = await import("../src/exec");
+    jest.useFakeTimers();
+    try {
+      let reject!: (error: Error) => void;
+      const pending = new Promise<void>((_resolve, fail) => {
+        reject = fail;
+      });
+      const result = resolvesBeforeDeadline(pending, 1_000);
+      jest.advanceTimersByTime(1_000);
+      await expect(result).resolves.toBe(false);
+      reject(new Error("late failure"));
+      // Drain the production rejection handler; Jest also rejects unhandled promises.
+      await Promise.resolve();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it.each([
     {
       value: "high",

@@ -354,6 +354,36 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
     }
 }
 
+/// Names other root sessions running a turn in this checkout that edited a
+/// file this patch touches, so a conflict or overlap is not mistaken for the
+/// session's own work.
+async fn concurrent_patch_note(
+    session: &Session,
+    turn: &TurnContext,
+    environment: &TurnEnvironment,
+    hunk_paths: &[PathBuf],
+) -> Option<String> {
+    if matches!(
+        turn.session_source,
+        codex_protocol::protocol::SessionSource::SubAgent(_)
+            | codex_protocol::protocol::SessionSource::Internal(_)
+    ) {
+        return None;
+    }
+    let cwd = environment.cwd().to_abs_path().ok()?;
+    let paths = hunk_paths
+        .iter()
+        .map(|path| cwd.as_path().join(path))
+        .collect::<Vec<_>>();
+    let others = crate::live_sessions::others_in_checkout(
+        turn.config.codex_home.as_path(),
+        &session.thread_id.to_string(),
+        turn.cwd().as_path(),
+    )
+    .await;
+    crate::live_sessions::overlapping_edits(&others, &paths, turn.cwd().as_path())
+}
+
 async fn effective_patch_permissions(
     session: &Session,
     turn: &TurnContext,
@@ -549,6 +579,15 @@ impl ApplyPatchHandler {
             })
             .sum();
         let retained_input = args.patch.clone();
+        let hunk_paths = args
+            .hunks
+            .iter()
+            .map(|hunk| match hunk {
+                Hunk::AddFile { path, .. }
+                | Hunk::DeleteFile { path }
+                | Hunk::UpdateFile { path, .. } => path.clone(),
+            })
+            .collect::<Vec<_>>();
         let cancellation = cancellation_token.clone();
         let result = async {
             let selected_environment_id =
@@ -656,7 +695,14 @@ impl ApplyPatchHandler {
                                 workspace_operation_permit,
                             )
                             .await?;
-                            Ok(boxed_tool_output(output))
+                            let note = concurrent_patch_note(
+                                &session,
+                                &turn,
+                                turn_environment,
+                                &hunk_paths,
+                            )
+                            .await;
+                            Ok(boxed_tool_output(output.with_concurrent_sessions(note)))
                         }
                     }
                 }
@@ -696,10 +742,13 @@ impl ApplyPatchHandler {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .retain(&retained_input, &turn_environment.environment_id,
                             turn_environment.cwd(), &Default::default(), observed_source);
+                    let note =
+                        concurrent_patch_note(&session, &turn, turn_environment, &hunk_paths).await;
                     Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
                         format!("apply_patch verification failed: {parse_error}"), false,
                         &Default::default(), Some(turn_environment.environment_id.clone()),
-                    ).with_retry(retry).with_patch_mismatch(mismatch)))
+                    ).with_retry(retry).with_patch_mismatch(mismatch)
+                    .with_concurrent_sessions(note)))
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                     tracing::trace!("Failed to parse apply_patch input, {error:?}");

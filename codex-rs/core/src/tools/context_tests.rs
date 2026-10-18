@@ -681,6 +681,7 @@ fn failed_patch_carries_its_retry_receipt_once_per_projection() {
         environment_id: None,
         retry: None,
         diagnostics: Vec::new(),
+        concurrent_sessions: None,
     }
     .with_retry(Some(receipt.clone()));
     let payload = ToolPayload::Custom {

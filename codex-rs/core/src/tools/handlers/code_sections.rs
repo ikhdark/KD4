@@ -337,6 +337,43 @@ pub(crate) fn parse(
     }
 }
 
+/// Whether `after` removes or rewrites a test item of `before`: an item under
+/// a test attribute or `#[cfg(test)]` (every item when `whole_file_is_test`),
+/// compared by qualified name and exact text including attributes. Modules,
+/// impls, traits and classes only contain tests, so adding a test or moving an
+/// unchanged one is not a change. `None` when a side cannot be parsed in time.
+pub(crate) fn existing_tests_changed(
+    path: &str,
+    before: &str,
+    after: Option<&str>,
+    whole_file_is_test: bool,
+    deadline: Instant,
+) -> Option<bool> {
+    fn tests<'a>(
+        path: &str,
+        source: &'a str,
+        whole_file_is_test: bool,
+        deadline: Instant,
+    ) -> Option<std::collections::HashSet<(String, &'a str)>> {
+        Some(
+            parse(path, source, "", deadline)?
+                .into_iter()
+                .filter(|item| {
+                    (whole_file_is_test || item.in_test_context)
+                        && !matches!(item.kind, "mod" | "impl" | "trait" | "class" | "extern")
+                })
+                .map(|item| (item.qualified_name, &source[item.start..item.end]))
+                .collect(),
+        )
+    }
+    let before = tests(path, before, whole_file_is_test, deadline)?;
+    let after = match after {
+        Some(after) => tests(path, after, whole_file_is_test, deadline)?,
+        None => std::collections::HashSet::new(),
+    };
+    Some(!before.is_subset(&after))
+}
+
 // A standalone file does not establish its crate-root or parent #[path] context.
 // Keep both directory possibilities for non-mod.rs files, including lib/main.rs.
 // An inline path replaces the pending stem; ordinary inline modules consume it.

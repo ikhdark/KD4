@@ -62,7 +62,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             BTreeMap::from([
                 ("index".to_string(), JsonSchema {
                     minimum: Some(0.into()),
-                    ..JsonSchema::integer(Some("Zero-based index in the latest current_plan.plan. Requires expected_revision; prefer step_id.".to_string()))
+                    ..JsonSchema::integer(Some("Zero-based index in the current plan as of this sampling step. Needs expected_revision only after the plan changed since then, for example by an earlier update in the same cell.".to_string()))
                 }),
                 ("step_id".to_string(), JsonSchema::string(Some(
                     "Stable ID from step_ids in the previous result, or a unique prefix of at least 8 characters; survives reordering and one-to-one continues renames. New split/merge steps get new IDs. Provide step_id or index, not both.".into()
@@ -74,7 +74,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             Some(vec!["status".to_string()]),
             Some(false.into()),
         )},
-        Some("Change only these statuses atomically, preserving step text and omitted steps. Use either set or plan. Omitted explanation is preserved with set. Pass expected_revision with every set: once a step's status has changed, a further change to it is rejected without expected_revision or its expected_step_revisions entry.".to_string()),
+        Some("Change only these statuses atomically, preserving step text and omitted steps; prefer this over resending the whole plan. Use either set or plan. Omitted explanation is preserved with set. Once the plan changed since this sampling step began, index updates and further changes to an already changed step are rejected without expected_revision or the step's expected_step_revisions entry.".to_string()),
     );
     status_updates.min_items = Some(1);
     ToolSpec::Function(ResponsesApiTool {
@@ -91,7 +91,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ..JsonSchema::object(
             BTreeMap::from([
                 ("expected_revision".to_string(), JsonSchema::string(Some(
-                    "Revision from the last update_plan result or conflict reconciliation; in exec pass the returned object's revision directly instead of retyping the hash. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began. Index-based updates always require it; stable-ID deltas may instead use expected_step_revisions.".into()
+                    "Revision from the last update_plan result or conflict reconciliation; in exec pass the returned object's revision directly instead of retyping the hash. Checked atomically before any change. A replacement or index-based set may omit it only if the plan has not changed since this sampling step began; stable-ID deltas may instead use expected_step_revisions.".into()
                 ))),
                 (
                     "explanation".to_string(),
@@ -148,7 +148,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 "step_ids": { "type": "array", "items": { "type": "string" }, "description": "Stable step IDs in current plan order." },
                 "lineage": {
                     "type": "object",
-                    "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume. Printed results omit entries restating their sole current step (same ID, text and status).",
+                    "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume. Printed results show only message, effect, no_progress, revision and obligations; the task-state context carries the stored plan, step IDs and this lineage.",
                     "properties": {
                         "resolved_requirements": { "type": "array", "items": { "type": "string" } },
                         "step_revisions": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },

@@ -59,18 +59,21 @@ async fn semnav_impls_qualified_names_and_generic_repairs_are_snapshot_bound() {
         ]}).to_string() };
         let repaired = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
         output.validate(&repaired).unwrap();
-        assert_eq!(repaired["complete"], false, "diagnostic aliases must never execute");
-        assert_eq!(repaired["selector_errors"].as_array().unwrap().len(), 3);
+        assert_eq!(repaired["complete"], false, "ambiguous names never execute");
+        // The only trait method answering S::run resolves and reports its real name.
+        let alias = repaired["selector_bindings"].as_array().unwrap().iter()
+            .find(|binding| binding["selector_index"] == 1).unwrap();
+        assert_eq!(alias["resolved_selectors"], json!([{"kind":"lines","start":4,"end":4}]));
+        assert_eq!(alias["qualified_name"], "<S as Action<u8>>::run");
+        assert_eq!(repaired["selector_errors"].as_array().unwrap().len(), 2);
         assert_eq!(repaired["selector_errors"][0]["candidates"].as_array().unwrap().len(), 2);
-        assert_eq!(repaired["selector_errors"][1]["candidates"].as_array().unwrap().len(), 1);
-        assert_eq!(repaired["selector_errors"][1]["candidates"][0]["qualified_name"], "<S as Action<u8>>::run");
-        assert_eq!(repaired["selector_errors"][2]["candidates"].as_array().unwrap().len(), 2, "impls must not collide with type names");
+        assert_eq!(repaired["selector_errors"][1]["candidates"].as_array().unwrap().len(), 2, "impls must not collide with type names");
         std::fs::write(&path, "replacement").unwrap();
         call.payload = ToolPayload::Function { arguments:json!({"artifact_id":repaired["artifact_id"],
-            "selectors":[repaired["selector_errors"][1]["candidates"][0]["selector"]]}).to_string() };
+            "selectors":[repaired["selector_errors"][0]["candidates"][0]["selector"]]}).to_string() };
         let recovered = ReadToolOutputHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
         assert_eq!(recovered["canonical_sha256"], repaired["source_sha256"]);
-        assert_eq!(recovered["results"][0]["text"], "    fn run(&self) {}\n");
+        assert_eq!(recovered["results"][0]["text"], "    fn make() -> Self { S }\n");
     }
 }
 
@@ -155,9 +158,19 @@ async fn semnav_syntax_errors_survive_search_and_snapshot_recovery() {
 
 #[test]
 fn semnav_nested_generics_python_and_duplicate_impls_stay_unambiguous() {
+    // The Rust path of the only trait method that answers resolves to it.
+    for (source, name, expected) in [
+        ("mod m { impl<T> Action<Vec<T>> for S<T> { fn run() {} } }", "m::S::run", "m::<S<T> as Action<Vec<T>>>::run"),
+        ("impl Action<<T as Other>::Item> for S { fn run() {} }", "S::run", "<S as Action<<T as Other>::Item>>::run"),
+    ] {
+        let mut canonical = CanonicalToolResult::text(source.to_string());
+        let (resolved, errors, bindings) = structure::resolve_batch("a.rs", &mut canonical, Some(vec![
+            serde_json::from_value(json!({"kind":"symbol","name":name})).unwrap()]));
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+        assert_eq!(resolved.unwrap(), vec![ToolOutputSelector::Lines {start:1, end:1}]);
+        assert_eq!(bindings[0]["qualified_name"], expected);
+    }
     for (path, source, name, expected) in [
-        ("a.rs", "mod m { impl<T> Action<Vec<T>> for S<T> { fn run() {} } }", "m::S::run", "m::<S<T> as Action<Vec<T>>>::run"),
-        ("a.rs", "impl Action<<T as Other>::Item> for S { fn run() {} }", "S::run", "<S as Action<<T as Other>::Item>>::run"),
         // Header spellings the caller cannot know before reading the file.
         ("a.rs", "impl<T> fmt::Display for S<T> { fn fmt() {} }", "impl Display for S", "impl fmt::Display for S<T>"),
         ("a.rs", "impl<T> fmt::Display for S<T> { fn fmt() {} }", "<S as Display>::fmt", "<S<T> as fmt::Display>::fmt"),

@@ -13925,11 +13925,28 @@ async fn build_initial_context_omits_multi_agent_usage_hint_when_disabled() {
 
 #[tokio::test]
 async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_message() {
+    // Delegation needs an explicit request by default, so the root carries a
+    // pointer to its configured guidance instead of resending it every step.
     let (session, turn_context) =
         make_multi_agent_v2_usage_hint_test_session(/*enable_multi_agent_v2*/ true).await;
-
     let initial_context = build_initial_context(&session, &turn_context).await;
+    let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
+    assert_eq!(usage_hints.len(), 1);
+    assert!(usage_hints[0].contains("read_file(path=\"context:multi-agent\")"));
+    assert!(!usage_hints[0].contains("Root guidance."));
 
+    // A custom delegation policy may permit delegation without a request, so
+    // the guidance itself stays in context.
+    let (session, mut turn_context) =
+        make_multi_agent_v2_usage_hint_test_session(/*enable_multi_agent_v2*/ true).await;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut turn_context)
+            .expect("unique turn context")
+            .config,
+    )
+    .multi_agent_v2
+    .multi_agent_mode_hint_text = Some("Delegate bounded work when it helps.".to_string());
+    let initial_context = build_initial_context(&session, &turn_context).await;
     let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
     assert_eq!(
         usage_hints,
@@ -14580,8 +14597,17 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
 #[tokio::test]
 async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hint_changes_or_is_removed()
  {
-    let (session, previous_context) =
+    let (session, mut previous_context) =
         make_multi_agent_v2_usage_hint_test_session(/*enable_multi_agent_v2*/ true).await;
+    // Under a custom delegation policy the configured guidance itself is in
+    // context; the default policy sends a fixed pointer to it instead.
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut previous_context)
+            .expect("unique turn context")
+            .config,
+    )
+    .multi_agent_v2
+    .multi_agent_mode_hint_text = Some("Delegate bounded work when it helps.".to_string());
     let previous_step = StepContext::for_test(Arc::clone(&previous_context));
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)

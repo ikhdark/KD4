@@ -608,6 +608,10 @@ impl CodeModeExecuteHandler {
         let mut output =
             handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
                 .map_err(FunctionCallError::RespondToModel)?;
+        exec.session
+            .services
+            .code_mode_service
+            .elide_bodies_already_in_context(&mut output);
         attach_delivery_decision(&mut output, delivery);
         if keep_dispatch_open {
             dispatch_lease.keep_open();

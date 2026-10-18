@@ -1521,14 +1521,24 @@ fn oversized_rg_leads_with_complete_per_file_counts() {
 }
 
 #[test]
-fn exit_one_means_no_matches_only_for_a_single_search() {
-    for command in ["rg -n foo src", "rg.exe -n 'a|b' src"] {
-        assert!(super::ends_with_native_search(command), "{command}");
-    }
+fn exit_one_means_no_matches_only_when_a_standalone_search_ends_the_sequence() {
+    // `;` and line-break sequences report their final statement's status.
     for command in [
+        "rg -n foo src",
+        "rg.exe -n 'a|b' src",
         "rg -n match src; rg -n missing src",
         "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
         "Get-ChildItem src\nrg.exe -n foo",
+        "Get-ChildItem src\n# probe\nrg -n foo src # trailing note",
+    ] {
+        assert!(super::ends_with_native_search(command), "{command}");
+    }
+    // An earlier command can set the status of pipelines, conditional chains,
+    // blocks and errexit scripts without writing to stderr.
+    for command in [
+        "set -e; test -f missing; rg foo src",
+        "set -euo pipefail\ngrep -q x f\nrg foo src",
+        "rg foo src; Write-Output done",
         "Get-Content log.txt | findstr ERROR",
         "set -o pipefail; false | rg pattern",
         "false | rg pattern",

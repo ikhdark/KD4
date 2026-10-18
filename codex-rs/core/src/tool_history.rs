@@ -5529,6 +5529,7 @@ fn workspace_call_observes_from_arguments(
                 path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
                     || path.starts_with("context:unsettled-tools/")
                     || path == crate::context::desktop_instructions::LOCATOR
+                    || path == crate::session::multi_agents::USAGE_HINT_LOCATOR
                     || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
             });
     }
@@ -5599,6 +5600,7 @@ fn source_dependencies_from_arguments(
         if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             || path.starts_with("context:unsettled-tools/")
             || path == crate::context::desktop_instructions::LOCATOR
+            || path == crate::session::multi_agents::USAGE_HINT_LOCATOR
             || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
         {
             return BTreeSet::new();

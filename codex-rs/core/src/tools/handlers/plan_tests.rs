@@ -94,10 +94,13 @@ async fn plan_replacement_uses_the_captured_sampling_fence() {
     let mut args = serde_json::to_value(plan_update_args("work", StepStatus::Completed)).unwrap();
     args["expected_revision"] = revision.into();
     PlanHandler
-        .handle(invoke(step, args.to_string()))
+        .handle(invoke(Arc::clone(&step), args.to_string()))
         .await
         .unwrap();
-    let next = session.capture_step_context(turn).await.unwrap();
+    let next = session
+        .capture_step_context(Arc::clone(&turn))
+        .await
+        .unwrap();
     assert!(
         PlanHandler
             .handle(invoke(Arc::clone(&next), args.to_string()))
@@ -108,17 +111,34 @@ async fn plan_replacement_uses_the_captured_sampling_fence() {
     assert!(
         PlanHandler
             .handle(invoke(
-                Arc::clone(&next),
+                step,
                 serde_json::json!({"set":[{"index":0,"status":"pending"}]}).to_string()
             ))
             .await
             .is_err(),
-        "index updates still require a revision"
+        "an index read before the plan changed still requires a revision"
     );
     PlanHandler
         .handle(invoke(next, plan_arguments("work", StepStatus::Completed)))
         .await
         .unwrap();
+    // The fence that admits a replacement equally proves the sampled indexes,
+    // so a status delta need not echo the plan or a revision hash.
+    let fresh = session.capture_step_context(turn).await.unwrap();
+    PlanHandler
+        .handle(invoke(
+            fresh,
+            serde_json::json!({"set":[{"index":0,"status":"pending"}]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let (plan, _) = session
+        .services
+        .plan_store
+        .snapshot_with_lineage()
+        .await
+        .unwrap();
+    assert_eq!(plan.plan[0].status, StepStatus::Pending);
 }
 
 #[tokio::test]
