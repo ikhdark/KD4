@@ -2421,7 +2421,7 @@ mod tests {
             "Use repository tools through their documented entrypoints and contracts (`--describe`, `--help`, AGENTS.md)",
             "fix a failed invocation at the call rather than rewriting a working tool",
             "Stop inspecting when further reading would not change the answer",
-            "compute counts and the decision-relevant projection in the tool and print only that",
+            "Summarize bulk logs and inventories in-tool",
             "Separate what you observed from what you infer",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
@@ -2433,13 +2433,13 @@ mod tests {
         let instructions = BaseInstructions::default();
         for required in [
             "read them in one batch with the native file tools",
-            "a new turn alone does not make evidence stale",
-            "Recover missing output from its retained artifact (`read_tool_output`) before rerunning the producer",
+            "a new turn or passing check alone does not warrant rereading",
+            "recover truncated output from retained artifacts (`read_tool_output`), not reruns",
             "coverage is the obligation",
-            "start known expensive validation before patch review or report writing",
+            "Start expensive validation before patch review or report writing",
             "discover and invoke in the same execution cell",
             "deliver the final answer directly from that cell",
-            "A passing check alone does not prove the task complete",
+            "a passing check alone does not establish completion",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2449,21 +2449,24 @@ mod tests {
     fn default_base_instructions_protect_a_shared_checkout() {
         let instructions = BaseInstructions::default();
         for required in [
-            "When other sessions share the checkout",
-            "reconcile the affected source immediately before patching",
-            "do not replay an obsolete whole-file replacement",
-            "do not launch a duplicate validation while its original run is still live",
+            "In shared checkouts",
+            "reconcile affected source immediately before patching",
+            "never replay obsolete whole-file replacements",
+            "Resume live operations rather than restarting or duplicating them, including validation",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
     }
 
     #[test]
-    fn default_base_instructions_state_that_missing_agents_md_needs_no_probe() {
+    fn default_base_instructions_rely_on_discovery_and_recover_reported_instruction_gaps() {
         let instructions = BaseInstructions::default();
         for required in [
-            "AGENTS.md files from the project root to the working directory are supplied automatically",
-            "if none is supplied, none applies there; do not probe for one",
+            "Rely on the harness's instruction discovery from the project root to the working directory",
+            "do not repeat discovery merely because an explicit completeness signal is absent",
+            "If the harness reports omitted, truncated, or unavailable instructions",
+            "use the supplied recovery guidance or targeted reads to resolve that gap before affected edits",
+            "report unresolved applicability rather than assuming absence",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }

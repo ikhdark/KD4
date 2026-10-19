@@ -165,6 +165,15 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     }
 
     /// Returns request credentials, optionally scoped to a Codex session task.
+    /// Unscoped extension setup. Custom providers retain their accessor overrides;
+    /// configured providers override this to resolve credentials exactly once.
+    fn resolve_unscoped_client_setup(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>> {
+        Box::pin(async move { Ok((self.api_provider().await?, self.api_auth().await?)) })
+    }
+
+    /// Returns request credentials, optionally scoped to a Codex session task.
     fn api_auth_for_scope(
         &self,
         scope: ProviderAuthScope,
@@ -448,6 +457,18 @@ impl ModelProvider for ConfiguredModelProvider {
         })
     }
 
+    fn resolve_unscoped_client_setup(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>> {
+        Box::pin(async move {
+            let auth = self.auth().await;
+            Ok((
+                request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?,
+                resolve_provider_auth(auth.as_ref(), &self.info)?,
+            ))
+        })
+    }
+
     fn resolve_client_setup(
         &self,
         scope: ProviderAuthScope,
@@ -721,7 +742,7 @@ mod tests {
                         profile: Some("profile".to_string()),
                         region: None,
                     }),
-                    ..second.clone()
+                    ..second
                 },
             ),
         ] {
@@ -998,6 +1019,10 @@ mod tests {
             setup.resolved_auth.auth.to_auth_headers()[http::header::AUTHORIZATION],
             "Bearer sk-external"
         );
+        let (api, auth) = provider.resolve_unscoped_client_setup().await.unwrap();
+        assert_eq!(resolves.load(Ordering::SeqCst), baseline + 2);
+        assert_eq!(auth.to_auth_headers()[http::header::AUTHORIZATION], "Bearer sk-external");
+        assert_eq!(api.url_for_path("images/generations"), "https://api.openai.com/v1/images/generations");
     }
 
     #[tokio::test]

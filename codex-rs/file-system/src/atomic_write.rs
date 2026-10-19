@@ -124,6 +124,12 @@ pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<
     write_bytes_atomically_impl(write_path, contents, true)
 }
 
+/// Durable replacement retaining the destination's permissions and Windows DACL.
+/// Resolve symlinks before calling. Pre-publication failures retain the old file.
+pub fn write_bytes_atomically_preserving_permissions(write_path: &Path, contents: &[u8]) -> io::Result<()> {
+    stage_and_replace_preserving(write_path, true, true, |temporary| temporary.write_all(contents))
+}
+
 /// Same-directory replacement without durability barriers or parent creation.
 /// Preserves existing permissions. Sharing/access failures leave the original
 /// intact; never fall back to truncating an existing file.
@@ -142,6 +148,15 @@ fn stage_and_replace(
     sync: bool,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
+    stage_and_replace_preserving(write_path, sync, !sync, write)
+}
+
+fn stage_and_replace_preserving(
+    write_path: &Path,
+    sync: bool,
+    preserve_permissions: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -151,7 +166,7 @@ fn stage_and_replace(
     if sync {
         std::fs::create_dir_all(parent)?;
     }
-    let permissions = if sync {
+    let permissions = if !preserve_permissions {
         None
     } else {
         match std::fs::metadata(write_path) {

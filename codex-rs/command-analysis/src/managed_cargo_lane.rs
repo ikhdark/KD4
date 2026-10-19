@@ -93,7 +93,6 @@ fn check(
                 .filter(|stages| stages.len() == 1)
                 .and_then(|stages| stages.first().cloned())
                 .filter(|stage| !stage.iter().any(|arg| arg.contains(['%', '!']))),
-            _ => None,
         };
         if let Some(argv) = standalone {
             return check(&argv, cwd, env, depth + 1);

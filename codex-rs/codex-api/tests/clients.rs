@@ -559,11 +559,14 @@ async fn streaming_client_does_not_replay_ambiguous_transport_error() -> Result<
             },
         )
         .await;
+    let error = result.err().expect("ambiguous dispatch must fail without replay");
     assert!(matches!(
-        result,
-        Err(ApiError::Transport(TransportError::Network(message)))
-            if message == "first attempt fails"
+        &error,
+        ApiError::ProviderFailure { code, message }
+            if code.as_deref() == Some("dispatch_outcome_unknown")
+                && message.contains("first attempt fails")
     ));
+    assert!(!codex_api::map_api_error(error).is_retryable());
     assert_eq!(transport.attempts(), 1);
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);

@@ -41,7 +41,8 @@ impl<T: HttpTransport> SearchClient<T> {
             .map_err(|e| ApiError::Stream(format!("failed to encode search request: {e}")))?;
         let resp = self
             .session
-            .execute(Method::POST, Self::path(), extra_headers, Some(body))
+            // Includes encrypted output and JSON overhead, not a model token cap.
+            .execute(Method::POST, Self::path(), extra_headers, Some(body), 32 * 1024 * 1024)
             .await?;
         serde_json::from_slice(&resp.body)
             .map_err(|e| ApiError::Stream(format!("failed to decode search response: {e}")))
@@ -219,6 +220,7 @@ mod tests {
             .expect("request should be captured");
         assert_eq!(request.method, Method::POST);
         assert_eq!(request.url, "https://example.com/v1/alpha/search");
+        assert_eq!(request.max_response_bytes, Some(32 * 1024 * 1024));
         let body: serde_json::Value =
             serde_json::from_slice(&request.prepare_body_for_send().unwrap().body_bytes())
                 .expect("request body should be JSON");

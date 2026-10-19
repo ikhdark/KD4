@@ -8,6 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 #     "resolution": { "cwd": "...", "path": "...", "pathext": "..." } | null }
 # We answer with one compact JSON line per request:
 #   { "id": <same>, "status": "ok", "commands": [["Get-Content", "foo.txt"]],
+#     "standalone_command": true,
 #     "direct_argv": ["git", "status"], "native_argument_mode": "Standard",
 #     "powershell_version": "7.5.2",
 #     "resolved_application": "C:\\Program Files\\Git\\cmd\\git.exe" | null }
@@ -180,7 +181,8 @@ function Invoke-ParseRequest {
         return @{ id = $RequestId; status = 'unsupported' }
     }
 
-    $directArgv = Get-DirectArgvCandidate $ast
+    $standaloneCommand = Get-StandaloneCommand $ast
+    $directArgv = Get-DirectArgvCandidate $standaloneCommand
     $nativeArgumentMode = $null
     $powershellVersion = $null
     if ($directArgv -ne $null) {
@@ -211,6 +213,7 @@ function Invoke-ParseRequest {
         id = $RequestId
         status = 'ok'
         commands = $commands
+        standalone_command = $standaloneCommand -ne $null
         direct_argv = $directArgv
         native_argument_mode = $nativeArgumentMode
         powershell_version = $powershellVersion
@@ -639,7 +642,7 @@ function Convert-DirectCommandElement {
     return $null
 }
 
-function Get-DirectArgvCandidate {
+function Get-StandaloneCommand {
     param($ast)
 
     if ($ast.EndBlock.Statements.Count -ne 1) {
@@ -669,6 +672,16 @@ function Get-DirectArgvCandidate {
         $command.InvocationOperator -ne $null -and
         $command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown
     ) {
+        return $null
+    }
+
+    return $command
+}
+
+function Get-DirectArgvCandidate {
+    param($command)
+
+    if ($command -eq $null) {
         return $null
     }
 

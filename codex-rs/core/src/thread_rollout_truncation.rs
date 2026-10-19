@@ -285,6 +285,16 @@ pub fn truncate_rollout_after_turn_id(
                 "lastTurnId '{last_turn_id}' has no persisted terminal boundary"
             ))
         })?;
+    // A terminal may be appended after a successor started. A raw prefix then
+    // contains that successor's input and checkpoints: refuse it rather than
+    // silently fork a different logical history.
+    if items[target_start_index + 1..terminal_index].iter().any(|item| {
+        matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+    }) {
+        return Err(CodexErr::InvalidRequest(format!(
+            "lastTurnId '{last_turn_id}' has an interleaved successor before its terminal boundary; cannot safely fork this prefix"
+        )));
+    }
     Ok(items[..=terminal_index].to_vec())
 }
 

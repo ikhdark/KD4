@@ -10,7 +10,8 @@ use codex_agent_task_store::AssignmentAdmissionOrigin;
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
-        EventMsg::TurnComplete(ev) => Some(if let Some(error) = ev.error.as_ref() {
+        EventMsg::TurnComplete(ev) => {
+            let mut status = if let Some(error) = ev.error.as_ref() {
             AgentStatus::Errored(error.message.clone())
         } else {
             match ev.surfaced_result.clone() {
@@ -20,7 +21,13 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
                 },
                 None => AgentStatus::Completed(ev.last_agent_message.clone()),
             }
-        }),
+            };
+            if let Some(summary) = ev.timing.as_ref().and_then(|timing| timing.completion_assessment.as_ref())
+                .and_then(|assessment| assessment.bounded_summary(&ev.turn_id)) {
+                append_host_observation(&mut status, &summary);
+            }
+            Some(status)
+        }
         EventMsg::TurnAborted(ev) => match ev.reason {
             codex_protocol::protocol::TurnAbortReason::Interrupted
             | codex_protocol::protocol::TurnAbortReason::BudgetLimited => {
@@ -54,16 +61,68 @@ pub(crate) fn agent_status_from_task(
     task: &AgentTask,
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
 ) -> Option<AgentStatus> {
+    let mut status = agent_status_from_task_inner(task, observed_status)?;
+    for observation in task.observations.iter().filter(|observation| {
+        observation.attempt_id == task.current_attempt.attempt_id
+            && observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
+    }).rev().take(1) {
+        append_host_observation(&mut status, &observation.summary);
+    }
+    Some(status)
+}
+
+fn append_host_observation(status: &mut AgentStatus, summary: &str) {
+    let message = match status {
+        // Host observations must not manufacture an authored final response:
+        // the missing-receipt path distinguishes Completed(None) from Some.
+        AgentStatus::Completed(Some(message)) => message,
+        AgentStatus::CompletedWithSurface { last_agent_message: message, .. } => {
+            message.get_or_insert_with(String::new)
+        }
+        AgentStatus::Errored(message) => message,
+        _ => return,
+    };
+    // Only presentation deduplication: no prose is parsed into host authority.
+    if !message.contains(summary) {
+        // Put known host facts before potentially long authored prose so the
+        // bounded notification cannot discard them merely because prose is long.
+        *message = if message.is_empty() { summary.to_string() }
+            else { format!("{summary}\n\n{message}") };
+    }
+}
+
+fn agent_status_from_task_inner(
+    task: &AgentTask,
+    observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
+) -> Option<AgentStatus> {
     let receipt = task.receipt.as_ref()?;
+    if receipt.attempt_id != task.current_attempt.attempt_id {
+        return None;
+    }
+    let plain_message = matches!(
+        task.assignment.admission_origin,
+        AssignmentAdmissionOrigin::LegacyMessage { .. }
+    );
+    let failures = task.gates.iter().filter(|gate| matches!(gate.status,
+        codex_agent_task_store::GateStatus::Failed |
+        codex_agent_task_store::GateStatus::ChangesRequested |
+        codex_agent_task_store::GateStatus::Violated))
+        .map(|gate| format!("{:?}: {:?}: {}", gate.kind, gate.status, gate.reason))
+        .collect::<Vec<_>>().join("; ");
+    let needs_main = task.current_attempt.state == codex_agent_task_store::AttemptState::NeedsMain;
+    if receipt.status == AgentStatusClaim::Completed
+        && (needs_main || (!plain_message && !failures.is_empty()))
+    {
+        let acceptance = if needs_main { "needs_main" } else { "blocked by gates" };
+        return Some(AgentStatus::Errored(format!(
+            "Agent execution completed; acceptance {acceptance}. {failures}\n\nAgent-reported result (not verification evidence): {}", receipt.summary
+        )));
+    }
     let observed_status = observed_status
         .filter(|(attempt_id, _)| {
             *attempt_id == task.current_attempt.attempt_id && *attempt_id == receipt.attempt_id
         })
         .map(|(_, status)| status);
-    let plain_message = matches!(
-        task.assignment.admission_origin,
-        AssignmentAdmissionOrigin::LegacyMessage { .. }
-    );
     // Preparation can fail before a follow-up gets a new attempt. Its live failure
     // must not be replaced by the previous turn's durable completed receipt.
     if plain_message
@@ -78,7 +137,8 @@ pub(crate) fn agent_status_from_task(
     // worker to reconstruct it. The attempt check above still excludes stale text,
     // and neither this prose nor a pending gate is promoted into verification.
     let reported_message = match (receipt.status, observed_status) {
-        (AgentStatusClaim::Completed, Some(AgentStatus::Completed(Some(message)))) => {
+        (AgentStatusClaim::Completed, Some(AgentStatus::Completed(Some(message))
+            | AgentStatus::CompletedWithSurface { last_agent_message: Some(message), .. })) => {
             message.as_str()
         }
         _ => receipt.summary.as_str(),
@@ -300,6 +360,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn host_completion_diagnostics_survive_plain_and_surfaced_statuses() {
+        let mut no_report = AgentStatus::Completed(None);
+        append_host_observation(&mut no_report, "host-only evidence");
+        assert_eq!(no_report, AgentStatus::Completed(None));
+        for surfaced in [false, true] {
+            let event = TurnCompleteEvent {
+                turn_id: "diagnostic-turn".into(), last_agent_message: Some("done".into()),
+                surfaced_result: surfaced.then(|| SurfacedToolResult {
+                    adapter: "owner".into(), value: serde_json::json!(42), canonical_message: None,
+                }),
+                error: None, completed_at: None, duration_ms: None, time_to_first_token_ms: None,
+                timing: Some(codex_protocol::protocol::TurnTiming {
+                    completion_assessment: Some(codex_protocol::protocol::TurnCompletionAssessment {
+                        failed_checks: vec!["check-alpha failed".into()],
+                        verification_gaps: vec!["check-beta awaits terminal evidence".into()],
+                        ..Default::default()
+                    }), ..Default::default()
+                }),
+            };
+            let status = agent_status_from_event(&EventMsg::TurnComplete(event)).unwrap();
+            let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+            let projected = agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))).unwrap();
+            let text = match projected {
+                AgentStatus::Completed(Some(message)) |
+                AgentStatus::CompletedWithSurface { last_agent_message: Some(message), .. } => message,
+                _ => panic!("completion lifecycle must be unchanged"),
+            };
+            assert!(text.contains("check-alpha failed"));
+            assert!(text.contains("check-beta awaits terminal evidence"));
+            assert!(text.contains("diagnostic-turn"));
+            task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
+            assert!(matches!(agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))),
+                Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates") && message.contains("check-alpha")));
+            assert!(matches!(agent_status_from_task(&task, Some((AttemptId::new(), &status))),
+                Some(AgentStatus::Completed(Some(message))) if !message.contains("check-alpha")));
+        }
+    }
+
     fn typed_task_with_receipt(receipt_status: AgentStatusClaim, pending_gate: bool) -> AgentTask {
         let assignment_id = AssignmentId::new();
         let attempt_id = AttemptId::new();
@@ -465,6 +564,32 @@ mod tests {
             agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Failed, true), None),
             Some(AgentStatus::Errored(message)) if message.contains("status: failed")
         ));
+    }
+
+    #[test]
+    fn failed_acceptance_is_not_recovered_as_execution_success() {
+        for kind in [codex_agent_task_store::GateKind::Review, codex_agent_task_store::GateKind::Verification] {
+            let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+            task.current_attempt.state = AttemptState::NeedsMain;
+            task.gates.push(codex_agent_task_store::AgentGate {
+                assignment_id: task.assignment.assignment_id, kind,
+                status: codex_agent_task_store::GateStatus::Failed,
+                reason: "missing behavior".into(), waiver_reason: None,
+                evidence_epoch: 0, updated_at: chrono::Utc::now(), sealed_at: Some(chrono::Utc::now()),
+            });
+            let observed = AgentStatus::Completed(Some("worker finished".into()));
+            for live in [None, Some((task.current_attempt.attempt_id, &observed))] {
+                assert!(matches!(agent_status_from_task(&task, live), Some(AgentStatus::Errored(message))
+                    if message.contains("execution completed") && message.contains("needs_main") && message.contains("missing behavior")));
+            }
+            assert_eq!(task.receipt.as_ref().unwrap().status, AgentStatusClaim::Completed);
+            // The first changes-requested review leaves execution Completed,
+            // but acceptance is blocked until an explicit correction is reviewed.
+            task.current_attempt.state = AttemptState::Completed;
+            task.gates[0].status = codex_agent_task_store::GateStatus::ChangesRequested;
+            assert!(matches!(agent_status_from_task(&task, None), Some(AgentStatus::Errored(message))
+                if message.contains("blocked by gates") && message.contains("ChangesRequested")));
+        }
     }
 
     #[test]

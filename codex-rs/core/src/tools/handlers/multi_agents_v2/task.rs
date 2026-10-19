@@ -12,9 +12,11 @@ use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::ArchitectureContractV1;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
+use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
@@ -149,7 +151,6 @@ async fn handle_get_agent_task(
     let caller_binding = if turn.session_source.is_non_root_agent() {
         let binding = coordinator
             .binding_for_turn(&turn)
-            .filter(|binding| binding.assignment_id == assignment_id)
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
@@ -163,15 +164,26 @@ async fn handle_get_agent_task(
         .get_agent_task(assignment_id, Some(observation_limit))
         .await
         .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    if caller_binding
-        .as_ref()
-        .is_some_and(|binding| binding.attempt_id != task.current_attempt.attempt_id)
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
-        )));
+    if let Some(binding) = &caller_binding {
+        let caller = if binding.assignment_id == assignment_id {
+            task.clone()
+        } else {
+            coordinator.get_agent_task(binding.assignment_id, Some(0)).await
+                .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?
+        };
+        let current = caller.current_attempt.attempt_id == binding.attempt_id;
+        let immediate_child = matches!(task.assignment.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: Some(parent) }
+            if parent == binding.assignment_id)
+            && caller.assignment.root_session_id == task.assignment.root_session_id
+            && caller.assignment.repository_id == task.assignment.repository_id;
+        if !current || (binding.assignment_id != assignment_id && !immediate_child) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: non-root callers may read only their current bound task or its immediate children"
+            )));
+        }
     }
-    let cold_review_context = if caller_binding.is_some() {
+    let cold_review_context = if caller_binding.as_ref().is_some_and(|binding| binding.assignment_id == assignment_id) {
         build_evaluation_context(session.as_ref(), turn.config.cwd.as_path(), &task).await?
     } else {
         None
@@ -414,6 +426,7 @@ async fn build_evaluation_context(
             &repo_root,
             ColdReviewContextInput {
                 assignment: target.assignment,
+                amendment: target.current_attempt.amendment,
                 attempt_id: target.current_attempt.attempt_id,
                 applicable_instructions,
                 attempt_specific_diff: "Automatic change snapshots are disabled. Inspect the declared changes independently; task receipts do not establish current workspace freshness.".to_string(),
@@ -506,6 +519,8 @@ async fn handle_set_agent_gate(
     let arguments = function_arguments(payload)?;
     let args: SetAgentGateArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
+    let expected_attempt_id = args.expected_attempt_id.parse::<AttemptId>()
+        .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     let coordinator = session.services.agent_control.task_coordinator();
     let actor = if turn.session_source.is_non_root_agent() {
         let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
@@ -523,7 +538,7 @@ async fn handle_set_agent_gate(
         ))
     })?;
     let gate = store
-        .set_agent_gate(actor, assignment_id, args.gate, args.status, args.reason)
+        .set_agent_gate(actor, assignment_id, expected_attempt_id, args.gate, args.status, args.reason)
         .await
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     coordinator
@@ -854,6 +869,7 @@ struct DeclaredChangeArgs {
 #[serde(deny_unknown_fields)]
 struct SetAgentGateArgs {
     assignment_id: String,
+    expected_attempt_id: String,
     gate: GateKind,
     status: GateStatus,
     reason: String,
@@ -1712,7 +1728,7 @@ fn get_agent_task_spec() -> ToolSpec {
         GET_AGENT_TASK_TOOL,
         "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
          validation calls, and recent observations. A bound reviewer or verifier also receives \
-         isolated evidence for its target. observation_limit defaults to 20 and is capped at 100.",
+         isolated evidence for its target. Non-root callers may also read their immediate children's durable receipts, not siblings or unrelated tasks. observation_limit defaults to 20 and is capped at 100.",
         object_schema(
             [
                 (
@@ -1952,6 +1968,7 @@ fn set_agent_gate_spec() -> ToolSpec {
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),
+                ("expected_attempt_id", JsonSchema::string(Some("Exact target attempt_id from the task or cold review context you evaluated. Stale verdicts are rejected; recover and evaluate the current attempt before retrying.".to_string()))),
                 (
                     "gate",
                     enum_schema(
@@ -1979,7 +1996,7 @@ fn set_agent_gate_spec() -> ToolSpec {
                     )),
                 ),
             ],
-            &["assignment_id", "gate", "status", "reason"],
+            &["assignment_id", "expected_attempt_id", "gate", "status", "reason"],
         ),
     )
 }
@@ -2560,6 +2577,51 @@ mod review_policy_tests {
     use codex_agent_task_store::WorkspaceStrategy;
 
     #[tokio::test]
+    async fn nested_parent_can_read_durable_child_but_not_sibling() {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let coordinator = session.services.agent_control.task_coordinator();
+        coordinator.initialize(codex_state::StateRuntime::init(home.path().into(), "test".into()).await.unwrap(), "root".into()).await.unwrap();
+        let draft = |parent_assignment_id| AssignmentDraft {
+            root_session_id: "root".into(), admission_origin: AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id },
+            role: AgentRole::Explorer, capability_profile: CapabilityProfile::ReadSearch,
+            objective: "report".into(), acceptance_criteria: vec![AcceptanceCriterion { id: "report".into(), text: "report".into() }],
+            read_scope: vec![], write_scope: vec![], stop_condition: "report".into(), dependencies: vec![],
+            risk_hints: vec![], required_evidence: vec![], prohibited_changes: vec![], contract_claims: vec![],
+            workspace_strategy: WorkspaceStrategy::Shared, relation: None, architecture_contract_ref: None,
+        };
+        let (parent, attempt) = coordinator.create_assignment(repo.path(), draft(None)).await.unwrap();
+        let path = codex_protocol::AgentPath::root().join("coordinator").unwrap();
+        let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: parent.assignment_id, attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(), task_name: "coordinator".into(), thread_id: Some(session.thread_id.to_string()),
+        }).await.unwrap();
+        turn.session_source = SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(), depth: 1, agent_path: Some(path), agent_nickname: None, agent_role: None,
+        });
+        turn.agent_task_binding.set(Some(binding)).unwrap();
+        let (child, child_attempt) = coordinator.create_assignment(repo.path(), draft(Some(parent.assignment_id))).await.unwrap();
+        coordinator.store().unwrap().record_legacy_agent_outcome(child_attempt.attempt_id, AgentStatusClaim::Completed, "durable nested result".into()).await.unwrap();
+        let (sibling, _) = coordinator.create_assignment(repo.path(), draft(None)).await.unwrap();
+        let (grandchild, _) = coordinator.create_assignment(repo.path(), draft(Some(child.assignment_id))).await.unwrap();
+        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+        // No live child exists: every read must recover the stored record.
+        for (id, allowed) in [(parent.assignment_id, true), (child.assignment_id, true), (sibling.assignment_id, false), (grandchild.assignment_id, false)] {
+            let result = handle_get_agent_task(ToolInvocation {
+                session: Arc::clone(&session), step_context: Arc::clone(&step),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+                call_id: "read-child".into(), tool_name: ToolName::plain(GET_AGENT_TASK_TOOL),
+                source: crate::tools::context::ToolCallSource::Direct,
+                payload: ToolPayload::Function { arguments: json!({"assignment_id":id}).to_string() },
+            }).await;
+            assert_eq!(result.is_ok(), allowed, "lineage access for {id}");
+        }
+    }
+
+    #[tokio::test]
     async fn mutation_free_explorer_avoids_implicit_validation_but_keeps_safety_gates() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -2684,6 +2746,7 @@ mod review_policy_tests {
             .set_agent_gate(
                 TaskActor::Root,
                 assignment.assignment_id,
+                attempt.attempt_id,
                 GateKind::Review,
                 GateStatus::Pending,
                 "explicit independent review".to_string(),

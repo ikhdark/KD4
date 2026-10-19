@@ -72,6 +72,8 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex.flush_rollout().await?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     let initial_messages = resumed
         .session_configured
@@ -158,6 +160,8 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex.flush_rollout().await?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     let (persisted_items, _, parse_errors) =
         codex_core::RolloutRecorder::load_rollout_items(&rollout_path).await?;
     assert_eq!(parse_errors, 0);
@@ -453,6 +457,8 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     .await;
     let _ = initial_mock.single_request();
     codex.flush_rollout().await?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     let resumed_mock = mount_sse_once(
         &server,

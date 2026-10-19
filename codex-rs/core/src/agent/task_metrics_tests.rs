@@ -831,3 +831,27 @@ fn terminal_adapter_reports_admission_read_overlap_as_duplicate_work() {
     task.assignment.benign_read_overlap_count = 3;
     assert_eq!(super::terminal_input(&task).duplicate_work, Some(3));
 }
+#[test]
+fn amended_criteria_use_current_metric_denominator() {
+    for count in [1, 2, 3] {
+        let mut task = completed_task_with_validation(&[], &[]);
+        task.current_attempt.ordinal = 1;
+        let criteria = (0..count).map(|i| AcceptanceCriterion {
+            id: format!("renamed-{i}"), text: "amended behavior".into(),
+        }).collect::<Vec<_>>();
+        task.current_attempt.amendment = Some(codex_agent_task_store::AttemptAmendment {
+            reason: "revise acceptance".into(), objective: None,
+            acceptance_criteria: Some(criteria.clone()), stop_condition: None,
+        });
+        task.receipt.as_mut().unwrap().criterion_results = criteria.iter().map(|criterion| CriterionResult {
+            criterion_id: criterion.id.clone(), status: CriterionStatus::Passed, evidence: None, evidence_ref: None,
+        }).collect();
+        let terminal = super::terminal_input(&task);
+        assert_eq!(terminal.acceptance_total, count);
+        assert_eq!(terminal.acceptance_final_closed, count);
+        assert_eq!(terminal.acceptance_first_pass_closed, None);
+        let mut runtime = TaskMetricRuntime::new(&task.assignment, 1, 1).unwrap();
+        assert!(runtime.finish(&task).unwrap().is_some());
+        assert!(runtime.finish(&task).unwrap().is_none());
+    }
+}

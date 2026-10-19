@@ -48,6 +48,33 @@ pub enum LoadableToolSpec {
 }
 
 impl LoadableToolSpec {
+    /// Normalize persisted discovery output, including legacy flat functions.
+    /// Unknown shapes must stay raw rather than become a complete name receipt.
+    pub fn callable_names_from_value(value: &serde_json::Value) -> Option<Vec<String>> {
+        let name = |value: &serde_json::Value| {
+            value.get("name").and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty()).map(str::to_owned)
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("namespace") {
+            let namespace = name(value)?;
+            return value.get("tools")?.as_array()?.iter().map(|tool| {
+                (tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+                    .then_some(())?;
+                Some(format!("{namespace}.{}", name(tool)?))
+            }).collect();
+        }
+        if value.get("type").is_some_and(|kind| kind != "function") {
+            return None;
+        }
+        let function = value.get("function").unwrap_or(value);
+        let name = name(function)?;
+        Some(vec![match value.get("namespace").and_then(serde_json::Value::as_str)
+            .filter(|namespace| !namespace.is_empty()) {
+            Some(namespace) => format!("{namespace}.{name}"),
+            None => name,
+        }])
+    }
+
     /// Returns every callable name declared by this loadable specification.
     pub fn callable_tool_names(&self) -> Vec<ToolName> {
         match self {

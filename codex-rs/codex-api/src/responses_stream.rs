@@ -32,6 +32,10 @@ pub(crate) const OPENAI_MODEL_HEADER: &str = "openai-model";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
+#[path = "response_lifecycle.rs"]
+mod response_lifecycle;
+pub(crate) use response_lifecycle::ConnectionResponseHistory;
+
 /// Transport-independent metadata returned when a Responses stream is established.
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesStreamMetadata {
@@ -124,9 +128,19 @@ pub(crate) struct ResponsesEventInterpreter {
     safety_buffering_treatment: SafetyBufferingTreatment,
     turn_state: Option<Arc<OnceLock<String>>>,
     events: Vec<ResponseEvent>,
+    lifecycle: response_lifecycle::ResponseLifecycle,
 }
 
 impl ResponsesEventInterpreter {
+    pub(crate) fn with_connection_history(mut self, history: ConnectionResponseHistory) -> Self {
+        self.lifecycle = response_lifecycle::ResponseLifecycle::with_connection_history(history);
+        self
+    }
+
+    pub(crate) fn into_connection_history(self) -> ConnectionResponseHistory {
+        self.lifecycle.into_connection_history()
+    }
+
     pub(crate) fn new(
         metadata: &ResponsesStreamMetadata,
         turn_state: Option<Arc<OnceLock<String>>>,
@@ -136,6 +150,7 @@ impl ResponsesEventInterpreter {
             safety_buffering_treatment: metadata.safety_buffering_treatment.clone(),
             turn_state,
             events: Vec::new(),
+            lifecycle: response_lifecycle::ResponseLifecycle::default(),
         }
     }
 
@@ -236,7 +251,23 @@ impl ResponsesEventInterpreter {
         if let Some(buffering) = event.safety_buffering(&self.safety_buffering_treatment) {
             self.events.push(ResponseEvent::SafetyBuffering(buffering));
         }
-        if let Some(event) = process_responses_event(event)? {
+        let rejected_completion_usage = if event.kind == "response.completed" {
+            event.response.as_ref().and_then(|response| {
+                let response_id = response.id.as_ref().and_then(Value::as_str);
+                if !self.lifecycle.owns_terminal_observation(response_id) { return None; }
+                parse_usage(response.usage.clone()).map(|usage| (response_id.map(str::to_owned), usage))
+            })
+        } else { None };
+        let interpreted = self.lifecycle.process(event, payload.len()).map_err(|error| {
+            match (error, rejected_completion_usage) {
+                (ResponsesEventError::Api(source), Some((response_id, usage))) =>
+                    ResponsesEventError::Api(ApiError::TerminalResponse {
+                        source: Box::new(source), response_id, token_usage: Some(usage),
+                    }),
+                (error, _) => error,
+            }
+        })?;
+        if let Some(event) = interpreted {
             self.events.push(event);
         }
         Ok(self.events.drain(..))
@@ -305,6 +336,7 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<ResponseEnvelope>,
+    response_id: Option<String>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -312,10 +344,11 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     text: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+    output_index: Option<u64>,
     safety_buffering: Option<Value>,
 }
 
-// Ignore full output snapshots: items have their own ordered stream events.
+// Terminal snapshots, when supplied, must agree with admitted ordered items.
 #[derive(Debug, Deserialize)]
 struct ResponseEnvelope {
     id: Option<Value>,
@@ -323,6 +356,7 @@ struct ResponseEnvelope {
     end_turn: Option<Value>,
     error: Option<Value>,
     incomplete_details: Option<Value>,
+    output: Option<Value>,
     headers: Option<Value>,
 }
 
@@ -341,6 +375,7 @@ fn is_known_event(kind: &str) -> bool {
             | "response.output_item.added"
             | "response.output_text.delta"
             | "response.custom_tool_call_input.delta"
+            | "response.function_call_arguments.delta"
             | "response.reasoning_summary_text.delta"
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.delta"
@@ -575,7 +610,7 @@ fn process_responses_event(
                 return Ok(Some(ResponseEvent::OutputTextDelta(delta)));
             }
         }
-        "response.custom_tool_call_input.delta" => {
+        "response.custom_tool_call_input.delta" | "response.function_call_arguments.delta" => {
             if let (Some(delta), Some(item_id)) =
                 (event.delta, event.item_id.or_else(|| event.call_id.clone()))
             {
@@ -619,11 +654,14 @@ fn process_responses_event(
             }
         }
         "response.failed" => {
-            let error = event
-                .response
-                .and_then(|response| response.error)
-                .unwrap_or(Value::Null);
-            return Err(ResponsesEventError::Api(provider_error(&error)));
+            let response = event.response;
+            let response_id = response.as_ref().and_then(|response| response.id.as_ref())
+                .and_then(Value::as_str).map(str::to_owned);
+            let error = provider_error(response.as_ref().and_then(|response| response.error.as_ref()).unwrap_or(&Value::Null));
+            let token_usage = parse_usage(response.and_then(|response| response.usage));
+            return Err(ResponsesEventError::Api(if response_id.is_some() || token_usage.is_some() {
+                ApiError::TerminalResponse { source: Box::new(error), response_id, token_usage }
+            } else { error }));
         }
         "response.incomplete" => {
             let response = event.response;
@@ -699,6 +737,19 @@ fn parse_required_response_item(
         debug!("{message}");
         ResponsesEventError::Api(ApiError::invalid_response(message))
     })?;
+    // The event name is not sufficient authority to execute a tool. Check
+    // explicit provider finality before deserialization can discard status
+    // (notably for legacy FunctionCall). Omitted/null status remains compatible.
+    if event_kind == "response.output_item.done"
+        && matches!(item.get("type").and_then(Value::as_str),
+            Some("function_call" | "custom_tool_call" | "tool_search_call" | "local_shell_call"))
+        && let Some(status) = item.get("status").filter(|status| !status.is_null())
+        && status.as_str() != Some("completed")
+    {
+        return Err(ResponsesEventError::Api(ApiError::invalid_response(
+            "executable output item has a non-completed status",
+        )));
+    }
     serde_json::from_value(item).map_err(|error| {
         let message = decode_diagnostic(
             &format!("failed to parse ResponseItem from {event_kind}"),
@@ -771,6 +822,84 @@ mod tests {
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn failed_envelope_retains_usage_identity_and_original_retry_class() {
+        for (code, retryable) in [("server_error", true), ("insufficient_quota", false)] {
+            let mut interpreter = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let payload = json!({"type":"response.failed","response":{"id":"failed-id",
+                "error":{"code":code,"message":"original failure"},
+                "usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,
+                    "input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":7}}
+            }}).to_string();
+            let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else { panic!("failed response must fail"); };
+            let error = crate::api_bridge::map_api_error(error);
+            assert_eq!(error.is_retryable(), retryable);
+            assert_eq!(error.terminal_response_id(), Some("failed-id"));
+            assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().total_tokens, 30);
+            assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().reasoning_output_tokens, 7);
+            assert_eq!(error.into_response_error().is_retryable(), retryable);
+        }
+    }
+
+    #[test]
+    fn invalid_completed_snapshot_keeps_known_usage_without_claiming_success() {
+        let mut interpreter = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let payload = json!({"type":"response.completed","response":{"id":"invalid",
+            "output":[{"type":"message","id":"m","role":"assistant","content":[]}],
+            "usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}
+        }}).to_string();
+        let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else { panic!("unadmitted terminal output"); };
+        let error = crate::api_bridge::map_api_error(error);
+        assert!(!error.is_retryable());
+        assert_eq!(error.terminal_response_id(), Some("invalid"));
+        assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().total_tokens, 30);
+    }
+
+    #[test]
+    fn executable_done_requires_completed_or_legacy_missing_status() {
+        for kind in ["function_call", "custom_tool_call", "tool_search_call"] {
+            for status in ["incomplete", "in_progress", "failed", "unknown"] {
+                let payload = json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": kind, "status": status, "name": "marker",
+                        "call_id": "call", "arguments": "{}", "input": "marker",
+                        "execution": "client"}
+                }).to_string();
+                let mut interpreter = ResponsesEventInterpreter::new(
+                    &ResponsesStreamMetadata::default(), None,
+                );
+                assert!(matches!(interpreter.process_payload(&payload),
+                    Err(ResponsesEventError::Api(_))), "{kind}: {status}");
+            }
+        }
+        for status in [Value::Null, json!("completed")] {
+            let payload = json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "name": "marker", "call_id": "call",
+                "arguments": "{}", "status": status
+            }}).to_string();
+            let mut interpreter = ResponsesEventInterpreter::new(
+                &ResponsesStreamMetadata::default(), None,
+            );
+            assert!(matches!(interpreter.process_payload(&payload).unwrap().next(),
+                Some(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. }))));
+        }
+    }
+
+    #[test]
+    fn function_argument_fragments_are_productive_but_empty_fragments_are_not() {
+        for delta in ["", "{\"code\":\"", "partial code"] {
+            let payload = json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_1", "delta": delta}).to_string();
+            let mut interpreter = ResponsesEventInterpreter::new(
+                &ResponsesStreamMetadata::default(), None,
+            );
+            let event = interpreter.process_payload(&payload).unwrap().next().unwrap();
+            assert_eq!(event.advances_model_response(), !delta.is_empty());
+            assert!(matches!(event, ResponseEvent::ToolCallInputDelta { item_id, delta: actual, .. }
+                if item_id == "fc_1" && actual == delta));
+        }
+    }
 
     #[test]
     fn transport_audit_initial_model_is_not_reemitted() {
@@ -912,7 +1041,7 @@ mod tests {
             let mut interpreter =
                 ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
             let payload = json!({"type":"response.completed","response":{"id":"done","end_turn":true,"usage":usage,
-                "output":[{"unused":"snapshot"}]}}).to_string();
+                "output":[]}}).to_string();
             let events = interpreter
                 .process_payload(&payload)
                 .unwrap()

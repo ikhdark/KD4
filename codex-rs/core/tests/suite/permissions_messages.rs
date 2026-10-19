@@ -437,6 +437,8 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     initial.codex.flush_rollout().await?;
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
         .codex
@@ -540,6 +542,8 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     assert_eq!(permissions_base.len(), 1);
     assert!(permissions_base[0].contains("Approval policy is `never`"));
     initial.codex.flush_rollout().await?;
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);

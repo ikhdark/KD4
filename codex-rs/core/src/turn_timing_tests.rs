@@ -50,6 +50,34 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
 
+#[test]
+fn diagnostic_usage_distinguishes_missing_zero_and_multiple_attempts() {
+    let known = super::ModelRequestTiming {
+        physical_attempt_ids: vec!["known".into()],
+        token_usage: Some(Default::default()),
+        generation_purpose: Some(TurnTimingGenerationPurpose::Wait),
+        ..Default::default()
+    };
+    for (requests, expected, observed) in [
+        (vec![], 0, 0),
+        (vec![known.clone()], 1, 1),
+        (vec![super::ModelRequestTiming { token_usage: None, ..known.clone() }], 1, 0),
+        (vec![super::ModelRequestTiming { physical_attempt_ids: vec!["a".into(), "b".into()], ..known.clone() }], 2, 0),
+        (vec![known.clone(), super::ModelRequestTiming { physical_attempt_ids: vec!["missing".into()], token_usage: None, ..known.clone() }], 2, 1),
+        (vec![known.clone(), known], 2, 1),
+    ] {
+        let aggregate = super::diagnostic_token_aggregate(&requests, |_| true, false);
+        assert_eq!(aggregate.expected_usage_count, Some(expected));
+        assert_eq!(aggregate.observed_usage_count, Some(observed));
+        assert_eq!(aggregate.total_tokens, 0);
+        let purposes = super::purpose_aggregates(&requests, &mut 0);
+        if let Some(purpose) = purposes.first() {
+            assert_eq!(purpose.expected_usage_count, Some(expected));
+            assert_eq!(purpose.observed_usage_count, Some(observed));
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn timing_storage_deadline_preserves_inline_details_and_creation_owner() {
     let timing = TurnTiming {
@@ -639,6 +667,7 @@ fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
             codex_protocol::protocol::SamplingBoundaryItem {
                 sampling_request_id: "sampling-1".to_string(),
                 physical_attempt_id: attempt.to_string(),
+                workspace_freshness_notices: Vec::new(),
                 turn_id: None,
                 unresolved_context: true,
                 timing_checkpoint: Some(checkpoint),
@@ -680,6 +709,7 @@ fn lost_turn_recovery_lists_nested_in_flight_calls_from_merged_checkpoints() {
         RolloutItem::SamplingBoundary(SamplingBoundaryItem {
             sampling_request_id: "sampling".into(),
             physical_attempt_id: "attempt".into(),
+            workspace_freshness_notices: Vec::new(),
             turn_id: None,
             unresolved_context: false,
             timing_checkpoint: Some(SamplingTimingCheckpoint {

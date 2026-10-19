@@ -762,6 +762,58 @@ async fn expensive_search_scope_remains_searchable_without_reusable_miss_evidenc
     assert!(miss.stdout.is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn linked_ignore_changes_search_results_without_reusable_miss_evidence() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    std::fs::create_dir_all(root.join(".git/info")).unwrap();
+    std::fs::write(root.join("data.txt"), "needle\n").unwrap();
+    let rules = fixture.path().join("external-rules");
+    let command = strings(&[
+        "rg",
+        "--no-config",
+        "--no-ignore-global",
+        "--no-ignore-parent",
+        "needle",
+        ".",
+    ]);
+    for name in [".ignore", ".rgignore", ".gitignore", ".git/info/exclude"] {
+        std::fs::write(&rules, "data.txt\n").unwrap();
+        let link = root.join(name);
+        std::os::unix::fs::symlink(&rules, &link).unwrap();
+        for (contents, expected_exit) in [("data.txt\n", 1), ("", 0)] {
+            std::fs::write(&rules, contents).unwrap();
+            // Establish visibility independently with rg, not the cache's own
+            // fingerprint. Only the external referent changes between searches.
+            let output = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if expected_exit == 1 {
+                assert!(output.stdout.is_empty(), "{name}");
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(text.contains("data.txt:needle"), "{name}: {text}");
+            }
+            let mut search = classify_rg_search_narrowing(&command, None, &root, &root)
+                .unwrap()
+                .unwrap();
+            assert!(search.can_record_miss, "the fixture must exercise scope capture");
+            crate::command_search::observe_rg_search_scope_state(&mut search).await;
+            assert_eq!(search.scope_state_identity, None, "{name}");
+        }
+        std::fs::remove_file(link).unwrap();
+    }
+}
+
 #[test]
 fn classifies_repository_wide_and_owner_scoped_rg() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))

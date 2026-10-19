@@ -137,6 +137,14 @@ pub fn parse_powershell_command_into_plain_commands(
     try_parse_powershell_ast_commands(extracted.shell, extracted.script)
 }
 
+/// Prove one literal command launch, without claiming native argv equivalence.
+/// Numeric arguments can preserve launch count while remaining ineligible for
+/// direct execution. This syntax-only proof must not authenticate runner receipts.
+pub fn is_standalone_powershell_command(script: &str) -> bool {
+    try_parse_powershell_ast_analysis("pwsh", script)
+        .is_some_and(|analysis| analysis.standalone_command)
+}
+
 /// Parse an exact-shape PowerShell command only when profiles are disabled, as required by
 /// approval and execution-policy decisions that depend on the parsed command being equivalent to
 /// the command that will actually run.

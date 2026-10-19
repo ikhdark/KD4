@@ -63,6 +63,13 @@ pub enum CodexErr {
     Stream(String, Option<RetryAfter>),
     #[error("{0}")]
     IncompleteResponse(Box<IncompleteResponse>),
+    /// Terminal provider accounting is independent of the outcome's retry class.
+    #[error("{source}")]
+    TerminalResponse {
+        source: Box<CodexErr>,
+        response_id: Option<String>,
+        token_usage: Option<crate::protocol::TokenUsage>,
+    },
     #[error("provider error {code:?}: {message}")]
     ProviderFailure {
         code: Option<String>,
@@ -164,8 +171,33 @@ impl From<CancelErr> for CodexErr {
 }
 
 impl CodexErr {
+    pub fn terminal_usage(&self) -> Option<&Option<crate::protocol::TokenUsage>> {
+        match self {
+            Self::IncompleteResponse(response) => Some(&response.token_usage),
+            Self::TerminalResponse { token_usage, .. } => Some(token_usage),
+            _ => None,
+        }
+    }
+
+    pub fn terminal_response_id(&self) -> Option<&str> {
+        match self {
+            Self::IncompleteResponse(response) => response.response_id.as_deref(),
+            Self::TerminalResponse { response_id, .. } => response_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Call only after observing terminal accounting, before outcome dispatch.
+    pub fn into_response_error(self) -> Self {
+        match self {
+            Self::TerminalResponse { source, .. } => source.into_response_error(),
+            other => other,
+        }
+    }
+
     pub fn retry_after(&self) -> Option<RetryAfter> {
         match self {
+            Self::TerminalResponse { source, .. } => source.retry_after(),
             Self::Stream(_, advice)
             | Self::ServerOverloaded {
                 retry_after: advice,
@@ -181,6 +213,11 @@ impl CodexErr {
 
     /// Prefer the original HTTP deadline over later provider-body advice.
     pub fn with_retry_after(mut self, advice: Option<RetryAfter>) -> Self {
+        if let Self::TerminalResponse { source, response_id, token_usage } = self {
+            return Self::TerminalResponse {
+                source: Box::new(source.with_retry_after(advice)), response_id, token_usage,
+            };
+        }
         let slot = match &mut self {
             Self::Stream(_, slot)
             | Self::ServerOverloaded { retry_after: slot }
@@ -195,6 +232,7 @@ impl CodexErr {
 
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::TerminalResponse { source, .. } => source.is_retryable(),
             CodexErr::TurnAborted
             | CodexErr::Interrupted
             | CodexErr::EnvVar(_)
@@ -246,6 +284,7 @@ impl CodexErr {
     /// Translate core error to client-facing protocol error.
     pub fn to_codex_protocol_error(&self) -> CodexErrorInfo {
         match self {
+            Self::TerminalResponse { source, .. } => source.to_codex_protocol_error(),
             CodexErr::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
             CodexErr::UsageLimitReached(_)
             | CodexErr::QuotaExceeded
@@ -288,6 +327,9 @@ impl CodexErr {
     }
 
     pub fn http_status_code_value(&self) -> Option<u16> {
+        if let Self::TerminalResponse { source, .. } = self {
+            return source.http_status_code_value();
+        }
         let http_status_code = match self {
             CodexErr::RetryLimit(err) => Some(err.status),
             CodexErr::UnexpectedStatus(err) | CodexErr::RegionRestricted(err) => Some(err.status),

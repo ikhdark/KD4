@@ -1,5 +1,5 @@
 import { CodexOptions } from "./codexOptions";
-import { ThreadEvent, ThreadError, TurnCompletedEvent, Usage } from "./events";
+import { ThreadEvent, ThreadError, TurnCompletedEvent, TurnFailedEvent, Usage } from "./events";
 import { CodexExec } from "./exec";
 import { ThreadItem } from "./items";
 import { ThreadOptions } from "./threadOptions";
@@ -11,12 +11,34 @@ export type Turn = {
   items: ThreadItem[];
   finalResponse: string;
   usage: Usage | null;
+  /** Owner timing; absence, unavailable (null), and measured zero remain distinct. */
+  timing?: TurnCompletedEvent["timing"];
   /** Authoritative typed result when a tool directly completes the turn. */
   surfacedResult?: TurnCompletedEvent["surfaced_result"];
 };
 
 /** Alias for `Turn` to describe the result of `run()`. */
 export type RunResult = Turn;
+
+/** Failed or incomplete turn, including all observations collected before failure. */
+export class TurnRunError extends Error {
+  readonly name = "TurnRunError";
+  constructor(
+    message: string,
+    public readonly threadId: string | null,
+    public readonly items: ThreadItem[],
+    public readonly finalResponse: string,
+    public readonly terminal: TurnFailedEvent | TurnCompletedEvent | undefined,
+    public readonly streamError: ThreadError | undefined,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+
+  get usage() { return this.terminal?.usage; }
+  get timing() { return this.terminal?.timing; }
+  get disposition() { return this.terminal?.type === "turn.failed" ? this.terminal.disposition : undefined; }
+}
 
 /** The result of the `runStreamed` method. */
 export type StreamedTurn = {
@@ -115,40 +137,75 @@ export class Thread {
 
   /** Provides the input to the agent and returns the completed turn. */
   async run(input: Input, turnOptions: TurnOptions = {}): Promise<Turn> {
-    const generator = this.runStreamedInternal(input, turnOptions);
+    const controller = new AbortController();
+    const abort = () => controller.abort(turnOptions.signal?.reason);
+    if (turnOptions.signal?.aborted) abort();
+    else turnOptions.signal?.addEventListener("abort", abort, { once: true });
+    const generator = this.runStreamedInternal(input, { ...turnOptions, signal: controller.signal });
     const items: ThreadItem[] = [];
+    const partialItems = new Map<string, ThreadItem>();
+    let partialResponse = "";
     let finalResponse: string = "";
     let usage: Usage | null = null;
     let surfacedResult: Turn["surfacedResult"];
-    let turnFailure: ThreadError | null = null;
-    let streamFailure: string | null = null;
-    for await (const event of generator) {
+    let terminal: TurnFailedEvent | TurnCompletedEvent | undefined;
+    let streamError: ThreadError | undefined;
+    let cause: unknown;
+    let failureTimer: ReturnType<typeof setTimeout> | undefined;
+    let trailingEvents = 0;
+    const boundFailureDrain = () => {
+      // The CLI emits error before its terminal accounting, then exits nonzero.
+      // Give that evidence a bounded drain, not an unbounded new model phase.
+      failureTimer ??= setTimeout(() => controller.abort(), 1_000);
+    };
+    try {
+      for await (const event of generator) {
+        if (failureTimer && ++trailingEvents > 128) {
+          controller.abort();
+          break;
+        }
+        if (terminal && (event.type === "turn.completed" || event.type === "turn.failed")) {
+          // Preserve the first terminal's accounting; a later success cannot
+          // erase an already observed failure while we drain trailing output.
+          throw new Error("Invalid turn stream: multiple terminal events received");
+        }
+        if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+          partialItems.set(event.item.id, event.item);
+          if (event.item.type === "agent_message") partialResponse = event.item.text;
+        }
       if (event.type === "item.completed") {
         if (event.item.type === "agent_message") {
           finalResponse = event.item.text;
         }
         items.push(event.item);
       } else if (event.type === "turn.completed") {
+        terminal = event;
         usage = event.usage;
         if (event.surfaced_result) {
           surfacedResult = event.surfaced_result;
           finalResponse = surfacedResult.canonicalMessage ?? "";
         }
       } else if (event.type === "turn.failed") {
-        turnFailure = event.error;
-        break;
+        terminal = event;
+        boundFailureDrain();
       } else if (event.type === "error") {
-        streamFailure = event.message;
-        break;
+        streamError ??= { message: event.message };
+        boundFailureDrain();
       }
+      }
+    } catch (error) {
+      cause = error;
+    } finally {
+      clearTimeout(failureTimer);
+      turnOptions.signal?.removeEventListener("abort", abort);
     }
-    if (streamFailure !== null) {
-      throw new Error(streamFailure);
+    if (streamError || terminal?.type !== "turn.completed" || cause !== undefined) {
+      const message = terminal?.type === "turn.failed" ? terminal.error.message
+        : streamError?.message ?? (cause && typeof cause === "object" && "message" in cause && typeof cause.message === "string" ? cause.message : cause !== undefined ? String(cause)
+          : "Incomplete turn stream: turn.completed event not received");
+      throw new TurnRunError(message, this._id, [...partialItems.values()], partialResponse || finalResponse, terminal, streamError, { cause });
     }
-    if (turnFailure) {
-      throw new Error(turnFailure.message);
-    }
-    return { items, finalResponse, usage, ...(surfacedResult ? { surfacedResult } : {}) };
+    return { items, finalResponse, usage, ...("timing" in terminal ? { timing: terminal.timing } : {}), ...(surfacedResult ? { surfacedResult } : {}) };
   }
 }
 

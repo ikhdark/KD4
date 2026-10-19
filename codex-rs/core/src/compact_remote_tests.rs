@@ -216,6 +216,7 @@ fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
                     &candidate.arguments,
                     &candidate.result_set_sha256,
                     candidate.result_count,
+                    candidate.callable_count,
                     candidate.omitted_result_count,
                     candidate.complete,
                     candidate.omitted_identity_count,
@@ -231,6 +232,50 @@ fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
         let (_, _, repeated) = remote_tool_search_receipt_group(&again, &[0, 1], true).unwrap();
         assert_eq!(repeated, again[1]);
     }
+}
+
+#[test]
+fn serialized_namespace_receipts_preserve_callable_names_and_legacy_versions() {
+    use codex_tools::{LoadableToolSpec, ResponsesApiNamespace, ResponsesApiNamespaceTool, ResponsesApiTool};
+    let namespace = LoadableToolSpec::Namespace(ResponsesApiNamespace {
+        name: "apps".into(), description: String::new(),
+        tools: ["search", "fetch"].into_iter().map(|name| {
+            ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: name.into(), description: String::new(), strict: false,
+                defer_loading: None, output_schema: None,
+                parameters: codex_tools::JsonSchema::object(Default::default(), None, None),
+            })
+        }).collect(),
+    });
+    let mut items = tool_search_group("namespace");
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] {
+        *tools = vec![serde_json::to_value(namespace).unwrap()];
+    }
+    let (_, call, output) = remote_tool_search_receipt_group(&items, &[0, 1], true).unwrap();
+    let ResponseItem::ToolSearchOutput { tools, .. } = &output else { unreachable!() };
+    let receipt = parse_remote_tool_search_receipt(&tools[0]).unwrap();
+    assert_eq!(receipt.result_count, 1);
+    assert_eq!(receipt.callable_count, Some(2));
+    assert_eq!(receipt.ordered_tool_identities, vec!["apps.search", "apps.fetch"]);
+    assert!(receipt.is_valid("namespace", "completed", "client"));
+    let (_, _, again) = remote_tool_search_receipt_group(&[call.clone(), output.clone()], &[0, 1], true).unwrap();
+    assert_eq!(again, output);
+
+    let mut legacy = receipt;
+    legacy.version = 2;
+    legacy.callable_count = None;
+    legacy.ordered_tool_identities = vec!["apps".into()];
+    legacy.receipt_id = remote_tool_search_receipt_id(
+        &legacy.call_id, &legacy.status, &legacy.execution, &legacy.arguments,
+        &legacy.result_set_sha256, legacy.result_count, None, legacy.omitted_result_count,
+        legacy.complete, legacy.omitted_identity_count, &legacy.ordered_tool_identities);
+    assert!(legacy.is_valid("namespace", "completed", "client"));
+    let mut old_output = output;
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut old_output {
+        *tools = vec![serde_json::json!({"type": TOOL_SEARCH_RECEIPT_KIND, "receipt": legacy})];
+    }
+    let (_, _, old_again) = remote_tool_search_receipt_group(&[call, old_output.clone()], &[0, 1], true).unwrap();
+    assert_eq!(old_again, old_output, "recompaction cannot invent lost callable knowledge");
 }
 
 #[tokio::test]

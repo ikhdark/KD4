@@ -372,6 +372,7 @@ struct EnvironmentProxy {
     addrs: EnvironmentProxyAddrs,
     http_task: JoinHandle<Result<()>>,
     socks_task: Option<JoinHandle<Result<()>>>,
+    connections: crate::connection_lifecycle::ConnectionLifecycle,
 }
 
 #[derive(Clone)]
@@ -804,12 +805,15 @@ impl NetworkProxy {
         let http_state = self.state.clone();
         let http_decider = self.policy_decider.clone();
         let http_environment_id = Some(environment_id.clone());
+        let connections = crate::connection_lifecycle::ConnectionLifecycle::new();
+        let http_guard = connections.guard();
         let http_task = runtime.spawn(async move {
             http_proxy::run_http_proxy_with_std_listener(
                 http_state,
                 http_listener,
                 http_decider,
                 http_environment_id,
+                http_guard,
             )
             .await
         });
@@ -819,6 +823,7 @@ impl NetworkProxy {
             let socks_decider = self.policy_decider.clone();
             let socks_environment_id = Some(environment_id.clone());
             let socks5_udp_enabled = self.socks5_udp_enabled;
+            let socks_guard = connections.guard();
             socks_listener.map(|listener| {
                 runtime.spawn(async move {
                     socks5::run_socks5_with_std_listener(
@@ -827,6 +832,7 @@ impl NetworkProxy {
                         socks_decider,
                         socks_environment_id,
                         socks5_udp_enabled,
+                        socks_guard,
                     )
                     .await
                 })
@@ -841,6 +847,7 @@ impl NetworkProxy {
                 addrs,
                 http_task,
                 socks_task,
+                connections,
             },
         );
         Ok(addrs)
@@ -919,6 +926,8 @@ impl NetworkProxy {
         let http_state = self.state.clone();
         let http_decider = self.policy_decider.clone();
         let http_addr = self.http_addr;
+        let connections = crate::connection_lifecycle::ConnectionLifecycle::new();
+        let http_guard = connections.guard();
         let http_task = tokio::spawn(async move {
             match http_listener {
                 Some(listener) => {
@@ -927,6 +936,7 @@ impl NetworkProxy {
                         listener,
                         http_decider,
                         /*environment_id*/ None,
+                        http_guard,
                     )
                     .await
                 }
@@ -936,6 +946,7 @@ impl NetworkProxy {
                         http_addr,
                         http_decider,
                         /*environment_id*/ None,
+                        http_guard,
                     )
                     .await
                 }
@@ -947,6 +958,7 @@ impl NetworkProxy {
             let socks_decider = self.policy_decider.clone();
             let socks_addr = self.socks_addr;
             let enable_socks5_udp = current_cfg.enable_socks5_udp;
+            let socks_guard = connections.guard();
             Some(tokio::spawn(async move {
                 match socks_listener {
                     Some(listener) => {
@@ -956,6 +968,7 @@ impl NetworkProxy {
                             socks_decider,
                             /*environment_id*/ None,
                             enable_socks5_udp,
+                            socks_guard,
                         )
                         .await
                     }
@@ -966,6 +979,7 @@ impl NetworkProxy {
                             socks_decider,
                             /*environment_id*/ None,
                             enable_socks5_udp,
+                            socks_guard,
                         )
                         .await
                     }
@@ -978,6 +992,7 @@ impl NetworkProxy {
         Ok(NetworkProxyHandle {
             http_task: Some(http_task),
             socks_task,
+            connections: Some(connections),
             environment_proxies: self.environment_proxies.clone(),
             completed: false,
         })
@@ -987,6 +1002,7 @@ impl NetworkProxy {
 pub struct NetworkProxyHandle {
     http_task: Option<JoinHandle<Result<()>>>,
     socks_task: Option<JoinHandle<Result<()>>>,
+    connections: Option<crate::connection_lifecycle::ConnectionLifecycle>,
     environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
     completed: bool,
 }
@@ -996,6 +1012,7 @@ impl NetworkProxyHandle {
         Self {
             http_task: Some(tokio::spawn(async { Ok(()) })),
             socks_task: None,
+            connections: None,
             environment_proxies,
             completed: false,
         }
@@ -1022,8 +1039,19 @@ impl NetworkProxyHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(connections) = self.connections.as_mut() { connections.cancel(); }
+        // Signal every runtime before waiting on any listener or accepted task.
+        {
+            let mut proxies = self.environment_proxies.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for proxy in proxies.as_mut().into_iter().flat_map(|proxies| proxies.values_mut()) {
+                proxy.connections.cancel();
+                proxy.http_task.abort();
+                if let Some(task) = &proxy.socks_task { task.abort(); }
+            }
+        }
         abort_tasks(self.http_task.take(), self.socks_task.take()).await;
         abort_environment_proxies(self.environment_proxies.clone()).await;
+        if let Some(connections) = self.connections.take() { connections.shutdown().await; }
         self.completed = true;
         Ok(())
     }
@@ -1051,7 +1079,7 @@ async fn abort_tasks(
 async fn abort_environment_proxies(
     environment_proxies: Arc<Mutex<Option<HashMap<String, EnvironmentProxy>>>>,
 ) {
-    let proxies = {
+    let mut proxies = {
         let mut guard = environment_proxies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1061,7 +1089,8 @@ async fn abort_environment_proxies(
             .into_values()
             .collect::<Vec<_>>()
     };
-    for proxy in &proxies {
+    for proxy in &mut proxies {
+        proxy.connections.cancel();
         proxy.http_task.abort();
         if let Some(task) = &proxy.socks_task {
             task.abort();
@@ -1070,6 +1099,7 @@ async fn abort_environment_proxies(
     for proxy in proxies {
         abort_task(Some(proxy.http_task)).await;
         abort_task(proxy.socks_task).await;
+        proxy.connections.shutdown().await;
     }
 }
 
@@ -1078,6 +1108,7 @@ impl Drop for NetworkProxyHandle {
         if self.completed {
             return;
         }
+        if let Some(connections) = self.connections.as_mut() { connections.cancel(); }
         if let Some(task) = &self.http_task {
             task.abort();
         }

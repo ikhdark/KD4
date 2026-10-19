@@ -195,7 +195,7 @@ if (-not (Ensure-Command 'cargo')) {
 Write-Host "==> Configuring Rust toolchain per rust-toolchain.toml" -ForegroundColor Cyan
 
 # Pin to the workspace toolchain and install components
-$toolchain = '1.98.1'
+$toolchain = '1.99.1'
 & rustup toolchain install $toolchain --profile minimal | Out-Host
 Assert-LastExitCode "rustup toolchain install $toolchain"
 & rustup default $toolchain | Out-Host

@@ -315,7 +315,11 @@ struct HeaderAuthProvider {
 
 impl AuthProvider for HeaderAuthProvider {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        headers.extend(self.auth.headers().clone());
+        let mut auth_headers = self.auth.headers().clone();
+        for value in auth_headers.values_mut() {
+            value.set_sensitive(true);
+        }
+        headers.extend(auth_headers);
     }
 }
 
@@ -699,6 +703,7 @@ mod tests {
         let actual = auth_provider_from_auth(&auth).to_auth_headers();
 
         assert_eq!(actual, expected);
+        assert!(actual.values().all(HeaderValue::is_sensitive));
     }
 
     #[test]

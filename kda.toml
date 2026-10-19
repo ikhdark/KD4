@@ -1,0 +1,14 @@
+# Repository-root language inventory. Rust profile policy remains in
+# codex-rs/kda.toml. Exclude installed dependencies and generated build/evidence
+# outputs, not authored maintenance tooling such as scripts/build.
+version = 1
+exclude = [
+    "**/.venv/**",
+    "**/node_modules/**",
+    "target/**",
+    "codex-rs/target/**",
+    "codex-rs/target-*/**",
+    ".kda/**",
+    "codex-rs/.kda/**",
+    "third_party/**",
+]

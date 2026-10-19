@@ -62,10 +62,12 @@ pub fn telemetry_transport_error_message(error: &TransportError) -> String {
         TransportError::Http { status, .. } => format!("http {}", status.as_u16()),
         TransportError::RetryLimit => "retry limit reached".to_string(),
         TransportError::Timeout => "timeout".to_string(),
+        TransportError::ConnectionTimeout => "connection establishment timeout".to_string(),
         TransportError::Connection(err) => err.to_string(),
         TransportError::Network(err) => err.to_string(),
         TransportError::Build(err) => err.to_string(),
         TransportError::PreDispatch(err) => err.to_string(),
+        TransportError::ResponseTooLarge { limit } => format!("response body exceeds {limit} bytes"),
     }
 }
 
@@ -83,6 +85,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
         ApiError::CyberPolicy { .. } => "cyber policy".to_string(),
         ApiError::ServerOverloaded { .. } => "server overloaded".to_string(),
         ApiError::IncompleteResponse(_) => "incomplete response".to_string(),
+        ApiError::TerminalResponse { source, .. } => telemetry_api_error_message(source),
         ApiError::ProviderFailure { .. } => "provider failure".to_string(),
     }
 }

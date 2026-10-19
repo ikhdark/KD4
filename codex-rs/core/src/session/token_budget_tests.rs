@@ -106,6 +106,13 @@ async fn legacy_fresh_window_reference(
 #[tokio::test]
 #[ignore = "paired native reset lifecycle measurement; no wall-clock assertion"]
 async fn benchmark_audit21_fresh_window_pipeline() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     use codex_protocol::plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs};
     let mut samples = [Vec::new(), Vec::new()];
     for round in 0..7 {
@@ -170,9 +177,13 @@ async fn benchmark_audit21_fresh_window_pipeline() {
     for values in &mut samples {
         values.sort_unstable();
     }
-    eprintln!(
-        "audit21_native_reset samples=7 baseline_median_us={} candidate_median_us={} baseline_correct=0 candidate_correct=7",
-        samples[0][3], samples[1][3]
+    tracing::info!(
+        samples = 7,
+        baseline_median_us = %samples[0][3],
+        candidate_median_us = %samples[1][3],
+        baseline_correct = 0,
+        candidate_correct = 7,
+        "audit21_native_reset"
     );
 }
 
@@ -400,6 +411,13 @@ async fn model_switch_uses_original_preferences_and_fresh_child_restores_activat
 }
 #[tokio::test]
 async fn fresh_window_replaces_stale_task_state_from_the_plan_owner() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     use codex_protocol::plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs};
 
     let (mut session, mut turn) = make_session_and_context().await;
@@ -467,9 +485,9 @@ async fn fresh_window_replaces_stale_task_state_from_the_plan_owner() {
         .start_new_context_window(&step, world)
         .await
         .unwrap();
-    eprintln!(
-        "fresh_window_task_state_reset_elapsed={:?}",
-        started.elapsed()
+    tracing::info!(
+        elapsed = ?started.elapsed(),
+        "fresh_window_task_state_reset"
     );
     let history = session.clone_history().await;
     let text = history_text(history.raw_items());

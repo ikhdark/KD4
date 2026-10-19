@@ -1436,7 +1436,7 @@ impl ContextManager {
         let last_tokens = self
             .token_info
             .as_ref()
-            .map(|info| info.last_token_usage.total_tokens)
+            .map(TokenUsageInfo::context_tokens)
             .unwrap_or(0);
         let tail_start = self.items.len() - items_after_last_model_generated.len();
         let items_after_last_model_generated_tokens = self

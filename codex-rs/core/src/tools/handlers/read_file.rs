@@ -68,9 +68,9 @@ impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
                 ("query".into(), JsonSchema::object(BTreeMap::from([
                     ("source_sha256".into(), JsonSchema::string(Some("Select the requested source snapshot hash.".into()))),
                     ("snapshot_id".into(), JsonSchema::string(Some("Select an exact returned snapshot identity, including source attribution.".into()))),
-                    ("snapshot_offset".into(), JsonSchema::integer(Some("Continue at next_snapshot_offset; default 0.".into()))),
-                    ("range_offset".into(), JsonSchema::integer(Some("Continue at next_range_offset for an exact snapshot; default 0.".into()))),
-                    ("artifact_offset".into(), JsonSchema::integer(Some("Continue at next_artifact_offset for an exact snapshot; default 0.".into()))),
+                    ("snapshot_offset".into(), JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Continue at next_snapshot_offset; default 0.".into())) }),
+                    ("range_offset".into(), JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Continue at next_range_offset for an exact snapshot; default 0.".into())) }),
+                    ("artifact_offset".into(), JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Continue at next_artifact_offset for an exact snapshot; default 0.".into())) }),
                 ]), None, Some(false.into()))),
             ]), Some(vec!["paths".into()]), Some(false.into())),
             output_schema: Some(json!({"type":"object", "properties":{
@@ -409,11 +409,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             required.retain(|key| {
                 !matches!(
                     key.as_str(),
-                    Some("artifact_id" | "canonical_sha256" | "delivered_selection_complete")
+                    Some("artifact_id" | "canonical_sha256" | "delivered_selection_complete" | "retained_bytes" | "retained_artifact_complete")
                 )
             });
             required.push(json!("source_sha256"));
         }
+        output["properties"]["retained_bytes"]["description"] = json!(
+            "Retained source bytes; omitted in presentation only for inline-only reads with no artifact, zero retained bytes and no snapshot error."
+        );
+        output["properties"]["retained_artifact_complete"]["description"] = json!(
+            "Whether all source bytes are retained; omitted alongside retained_bytes only for inline-only reads with no artifact (false)."
+        );
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges together cover the entire file in this response, including explicit selections. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
         output["properties"]["selector_bindings"] = json!({"type":"array", "maxItems":64,
             "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to source_sha256; no source is duplicated. qualified_name and kind are the bound item's parser-derived identity (owner included), not type resolution.",
@@ -498,8 +504,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ..JsonSchema::object(BTreeMap::from([
                 ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
-                ("offset".to_string(), JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string()))),
-                ("limit".to_string(), JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string()))),
+                ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
+                ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
                 ("force_fresh".to_string(), JsonSchema::boolean(Some("Bypass retained-result replay and read current contents, even if dependencies appear unchanged.".to_string()))),
                 ("selectors".to_string(), selectors),
@@ -1432,6 +1438,36 @@ mod tests {
 
     include!("read_file_navigation_tests.rs");
     include!("read_file_inspection_tests.rs");
+
+    #[test]
+    fn read_schemas_reject_undecodable_offsets() {
+        let ToolSpec::Function(read) = ReadFileHandler.spec() else { panic!("read_file tool"); };
+        let schema = serde_json::to_value(read.parameters).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for field in ["offset", "limit"] {
+            for invalid in [json!(-1), json!(0), json!(1.5)] {
+                let mut args = json!({"path":"file.rs"});
+                args[field] = invalid;
+                assert!(serde_json::from_value::<ReadFileArgs>(args.clone()).is_err());
+                assert!(!validator.is_valid(&args), "{args}");
+            }
+            let mut args = json!({"path":"file.rs"});
+            args[field] = json!(1);
+            assert!(validator.is_valid(&args));
+            assert!(serde_json::from_value::<ReadFileArgs>(args).is_ok());
+        }
+        let ToolSpec::Function(status) = ReadStatusHandler.spec() else { panic!("read_status tool"); };
+        let schema = serde_json::to_value(status.parameters).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for field in ["snapshot_offset", "range_offset", "artifact_offset"] {
+            let query = json!({field:-1});
+            assert!(serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone()).is_err());
+            assert!(!validator.is_valid(&json!({"paths":["file.rs"],"query":query})));
+            let query = json!({field:0});
+            assert!(serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone()).is_ok());
+            assert!(validator.is_valid(&json!({"paths":["file.rs"],"query":query})));
+        }
+    }
 
     #[tokio::test]
     async fn read_identity_and_json_pointer_survive_plain_attachment() {

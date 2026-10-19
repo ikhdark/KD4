@@ -98,7 +98,13 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             ),
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+            parameters: JsonSchema {
+                one_of: Some(["message", "items"].into_iter().map(|field| JsonSchema {
+                    required: Some(vec![field.to_string()]),
+                    ..JsonSchema::object(BTreeMap::new(), None, None)
+                }).collect()),
+                ..JsonSchema::object(properties, /*required*/ None, Some(false.into()))
+            },
             output_schema: Some(spawn_agent_output_schema_v1().into()),
         })],
     })
@@ -186,7 +192,13 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
                 .to_string(),
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
+            parameters: JsonSchema {
+                one_of: Some(["message", "items"].into_iter().map(|field| JsonSchema {
+                    required: Some(vec![field.to_string()]),
+                    ..JsonSchema::object(BTreeMap::new(), None, None)
+                }).collect()),
+                ..JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into()))
+            },
             output_schema: Some(send_input_output_schema().into()),
         })],
     })
@@ -680,10 +692,32 @@ fn create_collab_input_items_schema() -> JsonSchema {
         ),
     ]);
 
-    JsonSchema::array(JsonSchema::object(properties, /*required*/ None, Some(false.into())), Some(
+    // The decoder is the tagged UserInput enum. Keep the advertised item kinds
+    // and fields, but require each variant's actual payload before execution.
+    let variants = [
+        ("text", vec!["type", "text"]),
+        ("image", vec!["type", "image_url"]),
+        ("local_image", vec!["type", "path"]),
+        ("skill", vec!["type", "name", "path"]),
+        ("mention", vec!["type", "name", "path"]),
+    ]
+    .into_iter()
+    .map(|(kind, required)| {
+        let mut properties = properties.clone();
+        properties.insert("type".to_string(), JsonSchema::string_enum(vec![json!(kind)], None));
+        JsonSchema::object(
+            properties,
+            Some(required.into_iter().map(str::to_string).collect()),
+            Some(false.into()),
+        )
+    })
+    .collect();
+    let mut schema = JsonSchema::array(JsonSchema::any_of(variants, None), Some(
             "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
                 .to_string(),
-        ))
+        ));
+    schema.min_items = Some(1);
+    schema
 }
 
 fn spawn_agent_common_properties_v1(

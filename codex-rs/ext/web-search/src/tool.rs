@@ -116,24 +116,19 @@ impl WebSearchTool {
         let Some(client) = call
             .cancellation_token
             .run_until_cancelled(async {
-                let provider = self
+                let (provider, auth) = self
                     .provider
-                    .api_provider()
+                    .resolve_unscoped_client_setup()
                     .await
                     .map_err(|_| setup_error("provider configuration"))?;
-                let auth = self
-                    .provider
-                    .api_auth()
-                    .await
-                    .map_err(|_| setup_error("authentication"))?;
                 let endpoint = provider.url_for_path("alpha/search");
-                let client = self
+                self
                     .http_clients
                     .client_for_url(&endpoint)
                     .await
                     .map_err(|_| setup_error("HTTP client configuration"))?;
                 Ok::<_, FunctionCallError>(SearchClient::new(
-                    ReqwestTransport::from_http_client(client),
+                    ReqwestTransport::from_client_pool(self.http_clients.clone()),
                     provider,
                     auth,
                 ))

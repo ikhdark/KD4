@@ -930,13 +930,12 @@ impl ThreadState {
         } else {
             None
         };
-        let retained_turn_id = ThreadHistoryBuilder::scoped_event_turn_id(event)
+        let retained_turn = ThreadHistoryBuilder::scoped_event_turn_id(event)
             .or(wait_owner.as_deref())
             .filter(|id| !self.current_turn_history.contains_turn(id))
-            .filter(|id| self.turn_index.turns.contains_key(*id))
-            .map(str::to_string);
-        let changes = if let Some(turn_id) = retained_turn_id.as_deref() {
-            let turn = self.turn_index.turns.get_mut(turn_id).expect("indexed turn");
+            .and_then(|id| self.turn_index.turns.get_mut(id).map(|turn| (id, turn)));
+        let has_retained_turn = retained_turn.is_some();
+        let changes = if let Some((turn_id, turn)) = retained_turn {
             let changes = self.current_turn_history.handle_event_with_retained_turn(event, turn);
             self.turn_index.refresh_retained_turn_item_locations(turn_id);
             changes
@@ -964,7 +963,7 @@ impl ThreadState {
         } else {
             Vec::new()
         };
-        if retained_turn_id.is_none() {
+        if !has_retained_turn {
             self.turn_index.apply_changes(changes);
         }
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))

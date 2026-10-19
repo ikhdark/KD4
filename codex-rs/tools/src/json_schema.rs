@@ -9,6 +9,13 @@ use std::collections::BTreeSet;
 const DEFINITION_TABLE_KEYS: [&str; 2] = ["$defs", "definitions"];
 const SCHEMA_CHILD_KEYS: [&str; 4] = ["items", "anyOf", "oneOf", "allOf"];
 const COMPOSITION_SCHEMA_KEYS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+const UNSUPPORTED_ASSERTION_KEYS: &[&str] = &[
+    "not", "if", "then", "else", "prefixItems", "additionalItems", "contains",
+    "minContains", "maxContains", "uniqueItems", "minProperties", "maxProperties",
+    "patternProperties", "propertyNames", "dependencies", "dependentRequired",
+    "dependentSchemas", "unevaluatedItems", "unevaluatedProperties", "$dynamicRef",
+    "$recursiveRef", "$dynamicAnchor", "$recursiveAnchor",
+];
 
 /// Primitive JSON Schema type names we support in tool definitions.
 ///
@@ -334,6 +341,67 @@ fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, s
     Ok(input_schema)
 }
 
+/// MCP presentation may be a permissive approximation: its runtime validates
+/// the original provider schema before dispatch. Other tool owners stay strict.
+pub(crate) fn parse_mcp_input_schema(input: JsonValue) -> Result<JsonSchema, serde_json::Error> {
+    if let Ok(schema) = parse_owned_tool_input_schema(input.clone()) {
+        return Ok(schema);
+    }
+    let mut projected = input;
+    project_mcp_schema(&mut projected);
+    parse_owned_tool_input_schema(projected)
+}
+
+fn project_mcp_schema(value: &mut JsonValue) {
+    if value == &JsonValue::Bool(false) {
+        *value = json!({});
+    }
+    let Some(map) = value.as_object_mut() else { return };
+    if map.contains_key("patternProperties") {
+        // Keys accepted by a removed pattern must not become forbidden extras.
+        map.remove("additionalProperties");
+    }
+    for key in UNSUPPORTED_ASSERTION_KEYS {
+        map.remove(*key);
+    }
+    // Widening branches can make a valid oneOf match several branches. Use
+    // anyOf for presentation, including branches reached through local refs.
+    if let Some(branches) = map.remove("oneOf") {
+        if map.contains_key("anyOf") {
+            if let JsonValue::Array(all) = map.entry("allOf").or_insert_with(|| json!([])) {
+                all.push(json!({"anyOf": branches}));
+            }
+        } else {
+            map.insert("anyOf".into(), branches);
+        }
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(JsonValue::Object(children)) = map.get_mut(key) {
+            for child in children.values_mut() {
+                project_mcp_schema(child);
+            }
+        }
+    }
+    if map.get("items").is_some_and(JsonValue::is_array) {
+        map.insert("items".into(), json!({}));
+    }
+    for key in ["items", "additionalProperties"] {
+        if let Some(child) = map.get_mut(key) {
+            // additionalProperties:false is representable and must stay closed.
+            if key != "additionalProperties" || !child.is_boolean() {
+                project_mcp_schema(child);
+            }
+        }
+    }
+    for key in COMPOSITION_SCHEMA_KEYS {
+        if let Some(JsonValue::Array(children)) = map.get_mut(key) {
+            for child in children {
+                project_mcp_schema(child);
+            }
+        }
+    }
+}
+
 fn reject_unsupported_assertions(value: &JsonValue) -> Result<(), serde_json::Error> {
     match value {
         JsonValue::Array(values) => {
@@ -342,32 +410,8 @@ fn reject_unsupported_assertions(value: &JsonValue) -> Result<(), serde_json::Er
             }
         }
         JsonValue::Object(map) => {
-            for key in [
-                "not",
-                "if",
-                "then",
-                "else",
-                "prefixItems",
-                "additionalItems",
-                "contains",
-                "minContains",
-                "maxContains",
-                "uniqueItems",
-                "minProperties",
-                "maxProperties",
-                "patternProperties",
-                "propertyNames",
-                "dependencies",
-                "dependentRequired",
-                "dependentSchemas",
-                "unevaluatedItems",
-                "unevaluatedProperties",
-                "$dynamicRef",
-                "$recursiveRef",
-                "$dynamicAnchor",
-                "$recursiveAnchor",
-            ] {
-                if map.contains_key(key) {
+            for key in UNSUPPORTED_ASSERTION_KEYS {
+                if map.contains_key(*key) {
                     return Err(<serde_json::Error as serde::de::Error>::custom(format!(
                         "unsupported tool input schema assertion: {key}"
                     )));

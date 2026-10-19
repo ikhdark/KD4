@@ -939,7 +939,7 @@ async fn code_mode_eager_plan_contract_exposes_requirement_resolution() {
         panic!("expected plan tool");
     };
     let properties = full.parameters.properties.as_ref().unwrap();
-    for field in ["resolve", "superseded", "scope_change_instructions", "workflow"] {
+    for field in ["resolve", "superseded", "scope_change_instructions", "scope_change_refs", "workflow"] {
         assert!(properties.contains_key(field));
         if field != "resolve" {
             assert!(!exec.description.contains(&format!("{field}?:")));

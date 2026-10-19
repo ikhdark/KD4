@@ -3782,6 +3782,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
     let (mut rollout_items, _expected) = sample_rollout(&session, &turn_context).await;
 
     let info1 = TokenUsageInfo {
+        estimated_context_tokens: None,
         total_token_usage: TokenUsage {
             input_tokens: 10,
             cached_input_tokens: 0,
@@ -3799,6 +3800,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
         model_context_window: Some(1_000),
     };
     let info2 = TokenUsageInfo {
+        estimated_context_tokens: None,
         total_token_usage: TokenUsage {
             input_tokens: 100,
             cached_input_tokens: 50,
@@ -3853,9 +3855,42 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
     assert_eq!(actual, Some(info2));
 }
 
+#[tokio::test]
+async fn forked_history_preserves_pressure_without_inheriting_consumption() {
+    let (session, turn) = make_session_and_context().await;
+    let parent = TokenUsageInfo {
+        total_token_usage: TokenUsage { input_tokens: 100, output_tokens: 20, total_tokens: 120, ..Default::default() },
+        last_token_usage: TokenUsage { total_tokens: 90, ..Default::default() },
+        estimated_context_tokens: None, model_context_window: Some(200_000),
+    };
+    session.record_initial_history(InitialHistory::Forked(vec![RolloutItem::EventMsg(
+        EventMsg::TokenCount(TokenCountEvent { info: Some(parent.clone()), rate_limits: None }),
+    )])).await;
+    let child = session.token_usage_info().await.unwrap();
+    assert_eq!(child.total_token_usage, TokenUsage::default());
+    assert_eq!(child.last_token_usage, TokenUsage::default());
+    assert_eq!(child.estimated_context_tokens, Some(90));
+    let own = TokenUsage { input_tokens: 30, output_tokens: 10, total_tokens: 40, ..Default::default() };
+    session.record_token_usage_info(&turn, Some(&own)).await.unwrap();
+    let child = session.token_usage_info().await.unwrap();
+    assert_eq!(child.total_token_usage, own);
+    assert_eq!(parent.total_token_usage.total_tokens + child.total_token_usage.total_tokens, 160);
+    let persisted = serde_json::to_value(RolloutItem::EventMsg(EventMsg::TokenCount(
+        TokenCountEvent { info: Some(child.clone()), rate_limits: None },
+    ))).unwrap();
+    let (resumed, _) = make_session_and_context().await;
+    resumed.record_initial_history(InitialHistory::Resumed(ResumedHistory {
+        conversation_id: ThreadId::default(),
+        history: Arc::new(vec![serde_json::from_value(persisted).unwrap()]),
+        rollout_path: Some(PathBuf::from("/tmp/fork-usage.jsonl")),
+    })).await;
+    assert_eq!(resumed.token_usage_info().await, Some(child));
+}
+
 #[test]
 fn startup_rollout_facts_reduce_startup_consumers_in_one_pass() {
     let info = TokenUsageInfo {
+        estimated_context_tokens: None,
         total_token_usage: TokenUsage {
             input_tokens: 100,
             cached_input_tokens: 10,
@@ -3908,7 +3943,7 @@ fn startup_rollout_facts_reduce_startup_consumers_in_one_pass() {
 }
 
 #[tokio::test]
-async fn recompute_token_usage_uses_session_base_instructions() {
+async fn recompute_token_usage_uses_selected_turn_base_instructions() {
     let (session, turn_context) = make_session_and_context().await;
 
     let override_instructions = "SESSION_OVERRIDE_INSTRUCTIONS_ONLY".repeat(120);
@@ -3937,15 +3972,10 @@ async fn recompute_token_usage_uses_session_base_instructions() {
 
     session.recompute_token_usage(&turn_context).await;
 
-    let actual_tokens = session
-        .state
-        .lock()
-        .await
-        .token_info()
-        .expect("token info")
-        .last_token_usage
-        .total_tokens;
-    assert_eq!(actual_tokens, expected_tokens.max(0));
+    let actual_tokens = session.state.lock().await.token_info().expect("token info").context_tokens();
+    // The session-start singleton is deliberately stale. Ordinary sampling
+    // and post-compaction estimates must use the same captured turn base.
+    assert_eq!(actual_tokens, model_estimated_tokens.max(0));
 }
 
 #[tokio::test]
@@ -3996,6 +4026,7 @@ async fn recompute_token_usage_updates_model_context_window() {
     {
         let mut state = session.state.lock().await;
         state.set_token_info(Some(TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
@@ -4109,6 +4140,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
             thread_level_id: session.thread_id.to_string(),
             turn_level_id: turn_context.sub_id.clone(),
             token_usage: TokenUsageInfo {
+                estimated_context_tokens: None,
                 total_token_usage: first_usage.clone(),
                 last_token_usage: first_usage,
                 model_context_window: turn_context.model_context_window(),
@@ -4121,6 +4153,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
             thread_level_id: session.thread_id.to_string(),
             turn_level_id: turn_context.sub_id.clone(),
             token_usage: TokenUsageInfo {
+                estimated_context_tokens: None,
                 total_token_usage: expected_total_usage,
                 last_token_usage: second_usage,
                 model_context_window: turn_context.model_context_window(),
@@ -5019,7 +5052,12 @@ async fn thread_rollback_append_failure_preserves_live_history_and_context() {
         .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone())))
         .collect();
     session
-        .commit_rollback_history(&turn, replay, rollback)
+        .commit_rollback_history(
+            &turn,
+            replay,
+            rollback,
+            Arc::clone(&session.task_start_gate).acquire_owned().await.unwrap(),
+        )
         .await
         .expect_err("the ordered append must fail before publication");
     assert_eq!(session.clone_history().await.raw_items(), before);
@@ -5049,7 +5087,12 @@ async fn thread_rollback_barrier_failure_fences_retry_before_publication() {
         .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone())))
         .collect::<Vec<_>>();
     let error = session
-        .commit_rollback_history(&turn, replay.clone(), rollback.clone())
+        .commit_rollback_history(
+            &turn,
+            replay.clone(),
+            rollback.clone(),
+            Arc::clone(&session.task_start_gate).acquire_owned().await.unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("unconfirmed"));
@@ -5058,7 +5101,12 @@ async fn thread_rollback_barrier_failure_fences_retry_before_publication() {
     tokio::fs::remove_dir(&path).await.unwrap();
     assert!(
         session
-            .commit_rollback_history(&turn, replay, rollback)
+            .commit_rollback_history(
+                &turn,
+                replay,
+                rollback,
+                Arc::clone(&session.task_start_gate).acquire_owned().await.unwrap(),
+            )
             .await
             .is_err()
     );
@@ -5079,6 +5127,75 @@ async fn thread_rollback_barrier_failure_fences_retry_before_publication() {
         1
     );
     assert_eq!(session.clone_history().await.raw_items(), before);
+}
+
+#[tokio::test]
+async fn thread_rollback_retains_admission_after_observer_cancellation() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let path = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    session
+        .record_conversation_items(&turn, &[user_message("rolled back request"), assistant_message("answer")])
+        .await
+        .unwrap();
+    session.state.lock().await.set_reference_context_item(Some(turn.to_turn_context_item()));
+    let history_gate = session.durable_history_commit_gate.acquire().await.unwrap();
+    let observer = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { handlers::thread_rollback(&session, "rollback".into(), 1).await }
+    });
+    timeout(Duration::from_secs(5), async {
+        while session.durable_history_commits_in_flight.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback must reach its owned commit");
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert_eq!(session.task_start_gate.available_permits(), 0);
+    let mut idle_start = Box::pin(session.try_start_turn_if_idle(vec![user_message("idle work")]));
+    assert!(futures::poll!(idle_start.as_mut()).is_pending());
+    assert!(session.active_turn.lock().await.is_none());
+    drop(idle_start);
+    drop(history_gate);
+    timeout(Duration::from_secs(5), session.wait_for_ordered_history_commits())
+        .await
+        .expect("owned rollback must finish after its observer is cancelled");
+    assert_eq!(session.task_start_gate.available_permits(), 1);
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(session.reference_context_item().await.is_none());
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    assert_eq!(items.iter().filter(|item| matches!(
+        item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
+    )).count(), 1);
+}
+
+#[tokio::test]
+async fn thread_rollback_releases_admission_before_blocked_token_delivery() {
+    let (mut session, turn, events, received) = make_session_and_context_with_event_capacity(1).await;
+    attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    events.try_send(Event {
+        id: "occupied-channel".into(),
+        msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+            message: "hold delivery".into(),
+        }),
+    }).unwrap();
+    let rollback = EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 });
+    let permit = Arc::clone(&session.task_start_gate).acquire_owned().await.unwrap();
+    let mut commit = Box::pin(session.commit_rollback_history(
+        &turn, vec![RolloutItem::EventMsg(rollback.clone())], rollback, permit,
+    ));
+    assert!(futures::poll!(commit.as_mut()).is_pending());
+    timeout(Duration::from_secs(5), session.begin_shutdown())
+        .await
+        .expect("full event channel must not retain rollback admission");
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert_eq!(received.recv().await.unwrap().id, "occupied-channel");
+    let event = timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap();
+    assert!(matches!(event.msg, EventMsg::TokenCount(_)));
+    timeout(Duration::from_secs(5), commit).await.unwrap().unwrap();
+    assert_eq!(session.task_start_gate.available_permits(), 1);
 }
 
 #[tokio::test]
@@ -5422,7 +5539,11 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         Arc::get_mut(&mut sess).expect("session should not have additional references"),
     )
     .await;
-    let turn_context_item = tc.to_turn_context_item();
+    let context_for_turn = |turn_id: &str| {
+        let mut context = tc.to_turn_context_item();
+        context.turn_id = Some(turn_id.to_string());
+        context
+    };
 
     sess.persist_rollout_items(&[
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -5442,7 +5563,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             text_elements: Vec::new(),
             ..Default::default()
         })),
-        RolloutItem::TurnContext(turn_context_item.clone()),
+        RolloutItem::TurnContext(context_for_turn("turn-1")),
         RolloutItem::ResponseItem(user_message("turn 1 user")),
         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -5472,7 +5593,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             text_elements: Vec::new(),
             ..Default::default()
         })),
-        RolloutItem::TurnContext(turn_context_item.clone()),
+        RolloutItem::TurnContext(context_for_turn("turn-2")),
         RolloutItem::ResponseItem(user_message("turn 2 user")),
         RolloutItem::ResponseItem(assistant_message("turn 2 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -5502,7 +5623,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             text_elements: Vec::new(),
             ..Default::default()
         })),
-        RolloutItem::TurnContext(turn_context_item),
+        RolloutItem::TurnContext(context_for_turn("turn-3")),
         RolloutItem::ResponseItem(user_message("turn 3 user")),
         RolloutItem::ResponseItem(assistant_message("turn 3 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -10247,6 +10368,7 @@ where
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         agent_status: agent_status_tx,
+        agent_status_turn: std::sync::Mutex::new(None),
         state: Mutex::new(state),
         durable_history_commit_gate: Semaphore::new(1),
         durable_history_commits_in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -10260,7 +10382,7 @@ where
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
-        task_start_gate: Semaphore::new(/*permits*/ 1),
+        task_start_gate: Arc::new(Semaphore::new(/*permits*/ 1)),
         submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
         task_start_state: Mutex::new(super::session::TaskStartState::default()),
         active_turn: Mutex::new(None),
@@ -16607,6 +16729,7 @@ async fn initial_input_and_sampling_boundary_share_the_terminal_durability_barri
             turn_id: Some(tc.sub_id.clone()),
             unresolved_context: true,
             timing_checkpoint: None,
+            workspace_freshness_notices: Vec::new(),
         },
     )])
     .await
@@ -16671,6 +16794,7 @@ async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
             codex_protocol::protocol::SamplingBoundaryItem {
                 sampling_request_id: "request-after-failed-manifest".to_string(),
                 physical_attempt_id: "attempt-after-failed-manifest".to_string(),
+                workspace_freshness_notices: vec!["freshness audit survives only an ordered append".into()],
                 turn_id: Some(tc.sub_id.clone()),
                 unresolved_context: true,
                 timing_checkpoint: None,
@@ -16728,6 +16852,7 @@ async fn tool_manifest_and_first_sampling_boundary_share_one_ordered_append() {
             turn_id: Some(tc.sub_id.clone()),
             unresolved_context: true,
             timing_checkpoint: None,
+            workspace_freshness_notices: vec!["<workspace_evidence_invalidation>\nexact notice\n</workspace_evidence_invalidation>".into()],
         },
     )
     .await
@@ -16748,6 +16873,7 @@ async fn tool_manifest_and_first_sampling_boundary_share_one_ordered_append() {
         history.items.as_slice(),
         [.., RolloutItem::ToolManifest(_), RolloutItem::SamplingBoundary(boundary)]
             if boundary.sampling_request_id == "request-1"
+                && boundary.workspace_freshness_notices == vec!["<workspace_evidence_invalidation>\nexact notice\n</workspace_evidence_invalidation>"]
     ));
 }
 
@@ -18333,6 +18459,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
 async fn set_total_token_usage(sess: &Session, total_token_usage: TokenUsage) {
     let mut state = sess.state.lock().await;
     state.set_token_info(Some(TokenUsageInfo {
+        estimated_context_tokens: None,
         total_token_usage,
         last_token_usage: TokenUsage::default(),
         model_context_window: None,
@@ -20315,6 +20442,39 @@ fn session_trace_turn_started(turn_context: &TurnContext) -> EventMsg {
     })
 }
 
+#[tokio::test]
+async fn late_terminal_and_durable_status_leave_successor_running() {
+    let (session, first, rx) = make_session_and_context_with_rx().await;
+    let second = session.new_default_turn_with_sub_id("successor".into()).await;
+    for context in [&first, &second] {
+        session.deliver_event_raw(Event {
+            id: context.sub_id.clone(), msg: session_trace_turn_started(context),
+        }).await;
+    }
+    let completed = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: first.sub_id.clone(), last_agent_message: Some("old result".into()),
+        surfaced_result: None, error: None, completed_at: None, duration_ms: None,
+        time_to_first_token_ms: None, timing: None,
+    });
+    for msg in [completed.clone(), EventMsg::TurnAborted(TurnAbortedEvent {
+        turn_id: Some(first.sub_id.clone()), reason: TurnAbortReason::Interrupted,
+        completed_at: None, duration_ms: None, timing: None,
+    }), EventMsg::Error(ErrorEvent {
+        message: "old error".into(), codex_error_info: Some(CodexErrorInfo::InternalServerError),
+    })] {
+        session.deliver_event_raw(Event { id: first.sub_id.clone(), msg }).await;
+        assert_eq!(*session.agent_status.borrow(), AgentStatus::Running);
+    }
+    // The V2 post-dispatch projection uses this same owner fence.
+    session.update_agent_status(&first.sub_id, &completed, AgentStatus::Errored("old durable result".into()));
+    assert_eq!(*session.agent_status.borrow(), AgentStatus::Running);
+    assert_eq!(rx.len(), 5, "old events remain available as historical facts");
+    let mut own = completed;
+    if let EventMsg::TurnComplete(event) = &mut own { event.turn_id = second.sub_id.clone(); }
+    session.deliver_event_raw(Event { id: second.sub_id.clone(), msg: own }).await;
+    assert!(matches!(*session.agent_status.borrow(), AgentStatus::Completed(_)));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_trace_send_is_not_blocked_by_unrelated_payload_serialization() -> anyhow::Result<()>
 {
@@ -21005,6 +21165,41 @@ async fn audit_missing_usage_estimates_context_without_fabricating_billed_tokens
         .await
         .unwrap();
     let info = session.state.lock().await.token_info().unwrap();
-    assert_eq!(info.last_token_usage.total_tokens, expected);
+    assert_eq!(info.estimated_context_tokens, Some(expected));
+    assert_eq!(info.last_token_usage, billed);
     assert_eq!(info.total_token_usage, billed);
+}
+
+#[tokio::test]
+async fn context_pressure_mutations_preserve_observed_provider_consumption() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.model_info.context_window = Some(200_000);
+    turn.model_info.effective_context_window_percent = 100;
+    let billed = TokenUsage {
+        input_tokens: 800_000, cached_input_tokens: 500_000,
+        output_tokens: 200_000, reasoning_output_tokens: 120_000,
+        total_tokens: 1_000_000,
+    };
+    session.record_token_usage_info(&turn, Some(&billed)).await.unwrap();
+    session.set_total_tokens_full(&turn).await;
+    let full = session.token_usage_info().await.unwrap();
+    assert_eq!(full.total_token_usage, billed);
+    assert_eq!(full.last_token_usage, billed);
+    assert_eq!(full.estimated_context_tokens, Some(200_000));
+    session.discount_retired_context_tokens(20_000).await;
+    let retired = session.token_usage_info().await.unwrap();
+    assert_eq!(retired.total_token_usage, billed);
+    assert_eq!(retired.last_token_usage, billed);
+    assert_eq!(retired.estimated_context_tokens, Some(180_000));
+    session.recompute_token_usage(&turn).await;
+    let recomputed = session.token_usage_info().await.unwrap();
+    assert_eq!(recomputed.total_token_usage, billed);
+    assert_eq!(recomputed.last_token_usage, billed);
+    assert!(recomputed.estimated_context_tokens.is_some());
+    let next = TokenUsage { input_tokens: 10, total_tokens: 10, ..Default::default() };
+    session.record_token_usage_info(&turn, Some(&next)).await.unwrap();
+    let observed = session.token_usage_info().await.unwrap();
+    assert_eq!(observed.total_token_usage.total_tokens, 1_000_010);
+    assert_eq!(observed.last_token_usage, next);
+    assert_eq!(observed.estimated_context_tokens, None);
 }

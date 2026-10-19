@@ -2,6 +2,31 @@ use super::*;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+#[test]
+fn csv_schema_rejects_undecodable_numeric_limits() {
+    let codex_tools::ToolSpec::Function(tool) = crate::tools::handlers::agent_jobs_spec::create_spawn_agents_on_csv_tool() else { panic!("CSV tool"); };
+    let schema = serde_json::to_value(tool.parameters).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for field in ["max_concurrency", "max_workers", "max_runtime_seconds"] {
+        for invalid in [json!(-1), json!(1.5)] {
+            let mut args = json!({"csv_path":"input.csv","instruction":"Process row"});
+            args[field] = invalid;
+            assert!(serde_json::from_value::<SpawnAgentsOnCsvArgs>(args.clone()).is_err());
+            assert!(!validator.is_valid(&args), "{args}");
+        }
+        let mut args = json!({"csv_path":"input.csv","instruction":"Process row"});
+        args[field] = json!(1);
+        assert!(validator.is_valid(&args));
+        assert!(serde_json::from_value::<SpawnAgentsOnCsvArgs>(args).is_ok());
+    }
+    let zero_runtime = json!({"csv_path":"input.csv","instruction":"Process row","max_runtime_seconds":0});
+    assert!(!validator.is_valid(&zero_runtime));
+    assert!(normalize_max_runtime_seconds(Some(0)).is_err());
+    let zero_concurrency = json!({"csv_path":"input.csv","instruction":"Process row","max_concurrency":0});
+    assert!(validator.is_valid(&zero_concurrency));
+    assert_eq!(normalize_concurrency(Some(0), None), 1);
+}
+
 async fn create_running_job(
     item_count: usize,
 ) -> (

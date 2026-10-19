@@ -1,4 +1,6 @@
 use crate::attribution::BindConnectionAttribution;
+use crate::connection_lifecycle::CancelOnShutdown;
+use rama_core::graceful::ShutdownGuard;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
@@ -66,6 +68,7 @@ pub async fn run_socks5(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener = TcpListener::build()
         .bind(addr)
@@ -81,6 +84,7 @@ pub async fn run_socks5(
         policy_decider,
         environment_id,
         enable_socks5_udp,
+        guard,
     )
     .await
 }
@@ -91,6 +95,7 @@ pub async fn run_socks5_with_std_listener(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener =
         TcpListener::try_from(listener).context("convert std listener to SOCKS5 proxy listener")?;
@@ -100,6 +105,7 @@ pub async fn run_socks5_with_std_listener(
         policy_decider,
         environment_id,
         enable_socks5_udp,
+        guard,
     )
     .await
 }
@@ -110,6 +116,7 @@ async fn run_socks5_with_listener(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let addr = listener
         .local_addr()
@@ -162,15 +169,15 @@ async fn run_socks5_with_listener(
             }));
         let socks_acceptor = base.with_udp_associator(udp_relay);
         listener
-            .serve(BindConnectionAttribution::new(
+            .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(
                 socks_acceptor,
                 state,
                 environment_id,
-            ))
+            ), &guard))
             .await;
     } else {
         listener
-            .serve(BindConnectionAttribution::new(base, state, environment_id))
+            .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(base, state, environment_id), &guard))
             .await;
     }
     Ok(())

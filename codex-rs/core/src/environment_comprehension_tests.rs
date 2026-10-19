@@ -16,10 +16,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 fn capture_packet(name: &str, value: serde_json::Value) {
-    println!(
-        "AUDIT21_PACKET {}",
-        serde_json::json!({"name": name, "value": value})
-    );
+    tracing::info!(name, value = %value, "AUDIT21_PACKET");
 }
 
 async fn failed_primary(turn: &mut crate::session::turn_context::TurnContext, cause: &str) {
@@ -43,6 +40,13 @@ async fn failed_primary(turn: &mut crate::session::turn_context::TurnContext, ca
 
 #[tokio::test]
 async fn audit21_failed_primary_context_preserves_explicit_secondary_identity() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let (_session, mut turn) = make_session_and_context().await;
     failed_primary(&mut turn, "startup refused").await;
     let environments = &turn.environments;
@@ -82,7 +86,7 @@ async fn audit21_failed_primary_context_preserves_explicit_secondary_identity() 
         "context",
         serde_json::json!({"baseline": baseline, "candidate": rendered}),
     );
-    println!("AUDIT21_CONTEXT {rendered}");
+    tracing::info!(context = %rendered, "AUDIT21_CONTEXT");
     assert!(
         rendered.contains("id=\"secondary\""),
         "ready secondary identity is required for dispatch: {rendered}"
@@ -133,6 +137,13 @@ async fn audit21_failed_primary_context_preserves_explicit_secondary_identity() 
 
 #[tokio::test]
 async fn audit21_wait_failure_preserves_owner_cause_without_changing_task_scope() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let (session, mut turn) = make_session_and_context().await;
     let cause = "invalid shell for environment `primary`: unsupported shell /bin/fictional";
     failed_primary(&mut turn, cause).await;
@@ -161,7 +172,7 @@ async fn audit21_wait_failure_preserves_owner_cause_without_changing_task_scope(
             "candidate": result, "cause": cause,
         }),
     );
-    println!("AUDIT21_WAIT {result}");
+    tracing::info!(result = %result, "AUDIT21_WAIT");
     assert!(
         result.to_string().contains(cause),
         "startup cause must reach the caller: {result}"

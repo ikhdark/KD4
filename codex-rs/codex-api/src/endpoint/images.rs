@@ -40,6 +40,7 @@ impl<T: HttpTransport> ImagesClient<T> {
             request,
             extra_headers,
             "image generation",
+            request.n.unwrap_or(1),
         )
         .await
     }
@@ -49,7 +50,7 @@ impl<T: HttpTransport> ImagesClient<T> {
         request: &ImageEditRequest,
         extra_headers: HeaderMap,
     ) -> Result<ImageResponse, ApiError> {
-        self.post_image_request("images/edits", request, extra_headers, "image edit")
+        self.post_image_request("images/edits", request, extra_headers, "image edit", request.n.unwrap_or(1))
             .await
     }
 
@@ -59,12 +60,20 @@ impl<T: HttpTransport> ImagesClient<T> {
         request: &R,
         extra_headers: HeaderMap,
         operation: &str,
+        image_count: u64,
     ) -> Result<ImageResponse, ApiError> {
         let body = EncodedJsonBody::encode(request)
             .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
+        // Each supported image may contain 64 MiB of decoded data. Allow base64
+        // plus worst-case JSON Unicode escapes and one MiB of envelope metadata.
+        let per_image = (64_usize * 1024 * 1024).div_ceil(3) * 4 * 6;
+        let max_response_bytes = usize::try_from(image_count.max(1)).ok()
+            .and_then(|count| per_image.checked_mul(count))
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .ok_or_else(|| ApiError::InvalidRequest { message: "image response budget overflow".into() })?;
         let resp = self
             .session
-            .execute_non_idempotent(Method::POST, path, extra_headers, Some(body))
+            .execute_non_idempotent(Method::POST, path, extra_headers, Some(body), max_response_bytes)
             .await?;
         serde_json::from_slice(&resp.body)
             .map_err(|e| ApiError::Stream(format!("failed to decode {operation} response: {e}")))
@@ -278,6 +287,7 @@ mod tests {
             request.url,
             "https://example.com/api/codex/images/generations"
         );
+        assert_eq!(request.max_response_bytes, Some(537_919_504));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
                 &request.prepare_body_for_send().unwrap().body_bytes()
@@ -321,6 +331,7 @@ mod tests {
         let request = captured_request(&transport);
         assert_eq!(request.method, Method::POST);
         assert_eq!(request.url, "https://example.com/api/codex/images/edits");
+        assert_eq!(request.max_response_bytes, Some(537_919_504));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
                 &request.prepare_body_for_send().unwrap().body_bytes()

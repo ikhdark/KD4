@@ -1364,6 +1364,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 token_usage: ThreadTokenUsage {
+                    estimated_context_tokens: None,
                     total: TokenUsageBreakdown {
                         total_tokens: 42,
                         input_tokens: 10,

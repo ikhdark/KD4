@@ -32,6 +32,13 @@ export type Usage = {
   reasoning_output_tokens: number;
 };
 
+/** Authoritative owner-authored result, shared by turn and child completion. */
+export type SurfacedToolResult = {
+  adapter: string;
+  value: unknown;
+  canonicalMessage?: string;
+};
+
 /** Emitted when a turn is completed. Typically right after the assistant's response. */
 export type TurnCompletedEvent = {
   type: "turn.completed";
@@ -39,12 +46,7 @@ export type TurnCompletedEvent = {
   /** Owner-supplied timing, absent on legacy producers or null when unavailable. */
   timing?: Record<string, unknown> | null;
   /** Authoritative tool result delivered without a final assistant message. */
-  surfaced_result?: {
-    adapter: string;
-    value: unknown;
-    /** Owner-authored text, when available; never synthesized from `value`. */
-    canonicalMessage?: string;
-  };
+  surfaced_result?: SurfacedToolResult;
 };
 
 /** Indicates that a turn failed with an error. */

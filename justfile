@@ -584,11 +584,7 @@ deps-advisories-check:
 # plus the offline cargo-deny checks. Advisories need network access, so they
 # stay in the separate `deps-audit` gate configured by .cargo/audit.toml.
 deps-policy-check *args:
-    just deps-advisories-check
-    just _cargo-deny-installed
-    just deps-duplicates-check {args}
-    just deps-v8-boundary-check {args}
-    cargo deny check bans sources licenses
+    {{ python }} "{{ justfile_directory() }}/scripts/maintenance/check_duplicate_deps.py" --policy {args}
 
 [windows]
 _cargo-deny-installed:

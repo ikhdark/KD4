@@ -761,6 +761,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
             "plan",
             "resolve",
             "scope_change_instructions",
+            "scope_change_refs",
             "set",
             "superseded",
             "workflow"
@@ -792,8 +793,12 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
     assert!(validator.is_valid(&serde_json::json!({
         "plan": [{"step": "narrower", "status": "pending", "continues": ["old-id"]}],
         "superseded": [{"step_id": "dropped-id", "reason": "cancelled by the user"}],
+        "scope_change_refs": {"dropped-id": {"turn_id": "turn", "sha256": "input-hash"}},
     })));
     for invalid in [
+        serde_json::json!({"plan": [], "scope_change_refs": {"id": {"turn_id": "turn"}}}),
+        serde_json::json!({"plan": [], "scope_change_refs": {"id": {"turn_id": "turn", "sha256": "hash", "extra": true}}}),
+        serde_json::json!({"plan": [], "scope_change_refs": {"id": "not-an-input-reference"}}),
         serde_json::json!({"plan": [], "superseded": [{"step_id": "dropped-id"}]}),
         serde_json::json!({"set": [{"status": "completed"}]}),
         serde_json::json!({"set": [{"index": 0, "step_id": "stable-id", "status": "completed"}]}),

@@ -343,6 +343,17 @@ impl AgentTaskCoordinator {
             .await
     }
 
+    pub(crate) async fn record_host_completion_observation(
+        &self, binding: &AgentTaskBinding, thread_id: ThreadId, turn_id: &str, summary: String,
+    ) -> StoreResult<()> {
+        if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
+            return Ok(());
+        }
+        self.required_store()?.record_host_completion_observation(
+            binding.attempt_id, format!("{thread_id}:{turn_id}"), summary,
+        ).await
+    }
+
     pub(crate) async fn get_agent_task_authorization(
         &self,
         assignment_id: AssignmentId,
@@ -453,6 +464,10 @@ impl AgentTaskCoordinator {
         let Some(mut runtime) = metrics.runtimes.remove(&assignment_id) else {
             return;
         };
+        if task.current_attempt.ordinal < runtime.minimum_attempt_ordinal {
+            metrics.runtimes.insert(assignment_id, runtime);
+            return;
+        }
         if metrics.active.remove(&assignment_id) {
             transition_metric_runtimes(&mut metrics);
         }
@@ -498,6 +513,10 @@ impl AgentTaskCoordinator {
         if authorization.current_attempt.attempt_id == binding.attempt_id
             && authorization.current_attempt.state == AttemptState::Active
         {
+            if !self.has_task_metric_runtime(binding.assignment_id) {
+                let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+                self.activate_task_metric_attempt(&task, true);
+            }
             return Ok(());
         }
         // Typed attempts cannot be renewed implicitly. Reject before sampling,
@@ -521,8 +540,29 @@ impl AgentTaskCoordinator {
                 )
             })?;
         self.remember_binding(renewed);
-        self.set_task_metric_active(binding.assignment_id, true);
+        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+        self.activate_task_metric_attempt(&task, false);
         Ok(())
+    }
+
+    fn activate_task_metric_attempt(&self, task: &AgentTask, restored_active_attempt: bool) {
+        let mut metrics = self.metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active_turns = saturating_active_turns(metrics.active.len());
+        let capacity = metric_capacity(&metrics, active_turns);
+        // Only new deltas enter a recreated recorder. Previous emitted attempts
+        // are not replayed, including when this coordinator was restored.
+        if let std::collections::hash_map::Entry::Vacant(entry) = metrics.runtimes.entry(task.assignment.assignment_id) {
+            match TaskMetricRuntime::new(&task.assignment, active_turns, capacity) {
+                Ok(runtime) => { entry.insert(runtime); }
+                Err(error) => { warn!(?error, "failed to recreate task metrics"); return; }
+            }
+        }
+        let Some(runtime) = metrics.runtimes.get_mut(&task.assignment.assignment_id) else { return; };
+        runtime.minimum_attempt_ordinal = task.current_attempt.ordinal;
+        runtime.usage_history_partial |= restored_active_attempt;
+        if metrics.active.insert(task.assignment.assignment_id) {
+            transition_metric_runtimes(&mut metrics);
+        }
     }
 
     #[cfg(test)]
@@ -782,6 +822,7 @@ const fn observation_metric_label(kind: ObservationKind) -> &'static str {
         ObservationKind::Mutation => "mutation",
         ObservationKind::GateChanged => "gate_changed",
         ObservationKind::ReceiptSealed => "receipt_sealed",
+        ObservationKind::HostCompletion => "host_completion",
         ObservationKind::Completed => "completed",
         ObservationKind::NeedsMain => "needs_main",
         ObservationKind::Violated => "violated",

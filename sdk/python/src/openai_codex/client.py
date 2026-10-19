@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from ._goal import _GoalOperationState
 from ._message_router import MessageRouter
+from ._run import _raise_for_failed_turn
 from ._version import __version__ as SDK_VERSION
 from .errors import CodexError, InvalidRequestError, TransportClosedError
 from .generated.notification_registry import NOTIFICATION_MODELS
@@ -425,7 +426,7 @@ class CodexClient:
             stopped.set()
         deadline = time.monotonic() + self.config.shutdown_timeout_s
         try:
-            router.fail_all(TransportClosedError("Codex process was closed"))
+            router.fail_all(TransportClosedError("Codex process was closed"), discard_completed=True)
             # The writer owns stdin, including close/flush. Terminate first so a
             # full pipe cannot keep shutdown behind a blocked write or flush.
             while True:
@@ -515,7 +516,6 @@ class CodexClient:
                 self._write_message(message, proc=proc)
                 while True:
                     timeout = self._check_operation(operation)
-                    router.check_failure()
                     try:
                         item = waiter.get(timeout=timeout)
                         break
@@ -943,7 +943,7 @@ class CodexClient:
         text: str,
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> Iterator[AgentMessageDeltaNotification]:
-        """Start a text turn and yield only its agent-message delta payloads."""
+        """Yield text deltas; failed turns raise, interrupted turns end normally."""
         started = self.turn_start(thread_id, text, params=params)
         turn_id = started.turn.id
         self.register_turn_notifications(turn_id)
@@ -962,6 +962,7 @@ class CodexClient:
                     and isinstance(notification.payload, TurnCompletedNotification)
                     and notification.payload.turn.id == turn_id
                 ):
+                    _raise_for_failed_turn(notification.payload.turn)
                     break
         finally:
             self.unregister_turn_notifications(turn_id)

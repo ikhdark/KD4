@@ -545,6 +545,29 @@ pub struct AttemptAmendment {
     pub stop_condition: Option<String>,
 }
 
+/// Current specification, distinct from the immutable original assignment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EffectiveTaskContract {
+    pub objective: String,
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
+    pub stop_condition: String,
+}
+
+impl Assignment {
+    pub fn effective_criteria<'a>(&'a self, amendment: Option<&'a AttemptAmendment>) -> &'a [AcceptanceCriterion] {
+        amendment.and_then(|value| value.acceptance_criteria.as_deref())
+            .unwrap_or(&self.acceptance_criteria)
+    }
+
+    pub fn effective_contract(&self, amendment: Option<&AttemptAmendment>) -> EffectiveTaskContract {
+        EffectiveTaskContract {
+            objective: amendment.and_then(|value| value.objective.as_ref()).unwrap_or(&self.objective).clone(),
+            acceptance_criteria: self.effective_criteria(amendment).to_vec(),
+            stop_condition: amendment.and_then(|value| value.stop_condition.as_ref()).unwrap_or(&self.stop_condition).clone(),
+        }
+    }
+}
+
 impl AttemptAmendment {
     pub(crate) fn validate(&self) -> StoreResult<()> {
         validate_nonempty("amendment reason", &self.reason)?;
@@ -696,6 +719,8 @@ pub enum ObservationKind {
     Mutation,
     GateChanged,
     ReceiptSealed,
+    /// Host-only terminal diagnostics; does not modify acceptance or sealed receipts.
+    HostCompletion,
     Completed,
     NeedsMain,
     Violated,

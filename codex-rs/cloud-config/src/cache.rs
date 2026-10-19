@@ -161,8 +161,11 @@ impl CloudConfigBundleCache {
                 .map_err(|_| CloudConfigBundleCacheError)?;
         }
 
-        fs::write(&self.path, serialized)
-            .await
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let paths = codex_file_system::resolve_symlink_write_paths(&path)?;
+            codex_file_system::write_bytes_atomically_preserving_permissions(&paths.write_path, &serialized)
+        }).await.map_err(|_| CloudConfigBundleCacheError)?
             .map_err(|_| CloudConfigBundleCacheError)?;
         Ok(())
     }

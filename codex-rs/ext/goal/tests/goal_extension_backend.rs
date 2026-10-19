@@ -1697,6 +1697,7 @@ impl GoalExtensionHarness {
     async fn record_token_usage(&self, turn_id: &str, usage: &TokenUsage) {
         let turn_store = ExtensionData::new(turn_id);
         let token_usage = TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: usage.clone(),
             last_token_usage: TokenUsage::default(),
             model_context_window: None,

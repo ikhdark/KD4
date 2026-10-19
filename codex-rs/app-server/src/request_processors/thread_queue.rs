@@ -38,6 +38,9 @@ struct Queue {
     pending_start: Option<PendingStart>,
     #[serde(default)]
     accepted: Vec<AcceptedSubmission>,
+    /// Immutable execution inputs; submissions retain original UI/idempotency input.
+    #[serde(default)]
+    execution_inputs: HashMap<String, Vec<V2UserInput>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,11 +66,26 @@ impl Default for Queue {
             paused: false,
             pending_start: None,
             accepted: Vec::new(),
+            execution_inputs: HashMap::new(),
         }
     }
 }
 
 impl Queue {
+    async fn add_sealed(&mut self, params: ThreadQueueAddParams) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+        let (item, added) = self.add(params)?;
+        if added && item.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            match seal_queue_input(item.input.clone()).await {
+                Ok(input) => { self.execution_inputs.insert(item.id.clone(), input); }
+                Err(error) => {
+                    self.submissions.retain(|submission| submission.id != item.id);
+                    return Err(error);
+                }
+            }
+        }
+        Ok((item, added))
+    }
+
     fn add(&mut self, params: ThreadQueueAddParams) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
         if let Some(client_id) = &params.client_user_message_id
             && let Some(existing) = self
@@ -221,6 +239,7 @@ impl ThreadQueueRequestProcessor {
     }
 
     async fn save(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
+        queue.execution_inputs.retain(|id, _| queue.submissions.iter().any(|item| &item.id == id));
         // A pause protects the prompts queued when a turn was interrupted; it
         // must not outlive them and silently disable later automatic follow-ups.
         if queue.submissions.is_empty() && queue.pending_start.is_none() {
@@ -331,13 +350,13 @@ impl ThreadQueueRequestProcessor {
         let pending = queue.pending_start.take().ok_or_else(|| {
             internal_error("pending thread queue start disappeared during recovery")
         })?;
-        if accepted {
-            if let Some(index) = queue.submissions.iter().position(|item| item.id == pending.submission_id) {
-                let submission = queue.submissions.remove(index);
-                queue.accepted.push(AcceptedSubmission { submission, turn_id: pending.turn_id });
-                if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
-                    queue.accepted.remove(0);
-                }
+        if accepted
+            && let Some(index) = queue.submissions.iter().position(|item| item.id == pending.submission_id)
+        {
+            let submission = queue.submissions.remove(index);
+            queue.accepted.push(AcceptedSubmission { submission, turn_id: pending.turn_id });
+            if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
+                queue.accepted.remove(0);
             }
         }
         // Never silently replay an unaccepted start or resume after process death.
@@ -384,9 +403,14 @@ impl ThreadQueueRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        let (queued_submission, added) = self.mutate(id, |queue| {
-            queue.add(params).map(|(item, changed)| ((item, changed), changed))
-        }).await?;
+        let guard = self.lock(id).await?;
+        let mut queue = self.load(id).await?;
+        self.recover(id, &mut queue).await?;
+        // Duplicate accepted IDs are resolved before reading mutable source paths.
+        let (queued_submission, added) = queue.add_sealed(params).await?;
+        if added { self.save(id, &mut queue).await?; }
+        drop(guard);
+        if added { self.changed(id).await; }
         if added {
             self.origins
                 .lock()
@@ -413,6 +437,9 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueUpdateParams,
     ) -> Result<ThreadQueueUpdateResponse, JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
+        let execution_input = if params.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            Some(seal_queue_input(params.input.clone()).await?)
+        } else { None };
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let queued_submission = self
             .mutate(id, |queue| {
@@ -424,7 +451,13 @@ impl ThreadQueueRequestProcessor {
                     .iter_mut()
                     .find(|item| item.id == params.queued_submission_id)
                     .ok_or_else(|| invalid_params("queued submission not found"))?;
-                let changed = item.input != params.input;
+                let changed = item.input != params.input
+                    || queue.execution_inputs.get(&item.id) != execution_input.as_ref();
+                if let Some(input) = execution_input {
+                    queue.execution_inputs.insert(item.id.clone(), input);
+                } else {
+                    queue.execution_inputs.remove(&item.id);
+                }
                 item.input = params.input;
                 Ok((item.clone(), changed))
             })
@@ -529,6 +562,13 @@ impl ThreadQueueRequestProcessor {
             .await
             .map_err(queue_error)?;
         let turn_id = thread.reserve_turn_id();
+        let execution_input = match queue.execution_inputs.get(&item.id) {
+            Some(input) => input.clone(),
+            None if item.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) => {
+                return Err(invalid_request("queued local image predates immutable snapshots; update the submission before starting it"));
+            }
+            None => item.input.clone(),
+        };
         queue.paused = false;
         queue.pending_start = Some(PendingStart {
             submission_id: item.id.clone(),
@@ -542,7 +582,7 @@ impl ThreadQueueRequestProcessor {
                 TurnStartParams {
                     thread_id: id.to_string(),
                     client_user_message_id: item.client_user_message_id,
-                    input: item.input,
+                    input: execution_input,
                     ..Default::default()
                 },
                 origin.client_name,
@@ -684,9 +724,90 @@ fn queue_error(error: impl std::fmt::Display) -> JSONRPCErrorError {
     internal_error(format!("thread queue: {error}"))
 }
 
+async fn seal_queue_input(input: Vec<V2UserInput>) -> Result<Vec<V2UserInput>, JSONRPCErrorError> {
+    if !input.iter().any(|item| matches!(item, V2UserInput::LocalImage { .. })) {
+        return Ok(input);
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use codex_protocol::models::ContentItem;
+        let mut sealed = Vec::new();
+        let mut remaining = MAX_QUEUE_BYTES;
+        for item in input {
+            if let V2UserInput::LocalImage { path, detail } = item {
+                if !std::fs::metadata(&path).map_err(queue_error)?.is_file() {
+                    return Err(invalid_params("queued image must be a regular file"));
+                }
+                let file = File::open(&path).map_err(queue_error)?;
+                if !file.metadata().map_err(queue_error)?.is_file() {
+                    return Err(invalid_params("queued image must be a regular file"));
+                }
+                let mut bytes = Vec::new();
+                file.take(remaining as u64 + 1).read_to_end(&mut bytes).map_err(queue_error)?;
+                if bytes.len() > remaining {
+                    return Err(invalid_params("queued images exceed their storage limit"));
+                }
+                remaining -= bytes.len();
+                let prepared = codex_protocol::models::local_image_content_items_with_label_number(
+                    &path, bytes, None, detail.unwrap_or(codex_protocol::models::DEFAULT_IMAGE_DETAIL),
+                );
+                if !prepared.iter().any(|item| matches!(item, ContentItem::InputImage { .. })) {
+                    return Err(invalid_params("queued local image could not be decoded"));
+                }
+                for item in prepared {
+                    match item {
+                        ContentItem::InputImage { image_url, detail } => sealed.push(V2UserInput::Image { url: image_url, detail }),
+                        ContentItem::InputText { text } => sealed.push(V2UserInput::Text { text, text_elements: Vec::new() }),
+                        _ => {}
+                    }
+                }
+            } else {
+                sealed.push(item);
+            }
+        }
+        if serde_json::to_vec(&sealed).map_err(queue_error)?.len() > MAX_QUEUE_BYTES {
+            return Err(invalid_params("sealed queue input exceeds its storage limit"));
+        }
+        Ok(sealed)
+    }).await.map_err(queue_error)?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queue_seals_local_image_before_acceptance_and_preserves_retry_identity() {
+        use base64::Engine;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("image.png");
+        // Independently encoded 1x1 RGBA PNG (filter byte + red pixel).
+        let bytes = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==").unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let params = ThreadQueueAddParams {
+            thread_id: "thread".into(), client_user_message_id: Some("image".into()),
+            input: vec![V2UserInput::LocalImage { path: path.clone(), detail: None }],
+        };
+        let mut queue = Queue::default();
+        let (item, added) = queue.add_sealed(params.clone()).await.unwrap();
+        assert!(added);
+        assert_eq!(item.input, params.input);
+        let expected = queue.execution_inputs[&item.id].clone();
+        assert!(expected.iter().any(|item| matches!(item, V2UserInput::Image { url, .. } if url.starts_with("data:image/"))));
+        assert!(!expected.iter().any(|item| matches!(item, V2UserInput::LocalImage { .. })));
+        std::fs::write(&path, b"replacement is not an image").unwrap();
+        let mut restored: Queue = serde_json::from_slice(&serde_json::to_vec(&queue).unwrap()).unwrap();
+        let (retry, added) = restored.add_sealed(params.clone()).await.unwrap();
+        assert!(!added);
+        assert_eq!(retry, item);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(restored.execution_inputs[&item.id], expected);
+        assert!(!restored.add_sealed(params.clone()).await.unwrap().1);
+        let mut failed = Queue::default();
+        assert!(failed.add_sealed(params).await.is_err());
+        assert!(failed.submissions.is_empty());
+        assert!(failed.execution_inputs.is_empty());
+    }
 
     fn input(text: &str) -> Vec<V2UserInput> {
         vec![V2UserInput::Text {

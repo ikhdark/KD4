@@ -16,6 +16,7 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_sandboxing::transform_for_direct_spawn;
+use codex_sandboxing::transform_for_direct_spawn_with_codex_home;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
@@ -53,6 +54,11 @@ impl FileSystemSandboxRunner {
             runtime_paths,
             helper_env: helper_env(),
         }
+    }
+
+    pub(crate) fn with_env(mut self, env: HashMap<String, String>) -> Self {
+        self.helper_env.extend(env);
+        self
     }
 
     pub(crate) async fn run(
@@ -138,7 +144,7 @@ impl FileSystemSandboxRunner {
         } else {
             native_workspace_roots.as_slice()
         };
-        transform_for_direct_spawn(SandboxDirectSpawnTransformRequest {
+        let request = SandboxDirectSpawnTransformRequest {
             workspace_roots,
             windows_sandbox_proxy_settings_mode:
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
@@ -153,7 +159,14 @@ impl FileSystemSandboxRunner {
                 windows_sandbox_level: sandbox_context.windows_sandbox_level,
                 windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
             },
-        })
+        };
+        // Keep wrapper ACL ownership and the helper's trusted runtime environment
+        // on the same home. Per-instance overrides must not use the parent home.
+        let transformed = match self.helper_env.get("CODEX_HOME") {
+            Some(home) => transform_for_direct_spawn_with_codex_home(request, std::path::Path::new(home)),
+            None => transform_for_direct_spawn(request),
+        };
+        transformed
         .map_err(|err| invalid_request(format!("failed to prepare fs sandbox: {err}")))
     }
 }

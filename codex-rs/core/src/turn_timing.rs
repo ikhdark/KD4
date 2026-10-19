@@ -4840,6 +4840,25 @@ fn wait_generations_with_same_revision_count(requests: &[ModelRequestTiming]) ->
         .unwrap_or(u32::MAX)
 }
 
+fn usage_coverage<'a>(requests: impl Iterator<Item = &'a ModelRequestTiming>) -> (u64, u64) {
+    let mut expected = 0_u64;
+    let mut observed = 0_u64;
+    let mut seen = std::collections::BTreeSet::new();
+    for request in requests {
+        expected = expected.saturating_add(request.physical_attempt_ids.len().max(1) as u64);
+        // A logical row with several attempts and one usage object cannot certify
+        // each physical attempt. Missing identities and duplicates stay unknown.
+        if request.physical_attempt_ids.len() == 1
+            && !request.physical_attempt_ids[0].is_empty()
+            && seen.insert(request.physical_attempt_ids[0].as_str())
+            && request.token_usage.is_some()
+        {
+            observed = observed.saturating_add(1);
+        }
+    }
+    (expected, observed)
+}
+
 fn purpose_aggregates(
     requests: &[ModelRequestTiming],
     saturation_count: &mut u32,
@@ -4885,7 +4904,10 @@ fn purpose_aggregates(
             let tool_active_union_ns = matching.iter().fold(0_u128, |total, request| {
                 total.saturating_add(request.tool_active_union_ns)
             });
+            let (expected, observed) = usage_coverage(matching.iter().copied());
             Some(TurnTimingGenerationPurposeAggregate {
+                expected_usage_count: Some(expected),
+                observed_usage_count: Some(observed),
                 purpose,
                 generations,
                 model_stream_wait_ns: public_ns(wait_ns, saturation_count),
@@ -4950,7 +4972,11 @@ fn diagnostic_token_aggregate(
         })
         .map(|request| request.generation_index)
         .collect::<std::collections::BTreeSet<_>>();
+    let (expected, observed) = usage_coverage(requests.iter()
+        .filter(|request| generation_ids.contains(&request.generation_index)));
     let mut aggregate = TurnTimingDiagnosticTokenAggregate {
+        expected_usage_count: Some(expected),
+        observed_usage_count: Some(observed),
         logical_generations: u32::try_from(generation_ids.len()).unwrap_or(u32::MAX),
         ..Default::default()
     };

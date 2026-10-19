@@ -41,7 +41,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = turn_context.base_instructions.as_ref().clone();
     let tool_router = built_tools(sess.as_ref(), step_context, &[], cancellation_token).await?;
     let mut owned_client_session = None;
     let client_session = match client_session {
@@ -222,6 +222,44 @@ fn append_compaction_trigger(prompt: &mut Prompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_compaction_sends_the_selected_turn_base() -> anyhow::Result<()> {
+        use crate::test_harness::responses;
+        use codex_analytics::{CompactionImplementation, CompactionPhase, CompactionReason, CompactionTrigger};
+        crate::test_harness::require_network!();
+        let server = responses::start_mock_server().await;
+        let home = tempfile::tempdir()?;
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                },
+            ).await;
+        let selected_base = "SELECTED_COMPACTION_TURN_BASE";
+        Arc::get_mut(&mut turn).unwrap().base_instructions = Arc::new(
+            codex_protocol::models::BaseInstructions { text: selected_base.into() },
+        );
+        assert_ne!(session.get_base_instructions().await.text, selected_base);
+        let step = session.capture_step_context(Arc::clone(&turn)).await?;
+        let log = responses::mount_sse_once(&server, responses::sse(vec![
+            serde_json::json!({"type":"response.output_item.done",
+                "item":{"type":"compaction","encrypted_content":"opaque"}}),
+            responses::ev_completed("compacted"),
+        ])).await;
+        run_remote_compact_v2_attempt(
+            &session, &step, None, &CompactionTraceContext::disabled(),
+            CompactionTurnMetadata::new(
+                CompactionTrigger::Manual, CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2, CompactionPhase::StandaloneTurn,
+            ),
+            &mut CompactionAnalyticsDetails::default(), &CancellationToken::new(),
+        ).await?;
+        assert_eq!(log.single_request().body_json()["instructions"], selected_base);
+        Ok(())
+    }
 
     #[test]
     fn compaction_variants_preserve_sharing_and_measure_distinct_fallbacks() {

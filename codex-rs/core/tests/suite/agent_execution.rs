@@ -559,6 +559,14 @@ async fn code_mode_only_discovers_spawns_and_receives_from_real_subagent() -> Re
         sse(vec![
             ev_response_created("probe-start"),
             ev_custom_tool_call("probe-spawn", "exec", r#"
+const guidance = await tools.read_file({path: "context:multi-agent"});
+const guidanceText = guidance.results.map(result => result.text || "").join("\n");
+if (!guidance.file_complete ||
+    !guidanceText.includes("deferred inside `functions.exec`") ||
+    !guidanceText.includes("resolve and call in the same cell")) {
+  throw Error("missing retrieved nested-call guidance");
+}
+text("guidance-proof");
 const search = await tools.tool_search({query: "source:agents spawn_agent", limit: 1});
 if (search.status === "aborted") throw Error("agent discovery aborted");
 const spawn = resolve_tool("agents.spawn_agent");
@@ -679,15 +687,16 @@ text("list-proof:" + JSON.stringify(listed));
             .collect::<Vec<_>>()
             .join("\n");
         anyhow::ensure!(
-            developer_text.contains("deferred inside `functions.exec`")
-                && developer_text.contains("resolve and call in the same cell"),
-            "missing nested-call guidance"
+            developer_text.contains("context:multi-agent")
+                && developer_text.contains("Before spawning, messaging or waiting on agents"),
+            "missing deferred team-guidance locator"
         );
         anyhow::ensure!(
             !developer_text.contains("not from inside `functions.exec`"),
             "obsolete agent prohibition"
         );
         let spawned = output_text(&parent_wait.single_request(), "probe-spawn");
+        anyhow::ensure!(spawned.contains("guidance-proof"), "team guidance was not retrieved: {spawned}");
         anyhow::ensure!(spawned.contains("spawn-proof:"), "spawn failed: {spawned}");
         let finished = parent_finish.single_request();
         let waited = output_text(&finished, "probe-wait");

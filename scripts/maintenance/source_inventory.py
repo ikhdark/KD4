@@ -21,6 +21,7 @@ import argparse
 import fnmatch
 import hashlib
 import html
+import itertools
 import json
 import re
 import subprocess
@@ -219,12 +220,12 @@ def json_shape(value, depth=0, budget=None):
             result["omitted"] = len(value)
             return result
         items = (
-            list(value.items())
+            value.items()
             if isinstance(value, dict)
-            else list(enumerate(value[:3]))
+            else enumerate(value[:3])
         )
         shown = {}
-        for index, (key, child) in enumerate(items[:32]):
+        for index, (key, child) in enumerate(itertools.islice(items, 32)):
             if budget[0] <= 0:
                 break
             label = str(key)

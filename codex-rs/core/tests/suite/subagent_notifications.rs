@@ -35,8 +35,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::time::Instant;
@@ -961,18 +959,13 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     )
     .await;
 
-    let parent_prompt_cache_key = Arc::new(Mutex::new(None::<String>));
-    let child_parent_prompt_cache_key = Arc::clone(&parent_prompt_cache_key);
     let _child_request_log = mount_sse_once_match(
         &server,
-        move |req: &wiremock::Request| {
-            let parent_key = child_parent_prompt_cache_key
-                .lock()
-                .expect("parent prompt cache key lock poisoned")
-                .clone();
+        |req: &wiremock::Request| {
             req.url.path() == "/v1/responses"
-                && parent_key.is_some()
-                && prompt_cache_key(req) != parent_key
+                && core_test_support::responses::request_has_last_message_input_text(
+                    req, "user", CHILD_PROMPT,
+                )
         },
         sse(vec![
             ev_response_created("resp-child-1"),
@@ -1018,14 +1011,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
-    let seed_request = seed_turn.single_request();
-    let seed_prompt_cache_key = seed_request.body_json()["prompt_cache_key"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("seed request should include prompt_cache_key"))?;
-    *parent_prompt_cache_key
-        .lock()
-        .expect("parent prompt cache key lock poisoned") = Some(seed_prompt_cache_key.clone());
+    seed_turn.single_request();
 
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = spawn_turn.single_request();
@@ -1039,13 +1025,35 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             .into_iter()
             .find(|request| {
                 request.url.path() == "/v1/responses"
-                    && prompt_cache_key(request)
-                        .is_some_and(|request_key| request_key != seed_prompt_cache_key)
+                    && core_test_support::responses::request_has_last_message_input_text(
+                        request, "user", CHILD_PROMPT,
+                    )
             })
         {
             break request;
         }
         if Instant::now() >= deadline {
+            let mut child_diagnostics = Vec::new();
+            for id in test.thread_manager.list_thread_ids().await {
+                if id == test.session_configured.thread_id {
+                    continue;
+                }
+                let child = test.thread_manager.get_thread(id).await?;
+                let status = child.agent_status().await;
+                let model = child.config_snapshot().await.model;
+                let mut terminal_events = Vec::new();
+                for _ in 0..64 {
+                    let Some(Ok(event)) = futures::FutureExt::now_or_never(child.next_event()) else {
+                        break;
+                    };
+                    match event.msg {
+                        EventMsg::Error(error) => terminal_events.push(format!("error: {error:?}")),
+                        EventMsg::TurnComplete(completed) => terminal_events.push(format!("completed: error={:?}", completed.error)),
+                        _ => {}
+                    }
+                }
+                child_diagnostics.push((id, model, status, terminal_events));
+            }
             let observed = server
                 .received_requests()
                 .await
@@ -1061,7 +1069,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
                     )
                 })
                 .collect::<Vec<_>>();
-            anyhow::bail!("timed out waiting for forked child request; observed={observed:?}");
+            anyhow::bail!("timed out waiting for forked child request; children={child_diagnostics:?}; observed={observed:?}");
         }
         sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
             .await;

@@ -23,6 +23,41 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
+    def test_preparing_and_interrupted_failed_bundle_recovery_is_idempotent(self) -> None:
+        for phase in ("Preparing", "Recovering"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                install = root / "install"
+                stage = root / ".install.bundle.fixture"
+                rollback = root / ".install.rollback.fixture"
+                failed = root / ".install.bundle.fixture.failed"
+                install.mkdir()
+                (install / "codex.exe").write_bytes(b"previous")
+                stage.mkdir()
+                (stage / "partial-copy").write_bytes(b"partial")
+                if phase == "Recovering":
+                    failed.mkdir()
+                    (failed / "codex.exe").write_bytes(b"failed new bundle")
+                    # Crash after rollback was restored, before failed-root cleanup.
+                journal = root / ".install.codex-local-publish.transaction.json"
+                journal.write_text(json.dumps({
+                    "SchemaVersion": 1, "TransactionId": "fixture", "Phase": phase,
+                    "InstallDir": str(install), "StageRoot": str(stage),
+                    "RollbackRoot": str(rollback), "HadPreviousInstall": True,
+                    "JournalPath": str(journal), "Entries": [],
+                }), encoding="utf-8")
+                command = (f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                           f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}; "
+                           f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}")
+                result = subprocess.run([self.shell, "-NoProfile", "-Command", command],
+                                        env=clean_env(), capture_output=True, text=True,
+                                        check=False, timeout=RUN_TIMEOUT_SECONDS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((install / "codex.exe").read_bytes(), b"previous")
+                self.assertFalse(stage.exists())
+                self.assertFalse(failed.exists())
+                self.assertFalse(journal.exists())
+
     def test_recovery_rejects_unowned_paths_without_changing_files(self) -> None:
         # A durable journal is input, not authority to delete arbitrary paths.
         # Both rollback and committed cleanup own only the install directory

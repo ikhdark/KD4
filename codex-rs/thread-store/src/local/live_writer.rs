@@ -54,7 +54,18 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+    let store = store.clone();
+    // Loading/materialization may own blocking file work after caller cancellation.
+    tokio::spawn(async move { resume_thread_owned(&store, params).await })
+        .await.map_err(|error| ThreadStoreError::Internal { message: error.to_string() })?
+}
+
+async fn resume_thread_owned(
+    store: &LocalThreadStore,
+    params: ResumeThreadParams,
+) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
     store.ensure_live_recorder_absent(params.thread_id).await?;
+    let lease = store.acquire_writer_lease(params.thread_id, false).await?;
     let cwd = params
         .metadata
         .cwd
@@ -114,16 +125,18 @@ pub(super) async fn resume_thread(
         Some(history) => {
             // Reject supplied history before opening or materializing a writer.
             validate_history(&history)?;
-            let recorder = RolloutRecorder::new(
+            let recorder = RolloutRecorder::new_with_writer_lease(
                 &config,
                 RolloutRecorderParams::resume(rollout_path),
+                None,
+                lease,
             )
             .await
             .map_err(thread_store_io_error)?;
             (recorder, history)
         }
         None => {
-            let (recorder, history) = RolloutRecorder::resume_and_load(&config, rollout_path, params.thread_id)
+            let (recorder, history) = RolloutRecorder::resume_and_load_with_writer_lease(&config, rollout_path, params.thread_id, Some(lease))
                 .await.map_err(thread_store_io_error)?;
             validate_history(&history)?;
             (recorder, Arc::new(history))

@@ -3157,6 +3157,7 @@ mod tests {
                 failed_checks: vec!["validation failed; limitation reported".into()],
                 verification_gaps: Vec::new(),
                 advisories: vec!["checklist needs reconciliation".into()],
+                ..Default::default()
             }),
             schema_version: 1,
             profile_valid: true,
@@ -3445,6 +3446,7 @@ mod tests {
         );
 
         let info = TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: TokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 25,

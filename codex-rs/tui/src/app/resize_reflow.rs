@@ -52,10 +52,11 @@ fn retain_terminal_row_tail(lines: &mut Vec<HyperlinkLine>, width: usize, max_ro
 
         let line = &mut lines[start];
         let text = line.line.to_string();
+        // Counting and trimming share the same row iterator. If their
+        // invariant ever diverges, preserve the line rather than panic.
         let skip_bytes = terminal_row_ranges(&text, width)
             .nth(rows - remaining)
-            .expect("retained terminal row exists")
-            .start;
+            .map_or(0, |range| range.start);
         let columns = text[..skip_bytes].width();
         let mut bytes_left = skip_bytes;
         line.line.spans.retain_mut(|span| {

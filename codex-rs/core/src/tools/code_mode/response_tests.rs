@@ -2915,6 +2915,13 @@ async fn verified10_paginated_recovery_delivers_in_one_cell_without_erasing_fail
 
 #[tokio::test]
 async fn exit_with_abandoned_tools_refuses_explicit_delivery() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     use crate::session::turn_execution::ContinuationDisposition;
     use crate::session::turn_execution::SamplingRequestSettledState;
     use crate::session::turn_execution::TurnExecutionControl;
@@ -2945,10 +2952,11 @@ async fn exit_with_abandoned_tools_refuses_explicit_delivery() {
             // fixture setup. This is a local elapsed fixture, not an E2E claim.
             let started = Instant::now();
             let output = runtime.exec(&source).await;
-            eprintln!(
-                "exit_delivery abandoned={abandoned} timer={} elapsed_us={}",
-                exit.starts_with("setTimeout"),
-                started.elapsed().as_micros()
+            tracing::info!(
+                abandoned,
+                timer = exit.starts_with("setTimeout"),
+                elapsed_us = %started.elapsed().as_micros(),
+                "exit_delivery"
             );
             let visible = packet_output_text(output.as_ref());
             assert!(visible.contains("exit output"), "{visible}");

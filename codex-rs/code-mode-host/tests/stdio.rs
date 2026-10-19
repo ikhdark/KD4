@@ -281,10 +281,6 @@ impl CodeModeSessionDelegate for RecordingDelegate {
     }
 }
 
-fn cell_id(value: &str) -> CellId {
-    CellId::new(value.to_string())
-}
-
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
         state_path: None,

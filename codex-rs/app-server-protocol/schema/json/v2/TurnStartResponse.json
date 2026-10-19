@@ -1800,6 +1800,17 @@
           },
           "type": "array"
         },
+        "validationUncertainty": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnValidationUncertainty"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bounded unresolved questions for resume. Never passing proof or live handles."
+        },
         "verificationGaps": {
           "items": {
             "type": "string"
@@ -2646,6 +2657,15 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "expectedUsageCount": {
+          "description": "Expected physical usage reports; absent in legacy aggregates.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "inputTokens": {
           "format": "uint64",
           "minimum": 0.0,
@@ -2655,6 +2675,15 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "observedUsageCount": {
+          "description": "Attributable reports observed. Totals are lower bounds unless equal to expected.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "reasoningTokens": {
           "format": "uint64",
@@ -2816,6 +2845,15 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "expectedUsageCount": {
+          "description": "Expected physical usage reports; absent in legacy aggregates.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "generations": {
           "format": "uint32",
           "minimum": 0.0,
@@ -2831,6 +2869,15 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "observedUsageCount": {
+          "description": "Attributable reports observed. Totals are lower bounds unless equal to expected.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "outputTokens": {
           "format": "uint64",
@@ -4487,6 +4534,37 @@
         "modelStreamWaitUnionNs",
         "toolActiveUnionMs",
         "toolActiveUnionNs"
+      ],
+      "type": "object"
+    },
+    "TurnValidationUncertainty": {
+      "properties": {
+        "captureIncomplete": {
+          "type": "boolean"
+        },
+        "failedChecks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pendingChecks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "captureIncomplete",
+        "failedChecks",
+        "pendingChecks",
+        "version"
       ],
       "type": "object"
     },

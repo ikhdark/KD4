@@ -3178,6 +3178,7 @@ async fn host_legacy_outcome_persists_final_response_without_fabricating_evidenc
         .set_agent_gate(
             TaskActor::Root,
             assignment.assignment_id,
+            attempt.attempt_id,
             GateKind::Verification,
             GateStatus::Pending,
             "advisory verification not run".to_string(),
@@ -3223,6 +3224,28 @@ async fn host_legacy_outcome_persists_final_response_without_fabricating_evidenc
             .await,
         Err(StoreError::AttemptSealed(_))
     ));
+}
+
+#[tokio::test]
+async fn host_completion_observations_are_idempotent_and_do_not_rewrite_sealed_receipts() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("host-observation-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: None };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence.clear();
+    let (assignment, attempt) = fixture.store.create_assignment(fixture.repo.path(), draft).await.unwrap();
+    let receipt = fixture.store.record_legacy_agent_outcome(
+        attempt.attempt_id, AgentStatusClaim::Completed, "agent report".into()).await.unwrap();
+    let write = || fixture.store.record_host_completion_observation(
+        attempt.attempt_id, "thread:turn".into(), "Host: check-alpha failed".into());
+    let (first, duplicate) = tokio::join!(write(), write());
+    first.unwrap();
+    duplicate.unwrap();
+    let task = fixture.store.get_agent_task(assignment.assignment_id, None).await.unwrap();
+    assert_eq!(task.receipt, Some(receipt));
+    assert_eq!(task.observations.iter().filter(|item| item.kind == ObservationKind::HostCompletion).count(), 1);
+    assert!(fixture.store.append_observation(
+        attempt.attempt_id, ObservationKind::HostCompletion, "forged".into(), None).await.is_err());
 }
 
 #[tokio::test]
@@ -4038,6 +4061,7 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
         .set_agent_gate(
             TaskActor::Root,
             assignment.assignment_id,
+            attempt.attempt_id,
             GateKind::Review,
             GateStatus::Pending,
             "cold review required".to_string(),
@@ -4054,6 +4078,7 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
         .set_agent_gate(
             TaskActor::Root,
             assignment.assignment_id,
+            attempt.attempt_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
             "one correction is required".to_string(),
@@ -4150,6 +4175,7 @@ async fn risk_review_progresses_to_independent_verification() {
         .set_agent_gate(
             TaskActor::Attempt(reviewer_attempt.attempt_id),
             worker.assignment_id,
+            worker_attempt.attempt_id,
             GateKind::Review,
             GateStatus::Passed,
             "cold review passed".to_string(),
@@ -4180,6 +4206,7 @@ async fn risk_review_progresses_to_independent_verification() {
         .set_agent_gate(
             TaskActor::Attempt(verifier_attempt.attempt_id),
             worker.assignment_id,
+            worker_attempt.attempt_id,
             GateKind::Verification,
             GateStatus::Passed,
             "independent verification passed".to_string(),
@@ -4401,6 +4428,7 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         .set_agent_gate(
             TaskActor::Attempt(reviewer_attempt.attempt_id),
             review_worker.assignment_id,
+            review_attempt.attempt_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
             "one correction is required".to_string(),
@@ -4430,11 +4458,22 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         )
         .await
         .expect("corrected receipt");
+    // The same authorized reviewer may evaluate A1, but cannot attach an A0
+    // decision to it. Root authority does not bypass the version check either.
+    for actor in [TaskActor::Root, TaskActor::Attempt(reviewer_attempt.attempt_id)] {
+        for status in [GateStatus::Passed, GateStatus::Failed, GateStatus::ChangesRequested] {
+            assert!(matches!(review_fixture.store.set_agent_gate(
+                actor, review_worker.assignment_id, review_attempt.attempt_id,
+                GateKind::Review, status, "delayed A0 verdict".into(),
+            ).await, Err(StoreError::AttemptNotActive(id)) if id == review_attempt.attempt_id));
+        }
+    }
     review_fixture
         .store
         .set_agent_gate(
             TaskActor::Attempt(reviewer_attempt.attempt_id),
             review_worker.assignment_id,
+            correction.attempt_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
             "the correction remains unresolved".to_string(),
@@ -4508,6 +4547,7 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         .set_agent_gate(
             TaskActor::Attempt(verification_reviewer.attempt_id),
             verification_worker.assignment_id,
+            verification_attempt.attempt_id,
             GateKind::Review,
             GateStatus::Passed,
             "cold review passed".to_string(),
@@ -4531,6 +4571,7 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         .set_agent_gate(
             TaskActor::Attempt(verifier_attempt.attempt_id),
             verification_worker.assignment_id,
+            verification_attempt.attempt_id,
             GateKind::Verification,
             GateStatus::Failed,
             "independent verification failed".to_string(),
@@ -4993,6 +5034,7 @@ async fn integrator_admission_does_not_depend_on_claim_overlap_or_supersession()
         .set_agent_gate(
             TaskActor::Root,
             worker.assignment_id,
+            attempt.attempt_id,
             GateKind::Review,
             GateStatus::Pending,
             "cold review pending".to_string(),
@@ -5030,6 +5072,7 @@ async fn integrator_admission_does_not_depend_on_claim_overlap_or_supersession()
         .set_agent_gate(
             TaskActor::Root,
             worker.assignment_id,
+            attempt.attempt_id,
             GateKind::Review,
             GateStatus::Passed,
             "cold review passed".to_string(),
@@ -5336,6 +5379,7 @@ async fn correction_attempt_drift_updates_current_risk_gate() {
         .set_agent_gate(
             TaskActor::Attempt(reviewer_attempt.attempt_id),
             worker.assignment_id,
+            initial_attempt.attempt_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
             "one correction is required".to_string(),

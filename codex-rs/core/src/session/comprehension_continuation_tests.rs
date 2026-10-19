@@ -3,6 +3,13 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn audit21_real_hook_policy_is_exact_or_wholly_omitted() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     use codex_config::{
         ConfigLayerEntry, ConfigLayerSource, ConfigRequirements, ConfigRequirementsToml,
     };
@@ -79,9 +86,10 @@ async fn audit21_real_hook_policy_is_exact_or_wholly_omitted() {
         .unwrap();
         let history = session.clone_history().await;
         let text = developer_input_texts(history.raw_items()).join("\n");
-        eprintln!(
-            "audit21_hook_to_history oversized={oversized} elapsed_us={}",
-            started.elapsed().as_micros()
+        tracing::info!(
+            oversized,
+            elapsed_us = %started.elapsed().as_micros(),
+            "audit21_hook_to_history"
         );
         let mut completed = false;
         while let Ok(event) = events.try_recv() {
@@ -111,6 +119,13 @@ async fn audit21_real_hook_policy_is_exact_or_wholly_omitted() {
 
 #[tokio::test]
 async fn audit21_full_refresh_preserves_typed_retractions() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     for full_refresh in [false, true] {
         let (mut session, mut turn) = make_session_and_context().await;
         let _ = session.features.enable(Feature::Personality);
@@ -169,9 +184,10 @@ async fn audit21_full_refresh_preserves_typed_retractions() {
             crate::stable_context::StableContextTarget::Sampling,
         );
         let text = developer_input_texts(&projection.items).join("\n");
-        eprintln!(
-            "audit21_context_refresh full={full_refresh} elapsed_us={}",
-            started.elapsed().as_micros()
+        tracing::info!(
+            full = full_refresh,
+            elapsed_us = %started.elapsed().as_micros(),
+            "audit21_context_refresh"
         );
         assert!(
             !text.contains(&old_personality),
@@ -200,6 +216,13 @@ async fn audit21_full_refresh_preserves_typed_retractions() {
 
 #[tokio::test]
 async fn audit21_context_uses_captured_turn_not_future_session_mode() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let (session, mut turn) = make_session_and_context().await;
     turn.collaboration_mode.settings.developer_instructions =
         Some("captured turn policy sentinel".into());
@@ -224,9 +247,9 @@ async fn audit21_context_uses_captured_turn_not_future_session_mode() {
     let started = std::time::Instant::now();
     let items = build_initial_context(&session, &turn).await;
     let text = developer_input_texts(&items).join("\n");
-    eprintln!(
-        "audit21_captured_context elapsed_us={}",
-        started.elapsed().as_micros()
+    tracing::info!(
+        elapsed_us = %started.elapsed().as_micros(),
+        "audit21_captured_context"
     );
     assert!(text.contains("captured turn policy sentinel"), "{text}");
     assert!(!text.contains("future turn policy sentinel"), "{text}");

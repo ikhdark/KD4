@@ -130,6 +130,21 @@ def test_command_exec_environment_preserves_typed_map_contract() -> None:
     assert generated_v2.CommandExecParams(command=["echo"], env=None).env is None
 
 
+def test_context_estimate_round_trips_without_overwriting_provider_totals() -> None:
+    observed = {
+        "inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20,
+        "reasoningOutputTokens": 5, "totalTokens": 120,
+    }
+    wire = {"total": observed, "last": observed, "estimatedContextTokens": 500}
+    usage = generated_v2.ThreadTokenUsage.model_validate(wire)
+    assert usage.estimated_context_tokens == 500
+    assert usage.total.total_tokens == 120
+    assert usage.last.total_tokens == 120
+    assert usage.model_dump(by_alias=True, exclude_none=True) == wire
+    legacy = generated_v2.ThreadTokenUsage.model_validate({"total": observed, "last": observed})
+    assert legacy.estimated_context_tokens is None
+
+
 @pytest.mark.parametrize(
     ("model", "base", "field", "good", "bad"),
     [

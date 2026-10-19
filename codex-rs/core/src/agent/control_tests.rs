@@ -4329,6 +4329,62 @@ async fn completion_watcher_seals_missing_typed_receipt_and_retires_metrics() {
 }
 
 #[tokio::test]
+async fn failed_v2_parent_delivery_is_durably_recoverable_and_idempotent() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (child_id, child) = harness.start_thread().await;
+    // Terminal delivery uses the child's coordinator, not the harness's
+    // separately constructed root control.
+    let coordinator = child.codex.session.services.agent_control.task_coordinator();
+    if coordinator.store().is_none() {
+        coordinator.initialize(harness.state_db.clone().unwrap(), child_id.to_string()).await.unwrap();
+    }
+    let repository = TempDir::new().unwrap();
+    let (assignment, attempt) = coordinator.create_assignment(repository.path(), AssignmentDraft {
+        root_session_id: coordinator.root_session_id().unwrap(),
+        admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+        role: AgentRole::Worker, capability_profile: CapabilityProfile::ScopedSourceWrite,
+        objective: "retain terminal delivery evidence".into(),
+        acceptance_criteria: vec![AcceptanceCriterion { id: "done".into(), text: "retain outcome".into() }],
+        read_scope: Vec::new(), write_scope: Vec::new(), stop_condition: "report".into(),
+        dependencies: Vec::new(), risk_hints: Vec::new(), required_evidence: Vec::new(),
+        prohibited_changes: Vec::new(), contract_claims: Vec::new(),
+        workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
+        relation: None, architecture_contract_ref: None,
+    }).await.unwrap();
+    let path = AgentPath::root().join("delivery_worker").unwrap();
+    let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
+        assignment_id: assignment.assignment_id, attempt_id: attempt.attempt_id,
+        agent_path: path.to_string(), task_name: "delivery_worker".into(), thread_id: Some(child_id.to_string()),
+    }).await.unwrap();
+    let mut turn = child.codex.session.new_default_turn().await;
+    let turn_mut = Arc::get_mut(&mut turn).unwrap();
+    turn_mut.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(), depth: 1, agent_path: Some(path),
+        agent_nickname: None, agent_role: Some("worker".into()),
+    });
+    turn_mut.agent_task_binding = Arc::new(std::sync::OnceLock::from(Some(binding)));
+    let event = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: turn.sub_id.clone(), last_agent_message: Some("finished once".into()),
+        surfaced_result: None, error: None, completed_at: None, duration_ms: None,
+        time_to_first_token_ms: None, timing: None,
+    });
+    for _ in 0..2 {
+        assert!(!child.codex.session.maybe_notify_parent_of_terminal_turn(&turn, &event).await);
+    }
+    let task = coordinator.get_agent_task(assignment.assignment_id, None).await.unwrap();
+    assert!(task.receipt.is_some(), "the original typed result remains available");
+    assert_eq!(task.observations.iter().filter(|observation| {
+        observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
+            && observation.summary.contains("to recover the retained outcome")
+    }).count(), 1);
+    let status = crate::agent::agent_status_from_task(&task, None).unwrap();
+    assert!(serde_json::to_string(&status).unwrap().contains("to recover the retained outcome"));
+    assert!(child.codex.session.active_turn.lock().await.is_none(), "delivery recovery must not resample");
+}
+
+#[tokio::test]
 async fn completion_watcher_notifies_parent_when_child_is_missing() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -7190,6 +7246,13 @@ fn spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints() {
     run_current_thread_test_with_stack(
         "spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints",
         || async {
+            let _tracing = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_test_writer()
+                    .finish(),
+            );
             for identifiable_boundary in [true, false] {
                 let harness = AgentControlHarness::new().await;
                 let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -7258,7 +7321,7 @@ fn spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints() {
                         },
                     )
                     .await;
-                eprintln!("last_n_checkpoint_spawn_elapsed={:?}", started.elapsed());
+                tracing::info!(elapsed = ?started.elapsed(), "last_n_checkpoint_spawn");
                 if identifiable_boundary {
                     let child_thread_id = result.expect("bounded checkpoint fork").thread_id;
                     let child = harness

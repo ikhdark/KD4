@@ -14,6 +14,7 @@ from unittest import mock
 from scripts.build import rust_build_status
 from scripts.build import rust_test_runner as runner_module
 from scripts.build.test_rust_test_runner import FakeExecutor, MANIFEST_DATA, RunnerTestCase
+from scripts.build.test_rust_test_runner import nextest_run_payload
 
 
 class ValidationSchedulingTest(RunnerTestCase):
@@ -113,26 +114,35 @@ class ValidationSchedulingTest(RunnerTestCase):
                 self.assertEqual(receipts.required, receipts.executed)
 
     def test_success_exit_without_completion_receipts_is_not_proof(self):
-        for output in ("", "Summary: 1 passed", "PASS [0.01s] wrong-binary alpha",
-                       "SKIP [0.01s] codex-core alpha"):
+        for output, outcome in (
+            ("", "evidence_incomplete"),
+            ("Summary: 1 passed", "evidence_incomplete"),
+            (nextest_run_payload([("alpha", "ok")], package="wrong-binary"), "not_executed"),
+            (nextest_run_payload([("alpha", "ignored")]), "not_executed"),
+        ):
             with self.subTest(output=output):
                 runner, _ = self.pure_runner(output=output)
                 with self.assertRaises(runner_module.RunnerError) as error:
                     runner.run_target("core_lib", ["-E", "all()"])
-                self.assertEqual(error.exception.outcome, "not_executed")
+                self.assertEqual(error.exception.outcome, outcome)
                 self.assertEqual(error.exception.completed_tests, {})
                 runner.executor.assert_called_once()
 
     def test_success_exit_with_conflicting_results_preserves_only_independent_proof(self):
-        for statuses in (("PASS", "PASS"), ("PASS", "FAIL"), ("FAIL",), ("TIMEOUT",)):
+        for statuses, outcome in (
+            (("ok", "ok"), "evidence_incomplete"),
+            (("ok", "failed"), "evidence_incomplete"),
+            (("failed",), "not_executed"),
+            (("unknown-terminal",), "evidence_incomplete"),
+        ):
             with self.subTest(statuses=statuses):
-                output = "PASS [0.01s] codex-core good\n" + "".join(
-                    f"{status} [0.01s] codex-core bad\n" for status in statuses
+                output = nextest_run_payload(
+                    [("good", "ok"), *(("bad", status) for status in statuses)]
                 )
                 runner, _ = self.pure_runner(output=output)
                 with self.assertRaises(runner_module.RunnerError) as error:
                     runner.run_target("core_lib", ["-E", "all()"])
-                self.assertEqual(error.exception.outcome, "not_executed")
+                self.assertEqual(error.exception.outcome, outcome)
                 self.assertEqual(error.exception.completed_tests, {"codex-core": ["good"]})
                 runner.executor.assert_called_once()
 
@@ -181,14 +191,15 @@ class ValidationSchedulingTest(RunnerTestCase):
         self.assertIn("scripts.build.test_rust_test_runner", targets)
 
     def test_known_selection_failure_does_not_rescan_count(self):
-        runner, _ = self.pure_runner(output="FAIL [0.01s] codex-core alpha", returncode=100)
+        output = nextest_run_payload([("alpha", "failed")])
+        runner, _ = self.pure_runner(output=output, returncode=100)
         with (
             mock.patch.object(runner_module, "_nextest_selected_count") as count,
             self.assertRaises(runner_module.RunnerError),
         ):
             runner.run_target("core_lib", ["-E", "test(=alpha)"])
         count.assert_not_called()
-        runner, _ = self.pure_runner(output="FAIL [0.01s] codex-core alpha", returncode=100)
+        runner, _ = self.pure_runner(output=output, returncode=100)
         with (
             mock.patch.object(runner_module, "_nextest_selected_count", return_value=1) as count,
             self.assertRaises(runner_module.RunnerError),

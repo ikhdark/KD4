@@ -39,6 +39,61 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
 }
 
 #[test]
+fn v1_structured_input_schemas_require_decodable_variant_payloads() {
+    use codex_protocol::user_input::UserInput;
+
+    for tool in [
+        create_spawn_agent_tool_v1(SpawnAgentToolOptions::default()),
+        create_send_input_tool_v1(),
+    ] {
+        let ToolSpec::Namespace(namespace) = tool else { panic!("V1 namespace"); };
+        let ResponsesApiNamespaceTool::Function(function) = &namespace.tools[0];
+        let schema = serde_json::to_value(&function.parameters).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for mut arguments in [
+            json!({}), json!({"items":[]}),
+            json!({"message":"task","items":[{"type":"text","text":"task"}]}),
+        ] {
+            if function.name == "send_input" { arguments["target"] = json!("agent"); }
+            let message = arguments.get("message").map(|value| value.as_str().unwrap().to_string());
+            let items = arguments.get("items").map(|value| serde_json::from_value::<Vec<UserInput>>(value.clone()).unwrap());
+            assert!(super::super::multi_agents_common::parse_collab_input(message, items).is_err());
+            assert!(!validator.is_valid(&arguments), "schema admits invalid input choice {arguments}");
+        }
+        let mut message = json!({"message":"task"});
+        if function.name == "send_input" { message["target"] = json!("agent"); }
+        assert!(validator.is_valid(&message));
+        for item in [
+            json!({"type":"text","text":"task"}),
+            json!({"type":"image","image_url":"data:image/png;base64,AA=="}),
+            json!({"type":"local_image","path":"image.png"}),
+            json!({"type":"skill","name":"review","path":"SKILL.md"}),
+            json!({"type":"mention","name":"app","path":"app://connector"}),
+            // Previously accepted extra advertised fields remain accepted.
+            json!({"type":"text","text":"task","name":"label"}),
+        ] {
+            let mut arguments = json!({"items":[item]});
+            if function.name == "send_input" { arguments["target"] = json!("agent"); }
+            assert!(validator.is_valid(&arguments), "{arguments}");
+            let items: Vec<UserInput> = serde_json::from_value(arguments["items"].clone()).unwrap();
+            assert!(super::super::multi_agents_common::parse_collab_input(None, Some(items)).is_ok());
+        }
+        for item in [
+            json!({}), json!({"text":"missing tag"}), json!({"type":"unknown"}),
+            json!({"type":"text"}), json!({"type":"text","text":42}),
+            json!({"type":"image"}), json!({"type":"local_image"}),
+            json!({"type":"skill","path":"SKILL.md"}),
+            json!({"type":"mention","name":"app"}),
+        ] {
+            assert!(serde_json::from_value::<UserInput>(item.clone()).is_err());
+            let mut arguments = json!({"items":[item]});
+            if function.name == "send_input" { arguments["target"] = json!("agent"); }
+            assert!(!validator.is_valid(&arguments), "schema admits undecodable {arguments}");
+        }
+    }
+}
+
+#[test]
 fn spawn_agent_descriptions_require_report_reconciliation() {
     // V1's custom hint replaces its default guidance; V2 retains its base contract.
     let descriptions = [

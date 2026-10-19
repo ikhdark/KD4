@@ -33,7 +33,31 @@ def check_duplicate_deps(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    return check_duplicate_deps(list(argv if argv is not None else sys.argv[1:]))
+    args = list(argv if argv is not None else sys.argv[1:])
+    if args[:1] == ["--policy"]:
+        return check_dependency_policy(args[1:])
+    return check_duplicate_deps(args)
+
+
+def check_dependency_policy(extra_args: Sequence[str], *, runner: Runner = subprocess.run) -> int:
+    """Report every independent policy result without weakening duplicate policy."""
+    commands = [
+        ["just", "deps-advisories-check"],
+        ["just", "deps-duplicates-check", "--locked", *extra_args],
+        ["just", "deps-v8-boundary-check", "--locked", *extra_args],
+        ["cargo", "deny", "check", "bans", "sources", "licenses"],
+    ]
+    failed = False
+    for command in commands:
+        try:
+            result = runner(command, check=False)
+            code = result.returncode
+        except OSError as error:
+            print(f"{' '.join(command)}: {error}", file=sys.stderr)
+            code = 2
+        print(f"dependency policy: {' '.join(command)}: exit {code}", file=sys.stderr)
+        failed |= code != 0
+    return int(failed)
 
 
 if __name__ == "__main__":

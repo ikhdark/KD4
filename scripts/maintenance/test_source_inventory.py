@@ -1123,6 +1123,25 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertLess(len(json.dumps(bounded)), 1000)
         self.assertEqual(bounded["fields"]["many"]["omitted"], 4997)
 
+    def test_json_shape_reads_only_the_displayed_object_prefix(self):
+        class CountedDict(dict):
+            inspected = 0
+
+            def items(self):
+                for pair in super().items():
+                    self.inspected += 1
+                    yield pair
+
+        for width in (32, 100_000):
+            value = CountedDict((str(index), index) for index in range(width))
+            shape = inventory.json_shape(value)
+            self.assertEqual(shape, {
+                "type": "object", "length": width,
+                "fields": {str(index): {"type": "number"} for index in range(32)},
+                "omitted": width - 32,
+            })
+            self.assertEqual(value.inspected, 32)
+
     def test_public_contract_example_returns_successful_json_evidence_and_delivery(self):
         with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("must not scan")),
               mock.patch.object(Path, "read_text", side_effect=AssertionError("must not read state")),

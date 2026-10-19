@@ -120,6 +120,8 @@ pub(crate) struct TurnTerminalCoordinator {
     panic_before_worker_cancellation: AtomicBool,
     #[cfg(test)]
     panic_after_terminal_publication: AtomicBool,
+    #[cfg(test)]
+    publication_pause: std::sync::Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -252,6 +254,8 @@ impl TurnTerminalCoordinator {
             panic_before_worker_cancellation: AtomicBool::new(false),
             #[cfg(test)]
             panic_after_terminal_publication: AtomicBool::new(false),
+            #[cfg(test)]
+            publication_pause: std::sync::Mutex::new(None),
         })
     }
 
@@ -466,6 +470,23 @@ impl TurnTerminalCoordinator {
     pub(crate) fn request_panic_after_terminal_publication(&self) {
         self.panic_after_terminal_publication
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_publication_for_test(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (entered, wait_entered) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        *self.publication_pause.lock().unwrap() = Some((entered, wait_release));
+        (wait_entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_publication_pause_for_test(&self) {
+        let pause = self.publication_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     #[cfg(test)]

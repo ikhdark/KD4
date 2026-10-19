@@ -209,12 +209,23 @@ impl Drop for McpCallLease {
 pub struct McpHandler {
     tool_info: ToolInfo,
     spec: Arc<codex_tools::LoadableToolSpec>,
+    input_validator: jsonschema::Validator,
 }
 
 impl McpHandler {
     pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
         let spec = Arc::new(create_tool_spec(&tool_info)?);
-        Ok(Self { tool_info, spec })
+        let mut schema = Value::Object(tool_info.tool.input_schema.as_ref().clone());
+        // Match the existing MCP compatibility rule for omitted/null properties.
+        if schema.get("properties").is_some_and(Value::is_null) {
+            schema["properties"] = serde_json::json!({});
+        }
+        let input_validator = jsonschema::validator_for(&schema).map_err(|error| {
+            <serde_json::Error as serde::de::Error>::custom(format!(
+                "invalid MCP tool input schema: {error}"
+            ))
+        })?;
+        Ok(Self { tool_info, spec, input_validator })
     }
 
     fn hook_tool_name(&self) -> HookToolName {
@@ -367,12 +378,28 @@ impl McpHandler {
             }
         };
 
+        // This is after hook rewrites and before reserving/dispatching remote work.
+        // The advertised schema may be simplified; never validate against it alone.
+        let tool_input_value = serde_json::from_str::<Value>(&payload).map_err(|error| {
+            FunctionCallError::RespondToModel(format!("invalid MCP arguments: {error}"))
+        })?;
+        if !tool_input_value.is_object() {
+            return Err(FunctionCallError::RespondToModel(
+                "MCP arguments must be a JSON object".into(),
+            ));
+        }
+        let errors = self.input_validator.iter_errors(&tool_input_value)
+            .take(4).map(|error| error.to_string()).collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "tool `{}` arguments violate its full input schema: {}",
+                self.tool_name(), errors.join("; ")
+            )));
+        }
         let started = Instant::now();
         let jobs = session_deferred_jobs(&session);
         let logical_call_id = format!("{}/{call_id}", turn.sub_id);
         let job_key = McpDeferredJobs::job_key(&self.tool_info, &payload, &logical_call_id);
-        let tool_input_value =
-            serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| Value::Object(Map::new()));
         // TODO(sayan): Use StepContext for MCP file arguments when MCP follows dynamic environments.
         let call = {
             let session = Arc::clone(&session);
@@ -753,7 +780,12 @@ mod tests {
         let (session, turn) = make_session_and_context().await;
         let session = Arc::new(session);
         let turn = Arc::new(turn);
-        let info = tool_info("sample", "sample_tools", "task");
+        let mut info = tool_info("sample", "sample_tools", "task");
+        info.tool.input_schema = Arc::new(rmcp::model::object(json!({
+            "type":"object", "properties":{"task":{"type":"string"}},
+            "if":{"required":["task"]}, "then":{"properties":{"task":{"const":"slow"}}},
+            "dependentSchemas":{"task":{"not":{"required":["forbidden"]}}}
+        })));
         let handler = McpHandler::new(info.clone()).unwrap();
         let arguments = r#"{"task":"slow"}"#.to_string();
         let jobs = session_deferred_jobs(&session);
@@ -1165,6 +1197,38 @@ mod tests {
                 .external_mutation_intent(),
             ExternalMutationIntent::MayMutate
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_full_schema_rejects_invalid_arguments_before_remote_dispatch() {
+        let (session, turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let mut info = tool_info("sample", "sample_tools", "conditional");
+        info.tool.input_schema = Arc::new(rmcp::model::object(json!({
+            "type":"object", "properties":{"mode":{"type":"string"}, "text":{"type":"string"}},
+            "if":{"properties":{"mode":{"const":"edit"}}, "required":["mode"]},
+            "then":{"required":["text"]},
+            "dependentSchemas":{"text":{"required":["mode"]}},
+            "not":{"required":["forbidden"]}
+        })));
+        let handler = McpHandler::new(info).expect("conditional schema registers");
+        for arguments in [json!({"mode":"edit"}), json!({"text":"orphan"}), json!({"forbidden":true})] {
+            let result = handler.handle_call(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "invalid-conditional".into(),
+                tool_name: handler.tool_name(),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function { arguments: arguments.to_string() },
+            }).await;
+            let Err(FunctionCallError::RespondToModel(error)) = result else {
+                panic!("invalid full-schema arguments must not reach the remote tool");
+            };
+            assert!(error.contains("arguments violate its full input schema"), "{error}");
+        }
     }
 
     fn tool_info(server_name: &str, callable_namespace: &str, tool_name: &str) -> ToolInfo {

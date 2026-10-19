@@ -1,6 +1,7 @@
 // based on item types from codex-rs/exec/src/exec_events.rs
 
 import type { ContentBlock as McpContentBlock } from "@modelcontextprotocol/sdk/types.js";
+import type { SurfacedToolResult } from "./events";
 
 /** The status of a command execution. */
 export type CommandExecutionStatus = "in_progress" | "completed" | "failed" | "declined";
@@ -114,6 +115,8 @@ export type CollabAgentStatus =
 export type CollabAgentState = {
   status: CollabAgentStatus;
   message: string | null;
+  surfaced_result?: SurfacedToolResult;
+  last_agent_message?: string;
 };
 
 /** A call to a collaboration tool. */

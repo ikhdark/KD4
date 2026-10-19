@@ -448,6 +448,8 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let initial_request = initial_mock.single_request();
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     let resumed_mock = mount_sse_once(
         &server,
@@ -574,6 +576,8 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let initial_request = initial_mock.single_request();
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     let resumed_mock = mount_sse_once(
         &server,

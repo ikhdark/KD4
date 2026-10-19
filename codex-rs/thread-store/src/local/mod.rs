@@ -119,6 +119,22 @@ impl std::fmt::Debug for LocalThreadStore {
 }
 
 impl LocalThreadStore {
+    pub(super) async fn acquire_writer_lease(&self, id: ThreadId, allow_live: bool) -> ThreadStoreResult<Arc<std::fs::File>> {
+        if allow_live
+            && let Ok(recorder) = self.live_recorder(id).await
+            && let Some(lease) = recorder.writer_lease()
+        {
+            return Ok(lease);
+        }
+        codex_rollout::acquire_thread_writer(&self.config.codex_home, id).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                ThreadStoreError::Conflict { message: format!("thread {id} has another live writer or maintenance owner") }
+            } else {
+                ThreadStoreError::Internal { message: format!("thread {id} ownership: {error}") }
+            }
+        })
+    }
+
     /// Create a local store using an already initialized state DB handle.
     pub fn new(config: LocalThreadStoreConfig, state_db: Option<StateDbHandle>) -> Self {
         Self {
@@ -133,7 +149,13 @@ impl LocalThreadStore {
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         if let Err(err) = self.deletion_recovery.get_or_try_init(|| async {
-            delete_thread::recover_staged_deletes(self).await
+            if delete_thread::recover_staged_deletes(self).await? {
+                Ok(())
+            } else {
+                Err(ThreadStoreError::Conflict {
+                    message: "rollout maintenance is busy; deletion recovery deferred".to_string(),
+                })
+            }
         }).await {
             tracing::warn!(%err, "staged deletion recovery incomplete; unresolved files retained for retry");
         }
@@ -2305,6 +2327,30 @@ mod tests {
             initial_window_id: uuid::Uuid::now_v7().to_string(),
             metadata: thread_metadata(),
         }
+    }
+
+    #[tokio::test]
+    async fn independent_stores_exclude_live_writer_before_create_resume_or_delete() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let first = LocalThreadStore::new(config.clone(), None);
+        let second = LocalThreadStore::new(config, None);
+        let id = ThreadId::default();
+        first.create_thread(create_thread_params(id)).await.unwrap();
+        assert!(matches!(second.create_thread(create_thread_params(id)).await, Err(ThreadStoreError::Conflict { .. })));
+        first.persist_thread(id).await.unwrap();
+        let path = first.live_rollout_path(id).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+        assert!(matches!(second.resume_thread(ResumeThreadParams {
+            thread_id: id, rollout_path: None, history: None, include_archived: true, metadata: thread_metadata(),
+        }).await, Err(ThreadStoreError::Conflict { .. })));
+        assert!(second.delete_thread(crate::DeleteThreadParams { thread_id: id }).await.is_err());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        first.shutdown_thread(id).await.unwrap();
+        second.resume_thread(ResumeThreadParams {
+            thread_id: id, rollout_path: None, history: None, include_archived: true, metadata: thread_metadata(),
+        }).await.unwrap();
+        second.shutdown_thread(id).await.unwrap();
     }
 
     fn assert_paginated_threads_unsupported(err: ThreadStoreError) {

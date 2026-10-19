@@ -627,7 +627,9 @@ class ScriptReportRegressions(unittest.TestCase):
                     )
 
     def test_nextest_progress_counter_and_binary_identity(self):
-        from scripts.build.test_rust_test_runner import MANIFEST_DATA, METADATA_PACKAGES
+        from scripts.build.test_rust_test_runner import (
+            MANIFEST_DATA, METADATA_PACKAGES, nextest_run_payload,
+        )
         from scripts.build.rust_test_runner import (
             Manifest,
             RustTestRunner,
@@ -650,7 +652,9 @@ class ScriptReportRegressions(unittest.TestCase):
             )
             for binary in ("codex-core", "wrong-package"):
                 result = subprocess.CompletedProcess(
-                    [], 0, f"PASS [ 0.1s] (1/1) {binary} proof\n", ""
+                    [], 0,
+                    nextest_run_payload([("proof", "ok")], package=binary),
+                    "PASS [ 0.1s] (1/1) codex-core proof\n",
                 )
                 with mock.patch.object(runner, "_checked", return_value=result):
                     if binary == "codex-core":

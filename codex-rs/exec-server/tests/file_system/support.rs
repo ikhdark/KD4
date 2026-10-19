@@ -23,6 +23,7 @@ use crate::common::exec_server::test_codex_helper_paths;
 pub(crate) struct FileSystemContext {
     pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
     _helper_paths: Option<TestCodexHelperPaths>,
+    _codex_home: Option<tempfile::TempDir>,
     _server: Option<ExecServerHarness>,
 }
 
@@ -48,9 +49,14 @@ pub(crate) async fn create_file_system_context(
         FileSystemImplementation::Local => {
             let helper_paths = test_codex_helper_paths()?;
             let runtime_paths = ExecServerRuntimePaths::new(helper_paths.codex_exe.clone())?;
+            let codex_home = tempfile::TempDir::new()?;
+            let env = std::collections::HashMap::from([(
+                "CODEX_HOME".to_string(), codex_home.path().display().to_string(),
+            )]);
             Ok(FileSystemContext {
-                file_system: Arc::new(LocalFileSystem::with_runtime_paths(runtime_paths)),
+                file_system: Arc::new(LocalFileSystem::with_runtime_paths_and_env(runtime_paths, env)),
                 _helper_paths: Some(helper_paths),
+                _codex_home: Some(codex_home),
                 _server: None,
             })
         }
@@ -61,6 +67,7 @@ pub(crate) async fn create_file_system_context(
             Ok(FileSystemContext {
                 file_system: environment.get_filesystem(),
                 _helper_paths: None,
+                _codex_home: None,
                 _server: Some(server),
             })
         }

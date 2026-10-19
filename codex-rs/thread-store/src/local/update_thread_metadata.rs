@@ -95,6 +95,7 @@ pub(super) async fn update_thread_metadata(
     }
 
     let needs_rollout_compat = needs_rollout_compatibility_update(&patch);
+    let _lease = store.acquire_writer_lease(thread_id, true).await?;
     if needs_rollout_compat {
         // These explicit patches still write legacy rollout/name-index state after the
         // SQLite update. Paginated threads must fail before either side is mutated.

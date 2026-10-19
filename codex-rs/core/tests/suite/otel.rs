@@ -627,6 +627,7 @@ async fn process_sse_emits_completed_telemetry() {
         sse(vec![
             ev_reasoning_item_added("reasoning-1", &[]),
             core_test_support::responses::ev_reasoning_summary_text_delta("Thinking"),
+            ev_reasoning_item("reasoning-1", &["Thinking"], &[]),
             serde_json::json!({
                 "type": "response.completed",
                 "response": {
@@ -896,14 +897,14 @@ async fn record_responses_sets_span_fields_for_response_events() {
                 "arguments": "{\"value\":1}"
             }
         }),
-        ev_message_item_added("msg-added", "hi there"),
-        ev_reasoning_item_added("reasoning-1", &["summary"]),
+        ev_function_call("call-1", "fn", "{\"key\":\"value\"}"),
+        ev_message_item_added("msg-1", ""),
         ev_output_text_delta("delta"),
+        ev_assistant_message("msg-1", "delta"),
+        ev_reasoning_item_added("reasoning-1", &["summary"]),
         ev_reasoning_summary_text_delta("summary-delta"),
         ev_reasoning_text_delta("raw-delta"),
-        ev_function_call("call-1", "fn", "{\"key\":\"value\"}"),
-        ev_assistant_message("msg-1", "agent"),
-        ev_reasoning_item("reasoning-1", &["summary"], &[]),
+        ev_reasoning_item("reasoning-1", &["summary", "summary-delta"], &["raw-delta"]),
         ev_completed("resp-1"),
     ]);
 

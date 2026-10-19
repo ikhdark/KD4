@@ -2784,6 +2784,7 @@ async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()>
         .set_agent_gate(
             TaskActor::Root,
             assignment.assignment_id,
+            original.attempt_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
             "correct the attempt".into(),

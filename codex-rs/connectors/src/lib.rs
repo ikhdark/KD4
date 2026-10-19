@@ -621,14 +621,14 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
-    static CONNECTOR_DIRECTORY_CACHE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    // Data-free admission gate: tests retain one permit through async cache work.
+    static CONNECTOR_DIRECTORY_CACHE_TEST_LOCK: LazyLock<tokio::sync::Semaphore> =
+        LazyLock::new(|| tokio::sync::Semaphore::new(1));
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn workspace_pagination_is_complete_and_reused_without_granting_access()
     -> anyhow::Result<()> {
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "workspace-pages", true);
         let mut paths = Vec::new();
@@ -685,9 +685,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn complete_workspace_and_public_pagination_overlap() -> anyhow::Result<()> {
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "overlap-all-pages", true);
         let start = tokio::time::Instant::now();
@@ -737,10 +736,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn workspace_pagination_failure_preserves_complete_memory_and_disk_cache()
     -> anyhow::Result<()> {
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "workspace-pages-failure", true);
         let previous = vec![directory_app_to_app_info(app("previous", "Previous"))];
@@ -783,7 +781,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout cancellation and refresh")]
     async fn cancelled_directory_pagination_drops_both_fetches_and_releases_refresh()
     -> anyhow::Result<()> {
         struct ActiveFetch(Arc<AtomicUsize>);
@@ -793,7 +790,7 @@ mod tests {
             }
         }
 
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "cancel-both-directories", true);
         let previous = vec![directory_app_to_app_info(app("previous", "Previous"))];
@@ -838,7 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn alternating_scopes_keep_independent_fresh_snapshots_with_bounded_storage() {
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         clear_directory_memory_cache();
         for id in ["account-a", "account-b"] {
             write_cached_directory_connectors_in_memory(
@@ -894,12 +891,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes tests that mutate the shared connector directory cache"
-    )]
     async fn directory_scope_comes_from_the_cache_key() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         clear_directory_memory_cache();
         let home = TempDir::new()?;
         for (index, workspace) in [false, true, false].into_iter().enumerate() {
@@ -947,12 +940,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes tests that mutate the shared connector directory cache"
-    )]
     async fn pagination_cycles_fail_without_publishing_partial_results() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "cycle", false);
         let previous = vec![directory_app_to_app_info(app("complete", "Complete"))];
@@ -1009,12 +998,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes tests that mutate the shared connector directory cache"
-    )]
     async fn concurrent_directory_misses_share_one_refresh() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         clear_directory_memory_cache();
         let home = TempDir::new()?;
         let context = cache_context(&home, "concurrent", false);
@@ -1135,17 +1120,13 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes tests that mutate the shared connector directory cache"
-    )]
     fn directory_cache_publication_yields_and_persists_fetched_connectors() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
             .build()?;
         runtime.block_on(async {
-            let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+            let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
             clear_directory_memory_cache();
             let codex_home = TempDir::new()?;
             let context = cache_context(&codex_home, "publication-worker", false);
@@ -1190,12 +1171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn list_all_connectors_uses_shared_directory_cache() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let call_counter = Arc::clone(&calls);
@@ -1235,12 +1212,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn list_all_connectors_merges_and_normalizes_directory_apps() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "merged", true);
@@ -1320,7 +1293,7 @@ mod tests {
 
     #[tokio::test]
     async fn directory_ids_are_canonicalized_before_merging_and_caching() -> anyhow::Result<()> {
-        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
         let home = TempDir::new()?;
         let context = cache_context(&home, "canonical-directory-ids", false);
         let connectors = list_all_connectors_with_options(context.clone(), true, |_| async {
@@ -1358,12 +1331,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn list_all_connectors_overlaps_workspace_and_directory_requests() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "overlap", true);
@@ -1414,13 +1383,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn list_all_connectors_retries_workspace_page_after_transient_failure()
     -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "workspace-retry", true);
@@ -1476,12 +1441,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn failed_workspace_refresh_preserves_complete_cached_listing() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "workspace-refresh-failure", true);
@@ -1539,13 +1500,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
     async fn list_all_connectors_refreshes_when_only_directory_disk_cache_exists()
     -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "disk-refresh", false);
@@ -1603,7 +1560,7 @@ mod tests {
     #[tokio::test]
     async fn cached_directory_connectors_rejects_stale_disk_schema_without_deleting()
     -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.acquire().await.unwrap();
 
         clear_directory_memory_cache();
         let codex_home = TempDir::new()?;

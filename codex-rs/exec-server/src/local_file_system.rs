@@ -72,6 +72,17 @@ impl LocalFileSystem {
         }
     }
 
+    /// Override the helper's inherited environment without changing process-global state.
+    pub fn with_runtime_paths_and_env(
+        runtime_paths: ExecServerRuntimePaths,
+        env: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            unsandboxed: UnsandboxedFileSystem::default(),
+            sandboxed: Some(SandboxedFileSystem::new(runtime_paths).with_env(env)),
+        }
+    }
+
     fn sandboxed(&self) -> io::Result<&SandboxedFileSystem> {
         self.sandboxed.as_ref().ok_or_else(|| {
             io::Error::new(

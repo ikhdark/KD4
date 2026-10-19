@@ -2388,6 +2388,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TokenCount(TokenCountEvent {
                 info: Some(TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: TokenUsage {
                         input_tokens: 180,
                         cached_input_tokens: 40,
@@ -4444,8 +4445,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
         token_budget: None,
         instructions_template: Some(format!(
-            "{{{{ personality }}}}\n\n{}",
-            CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT
+            "{{{{ personality }}}}\n\n{CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT}"
         )),
         instructions_variables: Some(codex_protocol::openai_models::ModelInstructionsVariables {
             personality_default: Some(String::new()),
@@ -4497,6 +4497,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     )
     .await??;
 
+    // Resume hands logical writer ownership to the next process.
+    primary.shutdown().await?;
     let mut secondary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build()

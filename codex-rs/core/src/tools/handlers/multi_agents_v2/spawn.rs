@@ -852,14 +852,13 @@ fn emit_admission_overlap_metrics(
     session_telemetry: &SessionTelemetry,
     overlaps: codex_agent_task_store::AdmissionOverlapSummary,
 ) {
-    for (kind, count) in [("benign_read_read", overlaps.benign_read_overlap_count)] {
-        if count > 0 {
-            session_telemetry.counter(
-                "codex.multi_agent.admission_overlap",
-                i64::from(count),
-                &[("kind", kind), ("outcome", "admitted")],
-            );
-        }
+    let count = overlaps.benign_read_overlap_count;
+    if count > 0 {
+        session_telemetry.counter(
+            "codex.multi_agent.admission_overlap",
+            i64::from(count),
+            &[("kind", "benign_read_read"), ("outcome", "admitted")],
+        );
     }
 }
 

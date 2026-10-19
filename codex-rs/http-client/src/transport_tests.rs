@@ -8,6 +8,56 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 #[tokio::test]
+async fn unary_success_limits_reject_headers_and_chunked_overflow_without_eof() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    for (body, accepted) in [
+        ("Content-Length: 9\r\n\r\n", false),
+        ("Transfer-Encoding: chunked\r\n\r\n9\r\nabcdefghi\r\n", false),
+        ("Content-Length: 8\r\n\r\nabcdefgh", true),
+        ("Transfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n", true),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(format!("HTTP/1.1 200 OK\r\n{body}").as_bytes()).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), held).await;
+        });
+        let transport = ReqwestTransport::new(reqwest::Client::builder().no_proxy().build().unwrap());
+        let mut request = Request::new(Method::GET, format!("http://{address}/"));
+        request.max_response_bytes = Some(8);
+        let result = tokio::time::timeout(Duration::from_secs(2), transport.execute(request)).await;
+        let _ = release.send(());
+        server.await.unwrap();
+        let result = result.expect("receive bound must not wait for carrier EOF");
+        if accepted {
+            assert_eq!(result.unwrap().body, Bytes::from_static(b"abcdefgh"));
+        } else {
+            assert!(matches!(result, Err(TransportError::ResponseTooLarge { limit: 8 })));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_success_collector_stops_polling_at_first_excess_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let polls = AtomicUsize::new(0);
+    let stream = futures::stream::iter((0..100).map(|_| {
+        polls.fetch_add(1, Ordering::SeqCst);
+        Ok(Bytes::from_static(b"abcd"))
+    }));
+    assert!(matches!(collect_success_body(stream, 8).await,
+        Err(TransportError::ResponseTooLarge { limit: 8 })));
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn transport_timing_scopes_are_isolated_and_cancel_safe() {
     let first = capture_transport_timing(async {
         record_response_header_time(Duration::from_secs(2));

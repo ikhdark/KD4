@@ -4492,7 +4492,7 @@ fn turn_start_params_round_trip_environments() {
         params.environments,
         Some(vec![TurnEnvironmentParams {
             environment_id: "local".to_string(),
-            cwd: cwd.clone(),
+            cwd,
         }])
     );
     assert_eq!(

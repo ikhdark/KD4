@@ -1,6 +1,6 @@
 use crate::ToolDefinition;
 use crate::ToolOutputSchema;
-use crate::json_schema::parse_owned_tool_input_schema;
+use crate::json_schema::parse_mcp_input_schema;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -20,7 +20,7 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
         );
     }
 
-    let input_schema = parse_owned_tool_input_schema(serialized_input_schema)?;
+    let input_schema = parse_mcp_input_schema(serialized_input_schema)?;
     Ok(ToolDefinition {
         name: tool.name.to_string(),
         description: tool.description.clone().map(Into::into).unwrap_or_default(),

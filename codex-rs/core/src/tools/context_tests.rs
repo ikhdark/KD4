@@ -2202,7 +2202,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: Some(RawOutputArtifact::Stored {
             id: artifact_id,
-            path: artifact_path.clone(),
+            path: artifact_path,
             bytes: raw_output.len() as u64,
             truncated: false,
             handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
@@ -2867,7 +2867,7 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
     output.raw_output_artifact = Some(RawOutputArtifact::Failed {
         id: Some(artifact_id),
         message: format!("failed to flush `{}`", artifact_path.display()),
-        owned_path: Some(artifact_path.clone()),
+        owned_path: Some(artifact_path),
         bytes: 7,
     });
     let failed_result = output.code_mode_result(&ToolPayload::Function {

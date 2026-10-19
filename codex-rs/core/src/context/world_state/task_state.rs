@@ -52,6 +52,17 @@ impl TaskState {
         }
         self
     }
+
+    pub(crate) fn with_accepted_input_refs(
+        mut self,
+        references: Vec<crate::plan_store::PlanInputReference>,
+    ) -> Self {
+        if self.0["has_plan"] == true && !references.is_empty() {
+            std::sync::Arc::make_mut(&mut self.0)["accepted_input_refs"] =
+                serde_json::json!(references);
+        }
+        self
+    }
 }
 
 impl WorldStateSection for TaskState {

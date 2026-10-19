@@ -26,6 +26,67 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn late_terminal_cannot_steal_successor_replay_or_rollback_membership() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut first = accepted_context(turn_context.to_turn_context_item());
+    first.turn_id = Some("a".into());
+    first.model = "model-a".into();
+    let mut second = first.clone();
+    second.turn_id = Some("b".into());
+    second.model = "model-b".into();
+    for aborted in [false, true] {
+        for checkpoint in [false, true] {
+            for rollback in 0..=2 {
+                let mut items = completed_user_turn_rollout(first.clone(), vec![
+                    RolloutItem::ResponseItem(user_message("request-a")),
+                    RolloutItem::WorldState(WorldStateItem::full(json!({"turn": "a"}))),
+                ]);
+                let mut terminal = items.pop().unwrap();
+                if aborted {
+                    terminal = RolloutItem::EventMsg(EventMsg::TurnAborted(
+                        codex_protocol::protocol::TurnAbortedEvent {
+                            turn_id: Some("a".into()), reason: TurnAbortReason::Interrupted,
+                            completed_at: None, duration_ms: None, timing: None,
+                        }));
+                }
+                let mut b = vec![RolloutItem::ResponseItem(user_message("request-b"))];
+                if checkpoint {
+                    b.push(RolloutItem::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(vec![user_message("request-a"), user_message("request-b")]),
+                        window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+                    }));
+                    b.push(RolloutItem::TurnContext(second.clone()));
+                }
+                b.push(RolloutItem::WorldState(WorldStateItem::full(json!({"turn": "b"}))));
+                items.extend(completed_user_turn_rollout(second.clone(), b));
+                items.push(terminal);
+                items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
+                    codex_protocol::protocol::TurnAbortedEvent {
+                        turn_id: Some("unrelated-terminal".into()), reason: TurnAbortReason::Interrupted,
+                        completed_at: None, duration_ms: None, timing: None,
+                    })));
+                if rollback != 0 {
+                    items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: rollback })));
+                }
+                let rebuilt = session.reconstruct_history_from_rollout(&turn_context, &items).await;
+                let expected = match rollback {
+                    0 => vec![user_message("request-a"), user_message("request-b")],
+                    1 => vec![user_message("request-a")],
+                    _ => Vec::new(),
+                };
+                assert_eq!(rebuilt.history, expected);
+                assert_eq!(rebuilt.previous_turn_settings.map(|settings| settings.model),
+                    match rollback { 0 => Some("model-b".into()), 1 => Some("model-a".into()), _ => None });
+                assert_eq!(rebuilt.world_state_baseline.map(|state| serde_json::to_value(state).unwrap()),
+                    match rollback { 0 => Some(json!({"turn":"b"})), 1 => Some(json!({"turn":"a"})), _ => None });
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn continuity_loader_gap_survives_rollback_without_preserving_turn_messages() {
     let (_session, turn_context) = make_session_and_context().await;
     let home = tempfile::tempdir().unwrap();
@@ -578,7 +639,8 @@ fn compaction_preserves_resume_boundary_before_reused_live_handle() {
     // Remote compaction retains the previous handoff; local compaction does not.
     let remote = |items: &[ResponseItem]| crate::compact::build_task_input_checkpoint(items).0;
     let local = |items: &[ResponseItem]| crate::compact::build_local_task_input_checkpoint(items).0;
-    let builders: [&dyn Fn(&[ResponseItem]) -> Vec<ResponseItem>; 2] = [&remote, &local];
+    type CheckpointBuilder = fn(&[ResponseItem]) -> Vec<ResponseItem>;
+    let builders: [CheckpointBuilder; 2] = [remote, local];
     for build in builders {
         let checkpoint = build(&source);
         let boundary = checkpoint
@@ -2637,6 +2699,7 @@ async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
                 physical_attempt_id: "attempt-new".to_string(),
                 turn_id: Some(turn_context.sub_id.clone()),
                 unresolved_context: false,
+                workspace_freshness_notices: vec!["audit-only freshness".into()],
                 timing_checkpoint: None,
             }),
             false,
@@ -2647,6 +2710,7 @@ async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
                 physical_attempt_id: "attempt-new".to_string(),
                 turn_id: Some(turn_context.sub_id.clone()),
                 unresolved_context: true,
+                workspace_freshness_notices: vec!["audit-only freshness".into()],
                 timing_checkpoint: None,
             }),
             true,
@@ -3742,6 +3806,13 @@ fn continuity_unsettled_pages_follow_events_and_typed_delivery_not_payload() {
 
 #[tokio::test]
 async fn mixed_legacy_and_modern_rollback_preserves_legacy_turns_and_modern_steering() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let (session, turn_context) = make_session_and_context().await;
     let first = accepted_context(turn_context.to_turn_context_item());
     let mut second = first.clone();
@@ -3797,7 +3868,7 @@ async fn mixed_legacy_and_modern_rollback_preserves_legacy_turns_and_modern_stee
                 let rebuilt = session
                     .reconstruct_history_from_rollout(&turn_context, &items)
                     .await;
-                eprintln!("mixed_rollback_elapsed={:?}", started.elapsed());
+                tracing::info!(elapsed = ?started.elapsed(), "mixed_rollback");
                 let (expected_history, expected_context, expected_world) = if num_turns == 2 {
                     (vec![user_message("first")], &first, json!({"turn": 1}))
                 } else {

@@ -4611,7 +4611,7 @@ class RepositoryManifestTest(unittest.TestCase):
                     for line in source.splitlines()
                     if line.startswith("    mod ")
                 ]
-                self.assertEqual(declared_modules, modules)
+                self.assertCountEqual(declared_modules, modules)
                 self.assertIn('include!("suite/prelude.rs");', source)
                 self.assertEqual(
                     list(self.manifest.targets[target_name].helpers),

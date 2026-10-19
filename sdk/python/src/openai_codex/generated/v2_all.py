@@ -4836,15 +4836,6 @@ class ToolLifecycleWakeReason(Enum):
     retry = "retry"
 
 
-class TurnCompletionAssessment(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    advisories: list[str]
-    failed_checks: Annotated[list[str], Field(alias="failedChecks")]
-    verification_gaps: Annotated[list[str], Field(alias="verificationGaps")]
-
-
 class TurnDiffUpdatedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4957,8 +4948,24 @@ class TurnTimingDiagnosticTokenAggregate(BaseModel):
         populate_by_name=True,
     )
     cached_input_tokens: Annotated[int, Field(alias="cachedInputTokens", ge=0)]
+    expected_usage_count: Annotated[
+        int | None,
+        Field(
+            alias="expectedUsageCount",
+            description="Expected physical usage reports; absent in legacy aggregates.",
+            ge=0,
+        ),
+    ] = None
     input_tokens: Annotated[int, Field(alias="inputTokens", ge=0)]
     logical_generations: Annotated[int, Field(alias="logicalGenerations", ge=0)]
+    observed_usage_count: Annotated[
+        int | None,
+        Field(
+            alias="observedUsageCount",
+            description="Attributable reports observed. Totals are lower bounds unless equal to expected.",
+            ge=0,
+        ),
+    ] = None
     reasoning_tokens: Annotated[int, Field(alias="reasoningTokens", ge=0)]
     total_tokens: Annotated[int, Field(alias="totalTokens", ge=0)]
     visible_output_tokens: Annotated[int, Field(alias="visibleOutputTokens", ge=0)]
@@ -5022,9 +5029,25 @@ class TurnTimingGenerationPurposeAggregate(BaseModel):
         ),
     ] = 0
     decision_ready_requests: Annotated[int | None, Field(alias="decisionReadyRequests", ge=0)] = 0
+    expected_usage_count: Annotated[
+        int | None,
+        Field(
+            alias="expectedUsageCount",
+            description="Expected physical usage reports; absent in legacy aggregates.",
+            ge=0,
+        ),
+    ] = None
     generations: Annotated[int, Field(ge=0)]
     input_tokens: Annotated[int | None, Field(alias="inputTokens", ge=0)] = 0
     model_stream_wait_ns: Annotated[int, Field(alias="modelStreamWaitNs", ge=0)]
+    observed_usage_count: Annotated[
+        int | None,
+        Field(
+            alias="observedUsageCount",
+            description="Attributable reports observed. Totals are lower bounds unless equal to expected.",
+            ge=0,
+        ),
+    ] = None
     output_tokens: Annotated[int, Field(alias="outputTokens", ge=0)]
     purpose: TurnTimingGenerationPurpose
     reasoning_output_tokens: Annotated[int, Field(alias="reasoningOutputTokens", ge=0)]
@@ -5342,6 +5365,16 @@ class TurnTimingUnions(BaseModel):
     model_stream_wait_union_ns: Annotated[int, Field(alias="modelStreamWaitUnionNs", ge=0)]
     tool_active_union_ms: Annotated[int, Field(alias="toolActiveUnionMs", ge=0)]
     tool_active_union_ns: Annotated[int, Field(alias="toolActiveUnionNs", ge=0)]
+
+
+class TurnValidationUncertainty(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    capture_incomplete: Annotated[bool, Field(alias="captureIncomplete")]
+    failed_checks: Annotated[list[str], Field(alias="failedChecks")]
+    pending_checks: Annotated[list[str], Field(alias="pendingChecks")]
+    version: Annotated[int, Field(ge=0)]
 
 
 class TextUserInput(BaseModel):
@@ -8247,6 +8280,13 @@ class ThreadTokenUsage(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    estimated_context_tokens: Annotated[
+        int | None,
+        Field(
+            alias="estimatedContextTokens",
+            description="Local active-context estimate, not observed provider consumption.",
+        ),
+    ] = None
     last: TokenUsageBreakdown
     model_context_window: Annotated[int | None, Field(alias="modelContextWindow")] = None
     total: TokenUsageBreakdown
@@ -8285,6 +8325,22 @@ class ToolsV2(BaseModel):
         populate_by_name=True,
     )
     web_search: WebSearchToolConfig | None = None
+
+
+class TurnCompletionAssessment(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    advisories: list[str]
+    failed_checks: Annotated[list[str], Field(alias="failedChecks")]
+    validation_uncertainty: Annotated[
+        TurnValidationUncertainty | None,
+        Field(
+            alias="validationUncertainty",
+            description="Bounded unresolved questions for resume. Never passing proof or live handles.",
+        ),
+    ] = None
+    verification_gaps: Annotated[list[str], Field(alias="verificationGaps")]
 
 
 class TurnError(BaseModel):

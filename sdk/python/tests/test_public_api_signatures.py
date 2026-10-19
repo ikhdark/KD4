@@ -6,9 +6,8 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, get_args
 
-import tomllib
-
 import pytest
+import tomllib
 
 import openai_codex
 import openai_codex.types as public_types
@@ -176,6 +175,7 @@ def test_root_exports_turn_result() -> None:
             "final_response",
             "items",
             "usage",
+            "surfaced_result",
         ],
     }
 

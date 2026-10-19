@@ -1433,6 +1433,10 @@ pub struct ThreadTokenUsageUpdatedNotification {
 pub struct ThreadTokenUsage {
     pub total: TokenUsageBreakdown,
     pub last: TokenUsageBreakdown,
+    /// Local active-context estimate, not observed provider consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub estimated_context_tokens: Option<i64>,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
@@ -1443,6 +1447,7 @@ impl From<CoreTokenUsageInfo> for ThreadTokenUsage {
         Self {
             total: value.total_token_usage.into(),
             last: value.last_token_usage.into(),
+            estimated_context_tokens: value.estimated_context_tokens,
             model_context_window: value.model_context_window,
         }
     }
@@ -1453,6 +1458,7 @@ impl From<ThreadTokenUsage> for CoreTokenUsageInfo {
         Self {
             total_token_usage: value.total.into(),
             last_token_usage: value.last.into(),
+            estimated_context_tokens: value.estimated_context_tokens,
             model_context_window: value.model_context_window,
         }
     }
@@ -1505,6 +1511,7 @@ mod token_usage_conversion_tests {
     #[test]
     fn app_server_token_usage_round_trips_through_the_core_contract() {
         let core = CoreTokenUsageInfo {
+            estimated_context_tokens: Some(500),
             total_token_usage: CoreTokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 40,
@@ -1526,6 +1533,7 @@ mod token_usage_conversion_tests {
         assert_eq!(
             app_server,
             ThreadTokenUsage {
+                estimated_context_tokens: Some(500),
                 total: TokenUsageBreakdown {
                     input_tokens: 100,
                     cached_input_tokens: 40,

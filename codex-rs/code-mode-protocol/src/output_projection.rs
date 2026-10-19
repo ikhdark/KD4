@@ -130,6 +130,22 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             projected.remove("canonical_uri");
         }
         project_selector_bindings(object, &mut projected);
+        if object.get("complete") == Some(&Value::Bool(true))
+            && object.get("selection_status").and_then(Value::as_str) == Some("complete")
+        {
+            projected.remove("selection_status");
+        }
+        // Inline-only reads have no recovery handle. Keep failure diagnostics,
+        // partial retention and every live artifact's controls explicit.
+        if tool.name == "read_file"
+            && object.get("artifact_id").is_none_or(Value::is_null)
+            && object.get("retained_bytes").and_then(Value::as_u64) == Some(0)
+            && object.get("retained_artifact_complete") == Some(&Value::Bool(false))
+            && object.get("snapshot_error").is_none_or(Value::is_null)
+        {
+            projected.remove("retained_bytes");
+            projected.remove("retained_artifact_complete");
+        }
         // Keep required retention and search fields even when reconstructible:
         // direct tool responses must still satisfy their advertised schema.
         if let Some(results) = projected.get_mut("results").and_then(Value::as_array_mut) {
@@ -513,6 +529,28 @@ mod tests {
             model_visible_tool_result(&ToolName::plain("other"), &raw),
             None
         );
+    }
+
+    #[test]
+    fn inline_read_omits_only_redundant_retention_and_success_metadata() {
+        let raw = json!({"path":"small.py", "source_sha256":"full-revision",
+            "artifact_id":null, "retained_bytes":0, "retained_artifact_complete":false,
+            "complete":true, "selection_status":"complete", "file_complete":true,
+            "results":[{"status":"ok", "complete":true, "text":"print(1)\n"}]});
+        let projected = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
+        assert_eq!(projected["results"], raw["results"]);
+        assert_eq!(projected["source_sha256"], raw["source_sha256"]);
+        for field in ["selection_status", "retained_bytes", "retained_artifact_complete"] {
+            assert!(projected.get(field).is_none(), "{field}");
+        }
+        assert!(raw.to_string().len() - projected.to_string().len() >= 90);
+        for (field, value) in [("snapshot_error", json!("disk full")), ("artifact_id", json!("retained")), ("retained_bytes", json!(3))] {
+            let mut exceptional = raw.clone();
+            exceptional[field] = value;
+            let projected = model_visible_tool_result(&ToolName::plain("read_file"), &exceptional).unwrap();
+            assert_eq!(projected["retained_bytes"], exceptional["retained_bytes"]);
+            assert_eq!(projected["retained_artifact_complete"], exceptional["retained_artifact_complete"]);
+        }
     }
 
     #[test]

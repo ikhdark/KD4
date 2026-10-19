@@ -252,6 +252,7 @@ unsafe fn path_mask_allows_with_scope(
     }
 }
 
+#[cfg(test)]
 pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
     dacl_has_write_deny_for_sid_with_coverage(p_dacl, psid, false)
 }

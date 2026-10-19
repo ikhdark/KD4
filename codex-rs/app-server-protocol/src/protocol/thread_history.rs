@@ -4869,6 +4869,7 @@ mod tests {
                 failed_checks: vec!["validation failed; limitation reported".into()],
                 verification_gaps: vec!["final workspace not verified".into()],
                 advisories: Vec::new(),
+                ..Default::default()
             }),
             schema_version: 7,
             profile_valid: true,

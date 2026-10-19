@@ -85,7 +85,7 @@ class _NotificationQueue:
         deadline = now + (self.timeout_s if timeout is None else timeout)
         with self._condition:
             while True:
-                if self._failure is not None:
+                if self._failure is not None and not self._items:
                     raise self._failure
                 now = time.monotonic()
                 if self.deadline is not None and now >= self.deadline:
@@ -103,12 +103,11 @@ class _NotificationQueue:
                     remaining = min(remaining, self.deadline - now)
                 self._condition.wait(remaining)
 
-    def fail(self, exc: BaseException) -> None:
+    def fail(self, exc: BaseException, *, drain: bool = False) -> None:
         with self._condition:
-            if self._failure is not None:
-                return
-            self._failure = exc
-            while self._items:
+            if self._failure is None:
+                self._failure = exc
+            while self._items and not drain:
                 _, size = self._items.popleft()
                 self._budget.release(size)
             self._condition.notify_all()

@@ -293,6 +293,7 @@ struct PanickingTask;
 
 #[derive(Clone, Copy)]
 enum FailureMode {
+    Panicked,
     Fatal,
     ReturnedError,
     EmittedError,
@@ -320,6 +321,7 @@ impl SessionTask for FailureOnReleaseTask {
             self.0.cancelled().await;
             let message = "failure requires explicit new admission".to_string();
             match self.1 {
+                FailureMode::Panicked => panic!("injected worker failure after accepted steering"),
                 FailureMode::Fatal => Err(codex_protocol::error::CodexErr::Fatal(message)),
                 FailureMode::ReturnedError => {
                     Err(codex_protocol::error::CodexErr::InvalidRequest(message))
@@ -985,6 +987,11 @@ fn turn_error_fallback_uses_only_this_turns_messages() {
     );
 }
 
+#[tokio::test]
+async fn panicked_worker_preserves_pending_input_without_automatic_restart() {
+    assert_failed_turn_preserves_pending_input(FailureMode::Panicked).await;
+}
+
 async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
     for fail_safe in [false, true] {
         let (session, turn_context, events) = make_session_and_context_with_rx().await;
@@ -1053,6 +1060,11 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
                             .message
                             .contains("explicit new admission")
                     );
+                    completed += 1;
+                }
+                EventMsg::TurnAborted(done) if matches!(mode, FailureMode::Panicked) => {
+                    assert_eq!(done.turn_id.as_deref(), Some(turn_context.sub_id.as_str()));
+                    assert_eq!(done.reason, TurnAbortReason::InternalError);
                     completed += 1;
                 }
                 _ => {}
@@ -1452,8 +1464,8 @@ async fn terminalization_publishes_abort_while_worker_is_synchronously_blocked()
         true
     }));
     assert!(!late_tool_accepted);
-    // Interaction release precedes terminal-event publication. Wait for the
-    // observable event while the worker remains blocked by ReleaseWorker.
+    // Interaction release follows terminal acceptance, even while the worker
+    // remains blocked by ReleaseWorker.
     let aborted = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let EventMsg::TurnAborted(aborted) = events.recv().await.unwrap().msg {
@@ -1815,4 +1827,36 @@ fn emit_compact_metric_records_manual_and_automatic_compaction() {
             ])
         );
     }
+}
+#[tokio::test]
+async fn replacement_waits_for_predecessor_terminal_acceptance() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    session.spawn_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask).await;
+    let terminal = session.active_turn.lock().await.as_ref().unwrap().terminal.clone().unwrap();
+    let (entered, release) = terminal.pause_publication_for_test();
+    let (_, mut successor) = crate::session::tests::make_session_and_context().await;
+    successor.sub_id = "replacement".into();
+    let started = Arc::new(AtomicUsize::new(0));
+    let owner = Arc::clone(&session);
+    let count = Arc::clone(&started);
+    let replacement = tokio::spawn(async move {
+        owner.spawn_task(Arc::new(successor), Vec::new(), CountingBlockingTask {
+            started: count, release: CancellationToken::new(),
+        }).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+    assert!(!terminal.interaction_released());
+    assert!(session.active_turn.lock().await.is_some());
+    assert_eq!(started.load(Ordering::Acquire), 0);
+    assert!(!replacement.is_finished());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), replacement).await.unwrap().unwrap();
+    let mut terminals = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::TurnAborted(aborted) = event.msg { terminals.push(aborted); }
+    }
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].turn_id.as_deref(), Some(turn.sub_id.as_str()));
+    assert_eq!(session.active_turn.lock().await.as_ref().unwrap().task.as_ref().unwrap().turn_context.sub_id, "replacement");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

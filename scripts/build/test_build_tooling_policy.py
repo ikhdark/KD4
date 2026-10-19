@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -2473,9 +2475,21 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         )
 
     def test_dependency_policy_gate_runs_offline_cargo_deny(self) -> None:
+        from scripts.maintenance.check_duplicate_deps import check_dependency_policy
+
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertIn("cargo deny check bans sources licenses", justfile)
+        recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('scripts/maintenance/check_duplicate_deps.py" --policy {args}', recipe)
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(check_dependency_policy([], runner=runner), 0)
+        self.assertEqual(runner.call_args_list, [
+            mock.call(["just", "deps-advisories-check"], check=False),
+            mock.call(["just", "deps-duplicates-check", "--locked"], check=False),
+            mock.call(["just", "deps-v8-boundary-check", "--locked"], check=False),
+            mock.call(["cargo", "deny", "check", "bans", "sources", "licenses"], check=False),
+        ])
         self.assertIn("cargo tree -d --workspace", justfile)
         self.assertNotIn("--target all", justfile)
 

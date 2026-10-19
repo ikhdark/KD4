@@ -321,7 +321,7 @@ fn rustc_stderr_diagnostics_keep_constraints_through_both_output_paths() {
         );
     }
     // Do not silently drop another stream or reinterpret printed source JSON.
-    let mut mixed = output.clone();
+    let mut mixed = output;
     mixed.stdout.text = "other command output\n".into();
     mixed.aggregated_output.text.push_str(&mixed.stdout.text);
     assert!(

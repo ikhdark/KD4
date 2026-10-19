@@ -322,7 +322,7 @@ impl ExternalAgentConfigService {
     ) -> ExternalAgentConfigImportOutcome {
         let mut outcome = ExternalAgentConfigImportOutcome::default();
         for migration_item in migration_items {
-            if self.import_cancellation.as_ref().is_some_and(|token| token.is_cancelled()) {
+            if self.import_cancellation.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 break;
             }
             let item_type = migration_item.item_type;

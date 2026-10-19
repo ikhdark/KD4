@@ -1845,9 +1845,48 @@ pub struct TurnTiming {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnCompletionAssessment {
+    /// Bounded unresolved questions for resume. Never passing proof or live handles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub validation_uncertainty: Option<TurnValidationUncertainty>,
     pub failed_checks: Vec<String>,
     pub verification_gaps: Vec<String>,
     pub advisories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnValidationUncertainty {
+    pub version: u8,
+    pub failed_checks: Vec<String>,
+    pub pending_checks: Vec<String>,
+    pub capture_incomplete: bool,
+}
+
+impl TurnCompletionAssessment {
+    /// Bounded host observations, never acceptance or execution authority.
+    pub fn bounded_summary(&self, turn_id: &str) -> Option<String> {
+        if self.failed_checks.is_empty() && self.verification_gaps.is_empty() && self.advisories.is_empty() {
+            return None;
+        }
+        let mut result = format!("Host completion observations for turn {turn_id} (not acceptance):");
+        for (label, entries) in [
+            ("failed checks", &self.failed_checks),
+            ("verification gaps", &self.verification_gaps),
+            ("advisories", &self.advisories),
+        ] {
+            if entries.is_empty() { continue; }
+            result.push_str(&format!("\n{label} ({}):", entries.len()));
+            for entry in entries.iter().take(4) {
+                let text = entry.chars().take(192).collect::<String>();
+                result.push_str(&format!("\n- {text}"));
+                if text.len() < entry.len() { result.push_str(" [truncated]"); }
+            }
+            if entries.len() > 4 { result.push_str("\n[additional observations omitted; see the turn timing record]"); }
+        }
+        Some(result)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2817,6 +2856,14 @@ pub struct TurnTimingProviderTokenUsage {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingDiagnosticTokenAggregate {
+    /// Expected physical usage reports; absent in legacy aggregates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_usage_count: Option<u64>,
+    /// Attributable reports observed. Totals are lower bounds unless equal to expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observed_usage_count: Option<u64>,
     pub logical_generations: u32,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -2925,6 +2972,14 @@ pub struct TurnTimingGenerationPurposeCounts {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingGenerationPurposeAggregate {
+    /// Expected physical usage reports; absent in legacy aggregates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_usage_count: Option<u64>,
+    /// Attributable reports observed. Totals are lower bounds unless equal to expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observed_usage_count: Option<u64>,
     pub purpose: TurnTimingGenerationPurpose,
     pub generations: u32,
     pub model_stream_wait_ns: u64,
@@ -3401,6 +3456,10 @@ pub struct TokenUsage {
 pub struct TokenUsageInfo {
     pub total_token_usage: TokenUsage,
     pub last_token_usage: TokenUsage,
+    /// Local active-context estimate, not observed provider consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub estimated_context_tokens: Option<i64>,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
@@ -3421,6 +3480,7 @@ impl TokenUsageInfo {
             None => Self {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
+                estimated_context_tokens: None,
                 model_context_window,
             },
         };
@@ -3436,31 +3496,42 @@ impl TokenUsageInfo {
     pub fn append_last_usage(&mut self, last: &TokenUsage) {
         self.total_token_usage.add_assign(last);
         self.last_token_usage = last.clone();
+        self.estimated_context_tokens = None;
     }
 
     pub fn fill_to_context_window(&mut self, context_window: i64) {
-        let previous_total = self.total_token_usage.total_tokens;
-        let delta = (context_window - previous_total).max(0);
-
         self.model_context_window = Some(context_window);
-        self.total_token_usage = TokenUsage {
-            total_tokens: context_window,
-            ..TokenUsage::default()
-        };
-        self.last_token_usage = TokenUsage {
-            total_tokens: delta,
-            ..TokenUsage::default()
-        };
+        self.estimated_context_tokens = Some(context_window.max(0));
+    }
+
+    pub fn context_tokens(&self) -> i64 {
+        self.estimated_context_tokens.unwrap_or(self.last_token_usage.total_tokens)
+    }
+
+    /// Compatibility projection for context bars only, never a consumption ledger.
+    pub fn context_usage(&self) -> TokenUsage {
+        TokenUsage { total_tokens: self.context_tokens(), ..TokenUsage::default() }
     }
 
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
+            estimated_context_tokens: None,
             model_context_window: Some(context_window),
         };
         info.fill_to_context_window(context_window);
         info
+    }
+
+    /// A fork inherits context, not the parent's already-consumed provider work.
+    pub fn for_fork(&self) -> Self {
+        Self {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage::default(),
+            estimated_context_tokens: Some(self.context_tokens()),
+            model_context_window: self.model_context_window,
+        }
     }
 }
 
@@ -4543,6 +4614,10 @@ pub enum RolloutItem {
 pub struct SamplingBoundaryItem {
     pub sampling_request_id: String,
     pub physical_attempt_id: String,
+    /// Exact developer freshness notices in the prepared sampling prompt.
+    /// Audit-only: never replay these as canonical conversation history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_freshness_notices: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default)]
@@ -8237,6 +8312,7 @@ mod tests {
     #[test]
     fn token_usage_info_new_or_append_updates_context_window_when_provided() {
         let initial = Some(TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
@@ -8258,6 +8334,7 @@ mod tests {
     #[test]
     fn token_usage_info_new_or_append_preserves_context_window_when_not_provided() {
         let initial = Some(TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),

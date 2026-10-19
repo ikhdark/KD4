@@ -102,6 +102,7 @@ pub struct RolloutRecorder {
     tx: Sender<RolloutCmd>,
     writer_task: Arc<RolloutWriterTask>,
     pub(crate) rollout_path: PathBuf,
+    writer_lease: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Clone)]
@@ -178,6 +179,10 @@ enum RolloutCmd {
     Discard {
         ack: oneshot::Sender<()>,
     },
+    Maintenance {
+        ack: oneshot::Sender<std::io::Result<()>>,
+        decision: oneshot::Receiver<MaintenanceDecision>,
+    },
     #[cfg(test)]
     Pause {
         entered: oneshot::Sender<()>,
@@ -192,7 +197,7 @@ struct RolloutWriterTask {
     lifecycle: AtomicU8,
     /// Serializes the lifecycle check with command enqueue across recorder
     /// clones so no command can be accepted behind Shutdown.
-    enqueue_gate: tokio::sync::Semaphore,
+    enqueue_gate: Arc<tokio::sync::Semaphore>,
     pending_bytes: Arc<tokio::sync::Semaphore>,
 }
 
@@ -222,6 +227,54 @@ const WRITER_SHUTTING_DOWN: u8 = 1;
 const WRITER_SHUT_DOWN: u8 = 2;
 const WRITER_FAILED: u8 = 3;
 
+enum MaintenanceDecision {
+    Resume,
+    Commit,
+    RestoreFailed,
+}
+
+/// Temporarily closes the physical writer while retaining ordered admission and
+/// logical ownership. Restore files and release maintenance locks before dropping
+/// this guard. Cancellation then resumes the same writer, not a replacement task.
+pub struct RolloutMaintenanceGuard {
+    decision: Option<oneshot::Sender<MaintenanceDecision>>,
+    writer_task: Arc<RolloutWriterTask>,
+    _enqueue_guard: tokio::sync::OwnedSemaphorePermit,
+    _writer_lease: Option<Arc<std::fs::File>>,
+}
+
+impl std::fmt::Debug for RolloutMaintenanceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RolloutMaintenanceGuard").finish_non_exhaustive()
+    }
+}
+
+impl RolloutMaintenanceGuard {
+    /// Reject later admission before releasing the enqueue gate.
+    pub fn commit(mut self) {
+        self.writer_task.finish_shutdown(true);
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(MaintenanceDecision::Commit);
+        }
+    }
+
+    /// A failed restore must never reopen/create a replacement rollout.
+    pub fn restore_failed(mut self) {
+        self.writer_task.mark_failed(&IoError::other("rollout maintenance restoration failed"));
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(MaintenanceDecision::RestoreFailed);
+        }
+    }
+}
+
+impl Drop for RolloutMaintenanceGuard {
+    fn drop(&mut self) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(MaintenanceDecision::Resume);
+        }
+    }
+}
+
 impl RolloutWriterTask {
     /// Create task observability state before spawning the writer.
     fn new() -> Self {
@@ -229,7 +282,7 @@ impl RolloutWriterTask {
             handle: Mutex::new(None),
             terminal_failure: Mutex::new(None),
             lifecycle: AtomicU8::new(WRITER_ACTIVE),
-            enqueue_gate: tokio::sync::Semaphore::new(1),
+            enqueue_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pending_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ROLLOUT_BYTES)),
         }
     }
@@ -870,7 +923,47 @@ impl RolloutRecorder {
         params: RolloutRecorderParams,
         known_repository_context: Option<Option<RepositoryContext>>,
     ) -> std::io::Result<Self> {
-        Self::new_with_resume_state(config, params, known_repository_context, None).await
+        Self::new_with_resume_state(config, params, known_repository_context, None, None).await
+    }
+
+    /// Thread-store entrypoint; the background writer retains ownership through shutdown.
+    pub async fn new_with_writer_lease(
+        config: &impl RolloutConfigView,
+        params: RolloutRecorderParams,
+        known_repository_context: Option<Option<RepositoryContext>>,
+        lease: Arc<std::fs::File>,
+    ) -> std::io::Result<Self> {
+        Self::new_with_resume_state(config, params, known_repository_context, None, Some(lease)).await
+    }
+
+    pub fn writer_lease(&self) -> Option<Arc<std::fs::File>> {
+        self.writer_lease.clone()
+    }
+
+    /// Quiesce this recorder before acquiring rollout-move or maintenance locks.
+    /// Bounded admission prevents blocked storage from stranding a delete caller.
+    pub async fn pause_for_maintenance(&self) -> std::io::Result<RolloutMaintenanceGuard> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let enqueue_guard = Arc::clone(&self.writer_task.enqueue_gate)
+                .acquire_owned().await
+                .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+            self.writer_task.ensure_active("pause for maintenance")?;
+            let permit = self.tx.reserve().await
+                .map_err(|_| self.writer_task.writer_task_failure("pause for maintenance"))?;
+            let (decision, receiver) = oneshot::channel();
+            let guard = RolloutMaintenanceGuard {
+                decision: Some(decision),
+                writer_task: Arc::clone(&self.writer_task),
+                _enqueue_guard: enqueue_guard,
+                _writer_lease: self.writer_lease(),
+            };
+            let (ack, ready) = oneshot::channel();
+            permit.send(RolloutCmd::Maintenance { ack, decision: receiver });
+            ready.await.map_err(|_| self.writer_task.writer_task_failure("pause for maintenance"))??;
+            Ok(guard)
+        }).await.map_err(|_| IoError::new(
+            std::io::ErrorKind::TimedOut, "timed out waiting for rollout maintenance",
+        ))?
     }
 
     /// Load canonical history and its manifest dictionary in one pass. The
@@ -880,6 +973,15 @@ impl RolloutRecorder {
         config: &impl RolloutConfigView,
         path: PathBuf,
         expected_thread: ThreadId,
+    ) -> std::io::Result<(Self, Vec<RolloutItem>)> {
+        Self::resume_and_load_with_writer_lease(config, path, expected_thread, None).await
+    }
+
+    pub async fn resume_and_load_with_writer_lease(
+        config: &impl RolloutConfigView,
+        path: PathBuf,
+        expected_thread: ThreadId,
+        lease: Option<Arc<std::fs::File>>,
     ) -> std::io::Result<(Self, Vec<RolloutItem>)> {
         let (path, writer) = open_rollout_for_append(&path).await?;
         let lock_path = path.clone();
@@ -900,7 +1002,7 @@ impl RolloutRecorder {
         }
         Self::append_reconstruction_notice(&mut items, errors, partial_tail);
         let recorder = Self::new_with_resume_state(config, RolloutRecorderParams::resume(path), None,
-            Some((writer, manifests))).await?;
+            Some((writer, manifests)), lease).await?;
         Ok((recorder, items))
     }
 
@@ -909,6 +1011,7 @@ impl RolloutRecorder {
         params: RolloutRecorderParams,
         known_repository_context: Option<Option<RepositoryContext>>,
         resumed: Option<(JsonlWriter, crate::ToolManifestDictionary)>,
+        writer_lease: Option<Arc<std::fs::File>>,
     ) -> std::io::Result<Self> {
         let (writer, deferred_log_file_info, rollout_path, meta, tool_manifests) = match params {
             RolloutRecorderParams::Create {
@@ -1001,7 +1104,9 @@ impl RolloutRecorder {
         let writer_task = Arc::new(RolloutWriterTask::new());
         let writer_task_for_spawn = Arc::clone(&writer_task);
         let rollout_path_for_spawn = rollout_path.clone();
+        let writer_lease_for_spawn = writer_lease.clone();
         let handle = tokio::task::spawn(async move {
+            let _writer_lease = writer_lease_for_spawn;
             let result = rollout_writer(
                 writer,
                 deferred_log_file_info,
@@ -1032,6 +1137,7 @@ impl RolloutRecorder {
             tx,
             writer_task,
             rollout_path,
+            writer_lease,
         })
     }
 
@@ -1884,6 +1990,7 @@ struct LockedRolloutFile {
     path: PathBuf,
     file: File,
     append_lock: compression::RolloutAppendLock,
+    payload_retention: std::fs::File,
 }
 
 impl LockedRolloutFile {
@@ -1892,6 +1999,7 @@ impl LockedRolloutFile {
             path: self.path,
             file: tokio::fs::File::from_std(self.file),
             _append_lock: self.append_lock,
+            _payload_retention: self.payload_retention,
             #[cfg(test)]
             write_fault: None,
             #[cfg(test)]
@@ -1908,6 +2016,7 @@ fn open_log_file_with_options(
     path: &Path,
     create: bool,
 ) -> std::io::Result<(PathBuf, LockedRolloutFile)> {
+    let payload_retention = crate::payload_artifact::lock_publication(path)?;
     let (path, append_lock) = compression::lock_rollout_for_append_blocking(path)?;
     let Some(parent) = path.parent() else {
         return Err(IoError::other(format!(
@@ -1928,6 +2037,7 @@ fn open_log_file_with_options(
         path: path.clone(),
         file,
         append_lock,
+        payload_retention,
     };
     Ok((path, locked_file))
 }
@@ -2360,6 +2470,36 @@ async fn rollout_writer(
                 let _ = ack.send(());
                 return Ok(());
             }
+            RolloutCmd::Maintenance { ack, decision } => {
+                let materialized = !state.is_deferred();
+                if materialized && let Err(error) = state.flush().await {
+                    if state.retry_blocked_error.is_some() {
+                        let _ = ack.send(Err(clone_io_error(&error)));
+                        return Err(error);
+                    }
+                    let _ = ack.send(Err(error));
+                    continue;
+                }
+                // Keep lazy records, dictionaries and metadata in this owner.
+                state.writer.take();
+                let _ = ack.send(Ok(()));
+                match decision.await.unwrap_or(MaintenanceDecision::Resume) {
+                    MaintenanceDecision::Commit => {
+                        drop(state);
+                        writer_task.finish_shutdown(true);
+                        return Ok(());
+                    }
+                    MaintenanceDecision::RestoreFailed => {
+                        return Err(IoError::other("rollout maintenance restoration failed"));
+                    }
+                    MaintenanceDecision::Resume if materialized => {
+                        // Restore must have succeeded: never create a new file.
+                        let (_, writer) = open_rollout_for_append(&state.rollout_path).await?;
+                        state.writer = Some(writer);
+                    }
+                    MaintenanceDecision::Resume => {}
+                }
+            }
             #[cfg(test)]
             RolloutCmd::Pause { entered, resume } => {
                 let _ = entered.send(());
@@ -2433,6 +2573,7 @@ struct JsonlWriter {
     path: PathBuf,
     file: tokio::fs::File,
     _append_lock: compression::RolloutAppendLock,
+    _payload_retention: std::fs::File,
     #[cfg(test)]
     write_fault: Option<JsonlWriteFault>,
     #[cfg(test)]

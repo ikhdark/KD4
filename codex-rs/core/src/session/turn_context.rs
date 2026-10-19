@@ -170,8 +170,6 @@ impl std::fmt::Debug for TurnEnvironment {
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
-    pub(crate) mcp_runtime: Arc<OnceLock<Arc<super::McpRuntimeSnapshot>>>,
-    pub(crate) mcp_tool_snapshot: Arc<tokio::sync::OnceCell<super::step_context::McpToolSnapshot>>,
     pub(crate) hook_context_budget: Arc<Mutex<codex_context_fragments::ModelContextBudget>>,
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
@@ -617,8 +615,6 @@ impl TurnContext {
 
         Self {
             hook_context_budget: Arc::clone(&self.hook_context_budget),
-            mcp_runtime: Arc::clone(&self.mcp_runtime),
-            mcp_tool_snapshot: Arc::clone(&self.mcp_tool_snapshot),
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
@@ -993,8 +989,6 @@ impl Session {
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {
             hook_context_budget: Default::default(),
-            mcp_runtime: Default::default(),
-            mcp_tool_snapshot: Default::default(),
             sub_id,
             trace_id: current_span_trace_id(),
             config: per_turn_config,

@@ -688,6 +688,11 @@ impl Session {
         // A resumed legacy rollout can acquire modern turns. Only user events
         // outside a started turn are legacy boundaries; steering inside a
         // modern turn must still roll back with that turn, not independently.
+        // Modern starts own membership. Terminal publication can lag a successor;
+        // those terminal facts must not seed an unrelated reverse segment.
+        let first_started_turn = rollout_items.iter().position(|item| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+        });
         let mut started_turn = None;
         let mut legacy_user_boundaries = HashSet::new();
         for (index, item) in rollout_items.iter().enumerate() {
@@ -795,6 +800,9 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                    if first_started_turn.is_some_and(|start| index >= start) {
+                        continue;
+                    }
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     // Reverse replay often sees `TurnComplete` before any turn-scoped metadata.
@@ -804,6 +812,9 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
+                    if first_started_turn.is_some_and(|start| index >= start) {
+                        continue;
+                    }
                     if let Some(active_segment) = active_segment.as_mut() {
                         if active_segment.turn_id.is_none()
                             && let Some(turn_id) = &event.turn_id

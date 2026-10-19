@@ -830,13 +830,13 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
     // Scheduling is under test, not interactive shell approval.
     submit_danger_full_access_user_turn(&test, "first prompt").await;
 
-    wait_for_reasoning_item_started(&codex).await;
+    wait_for_reasoning_item_started(codex).await;
 
-    submit_queue_only_agent_mail(&codex, "queued child update").await;
+    submit_queue_only_agent_mail(codex, "queued child update").await;
 
     let _ = gate_reasoning_done_tx.send(());
 
-    wait_for_turn_complete(&codex).await;
+    wait_for_turn_complete(codex).await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
@@ -853,7 +853,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
     );
 
     codex.submit(Op::Shutdown).await.expect("shutdown session");
-    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 
@@ -900,7 +900,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
     // Scheduling is under test, not interactive shell approval.
     submit_danger_full_access_user_turn(&test, "first prompt").await;
 
-    wait_for_event(&codex, |event| {
+    wait_for_event(codex, |event| {
         matches!(
             event,
             EventMsg::ItemStarted(item_started)
@@ -909,13 +909,13 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
     })
     .await;
 
-    submit_queue_only_agent_mail(&codex, "queued child update").await;
+    submit_queue_only_agent_mail(codex, "queued child update").await;
 
     let _ = gate_message_done_tx.send(());
 
-    wait_for_agent_message(&codex, "first answer").await;
+    wait_for_agent_message(codex, "first answer").await;
 
-    wait_for_turn_complete(&codex).await;
+    wait_for_turn_complete(codex).await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
@@ -932,7 +932,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
     );
 
     codex.submit(Op::Shutdown).await.expect("shutdown session");
-    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 
@@ -975,15 +975,15 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
     // Scheduling is under test, not interactive shell approval.
     submit_danger_full_access_user_turn(&test, "first prompt").await;
 
-    wait_for_reasoning_item_started(&codex).await;
+    wait_for_reasoning_item_started(codex).await;
 
-    steer_user_input(&codex, "second prompt").await;
+    steer_user_input(codex, "second prompt").await;
 
     let _ = gate_reasoning_done_tx.send(());
 
-    wait_for_agent_message(&codex, "first answer").await;
+    wait_for_agent_message(codex, "first answer").await;
 
-    wait_for_turn_complete(&codex).await;
+    wait_for_turn_complete(codex).await;
 
     let requests = server.requests().await;
     assert_two_responses_input_snapshot(
@@ -992,7 +992,7 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
     );
 
     codex.submit(Op::Shutdown).await.expect("shutdown session");
-    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 

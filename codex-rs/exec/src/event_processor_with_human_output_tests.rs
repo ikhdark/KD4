@@ -45,6 +45,7 @@ fn blended_token_total_is_nonnegative_and_saturates_at_the_display_limit() {
             reasoning_output_tokens: 0,
         };
         let usage = codex_app_server_protocol::ThreadTokenUsage {
+            estimated_context_tokens: None,
             last: total.clone(),
             total,
             model_context_window: None,

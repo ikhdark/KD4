@@ -391,8 +391,25 @@ impl TestCodexBuilder {
         let config = self
             .prepare_config(base_url, &home, test_env.cwd().clone())
             .await?;
+        let local_helper = if cfg!(windows)
+            && matches!(
+                config.permissions.windows_sandbox_mode,
+                Some(codex_config::types::WindowsSandboxModeToml::Elevated)
+            )
+        {
+            // The elevated wrapper resolves command-runner beside its executable.
+            // Cargo test binaries live in deps/, unlike the configured helper
+            // bundle. Keep test-binary reexecution for every other fixture.
+            match config.codex_self_exe.clone() {
+                Some(path) => path,
+                None => codex_utils_cargo_bin::cargo_bin("codex")
+                    .context("resolve Codex executable for Windows elevated test runtime")?,
+            }
+        } else {
+            std::env::current_exe()?
+        };
         let local_runtime_paths =
-            codex_exec_server::ExecServerRuntimePaths::new(std::env::current_exe()?)?;
+            codex_exec_server::ExecServerRuntimePaths::new(local_helper)?;
         let environment_manager = Arc::new(
             codex_exec_server::EnvironmentManager::create_for_tests(
                 self.exec_server_url.clone(),

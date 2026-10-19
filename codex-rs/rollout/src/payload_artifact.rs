@@ -116,6 +116,96 @@ pub(crate) fn root(path: &Path) -> PathBuf {
     path.parent().unwrap_or(Path::new(".")).join("rollout-payloads")
 }
 
+/// Held from opening an append owner through its last reference publication.
+/// Ordering: retention, physical append/compression lock, append transaction.
+pub(crate) fn lock_publication(path: &Path) -> io::Result<std::fs::File> {
+    let directory = root(path);
+    std::fs::create_dir_all(&directory)?;
+    let file = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+        .open(directory.join(".retention.lock"))?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+/// Conservative bounded collection. Busy writers, corrupt histories, unknown
+/// layouts and incomplete scans retain every blob rather than guessing reachability.
+pub async fn reclaim_payload_artifacts(home: &Path) -> io::Result<usize> {
+    let Some(moves) = crate::try_lock_rollout_moves(home).await? else { return Ok(0); };
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let _moves = moves;
+        let directory = home.join("rollout-payloads");
+        if !directory.try_exists()? { return Ok(0); }
+        let lock = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+            .open(directory.join(".retention.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {},
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(0),
+            Err(error) => return Err(error.into()),
+        }
+        let mut referenced = std::collections::HashSet::new();
+        let mut stack = vec![home.join(crate::SESSIONS_SUBDIR), home.join(crate::ARCHIVED_SESSIONS_SUBDIR)];
+        // Uncommitted/recoverable deletion staging is retained evidence too.
+        for entry in std::fs::read_dir(&home)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("thread-delete-") {
+                stack.push(entry.path());
+            }
+        }
+        let mut entries_left = 100_000usize;
+        let mut bytes_left = 128 * 1024 * 1024usize;
+        while let Some(path) = stack.pop() {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && (path == home.join(crate::SESSIONS_SUBDIR) || path == home.join(crate::ARCHIVED_SESSIONS_SUBDIR)) => continue,
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() { return Err(io::Error::other("payload sweep encountered a symlink")); }
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path)? {
+                    entries_left = entries_left.checked_sub(1).ok_or_else(|| io::Error::other("payload sweep entry budget exceeded"))?;
+                    stack.push(entry?.path());
+                }
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.ends_with(".jsonl") && !name.ends_with(".jsonl.zst") { continue; }
+            let file = std::fs::File::open(&path)?;
+            let reader: Box<dyn std::io::Read> = if name.ends_with(".zst") {
+                Box::new(zstd::stream::read::Decoder::new(file)?)
+            } else { Box::new(file) };
+            let mut reader = std::io::BufReader::new(reader);
+            loop {
+                let mut line = Vec::new();
+                let read = (&mut reader).take(bytes_left as u64 + 1).read_until(b'\n', &mut line)?;
+                if read == 0 { break; }
+                bytes_left = bytes_left.checked_sub(read).ok_or_else(|| io::Error::other("payload sweep byte budget exceeded"))?;
+                let value: serde_json::Value = serde_json::from_slice(&line)?;
+                if value["type"] == KIND {
+                    let hash = value["payload"]["sha256"].as_str().ok_or_else(|| io::Error::other("invalid payload reference"))?;
+                    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(io::Error::other("invalid payload digest")); }
+                    referenced.insert(hash.to_string());
+                }
+            }
+        }
+        let mut garbage = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries_left = entries_left.checked_sub(1).ok_or_else(|| io::Error::other("payload sweep entry budget exceeded"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(hash) = name.strip_suffix(".json")
+                && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && entry.file_type()?.is_file() && !referenced.contains(hash)
+            { garbage.push(entry.path()); }
+        }
+        let mut removed = 0;
+        for path in garbage { std::fs::remove_file(path)?; removed += 1; }
+        Ok(removed)
+    }).await.map_err(io::Error::other)?
+}
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -229,6 +319,34 @@ pub(crate) fn hydrate_line(path: &Path, line: String) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sweep_preserves_shared_archived_staged_and_inflight_references() {
+        let home = tempfile::tempdir().unwrap();
+        let active = home.path().join("sessions/active.jsonl");
+        let archived = home.path().join("archived_sessions/archive.jsonl.zst");
+        let staged = home.path().join("thread-delete-v2-fixture/unindexed/thread/sessions/staged.jsonl");
+        for path in [&active, &archived, &staged] { std::fs::create_dir_all(path.parent().unwrap()).unwrap(); }
+        let line = serde_json::to_vec(&serde_json::json!({"type":"event_msg", "payload":{"text":"x".repeat(INLINE_BYTES)}})).unwrap();
+        let publication = lock_publication(&active).unwrap();
+        let reference = store_line(&active, &line).unwrap();
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0, "inflight publication owns the unreferenced blob");
+        std::fs::write(&active, &reference).unwrap();
+        std::fs::write(&archived, zstd::stream::encode_all(reference.as_slice(), 0).unwrap()).unwrap();
+        std::fs::write(&staged, &reference).unwrap();
+        drop(publication);
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
+        std::fs::remove_file(&active).unwrap();
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
+        std::fs::remove_file(&archived).unwrap();
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&active, b"corrupt history").unwrap();
+        assert!(reclaim_payload_artifacts(home.path()).await.is_err());
+        std::fs::remove_file(&active).unwrap();
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 1);
+        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
+    }
 
     #[test]
     fn parallel_payload_sync_is_bounded_and_joins_failed_or_panicking_siblings() {

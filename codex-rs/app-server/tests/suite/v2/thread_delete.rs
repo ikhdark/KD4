@@ -340,6 +340,12 @@ BEGIN
     );
     assert!(rollout_path.exists());
     assert!(state_db.get_thread(thread_id).await?.is_some());
+    sqlx::query("DROP TRIGGER fail_selected_thread_delete").execute(&trigger_pool).await?;
+    // Failed deletion must resume the original recorder, not just restore bytes.
+    send_turn_and_wait(&mut mcp, &thread.id, "record after failed delete").await?;
+    mcp.shutdown().await?;
+    let contents = std::fs::read_to_string(&rollout_path)?;
+    assert!(contents.contains("record after failed delete"));
     trigger_pool.close().await;
     Ok(())
 }

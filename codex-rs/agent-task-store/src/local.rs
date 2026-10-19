@@ -1057,6 +1057,9 @@ LIMIT 1
         summary: String,
         call_id: Option<String>,
     ) -> StoreResult<RuntimeObservation> {
+        if kind == ObservationKind::HostCompletion {
+            return Err(StoreError::InvalidAssignment("host completion observations require the host terminal boundary".into()));
+        }
         if summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
                 "observation summary cannot be empty".to_string(),
@@ -1829,6 +1832,7 @@ LIMIT 1
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
+        expected_attempt_id: AttemptId,
         kind: GateKind,
         status: GateStatus,
         reason: String,
@@ -1848,6 +1852,9 @@ LIMIT 1
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         require_gate_actor_tx(&mut transaction, actor, &assignment, kind).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if attempt.attempt_id != expected_attempt_id {
+            return Err(StoreError::AttemptNotActive(expected_attempt_id));
+        }
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
@@ -2889,6 +2896,36 @@ impl LocalAgentTaskStore {
         })
     }
 
+    /// Terminal diagnostics may follow an already-sealed authored receipt.
+    /// The current-attempt fence and idempotency key are checked under the writer lock.
+    pub fn record_host_completion_observation(
+        &self, attempt_id: AttemptId, origin: String, summary: String,
+    ) -> TaskStoreFuture<'_, ()> {
+        Box::pin(async move {
+            if origin.is_empty() || origin.len() > 256 || summary.is_empty() || summary.len() > 64 * 1024 {
+                return Err(StoreError::InvalidAssignment("invalid bounded host completion observation".into()));
+            }
+            let mut transaction = self.pool.begin().await?;
+            lock_attempt_tx(&mut transaction, attempt_id).await?;
+            let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
+            if load_current_attempt_tx(&mut transaction, attempt.assignment_id).await?.attempt_id != attempt_id {
+                return Err(StoreError::AttemptNotActive(attempt_id));
+            }
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ? AND json_extract(body_json, '$.call_id') = ? LIMIT 1")
+                .bind(attempt_id.to_string()).bind(encode(&ObservationKind::HostCompletion)?).bind(&origin)
+                .fetch_optional(&mut *transaction).await?;
+            if existing.is_none() {
+                let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+                append_observation_tx(&mut transaction, &assignment, attempt_id,
+                    ObservationKind::HostCompletion, summary, Some(origin)).await?;
+            }
+            transaction.commit().await?;
+            self.notify_wake_waiters();
+            Ok(())
+        })
+    }
+
     pub fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()> {
         Box::pin(async move {
             let result = self.record_validation_call_impl(call).await;
@@ -3126,13 +3163,14 @@ impl LocalAgentTaskStore {
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
+        expected_attempt_id: AttemptId,
         kind: GateKind,
         status: GateStatus,
         reason: String,
     ) -> TaskStoreFuture<'_, AgentGate> {
         Box::pin(async move {
             let result = self
-                .set_agent_gate_impl(actor, assignment_id, kind, status, reason)
+                .set_agent_gate_impl(actor, assignment_id, expected_attempt_id, kind, status, reason)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -4862,9 +4900,7 @@ fn effective_criteria<'a>(
     assignment: &'a Assignment,
     amendment: Option<&'a AttemptAmendment>,
 ) -> &'a [crate::AcceptanceCriterion] {
-    amendment
-        .and_then(|value| value.acceptance_criteria.as_deref())
-        .unwrap_or(&assignment.acceptance_criteria)
+    assignment.effective_criteria(amendment)
 }
 
 fn dependency_state(status: AgentStatusClaim) -> DependencyState {

@@ -205,6 +205,25 @@ fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses
 }
 
 #[test]
+fn websocket_throughput_does_not_compare_different_workloads() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    throughput.select_workload(serde_json::json!({"model": "A", "effort": "high"}));
+    for _ in 0..5 {
+        record_response_rate(&mut throughput, 40);
+    }
+    throughput.select_workload(serde_json::json!({"model": "B", "effort": "max"}));
+    for _ in 0..5 {
+        record_response_rate(&mut throughput, 10);
+        assert_eq!(throughput.take_collapse(), None);
+    }
+    // Re-selecting the same workload preserves its own useful baseline.
+    throughput.select_workload(serde_json::json!({"model": "B", "effort": "max"}));
+    record_response_rate(&mut throughput, 2);
+    record_response_rate(&mut throughput, 2);
+    assert!(throughput.take_collapse().is_some());
+}
+
+#[test]
 fn websocket_throughput_collapse_declines_rotation_costlier_than_its_replay() {
     // Rotation discards the inherited prefix, so a large context must resend it
     // uncached. At a 40 -> 10 tok/s collapse the recovered output time cannot
@@ -429,15 +448,22 @@ fn test_model_client_with_thread_id(
 }
 
 #[tokio::test]
-async fn prompt_cache_routing_is_stable_per_thread() {
+async fn prompt_cache_routing_is_stable_per_agent_tree() {
     let first = test_model_client(SessionSource::Cli);
-    let second = test_model_client(SessionSource::Cli);
+    let child = test_model_client(SessionSource::SubAgent(SubAgentSource::Review));
     let resumed = test_model_client_with_thread_id(first.state.thread_id, SessionSource::Cli);
-    let key = first.prompt_cache_key();
-    assert_eq!(key, first.state.thread_id.to_string());
-    assert_ne!(key, second.prompt_cache_key());
-    assert_eq!(key, resumed.prompt_cache_key());
-    assert_eq!(key, first.new_session().client.prompt_cache_key());
+    let metadata = CodexResponsesMetadata::new(
+        "installation".into(), "agent-tree".into(), first.state.thread_id.to_string(), "window".into(),
+    );
+    let mut child_metadata = metadata.clone();
+    child_metadata.thread_id = child.state.thread_id.to_string();
+    let key = first.prompt_cache_key(&metadata);
+    assert_eq!(key, "agent-tree");
+    assert_eq!(key, child.prompt_cache_key(&child_metadata));
+    assert_eq!(key, resumed.prompt_cache_key(&metadata));
+    assert_eq!(key, first.new_session().client.prompt_cache_key(&metadata));
+    child_metadata.session_id = "another-agent-tree".into();
+    assert_ne!(key, child.prompt_cache_key(&child_metadata));
 }
 
 #[tokio::test]
@@ -472,7 +498,7 @@ async fn model_http_clients_share_transports_without_sharing_conversations() {
             .shares_cache_with(&second.state.http_clients)
     );
     assert!(!Arc::ptr_eq(&first.state, &second.state));
-    assert_ne!(first.prompt_cache_key(), second.prompt_cache_key());
+    assert_ne!(first.state.thread_id, second.state.thread_id);
     let pool = first.state.http_clients.clone();
     drop(first);
     drop(second);
@@ -688,6 +714,19 @@ async fn websocket_fallback_ignores_http_failures_even_after_cooldown_expires() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn websocket_connection_deadline_uses_transient_fallback_cooldown() {
+    let client = websocket_test_model_client();
+    let mut session = client.new_session();
+    session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+    let error = codex_api::map_api_error(ApiError::Transport(TransportError::ConnectionTimeout));
+    assert!(error.is_retryable());
+    assert!(session.try_switch_fallback_transport_after_error(&test_session_telemetry(), &error));
+    assert!(!client.responses_websocket_enabled());
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(client.responses_websocket_enabled());
+}
+
+#[tokio::test(start_paused = true)]
 async fn websocket_fallback_timeout_server_error_and_upgrade_rejection_are_permanent() {
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::UnexpectedResponseError;
@@ -746,11 +785,12 @@ async fn websocket_fallback_counts_concurrent_websocket_failures_only_once_each(
 #[tokio::test]
 async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
     use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::ev_response_created;
     use crate::test_harness::responses::start_websocket_server;
 
     let server = start_websocket_server(vec![vec![
-        vec![ev_completed("recovered")],
-        vec![ev_completed("next-turn")],
+        vec![ev_response_created("recovered"), ev_completed("recovered")],
+        vec![ev_response_created("next-turn"), ev_completed("next-turn")],
     ]])
     .await;
     let mut provider =
@@ -5309,6 +5349,10 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
                 Some("turn".into()),
                 None,
             );
+            attempt.observe_terminal_usage(Some("provider-response"), Some(&codex_protocol::protocol::TokenUsage {
+                input_tokens: 100, cached_input_tokens: 90, output_tokens: 20,
+                reasoning_output_tokens: 7, total_tokens: 120,
+            }));
             for _ in 0..2 {
                 attempt.finish(
                     codex_otel::ModelAttemptOutcome::Success,
@@ -5328,6 +5372,10 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
             assert_eq!(event["diagnostics_available"], (!cancelled).to_string());
             assert_eq!(event["sampling_request_id"], "sampling");
             assert_eq!(event["uncached_input_tokens"], "10");
+            assert_eq!(event["response_id"], "provider-response");
+            assert_eq!(event["output_tokens"], "20");
+            assert_eq!(event["reasoning_output_tokens"], "7");
+            assert_eq!(event["total_tokens"], "120");
             assert!(!format!("{event:?}").contains("private prompt text"));
 
             // The per-category breakdown must reach the local event without

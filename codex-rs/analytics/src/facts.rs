@@ -231,6 +231,7 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
             CodexErr::Stream(..) => CodexErrKind::Stream,
             CodexErr::IncompleteResponse(_) => CodexErrKind::IncompleteResponse,
+            CodexErr::TerminalResponse { source, .. } => Self::from(source.as_ref()),
             CodexErr::ProviderFailure { .. } => CodexErrKind::ProviderFailure,
             CodexErr::PreDispatchRetryExhausted(_) => CodexErrKind::PreDispatchRetryExhausted,
             CodexErr::RequestBuild(_) => CodexErrKind::RequestBuild,

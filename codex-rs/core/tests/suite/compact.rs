@@ -793,6 +793,7 @@ async fn wait_for_failed_turn_complete(
     })
     .await;
     let completed = wait_for_event_match(codex, |event| match event {
+        EventMsg::Error(duplicate) => panic!("duplicate terminal compaction error: {duplicate:?}"),
         EventMsg::TurnComplete(completed) => Some(completed.clone()),
         _ => None,
     })
@@ -1020,10 +1021,11 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
 
     // Second TokenCount: from the local post-compaction estimate.
     let last = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::TokenCount(tc) => tc
-            .info
-            .as_ref()
-            .map(|info| info.last_token_usage.total_tokens),
+        EventMsg::TokenCount(tc) => tc.info.as_ref().and_then(|info| {
+            assert_eq!(info.last_token_usage.total_tokens, 0, "local estimates must not rewrite the last provider observation");
+            assert_eq!(info.total_token_usage.total_tokens, 0, "local estimates must not invent consumption");
+            info.estimated_context_tokens
+        }),
         _ => None,
     })
     .await;

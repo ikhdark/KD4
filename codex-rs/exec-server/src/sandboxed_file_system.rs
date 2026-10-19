@@ -46,6 +46,11 @@ impl SandboxedFileSystem {
         }
     }
 
+    pub(crate) fn with_env(mut self, env: std::collections::HashMap<String, String>) -> Self {
+        self.sandbox_runner = self.sandbox_runner.with_env(env);
+        self
+    }
+
     async fn run_sandboxed(
         &self,
         sandbox: &FileSystemSandboxContext,

@@ -14,6 +14,171 @@ from scripts.build.test_rust_test_runner import nextest_run_payload
 
 
 class NextestReceiptBoundariesTest(RunnerTestCase):
+    def test_direct_target_requires_complete_suite_evidence_without_extra_discovery(self):
+        from dataclasses import replace
+
+        complete = [json.loads(line) for line in nextest_run_payload(
+            [("alpha", "ok"), ("beta", "ok")]).splitlines()]
+        for case in ("complete", "missing_test", "missing_terminal", "wrong_count", "duplicate"):
+            with self.subTest(case=case):
+                events = [dict(event) for event in complete]
+                if case == "missing_test":
+                    events = [event for event in events if not event.get("name", "").endswith("$beta")]
+                elif case == "missing_terminal":
+                    events.pop()
+                elif case == "wrong_count":
+                    events[-1]["passed"] = 3
+                elif case == "duplicate":
+                    events.insert(-1, dict(events[4]))
+                manifest = self.manifest()
+                manifest.targets["core_lib"] = replace(
+                    manifest.targets["core_lib"], helpers=(), helpers_by_test_prefix={})
+                runner, _ = self.runner(manifest=manifest)
+                calls = []
+                def execute(args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(
+                        args, 0, "\n".join(json.dumps(event) for event in events), "")
+                runner.executor = execute
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    if case == "complete":
+                        self.assertEqual(runner.run_target("core_lib", ["-E", "test(alpha) | test(beta)"]),
+                                         {"codex-core": ["alpha", "beta"]})
+                    else:
+                        with self.assertRaises(rust_test_runner.RunnerError) as caught:
+                            runner.run_target("core_lib", ["-E", "test(alpha) | test(beta)"])
+                        self.assertIn("reporter evidence", str(caught.exception))
+                        self.assertIn("alpha", caught.exception.completed_tests["codex-core"])
+                self.assertEqual(len(calls), 1, "framing must not add a discovery invocation")
+
+    def test_direct_target_reconciles_fragmented_suite_without_losing_identity_checks(self):
+        from dataclasses import replace
+
+        # Native libtest-json-plus shape retained from validation
+        # db7afd95-188f-4591-9771-58fb49beb05e: an unmatched ignored case
+        # causes a suite terminal/restart while another started test is running.
+        metadata = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+        start = {"type": "suite", "event": "started", "test_count": 3, "nextest": metadata}
+        terminal = {"type": "suite", "event": "ok", "passed": 1, "failed": 0,
+                    "ignored": 1, "measured": 0, "filtered_out": 142, "nextest": metadata}
+        def test_event(event, name):
+            return {"type": "test", "event": event, "name": f"codex-core::codex_core${name}"}
+
+        complete = [start, test_event("started", "outside_filter"),
+                    test_event("started", "alpha"), test_event("started", "beta"),
+                    test_event("ignored", "outside_filter"), test_event("ok", "alpha"),
+                    terminal, start, test_event("ok", "beta"),
+                    {**terminal, "filtered_out": 143}]
+        for case in ("complete", "ignored_without_start", "missing_test", "missing_terminal", "duplicate_test",
+                     "changed_identity", "changed_count", "float_count", "missing_start", "missing_ignored",
+                     "overlapping_start", "wrong_fragment_count"):
+            with self.subTest(case=case):
+                events = json.loads(json.dumps(complete))
+                if case == "ignored_without_start":
+                    del events[1]
+                elif case == "missing_test":
+                    del events[8]
+                elif case == "missing_terminal":
+                    events.pop()
+                elif case == "duplicate_test":
+                    events[8] = test_event("ok", "alpha")
+                elif case == "changed_identity":
+                    events[7]["nextest"]["kind"] = "bin"
+                elif case == "changed_count":
+                    events[7]["test_count"] = 2
+                elif case == "float_count":
+                    events[7]["test_count"] = 3.0
+                elif case == "missing_start":
+                    del events[3]
+                elif case == "missing_ignored":
+                    del events[4]
+                elif case == "overlapping_start":
+                    events[6], events[7] = events[7], events[6]
+                elif case == "wrong_fragment_count":
+                    events[6]["passed"] = 2
+                manifest = self.manifest()
+                manifest.targets["core_lib"] = replace(
+                    manifest.targets["core_lib"], helpers=(), helpers_by_test_prefix={})
+                runner, _ = self.runner(manifest=manifest)
+                calls = []
+                def execute(args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(
+                        args, 0, "\n".join(json.dumps(event) for event in events), "")
+                runner.executor = execute
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    if case in ("complete", "ignored_without_start"):
+                        self.assertEqual(
+                            runner.run_target("core_lib", ["-E", "test(=alpha) | test(=beta)"]),
+                            {"codex-core": ["alpha", "beta"]})
+                    else:
+                        with self.assertRaises(rust_test_runner.RunnerError):
+                            runner.run_target("core_lib", ["-E", "test(=alpha) | test(=beta)"])
+                self.assertEqual(len(calls), 1, "report reconciliation must not rerun tests")
+
+    def test_direct_target_reconciles_skip_only_fragments_without_execution_receipts(self):
+        from dataclasses import replace
+
+        # Native stream from validation fab29cad-31c0-4270-b737-fdb572b691bc:
+        # three skipped fixture names each get a started/empty-suite fragment,
+        # not an ignored event; only the final selected test actually completes.
+        metadata = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+        start = {"type": "suite", "event": "started", "test_count": 4, "nextest": metadata}
+        terminal = {"type": "suite", "event": "ok", "passed": 0, "failed": 0,
+                    "ignored": 3, "measured": 0, "filtered_out": 102, "nextest": metadata}
+        def test_event(event, name):
+            return {"type": "test", "event": event, "name": f"codex-core::codex_core${name}"}
+
+        complete = []
+        for name in ("skipped-a", "skipped-b", "skipped-c"):
+            complete.extend([start, test_event("started", name), terminal])
+        complete.extend([start, test_event("started", "alpha"), test_event("ok", "alpha"),
+                         {**terminal, "passed": 1}])
+        for case in ("complete", "missing_skip_start", "missing_selected_completion",
+                     "missing_terminal", "duplicate_skip", "ignored_count_changed",
+                     "wrong_global_count", "unstarted_pass", "overlapping_start",
+                     "multiple_unfinished_starts"):
+            with self.subTest(case=case):
+                events = json.loads(json.dumps(complete))
+                if case == "missing_skip_start":
+                    del events[4]
+                elif case == "missing_selected_completion":
+                    del events[11]
+                elif case == "missing_terminal":
+                    events.pop()
+                elif case == "duplicate_skip":
+                    events[4] = test_event("started", "skipped-a")
+                elif case == "ignored_count_changed":
+                    events[5]["ignored"] = 2
+                elif case == "wrong_global_count":
+                    for event in events:
+                        if event.get("type") == "suite" and event.get("event") == "started":
+                            event["test_count"] = 5
+                elif case == "unstarted_pass":
+                    del events[10]
+                elif case == "overlapping_start":
+                    events[2], events[3] = events[3], events[2]
+                elif case == "multiple_unfinished_starts":
+                    events.insert(2, test_event("started", "unexplained"))
+                manifest = self.manifest()
+                manifest.targets["core_lib"] = replace(
+                    manifest.targets["core_lib"], helpers=(), helpers_by_test_prefix={})
+                runner, _ = self.runner(manifest=manifest)
+                calls = []
+                def execute(args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(
+                        args, 0, "\n".join(json.dumps(event) for event in events), "")
+                runner.executor = execute
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    if case == "complete":
+                        self.assertEqual(runner.run_target("core_lib", ["-E", "test(=alpha)"]),
+                                         {"codex-core": ["alpha"]})
+                    else:
+                        with self.assertRaises(rust_test_runner.RunnerError):
+                            runner.run_target("core_lib", ["-E", "test(=alpha)"])
+                self.assertEqual(len(calls), 1, "reconcile retained evidence without replay")
+
     @staticmethod
     def immediate_output(stdout: str, stderr: str = "diagnostic") -> str:
         # Native nextest framing observed in retained

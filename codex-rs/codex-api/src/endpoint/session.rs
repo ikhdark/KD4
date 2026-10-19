@@ -90,13 +90,14 @@ impl<T: HttpTransport> EndpointSession<T> {
         path: &str,
         extra_headers: HeaderMap,
         body: Option<EncodedJsonBody>,
+        max_response_bytes: usize,
     ) -> Result<Response, ApiError> {
         self.execute_body_with(
             method,
             path,
             extra_headers,
             body.map(RequestBody::EncodedJson),
-            |_| {},
+            |req| req.max_response_bytes = Some(max_response_bytes),
         )
         .await
     }
@@ -113,9 +114,11 @@ impl<T: HttpTransport> EndpointSession<T> {
         path: &str,
         extra_headers: HeaderMap,
         body: Option<EncodedJsonBody>,
+        max_response_bytes: usize,
     ) -> Result<Response, ApiError> {
         let body = body.map(RequestBody::EncodedJson);
-        let request = self.make_request(&method, path, &extra_headers, body);
+        let mut request = self.make_request(&method, path, &extra_headers, body);
+        request.max_response_bytes = Some(max_response_bytes);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();
 
@@ -224,7 +227,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         let header_deadline_elapsed = AtomicBool::new(false);
 
         // The new header deadline must not replay an ambiguously dispatched
-        // model request. Concrete transport errors retain their existing policy.
+        // model request. Native post-send errors need the same outer guard.
         // Scope the deadline to obtaining headers, not the response body's lifetime.
         let stream = run_with_request_telemetry_non_idempotent(
             self.provider.retry.to_policy(),
@@ -258,7 +261,17 @@ impl<T: HttpTransport> EndpointSession<T> {
             });
         }
 
-        Ok(stream?)
+        match stream {
+            Err(error @ (TransportError::Timeout | TransportError::Network(_))) => {
+                Err(ApiError::ProviderFailure {
+                    code: Some("dispatch_outcome_unknown".to_string()),
+                    message: format!(
+                        "Model request outcome is unknown after dispatch ({error}); automatic replay was stopped to avoid duplicate generation."
+                    ),
+                })
+            }
+            result => Ok(result?),
+        }
     }
 }
 
@@ -435,6 +448,7 @@ mod tests {
 
         struct HeaderProbe {
             delay: Option<Duration>,
+            network_error: bool,
             calls: Arc<AtomicUsize>,
         }
         impl HttpTransport for HeaderProbe {
@@ -448,7 +462,11 @@ mod tests {
                     return std::future::pending().await;
                 };
                 if delay.is_zero() {
-                    return Err(TransportError::Timeout);
+                    return Err(if self.network_error {
+                        TransportError::Network("accepted upload, then reset".into())
+                    } else {
+                        TransportError::Timeout
+                    });
                 }
                 tokio::time::sleep(delay).await;
                 Ok(StreamResponse {
@@ -466,11 +484,17 @@ mod tests {
             fn add_auth_headers(&self, _: &mut HeaderMap) {}
         }
 
-        for delay in [None, Some(Duration::ZERO), Some(Duration::from_millis(10))] {
+        for (delay, network_error) in [
+            (None, false),
+            (Some(Duration::ZERO), false),
+            (Some(Duration::ZERO), true),
+            (Some(Duration::from_millis(10)), false),
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let session = EndpointSession::new(
                 HeaderProbe {
                     delay,
+                    network_error,
                     calls: calls.clone(),
                 },
                 Provider {
@@ -506,11 +530,9 @@ mod tests {
                 assert_eq!(started.elapsed(), Duration::from_millis(50));
             } else if delay == Some(Duration::ZERO) {
                 let error = result.err().expect("concrete transport timeout");
-                assert!(matches!(
-                    &error,
-                    ApiError::Transport(TransportError::Timeout)
-                ));
-                assert!(crate::api_bridge::map_api_error(error).is_retryable());
+                assert!(matches!(&error, ApiError::ProviderFailure { code, .. }
+                    if code.as_deref() == Some("dispatch_outcome_unknown")));
+                assert!(!crate::api_bridge::map_api_error(error).is_retryable());
                 assert_eq!(started.elapsed(), Duration::ZERO);
             } else {
                 assert_eq!(started.elapsed(), Duration::from_millis(10));

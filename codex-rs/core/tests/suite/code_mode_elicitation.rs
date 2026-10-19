@@ -6,6 +6,7 @@ use anyhow::Result;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -66,6 +67,40 @@ impl CodeModeElicitationHarness {
             follow_up,
             turn_id,
         })
+    }
+
+    async fn wait_for_patch_approval(&self) -> Result<ApplyPatchApprovalRequestEvent> {
+        let result = tokio::time::timeout(TURN_COMPLETE_TIMEOUT, async {
+            loop {
+                match self.test.codex.next_event().await?.msg {
+                    EventMsg::ApplyPatchApprovalRequest(approval) => return Ok(approval),
+                    EventMsg::Error(error) => anyhow::bail!("error before patch approval: {error:?}"),
+                    EventMsg::TurnComplete(completed) if completed.turn_id == self.turn_id => {
+                        anyhow::bail!("turn completed before patch approval: {:?}", completed.error);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let failure = match result {
+            Ok(Ok(approval)) => return Ok(approval),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "timed out waiting for patch approval".to_string(),
+        };
+        let requests = self.follow_up.requests();
+        let output = requests.first().map(|request| {
+            serde_json::to_string(&request.inputs_of_type("custom_tool_call_output"))
+                .unwrap_or_default()
+                .chars()
+                .take(2048)
+                .collect::<String>()
+        });
+        anyhow::bail!(
+            "{failure}; status={:?}; follow-up requests={}; bounded tool output={output:?}",
+            self.test.codex.agent_status().await,
+            requests.len(),
+        )
     }
 
     async fn assert_result_held(&self) {
@@ -215,15 +250,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
         |config| config.set_windows_elevated_sandbox_enabled(true),
     )
     .await?;
-    let approval = wait_for_event_match_with_timeout(
-        &harness.test.codex,
-        |event| match event {
-            EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
-            _ => None,
-        },
-        TURN_COMPLETE_TIMEOUT,
-    )
-    .await;
+    let approval = harness.wait_for_patch_approval().await?;
 
     harness.assert_result_held().await;
     let patched_file = harness.test.config.cwd.join("code_mode_patch_approval.txt");
@@ -296,15 +323,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         |config| config.set_windows_elevated_sandbox_enabled(true),
     )
     .await?;
-    let approval = wait_for_event_match_with_timeout(
-        &harness.test.codex,
-        |event| match event {
-            EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
-            _ => None,
-        },
-        TURN_COMPLETE_TIMEOUT,
-    )
-    .await;
+    let approval = harness.wait_for_patch_approval().await?;
 
     harness
         .test

@@ -1627,6 +1627,13 @@ macro_rules! server_notification_definitions {
             }
         }
 
+        impl ServerNotification {
+            /// Recognize registered methods without accepting malformed payloads.
+            pub fn is_known_method(method: &str) -> bool {
+                matches!(method, $($wire)|*)
+            }
+        }
+
         #[allow(clippy::vec_init_then_push)]
         pub(crate) fn export_server_notification_schemas(
         ) -> ::anyhow::Result<Vec<GeneratedSchema>> {

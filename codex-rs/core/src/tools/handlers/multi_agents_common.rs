@@ -322,10 +322,8 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     let selected_model_info = models_manager
         .get_model_info(&selected_model_name, &config.to_models_manager_config())
         .await;
-    // Carry the resolved child-model limits into the spawn config so bounded history forks can
-    // reject a selection that would already exhaust the child's usable context window.
-    config.model_context_window = selected_model_info.resolved_context_window();
-    config.model_auto_compact_token_limit = selected_model_info.auto_compact_token_limit();
+    // Resolved catalog limits are not configuration overrides. Bounded forks
+    // resolve their admission budget from the selected model at admission.
     let reasoning_effort = explicit_reasoning_effort.or_else(|| {
         default_spawn_reasoning_effort(
             &selected_model_info.supported_reasoning_levels,
@@ -569,5 +567,25 @@ mod compatible_defaults_tests {
             "local-model"
         );
         assert!(find_spawn_agent_model_name(&catalog, DEFAULT_SPAWN_AGENT_MODEL).is_err());
+    }
+}
+#[cfg(test)]
+mod model_limit_provenance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn child_and_grandchild_keep_limit_override_provenance() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        for limits in [(None, None), (Some(128_000), Some(90_000))] {
+            let mut config = (*turn.config).clone();
+            config.model_context_window = limits.0;
+            config.model_auto_compact_token_limit = limits.1;
+            for model in ["custom-child-model", "custom-grandchild-model"] {
+                config.model = Some(model.into());
+                apply_spawn_agent_model_defaults_and_overrides(&session, &turn, &mut config,
+                    None, None, AgentRoleLocks { model: true, ..Default::default() }).await.unwrap();
+                assert_eq!((config.model_context_window, config.model_auto_compact_token_limit), limits);
+            }
+        }
     }
 }

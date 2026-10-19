@@ -70,25 +70,6 @@ pub(crate) fn bounded_path_list(paths: &[String]) -> String {
     }
 }
 
-/// Whether a request explicitly rules out running tests, as in "Do not run
-/// tests or benchmarks." Partial or conditional wording such as "do not run
-/// tests in parallel" or "unless the build passes" does not match.
-pub(crate) fn request_excludes_tests(text: &str) -> bool {
-    #[expect(
-        clippy::expect_used,
-        reason = "the regex is a fixed source literal, not runtime input"
-    )]
-    static EXCLUSION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
-        regex_lite::Regex::new(concat!(
-            r"(?im)\b(?:(?:do\s+not|don['’]?t|never|no\s+need\s+to)\s+(?:run|execute)|skip(?:\s+running)?|without\s+running)",
-            r"\s+(?:any\s+|the\s+)?(?:unit\s+|integration\s+)?(?:tests?|test\s+suites?)\b",
-            r"(?:\s+(?:or|and|nor|yet)\b|\s*(?:[.,;:!)*]|$))",
-        ))
-        .expect("valid test exclusion regex")
-    });
-    EXCLUSION.is_match(text)
-}
-
 /// Advisory-only policy. Production keeps these defaults; replay fixtures can
 /// compare alternatives without changing completion, recovery or cancellation
 /// invariants. This does not select models or alter reasoning effort.
@@ -3335,8 +3316,8 @@ pub(crate) struct TurnExecutionControl {
     validation_check_orders: BTreeMap<String, (u64, u64)>,
     next_validation_request: AtomicU64,
     pending_validation_coverage: BTreeMap<u64, PendingValidation>,
-    /// The request explicitly ruled out running tests.
-    tests_excluded_by_request: bool,
+    resumed_pending_checks: BTreeSet<String>,
+    validation_capture_incomplete: bool,
     session_path_replays: Option<Arc<SessionPathReplays>>,
     session_validation_uncertainty: Option<Arc<Mutex<SessionValidationUncertainty>>>,
 }
@@ -3350,6 +3331,41 @@ pub(crate) struct SessionValidationUncertainty {
     check_orders: BTreeMap<String, (u64, u64)>,
     next_request: u64,
     pending: BTreeMap<u64, PendingValidation>,
+    resumed_pending_checks: BTreeSet<String>,
+    capture_incomplete: bool,
+}
+
+impl SessionValidationUncertainty {
+    /// Called during the existing rollout reduction, never on the sampling path.
+    pub(crate) fn observe_durable_event(&mut self, event: &codex_protocol::protocol::EventMsg) {
+        use codex_protocol::protocol::EventMsg;
+        let timing = match event {
+            EventMsg::ThreadRolledBack(_) => {
+                *self = Self::default();
+                self.capture_incomplete = true;
+                return;
+            }
+            EventMsg::TurnStarted(_) => {
+                self.capture_incomplete = true;
+                return;
+            }
+            EventMsg::TurnComplete(event) => event.timing.as_ref(),
+            EventMsg::TurnAborted(event) => event.timing.as_ref(),
+            _ => return,
+        };
+        let Some(snapshot) = timing.and_then(|timing| timing.completion_assessment.as_ref())
+            .and_then(|assessment| assessment.validation_uncertainty.as_ref()) else {
+            return;
+        };
+        if snapshot.version != 1 || snapshot.failed_checks.len() + snapshot.pending_checks.len() > 32
+            || snapshot.failed_checks.iter().chain(&snapshot.pending_checks).any(|check| check.len() > 256) {
+            self.capture_incomplete = true;
+            return;
+        }
+        self.failed_checks = snapshot.failed_checks.iter().cloned().collect();
+        self.resumed_pending_checks = snapshot.pending_checks.iter().cloned().collect();
+        self.capture_incomplete = snapshot.capture_incomplete;
+    }
 }
 
 impl Drop for TurnExecutionControl {
@@ -3365,6 +3381,8 @@ impl Drop for TurnExecutionControl {
         retained.check_orders = std::mem::take(&mut self.validation_check_orders);
         retained.next_request = self.next_validation_request.load(Ordering::Relaxed);
         retained.pending = std::mem::take(&mut self.pending_validation_coverage);
+        retained.resumed_pending_checks = std::mem::take(&mut self.resumed_pending_checks);
+        retained.capture_incomplete = self.validation_capture_incomplete;
         let pending_checks = retained
             .pending
             .values()
@@ -3548,16 +3566,11 @@ impl TurnExecutionControl {
             validation_check_orders: BTreeMap::new(),
             next_validation_request: AtomicU64::new(0),
             pending_validation_coverage: BTreeMap::new(),
-            tests_excluded_by_request: false,
+            resumed_pending_checks: BTreeSet::new(),
+            validation_capture_incomplete: false,
             session_path_replays: None,
             session_validation_uncertainty: None,
         }
-    }
-
-    /// Untested changes are what a request that rules out tests asked for,
-    /// so completion stops reporting them as a verification gap.
-    pub(crate) fn note_request_excludes_tests(&mut self) {
-        self.tests_excluded_by_request = true;
     }
 
     pub(crate) fn with_active_plan(
@@ -3588,6 +3601,33 @@ impl TurnExecutionControl {
         settled_mutation_revision: u64,
     ) -> codex_protocol::protocol::TurnCompletionAssessment {
         let mut assessment = codex_protocol::protocol::TurnCompletionAssessment::default();
+        let mut snapshot = codex_protocol::protocol::TurnValidationUncertainty {
+            version: 1,
+            capture_incomplete: self.validation_capture_incomplete,
+            ..Default::default()
+        };
+        // Keep complete check identities or explicitly omit them; truncated keys
+        // could falsely match a later execution. No revisions or process IDs persist.
+        for (pending, check) in self.failed_validation_checks.iter().map(|check| (false, check))
+            .chain(self.resumed_pending_checks.iter().map(|check| (true, check)))
+            .chain(self.pending_validation_coverage.values().map(|pending| (true, &pending.check))) {
+            if check.len() > 256 || snapshot.failed_checks.len() + snapshot.pending_checks.len() >= 32 {
+                snapshot.capture_incomplete = true;
+                continue;
+            }
+            if pending { snapshot.pending_checks.push(check.clone()); }
+            else { snapshot.failed_checks.push(check.clone()); }
+        }
+        assessment.validation_uncertainty = Some(snapshot);
+        if !self.resumed_pending_checks.is_empty() {
+            assessment.advisories.push(format!(
+                "{} pre-restart validation execution(s) have no consumed result; no live process handle is restored. Relevance is unverified; this is not a rerun request.",
+                self.resumed_pending_checks.len()));
+        }
+        if self.validation_capture_incomplete {
+            assessment.advisories.push(
+                "Earlier validation capture is incomplete after interruption/resume; no execution outcome or test requirement is inferred.".into());
+        }
         let current_failures = self
             .failed_validation_checks
             .len()
@@ -3602,6 +3642,10 @@ impl TurnExecutionControl {
             assessment.failed_checks.push(format!(
                 "{current_failures} validation check(s) failed without a later passing execution or current per-test repairs.",
             ));
+            for check in self.failed_validation_checks.iter()
+                .filter(|check| !self.inherited_validation_checks.contains(*check)).take(8) {
+                assessment.failed_checks.push(format!("Unresolved check: {check}"));
+            }
             for (_, failed) in self
                 .failed_validation_tests
                 .iter()
@@ -3651,6 +3695,11 @@ impl TurnExecutionControl {
                 assessment.verification_gaps.push(format!(
                     "{current} validation process(es) still await a consumed terminal result.",
                 ));
+                for (process, pending) in self.pending_validation_coverage.iter()
+                    .filter(|(_, pending)| !pending.inherited).take(8) {
+                    assessment.verification_gaps.push(format!(
+                        "Pending validation observation: process {process}, check {}. Process identity alone is not a callable capability.", pending.check));
+                }
             }
             let inherited = self.pending_validation_coverage.len() - current;
             if inherited != 0 {
@@ -3714,7 +3763,7 @@ impl TurnExecutionControl {
                     uncovered.push(changed);
                 }
             }
-            if !uncovered.is_empty() && !self.tests_excluded_by_request {
+            if !uncovered.is_empty() {
                 // With nothing attributed at all, the likeliest cause is a
                 // repository runner the classifier was never told about.
                 let unrecognized = if self.validation_coverage_revision
@@ -3726,7 +3775,7 @@ impl TurnExecutionControl {
                     ""
                 };
                 assessment.verification_gaps.push(format!(
-                    "Changed paths without a passing test execution attributed to them: {}.{unrecognized} Non-test checks and declared paths are not test coverage; behavior remains unverified. Inspection or intentionally omitted validation must be reported.",
+                    "Changed paths without a passing test execution attributed to them: {}.{unrecognized} Behavior remains unverified. This observation does not require or authorize tests; follow the applicable user instructions, including intentional omission.",
                     bounded_path_list(&uncovered)
                 ));
             }
@@ -4242,6 +4291,8 @@ impl TurnExecutionControl {
             self.next_validation_request
                 .store(retained.next_request, Ordering::Relaxed);
             self.pending_validation_coverage = std::mem::take(&mut retained.pending);
+            self.resumed_pending_checks = std::mem::take(&mut retained.resumed_pending_checks);
+            self.validation_capture_incomplete = retained.capture_incomplete;
         }
         // Mutation revisions are turn-local. Preserve the question, not an old
         // pass or the fiction that revision zero in two turns means equal inputs.
@@ -4926,6 +4977,7 @@ impl TurnExecutionControl {
                             self.validated_check = None;
                         }
                         if revision == settled.mutation_revision {
+                            self.resumed_pending_checks.remove(&check);
                             self.failed_validation_checks.remove(&check);
                             self.inherited_validation_checks.remove(&check);
                             self.failed_validation_tests.remove(&check);
@@ -10173,7 +10225,7 @@ mod tests {
                     .verification_gaps
                     .iter()
                     .any(|gap| gap.contains("unrelated.rs")
-                        && gap.contains("behavior remains unverified")),
+                        && gap.contains("Behavior remains unverified")),
                 !test_execution
             );
             assert_eq!(
@@ -10503,11 +10555,24 @@ mod tests {
                 }
                 let revision_gaps =
                     control.completion_gaps_with_changed_paths(revision, None, false);
+                let assessment = control.completion_assessment(revision);
                 assert_eq!(
-                    revision_gaps.len(),
-                    usize::from(matches!(scenario, "failed" | "stale")),
+                    assessment.failed_checks.len(),
+                    2 * usize::from(scenario == "failed"),
                     "{nested} {scenario}: {revision_gaps:?}"
                 );
+                for check in &control.failed_validation_checks {
+                    assert!(
+                        assessment.failed_checks.contains(&format!("Unresolved check: {check}")),
+                        "{nested} {scenario}: {revision_gaps:?}"
+                    );
+                }
+                assert_eq!(
+                    assessment.verification_gaps.len(),
+                    usize::from(scenario == "stale"),
+                    "{nested} {scenario}: {revision_gaps:?}"
+                );
+                assert!(assessment.advisories.is_empty());
                 let gaps =
                     control.completion_gaps_with_changed_paths(revision, Some(&changed), false);
                 let attributed =
@@ -10794,16 +10859,23 @@ mod tests {
                     };
                     record(&failure, "a", false);
                     control.settle(&baseline, &failure, &settled(0));
-                    let gaps = control.completion_gaps_with_changed_paths(0, Some(&changed), false);
-                    assert_eq!(
-                        gaps.len(),
-                        2,
-                        "{nested} {separate_request} {failure_has_scope}: {gaps:?}"
+                    let report = control.completion_assessment_with_changed_paths(
+                        0, Some(&changed), false,
                     );
-                    assert!(gaps[0].contains("1 validation check(s) failed"));
-                    assert!(gaps[1].contains(&changed[0].1.display().to_string()));
-                    assert!(!gaps[1].contains(&changed[1].1.display().to_string()));
-                    assert!(gaps[1].contains(&changed[2].1.display().to_string()));
+                    assert_eq!(
+                        report.failed_checks.len(),
+                        2,
+                        "{nested} {separate_request} {failure_has_scope}: {report:?}"
+                    );
+                    assert!(report.failed_checks[0].contains("1 validation check(s) failed"));
+                    let failed_check = control.failed_validation_checks.iter().next().unwrap();
+                    assert_eq!(report.failed_checks[1], format!("Unresolved check: {failed_check}"));
+                    assert_eq!(report.verification_gaps.len(), 1);
+                    let gap = &report.verification_gaps[0];
+                    assert!(gap.contains(&changed[0].1.display().to_string()));
+                    assert!(!gap.contains(&changed[1].1.display().to_string()));
+                    assert!(gap.contains(&changed[2].1.display().to_string()));
+                    assert!(report.advisories.is_empty());
                     assert_delivery_retains_validation_gap(&mut control, 0);
 
                     let unrelated = control.collector(&baseline);
@@ -10988,6 +11060,44 @@ mod tests {
         let last = TurnExecutionControl::new().with_session_validation_uncertainty(owner);
         assert!(last.completion_assessment(0).advisories.is_empty());
         assert!(last.validated_mutation_revision.is_none());
+    }
+
+    #[test]
+    fn durable_validation_snapshot_restores_questions_without_process_authority_or_passes() {
+        use codex_protocol::protocol::{EventMsg, TurnCompleteEvent, TurnTiming};
+        let mut first = TurnExecutionControl::new();
+        let baseline = first.baselines(0);
+        let failure = recorded_validation_collector(&first, &baseline, ToolOutputOutcome::Failure);
+        first.settle(&baseline, &failure, &settled(0));
+        let mut assessment = first.completion_assessment(0);
+        assessment.validation_uncertainty.as_mut().unwrap().pending_checks.push("old-pending".into());
+        let event = |assessment| EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "before-restart".into(), last_agent_message: None, surfaced_result: None,
+            error: None, completed_at: None, duration_ms: None, time_to_first_token_ms: None,
+            timing: Some(TurnTiming { completion_assessment: Some(assessment), ..Default::default() }),
+        });
+        let serialized = serde_json::to_vec(&event(assessment)).unwrap();
+        let mut owner = SessionValidationUncertainty::default();
+        owner.observe_durable_event(&serde_json::from_slice(&serialized).unwrap());
+        let mut resumed = TurnExecutionControl::new()
+            .with_session_validation_uncertainty(Arc::new(Mutex::new(owner)));
+        assert_eq!(resumed.failed_validation_checks.len(), 1);
+        assert_eq!(resumed.resumed_pending_checks.len(), 1);
+        assert!(resumed.pending_validation_coverage.is_empty());
+        assert!(resumed.validated_mutation_revision.is_none());
+        assert!(resumed.validation_coverage.is_empty());
+        let baseline = resumed.baselines(0);
+        let repair = recorded_validation_collector(&resumed, &baseline, ToolOutputOutcome::Success);
+        resumed.settle(&baseline, &repair, &settled(0));
+        assert!(resumed.failed_validation_checks.is_empty());
+        let mut again = SessionValidationUncertainty::default();
+        again.observe_durable_event(&event(resumed.completion_assessment(0)));
+        assert!(again.failed_checks.is_empty());
+        assert_eq!(again.resumed_pending_checks.len(), 1);
+        let mut invalid = resumed.completion_assessment(0);
+        invalid.validation_uncertainty.as_mut().unwrap().version = 255;
+        again.observe_durable_event(&event(invalid));
+        assert!(again.capture_incomplete);
     }
 
     #[test]
@@ -11283,35 +11393,15 @@ mod tests {
         assert!(gap.contains("and 2 more"), "{gap}");
     }
 
-    /// Recorded audits said "Do not run tests or benchmarks." and still got a
-    /// verification-gap warning naming every edited file.
     #[test]
-    fn request_that_rules_out_tests_owes_no_untested_path_gap() {
-        for request in [
-            "Finish implementing all 3 verified findings. **Do not run tests or benchmarks.** Regression cases may be added without execution.",
-            "Don't run tests.",
-            "Implement it without running the tests.",
-            "do not run the test suite, just report",
-            "Fix the bug.\nSkip tests\nThen summarize.",
-        ] {
-            assert!(super::request_excludes_tests(request), "{request}");
-        }
-        for request in [
-            "Run the tests and fix failures.",
-            "Do not run tests in parallel.",
-            "Do not run tests unless the build passes.",
-            "Skip tests that need network access.",
-            "Make sure tests pass; do not skip any assertion.",
-        ] {
-            assert!(!super::request_excludes_tests(request), "{request}");
-        }
-
+    fn missing_test_evidence_is_not_execution_authority() {
         let changed = vec![("local".into(), std::path::PathBuf::from("src/lib.rs"))];
         let mut control = TurnExecutionControl::new();
-        control.note_request_excludes_tests();
+        control.accepted_user_input();
         let gaps = control.completion_gaps_with_changed_paths(0, Some(&changed), false);
         assert!(
-            !gaps.iter().any(|gap| gap.starts_with("Changed paths")),
+            gaps.iter().any(|gap| gap.starts_with("Changed paths")
+                && gap.contains("does not require or authorize tests")),
             "{gaps:?}"
         );
         // Other gaps still report: an unavailable change set is not excused.

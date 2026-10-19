@@ -116,6 +116,17 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
                 }),
                 ("superseded".to_string(), superseded),
+                ("scope_change_refs".to_string(), JsonSchema {
+                    description: Some("Superseded step/orphan ID to an accepted_input_refs entry from current task state. Alternative to copying scope_change_instructions; identical user provenance checks apply. A reference establishes source identity, not semantic authorization. Conflicting text and reference sources are rejected.".into()),
+                    ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::object(
+                        BTreeMap::from([
+                            ("turn_id".into(), JsonSchema::string(None)),
+                            ("sha256".into(), JsonSchema::string(None)),
+                        ]),
+                        Some(vec!["turn_id".into(), "sha256".into()]),
+                        Some(false.into()),
+                    ).into()))
+                }),
                 ("workflow".to_string(), JsonSchema {
                     description: Some("Optional map of at most 128 stable step IDs to existing task-coordinator assignment IDs in this root session. Dependencies and capabilities are resolved by the host; checklist order does not schedule execution.".to_string()),
                     ..JsonSchema::object(

@@ -3002,6 +3002,7 @@ END
         let items = vec![RolloutItem::EventMsg(EventMsg::TokenCount(
             codex_protocol::protocol::TokenCountEvent {
                 info: Some(codex_protocol::protocol::TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: codex_protocol::protocol::TokenUsage {
                         input_tokens: 0,
                         cached_input_tokens: 0,

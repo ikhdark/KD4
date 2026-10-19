@@ -108,6 +108,17 @@ pub(super) fn remove_sensitive_headers(
             headers.remove(header);
         }
         headers.remove("cookie2");
+        // Authentication is not limited to standard header names. Drop every
+        // value marked by provider configuration or external auth, including
+        // repeated values of the same header. Same-origin redirects retain it.
+        let sensitive_names = headers
+            .iter()
+            .filter(|(_, value)| value.is_sensitive())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in sensitive_names {
+            headers.remove(name);
+        }
     }
 }
 

@@ -6,6 +6,18 @@ use std::num::NonZeroU64;
 use tempfile::tempdir;
 
 #[test]
+fn configured_provider_headers_retain_sensitive_origin_provenance() {
+    let provider: ModelProviderInfo = toml::from_str(r#"
+name = "Header auth fixture"
+http_headers = { api-key = "fake-api-key", arbitrary-credential = "fake-secret" }
+"#).unwrap();
+    let headers = provider.build_header_map().unwrap();
+    assert_eq!(headers["api-key"], "fake-api-key");
+    assert_eq!(headers["arbitrary-credential"], "fake-secret");
+    assert!(headers.values().all(HeaderValue::is_sensitive));
+}
+
+#[test]
 fn test_deserialize_ollama_model_provider_toml() {
     let azure_provider_toml = r#"
 name = "Ollama"

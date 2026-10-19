@@ -2494,7 +2494,7 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
     // layout the provider cached and appends the request after it.
     let earlier_work = message("assistant", &"earlier analysis ".repeat(2_000));
     let padded: Arc<[ResponseItem]> =
-        Arc::from([earlier_work, function_call("read-old"), output.clone()]);
+        Arc::from([earlier_work, function_call("read-old"), output]);
     let padded_previous =
         state.project_sampling_with_workspace_cache(Arc::clone(&padded), Some(&changed), &cache);
     assert_eq!(
@@ -3475,6 +3475,38 @@ fn non_git_unknown_workspace_evidence_invalidates_on_recorded_mutation() {
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
     assert_eq!(notices[0]["stale_workspace_evidence"], true);
+}
+
+#[tokio::test]
+async fn non_git_watched_evidence_keeps_mutation_and_watcher_guards() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "unchanged").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    assert!(cache.workspace_evidence_identity(root.path()).await.is_none());
+    let output = text_output("non-git-read", "unchanged".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("non-git-read"), output.clone()]);
+    let observation = watched(&cache, root.path(),
+        WorkspaceEvidenceObservation::from_response_item(None, &output,
+            BTreeSet::from([SourceDependencyV1::new(&path, false)])).unwrap()
+            .with_source_scope_complete(true),
+    ).await;
+    assert_eq!(observation.dependency_notice("unchanged", None, Some(&cache))["dependencies"][0]["freshness"], "current");
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(observation);
+    assert!(freshness_notices(&state, &items, None, &cache).is_empty());
+    cache.note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()]).await;
+    assert!(freshness_notices(&state, &items, None, &cache).is_empty());
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(freshness_notices(&restored, &items, None, &cache).is_empty());
+    let restarted_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    assert_eq!(freshness_notices(&restored, &items, None, &restarted_cache).len(), 1);
+    assert_eq!(freshness_notices(&state, &items, Some(&workspace_identity_at(root.path(), "now-git")), &cache).len(), 1);
+    let mut mutated = state.clone();
+    assert!(mutated.invalidate_source_dependencies(Some(&BTreeSet::from([path])), None));
+    assert_eq!(freshness_notices(&mutated, &items, None, &cache).len(), 1);
+    cache.note_host_workspace_mutation();
+    assert_eq!(freshness_notices(&state, &items, None, &cache).len(), 1);
 }
 
 #[test]
@@ -7324,7 +7356,7 @@ fn exact_recovery_selectors_survive_restore_into_compaction_metadata() {
     state.register(record);
     let selector = serde_json::json!({"kind": "bytes", "start": 100, "end": 200});
     let mutation = ToolHistoryMutation::RecordArtifactRecovery {
-        artifact_id: artifact_id.clone(),
+        artifact_id,
         recovery_call_id: "recovery".into(),
         selectors: vec![selector.clone()],
     };
@@ -7863,13 +7895,26 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let revision = workspace_identity_at(root.path(), "captured");
     let arguments = serde_json::json!({"path": source});
-    let classification = classify_workspace_tool_call(
+    let mut classification = classify_workspace_tool_call(
         "read_file",
         &ToolPayload::Function {
             arguments: arguments.to_string(),
         },
         root.path(),
     );
+    // Exceed the notice's eight-path display cap. Complete watcher evidence,
+    // not that truncated display, must determine whether anything changed.
+    for index in 0..9 {
+        let extra = root.path().join(format!("extra-{index}.txt"));
+        std::fs::write(&extra, "unchanged").unwrap();
+        classification.source_dependencies.extend(classify_workspace_tool_call(
+            "read_file",
+            &ToolPayload::Function {
+                arguments: serde_json::json!({"path": extra}).to_string(),
+            },
+            root.path(),
+        ).source_dependencies);
+    }
     assert!(
         classification.source_scope_complete,
         "native exact inputs remain complete"

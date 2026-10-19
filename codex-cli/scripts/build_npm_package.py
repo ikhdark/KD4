@@ -127,6 +127,7 @@ def main() -> int:
     if not version:
         raise RuntimeError("Must specify --version or --release-version.")
 
+    validate_notice_inputs()
     staging_dir, created_temp = prepare_staging_dir(args.staging_dir)
 
     try:
@@ -207,7 +208,14 @@ def prepare_staging_dir(staging_dir: Path | None) -> tuple[Path, bool]:
     return temp_dir, True
 
 
+def validate_notice_inputs() -> None:
+    for name in ("LICENSE", "NOTICE"):
+        if not (REPO_ROOT / name).is_file():
+            raise RuntimeError(f"Required package notice is missing: {REPO_ROOT / name}")
+
+
 def stage_sources(staging_dir: Path, version: str, package: str) -> None:
+    validate_notice_inputs()
     package_json: dict
     package_json_path: Path | None = None
 

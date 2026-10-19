@@ -98,6 +98,22 @@ pub struct StreamResponse {
     pub bytes: ByteStream,
 }
 
+async fn collect_success_body(
+    stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
+    limit: usize,
+) -> Result<Bytes, TransportError> {
+    tokio::pin!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReqwestTransport::map_error)?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(TransportError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
+}
+
 pub trait HttpTransport: Send + Sync {
     fn execute(
         &self,
@@ -146,6 +162,7 @@ impl ReqwestTransport {
             body: _,
             compression: _,
             timeout,
+            max_response_bytes: _,
         } = req;
 
         let mut builder = client.request(
@@ -268,6 +285,7 @@ impl HttpTransport for ReqwestTransport {
         self.trace_request(&req);
 
         let accepts_not_modified = req.headers.contains_key(IF_NONE_MATCH);
+        let max_response_bytes = req.max_response_bytes;
         let url = req.url.clone();
         let resp = self.send(req).await?;
         let status = resp.status();
@@ -283,7 +301,14 @@ impl HttpTransport for ReqwestTransport {
                 retry_after,
             });
         }
-        let bytes = resp.bytes().await.map_err(Self::map_error)?;
+        let bytes = if let Some(limit) = max_response_bytes {
+            if resp.content_length().is_some_and(|length| length > limit as u64) {
+                return Err(TransportError::ResponseTooLarge { limit });
+            }
+            collect_success_body(resp.bytes_stream(), limit).await?
+        } else {
+            resp.bytes().await.map_err(Self::map_error)?
+        };
         Ok(Response {
             status,
             headers,

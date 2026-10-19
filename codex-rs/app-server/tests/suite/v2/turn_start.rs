@@ -2944,8 +2944,7 @@ fn model_visible_environment_cwds(
         .filter(|item| item["role"] == "user")
         .flat_map(|item| item["content"].as_array().into_iter().flatten())
         .filter_map(|content| content["text"].as_str())
-        .filter(|text| text.starts_with("<environment_context>"))
-        .next_back()
+        .rfind(|text| text.starts_with("<environment_context>"))
         .context("environment context should be model visible")?;
     Ok(environment_context
         .lines()
@@ -3287,6 +3286,19 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
                 "type": "response.function_call_arguments.delta",
                 "item_id": "fc-other-call",
                 "delta": r#"{"input":"*** Begin Patch\n*** Add File: ignored.txt\n+ignored"#,
+            }),
+            // Finish the non-patch item before beginning another output item.
+            // Its deltas still must not produce file-change streaming events.
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-other-call",
+                    "call_id": "other-call",
+                    "name": "not_apply_patch",
+                    "arguments": r#"{"input":"*** Begin Patch\n*** Add File: ignored.txt\n+ignored"}"#,
+                    "status": "completed"
+                }
             }),
             serde_json::json!({
                 "type": "response.output_item.added",

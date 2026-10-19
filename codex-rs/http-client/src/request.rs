@@ -81,6 +81,8 @@ pub struct Request {
     pub body: Option<RequestBody>,
     pub compression: RequestCompression,
     pub timeout: Option<Duration>,
+    /// Receive bound for unary success bodies; never applies to streaming output.
+    pub max_response_bytes: Option<usize>,
 }
 
 impl Request {
@@ -92,6 +94,7 @@ impl Request {
             body: None,
             compression: RequestCompression::None,
             timeout: None,
+            max_response_bytes: None,
         }
     }
 

@@ -207,7 +207,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         instructions_text.as_str(),
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
-    assert!(instructions_text.contains("Add tests only to prevent concrete behavioral failures"));
+    assert!(instructions_text.contains("Add tests only for concrete behavioral failures through the real owning path"));
     assert!(!instructions_text.contains("{{ personality }}"));
 
     assert!(

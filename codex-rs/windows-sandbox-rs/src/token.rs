@@ -62,16 +62,15 @@ struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
 }
 
-/// Sets a permissive default DACL so sandboxed processes can create pipes/IPC objects
-/// without hitting ACCESS_DENIED when PowerShell builds pipelines.
-unsafe fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()> {
-    if sids.is_empty() {
-        return Ok(());
-    }
-    let entries: Vec<EXPLICIT_ACCESS_W> = sids
+/// Allow same-logon pipelines/IPC without granting other logons object access.
+unsafe fn set_default_dacl(h_token: HANDLE, logon_sid: *mut c_void) -> Result<()> {
+    // OWNER RIGHTS suppresses the owner's implicit WRITE_DAC. Sandbox launches
+    // can share an account owner without sharing their creating logon.
+    let owner_rights = LocalSid::from_string("S-1-3-4")?;
+    let entries: Vec<EXPLICIT_ACCESS_W> = [(logon_sid, GENERIC_ALL), (owner_rights.as_ptr(), 0x0002_0000)]
         .iter()
-        .map(|sid| EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
+        .map(|(sid, permissions)| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: *permissions,
             grfAccessMode: GRANT_ACCESS,
             grfInheritance: 0,
             Trustee: TRUSTEE_W {
@@ -493,11 +492,7 @@ unsafe fn create_token_with_caps_from(
         return Err(anyhow!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    let mut dacl_sids: Vec<*mut c_void> = Vec::with_capacity(psid_capabilities.len() + 2);
-    dacl_sids.push(psid_logon);
-    dacl_sids.push(psid_everyone);
-    dacl_sids.extend_from_slice(psid_capabilities);
-    let configured = match set_default_dacl(new_token, &dacl_sids) {
+    let configured = match set_default_dacl(new_token, psid_logon) {
         Ok(()) => enable_single_privilege(new_token, "SeChangeNotifyPrivilege"),
         Err(err) => Err(err),
     };
@@ -582,6 +577,55 @@ pub(crate) fn probe_legacy_delete_child_restriction() -> Result<bool> {
             Some(err) => Err(anyhow!(
                 "FILE_DELETE_CHILD compatibility probe failed: {err}"
             )),
+        }
+    }
+}
+#[cfg(test)]
+mod default_dacl_tests {
+    use super::*;
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, EqualSid, GetAce, TOKEN_DEFAULT_DACL};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+    }
+
+    #[test]
+    fn restricted_token_default_dacl_only_grants_creating_logon_and_owner_read() {
+        unsafe {
+            let base = Token(get_current_token_for_restriction().unwrap());
+            let home = tempfile::tempdir().unwrap();
+            let caps = crate::cap::load_or_create_cap_sids(home.path()).unwrap();
+            let capability = LocalSid::from_string(&caps.workspace).unwrap();
+            let restricted = Token(create_token_with_caps_from(base.0, &[capability.as_ptr()], &[]).unwrap());
+            let mut logon = get_logon_sid_bytes(base.0).unwrap();
+            let owner = LocalSid::from_string("S-1-3-4").unwrap();
+            let everyone = LocalSid::from_string("S-1-1-0").unwrap();
+            let mut needed = 0;
+            GetTokenInformation(restricted.0, TokenDefaultDacl, std::ptr::null_mut(), 0, &mut needed);
+            let mut buffer = vec![0u8; needed as usize];
+            assert_ne!(GetTokenInformation(restricted.0, TokenDefaultDacl, buffer.as_mut_ptr().cast(), needed, &mut needed), 0);
+            let dacl = std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl;
+            assert!(!dacl.is_null());
+            assert_eq!((*dacl).AceCount, 2);
+            let mut found_logon = false;
+            let mut found_owner = false;
+            for index in 0..u32::from((*dacl).AceCount) {
+                let mut ace = std::ptr::null_mut();
+                assert_ne!(GetAce(dacl, index, &mut ace), 0);
+                let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                let sid = std::ptr::addr_of!(ace.SidStart).cast_mut().cast();
+                assert_eq!(EqualSid(sid, everyone.as_ptr()), 0);
+                assert_eq!(EqualSid(sid, capability.as_ptr()), 0);
+                if EqualSid(sid, logon.as_mut_ptr().cast()) != 0 {
+                    found_logon = true;
+                    assert_eq!(ace.Mask, GENERIC_ALL);
+                } else if EqualSid(sid, owner.as_ptr()) != 0 {
+                    found_owner = true;
+                    assert_eq!(ace.Mask, 0x0002_0000); // READ_CONTROL, not WRITE_DAC
+                } else { panic!("unexpected trustee in token default DACL"); }
+            }
+            assert!(found_logon && found_owner);
         }
     }
 }

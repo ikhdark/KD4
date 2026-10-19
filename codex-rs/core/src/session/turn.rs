@@ -66,6 +66,7 @@ use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
+use crate::responses_retry::AccountChangeIdentity;
 use crate::responses_retry::AccountChangeWait;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
@@ -602,12 +603,6 @@ pub(crate) async fn run_turn(
                 sess.services.plan_store.execution_snapshot().await
             });
     turn_execution.rehydrate_argument_failures(sess.state.lock().await.history.raw_items());
-    if turn_input_text_matches(
-        &input,
-        crate::session::turn_execution::request_excludes_tests,
-    ) {
-        turn_execution.note_request_excludes_tests();
-    }
     let mut exhaustive_scope_requested =
         turn_input_text_matches(&input, request_asks_for_exhaustive_scope);
     // A root session publishes its request and edits while this turn runs, so
@@ -673,10 +668,6 @@ pub(crate) async fn run_turn(
             break 'sampling_loop;
         };
 
-        let pending_input_excludes_tests = turn_input_text_matches(
-            &pending_input,
-            crate::session::turn_execution::request_excludes_tests,
-        );
         let pending_input_exhaustive =
             turn_input_text_matches(&pending_input, request_asks_for_exhaustive_scope);
         let recorded_input =
@@ -688,9 +679,6 @@ pub(crate) async fn run_turn(
             completion_evidence = None;
             provider_overflow_recovery_attempted = false;
             turn_execution.accepted_user_input();
-            if pending_input_excludes_tests {
-                turn_execution.note_request_excludes_tests();
-            }
             exhaustive_scope_requested |= pending_input_exhaustive;
         }
         if recorded_input.renews_generation_budget {
@@ -4238,6 +4226,9 @@ fn run_auto_compact<'a>(
     Box::pin(async move {
         let turn_context = &step_context.turn;
         let budget_turn_context = Arc::clone(turn_context);
+        // Pre-turn planning reports returned failures at its terminal boundary.
+        // Mid-turn callers retain the existing inline error notification.
+        let emit_error_event = !matches!(phase, CompactionPhase::PreTurn);
         // Consumed results already have exact recovery pins. Retiring them
         // costs no model request; summarize only when that cannot bring the
         // window under its limit.
@@ -4326,6 +4317,15 @@ fn run_auto_compact<'a>(
                     .await;
                     return Ok(ContextPressureRelief::Compaction);
                 }
+                if !crate::compact_model_fallback::should_retry_with_local_compaction(&remote_error) {
+                    return Err(remote_error);
+                }
+                if let Some(advice) = remote_error.retry_after() {
+                    let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+                    crate::responses_retry::wait_for_retry_deadline(
+                        advice.deadline(), cancellation_token,
+                    ).await?;
+                }
                 sess.send_event(
                     turn_context,
                     EventMsg::Warning(WarningEvent {
@@ -4356,7 +4356,7 @@ fn run_auto_compact<'a>(
                 initial_context_injection.clone(),
                 reason,
                 phase,
-                /*emit_error_event*/ fallback_step_context.is_none(),
+                /*emit_error_event*/ emit_error_event && fallback_step_context.is_none(),
                 cancellation_token,
             )
             .await;
@@ -4370,6 +4370,12 @@ fn run_auto_compact<'a>(
                     if !should_retry_with_current_model(&previous_error) {
                         return Err(previous_error);
                     }
+                    if let Some(advice) = previous_error.retry_after() {
+                        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+                        crate::responses_retry::wait_for_retry_deadline(
+                            advice.deadline(), cancellation_token,
+                        ).await?;
+                    }
 
                     let fallback_turn_context = &fallback_step_context.turn;
                     let fallback_result = run_inline_auto_compact_task(
@@ -4382,7 +4388,7 @@ fn run_auto_compact<'a>(
                         initial_context_injection,
                         reason,
                         phase,
-                        /*emit_error_event*/ true,
+                        emit_error_event,
                         cancellation_token,
                     )
                     .await;
@@ -4419,14 +4425,16 @@ fn run_auto_compact<'a>(
                 let error = CodexErr::Fatal(
                     "Compaction did not bring the context below its configured token limit. Stopped automatic continuation to prevent repeated compaction and usage drain; reduce context or start a new task.".to_string(),
                 );
-                sess.send_event(
-                    &budget_turn_context,
-                    EventMsg::Error(ErrorEvent {
-                        message: error.to_string(),
-                        codex_error_info: Some(error.to_codex_protocol_error()),
-                    }),
-                )
-                .await;
+                if emit_error_event {
+                    sess.send_event(
+                        &budget_turn_context,
+                        EventMsg::Error(ErrorEvent {
+                            message: error.to_string(),
+                            codex_error_info: Some(error.to_codex_protocol_error()),
+                        }),
+                    )
+                    .await;
+                }
                 return Err(error);
             }
         }
@@ -5131,6 +5139,9 @@ async fn run_sampling_request(
             continue;
         }
         let mut attempt_progress = SamplingAttemptProgress::default();
+        let request_account = turn_context.provider.auth_manager()
+            .and_then(|manager| manager.auth_cached())
+            .and_then(|auth| AccountChangeIdentity::from_auth(&auth));
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -5163,7 +5174,7 @@ async fn run_sampling_request(
                 // An account switch or limit reset makes the same request
                 // succeed; it does not spend the stream retry budget.
                 if !wait_for_account_change(
-                    AccountChangeWait::UsageLimit(&e),
+                    AccountChangeWait::UsageLimit(&e, request_account.as_ref()),
                     &mut account_wait_deadline,
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -6864,6 +6875,17 @@ async fn try_run_sampling_request(
     let bound_context_attempts = Arc::new(Mutex::new(HashSet::new()));
     let boundary_bound_context_attempts = Arc::clone(&bound_context_attempts);
     let boundary_pending_tool_manifest = Arc::clone(&pending_tool_manifest);
+    let boundary_workspace_freshness_notices = prompt.input.iter().flat_map(|item| {
+        match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => content.iter().filter_map(|item| {
+                match item {
+                    ContentItem::InputText { text } if text.starts_with("<workspace_evidence_invalidation>\n") => Some(text.clone()),
+                    _ => None,
+                }
+            }).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }
+    }).collect::<Vec<_>>();
     let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
         let sess = Arc::clone(&boundary_session);
         let turn_id = boundary_turn_id.clone();
@@ -6872,6 +6894,7 @@ async fn try_run_sampling_request(
         let harness_build = boundary_harness_build.clone();
         let bound_context_attempts = Arc::clone(&boundary_bound_context_attempts);
         let pending_tool_manifest = Arc::clone(&boundary_pending_tool_manifest);
+        let workspace_freshness_notices = boundary_workspace_freshness_notices.clone();
         Box::pin(async move {
             let terminal = sess
                 .active_turn
@@ -6950,6 +6973,7 @@ async fn try_run_sampling_request(
                 SamplingBoundaryItem {
                     sampling_request_id: identity.sampling_request_id.clone(),
                     physical_attempt_id: identity.physical_attempt_id.clone(),
+                    workspace_freshness_notices,
                     turn_id: Some(turn_id),
                     unresolved_context: true,
                     timing_checkpoint: Some(timing_checkpoint),
@@ -7094,18 +7118,18 @@ async fn try_run_sampling_request(
         let event = match event {
             Some(Ok(event)) => event,
             Some(Err(err)) => {
-                if let CodexErr::IncompleteResponse(response) = &err {
+                if let Some(token_usage) = err.terminal_usage() {
                     turn_context
                         .turn_timing_state
-                        .record_generation_token_usage(response.token_usage.as_ref());
+                        .record_generation_token_usage(token_usage.as_ref());
                     if let Err(accounting_error) = sess
-                        .update_token_usage_info(&turn_context, response.token_usage.as_ref())
+                        .update_token_usage_info(&turn_context, token_usage.as_ref())
                         .await
                     {
                         break Err(accounting_error);
                     }
                 }
-                break Err(err);
+                break Err(err.into_response_error());
             }
             None => {
                 break Err(CodexErr::Stream(

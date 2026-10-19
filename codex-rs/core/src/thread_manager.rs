@@ -1720,6 +1720,24 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    pub(crate) async fn fork_context_token_limit(&self, config: &Config) -> CodexResult<Option<i64>> {
+        let manager = models_manager_for_config(
+            &self.models_manager,
+            &self.models_manager_provider_id,
+            &self.models_manager_provider,
+            config,
+            Arc::clone(&self.auth_manager),
+        );
+        let model = manager.get_default_model(
+            &config.model,
+            false,
+            codex_models_manager::manager::RefreshStrategy::Offline,
+            config.http_client_factory(),
+        ).await?;
+        let info = manager.get_model_info(&model, &config.to_models_manager_config()).await;
+        Ok(info.auto_compact_token_limit().or(info.resolved_context_window()))
+    }
+
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
         self.agent_graph_store.clone()
     }

@@ -9,10 +9,33 @@ use codex_secrets::SecretsManager;
 use codex_secrets::compute_keyring_account;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::fs::OpenOptions;
 use tempfile::tempdir;
 
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
+
+#[test]
+fn file_storage_failed_replace_preserves_committed_credentials() -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let home = tempdir()?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let old: AuthDotJson = serde_json::from_value(json!({"OPENAI_API_KEY": "old-key"}))?;
+    let new: AuthDotJson = serde_json::from_value(json!({"OPENAI_API_KEY": "new-key"}))?;
+    storage.save(&old)?;
+    let path = get_auth_file(home.path());
+    let original = std::fs::read(&path)?;
+    // Permit reads and writes but forbid replacement, reproducing the Windows
+    // sharing failure after the replacement payload has been staged.
+    let reader = std::fs::OpenOptions::new().read(true).share_mode(3).open(&path)?;
+    assert!(storage.save(&new).is_err());
+    assert_eq!(std::fs::read(&path)?, original);
+    assert_eq!(storage.load()?, Some(old));
+    drop(reader);
+    storage.save(&new)?;
+    assert_eq!(storage.load()?, Some(new));
+    Ok(())
+}
 
 #[test]
 fn file_storage_save_and_load_preserve_auth_dot_json() -> anyhow::Result<()> {

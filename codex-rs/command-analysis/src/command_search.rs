@@ -351,6 +351,17 @@ fn hash_scope_path(
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
+        // rg follows configuration links even without --follow. The source-tree
+        // no-follow fingerprint cannot prove their effective rules unchanged.
+        if path.file_name().is_some_and(|name| {
+            [".ignore", ".rgignore", ".gitignore", "exclude", "commondir", ".git"]
+                .iter().any(|candidate| name == *candidate)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "linked search configuration requires fresh execution",
+            ));
+        }
         symlinks.push(path.to_path_buf());
         hasher.update(b"symlink\0");
         hash_path_field(hasher, &std::fs::read_link(path)?);
@@ -1036,6 +1047,30 @@ impl<'a> RgArgumentRoles<'a> {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn effective_ignore_links_disable_negative_search_reuse() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("data.txt"), "needle\n").unwrap();
+        let rules = fixture.path().join("rules");
+        for name in [".ignore", ".rgignore", ".gitignore"] {
+            std::fs::write(&rules, "data.txt\n").unwrap();
+            std::os::unix::fs::symlink(&rules, root.join(name)).unwrap();
+            for contents in ["data.txt\n", ""] {
+                std::fs::write(&rules, contents).unwrap();
+                let mut search = classify_rg_search_narrowing(
+                    &["rg".into(), "--no-ignore-global".into(), "--no-ignore-parent".into(), "needle".into(), ".".into()],
+                    None, &root, &root,
+                ).unwrap().unwrap();
+                observe_rg_search_scope_state(&mut search).await;
+                assert!(search.scope_state_identity.is_none(), "{name}");
+            }
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+    }
 
     #[test]
     fn hidden_rg_advisory_respects_operands_and_hidden_flags() {

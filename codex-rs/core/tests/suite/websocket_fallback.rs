@@ -54,7 +54,7 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
     .await;
     let websocket = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
-            vec![ev_completed("warmup")],
+            vec![ev_response_created("warmup"), ev_completed("warmup")],
             vec![
                 ev_response_created("interrupted"),
                 ev_assistant_message("accepted", "accepted before disconnect"),

@@ -450,8 +450,7 @@ pub fn describe_context_compaction(
         && before > 0
     {
         parts.push(format!(
-            "{} tokens of context replaced by a {} token summary",
-            before, after
+            "{before} tokens of context replaced by a {after} token summary"
         ));
     }
     match omitted_image_count {

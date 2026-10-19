@@ -2613,6 +2613,13 @@ async fn failed_discovery_preserves_truncated_source_without_charging_generated_
 
 #[tokio::test]
 async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     const LIMIT: usize = 11;
     let primary = tempfile::tempdir().unwrap();
     let secondary = tempfile::tempdir().unwrap();
@@ -2738,10 +2745,11 @@ async fn failed_discovery_rebudgets_nearest_sources_like_healthy_loading() {
     }
     // Instrument the actual discovery + owning load paths, without a latency
     // assertion or a claimed speedup; Cargo execution is needed for samples.
-    eprintln!(
-        "AGENTS discovery/load cases={cases} healthy_elapsed_us={} fallback_elapsed_us={}",
-        healthy_elapsed.as_micros(),
-        fallback_elapsed.as_micros(),
+    tracing::info!(
+        cases,
+        healthy_elapsed_us = %healthy_elapsed.as_micros(),
+        fallback_elapsed_us = %fallback_elapsed.as_micros(),
+        "AGENTS discovery/load"
     );
 }
 

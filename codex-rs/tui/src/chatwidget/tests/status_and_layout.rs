@@ -93,6 +93,7 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         ..TokenUsage::default()
     };
     let token_info = TokenUsageInfo {
+        estimated_context_tokens: None,
         total_token_usage: token_usage.clone(),
         last_token_usage: token_usage,
         model_context_window: None,

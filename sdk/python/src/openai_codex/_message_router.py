@@ -158,7 +158,7 @@ class MessageRouter:
 
         turn_queue = self._notification_queue(deadline=deadline)
         with self._lock:
-            if self._failure is not None:
+            if self._failure is not None and turn_id not in self._terminal_turns:
                 raise self._failure
             if turn_id in self._turn_notifications:
                 return
@@ -171,6 +171,8 @@ class MessageRouter:
             for notification, size in self._pending_turn_notifications.pop(turn_id, ()):
                 turn_queue.put_reserved(notification, size)
             self._turn_notifications[turn_id] = turn_queue
+            if self._failure is not None:
+                turn_queue.fail(self._failure, drain=True)
 
     def unregister_turn(self, turn_id: str) -> None:
         """Stop retaining events for a turn that the caller will not consume."""
@@ -190,7 +192,7 @@ class MessageRouter:
         """Block until the next notification for a registered turn."""
 
         with self._lock:
-            if self._failure is not None:
+            if self._failure is not None and turn_id not in self._terminal_turns:
                 raise self._failure
             turn_queue = self._turn_notifications.get(turn_id)
         if turn_queue is None:
@@ -317,9 +319,7 @@ class MessageRouter:
                 if notification.method == "turn/completed":
                     self._abandoned_turns.remove(turn_id)
                 return
-            if notification.method == "turn/completed" and turn_id not in self._terminal_turns:
-                self._check_route_capacity("turn", turn_id)
-                self._terminal_turns.add(turn_id)
+            self._check_route_capacity("turn", turn_id)
             turn_queue = self._turn_notifications.get(turn_id)
             if turn_queue is None:
                 if turn_id not in self._pending_turn_notifications:
@@ -328,14 +328,18 @@ class MessageRouter:
                 self._pending_turn_notifications.setdefault(turn_id, deque()).append(
                     (notification, size)
                 )
-                return
-        turn_queue.put(notification)
+            else:
+                turn_queue.put(notification)
+            # Mark terminal only after successful bounded retention, atomically
+            # with failure. Overflow must never certify a missing completion.
+            if notification.method == "turn/completed":
+                self._terminal_turns.add(turn_id)
 
-    def fail_all(self, exc: BaseException) -> None:
+    def fail_all(self, exc: BaseException, *, discard_completed: bool = False) -> None:
         """Wake every blocked waiter when the reader thread exits."""
 
         with self._lock:
-            if self._failure is not None:
+            if self._failure is not None and not discard_completed:
                 return
             self._failure = exc
             response_waiters = list(self._response_waiters.values())
@@ -345,13 +349,22 @@ class MessageRouter:
             for pending in self._pending_login_notifications.values():
                 self._discard_pending(pending)
             self._pending_login_notifications.clear()
-            turn_queues = list(self._turn_notifications.values())
-            self._turn_notifications.clear()
-            for pending in self._pending_turn_notifications.values():
-                self._discard_pending(pending)
-            self._pending_turn_notifications.clear()
+            retained = set() if discard_completed else self._terminal_turns
+            turn_queues = [
+                (notifications, turn_id in retained)
+                for turn_id, notifications in self._turn_notifications.items()
+            ]
+            self._turn_notifications = {
+                turn_id: notifications
+                for turn_id, notifications in self._turn_notifications.items()
+                if turn_id in retained
+            }
+            for turn_id in list(self._pending_turn_notifications):
+                if turn_id not in retained:
+                    self._discard_pending(self._pending_turn_notifications.pop(turn_id))
             self._abandoned_turns.clear()
-            self._terminal_turns.clear()
+            if discard_completed:
+                self._terminal_turns.clear()
             goal_operations = list(self._goal_operations.values())
             self._goal_operations.clear()
         # Put the same transport failure into every queue so no SDK call blocks
@@ -360,8 +373,8 @@ class MessageRouter:
             waiter.put(exc)
         for login_queue in login_queues:
             login_queue.put(exc)
-        for turn_queue in turn_queues:
-            turn_queue.put(exc)
+        for turn_queue, drain in turn_queues:
+            turn_queue.fail(exc, drain=drain)
         for goal_operation in goal_operations:
             goal_operation.fail(exc)
         self._global_notifications.put(exc)

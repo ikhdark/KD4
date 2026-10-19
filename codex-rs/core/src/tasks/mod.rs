@@ -973,6 +973,9 @@ impl Session {
     }
 
     async fn detach_terminal_turn(&self, finalization: &mut TerminalFinalization) -> bool {
+        if finalization.coordinator.interaction_released() {
+            return false;
+        }
         drop(finalization.task._agent_execution_guard.take());
         let mut active = self.active_turn.lock().await;
         if active.as_ref().is_some_and(|active_turn| {
@@ -1106,7 +1109,7 @@ impl Session {
         &self,
         finalization: &mut TerminalFinalization,
         event: EventMsg,
-    ) {
+    ) -> bool {
         let turn_context = Arc::clone(&finalization.task.turn_context);
         // Only a retry can have an earlier append from this terminal owner.
         let recovering_publication = finalization.selected_terminal_event.is_some();
@@ -1115,14 +1118,16 @@ impl Session {
             .selected_terminal_event
             .get_or_insert(event)
             .clone();
+        #[cfg(test)]
+        finalization.coordinator.wait_publication_pause_for_test().await;
         let published_event = self
-            .publish_terminal_event(
-                turn_context.as_ref(),
-                event,
-                &mut finalization.published_terminal_event,
-                recovering_publication,
-            )
+            .publish_terminal_event(turn_context.as_ref(), event,
+                &mut finalization.published_terminal_event, recovering_publication)
             .await;
+        // The live event and status transition must precede successor admission.
+        // Do not acquire task_start_gate here: a replacement holds it while
+        // waiting for this coordinator. Optional post-dispatch work stays outside.
+        let cleared_active_turn = self.detach_terminal_turn(finalization).await;
         #[cfg(test)]
         finalization
             .coordinator
@@ -1132,6 +1137,7 @@ impl Session {
                 .finish_terminal_event_dispatch(turn_context.as_ref(), &published_event)
                 .await;
         }
+        cleared_active_turn
     }
 
     async fn finalize_turn_terminal(self: &Arc<Self>, finalization: &mut TerminalFinalization) {
@@ -1276,7 +1282,10 @@ impl Session {
             .await;
         }
 
-        finalization.restart_for_pending_input = if requires_abort_cleanup {
+        // Quiescing a broken worker is not permission to discard acknowledged
+        // input. Recovery retains it; allows_pending_input_restart still forbids
+        // automatic resampling after worker failure.
+        finalization.restart_for_pending_input = if matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_)) {
             self.input_queue
                 .clear_pending_for_turn_state(finalization.turn_state.as_ref())
                 .await;
@@ -1456,8 +1465,7 @@ impl Session {
                 thread_id: self.thread_id.to_string(),
                 token_usage: turn_token_usage.clone(),
             });
-        let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        self.publish_terminal_outcome(finalization, event).await;
+        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
         if cleared_active_turn
             && finalization
                 .outcome
@@ -1583,7 +1591,7 @@ impl Session {
             .cancel_git_enrichment_task();
         if !matches!(
             finalization.outcome,
-            TurnTerminalOutcome::Aborted(_) | TurnTerminalOutcome::WorkerJoinFailed(_)
+            TurnTerminalOutcome::Aborted(_)
         ) {
             finalization.restart_for_pending_input |= self
                 .input_queue
@@ -1630,8 +1638,7 @@ impl Session {
                 timing: Some(timing),
             })
         };
-        let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        self.publish_terminal_outcome(finalization, event).await;
+        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
         self.input_queue
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;

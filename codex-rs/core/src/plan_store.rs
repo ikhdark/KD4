@@ -485,6 +485,9 @@ pub(crate) struct PlanToolArgs {
     /// is verified under the plan lock; a free-form reason alone cannot retire.
     #[serde(default)]
     pub(crate) scope_change_instructions: BTreeMap<String, String>,
+    /// Compact alternative with the same accepted-input membership checks.
+    #[serde(default)]
+    pub(crate) scope_change_refs: BTreeMap<String, PlanInputReference>,
     #[serde(default)]
     pub(crate) superseded: Vec<SupersededStep>,
     /// Stable checklist step ID -> existing executable assignment ID.
@@ -627,7 +630,9 @@ pub(crate) struct PlanStore {
     /// Serializes publication through client notification, independently of
     /// repository tool admission. Lock order: publication -> current -> rollout.
     publication: Mutex<()>,
-    accepted_input: Mutex<Option<(String, HashSet<String>)>>,
+    // Every production access already holds current. These short in-memory
+    // reads/writes need no second async acquisition while publication is fenced.
+    accepted_input: std::sync::Mutex<Option<(String, HashSet<String>)>>,
 }
 
 /// Holds the existing plan lock across publication so revision validation and
@@ -680,7 +685,12 @@ impl PlanStore {
             .filter(|text| !text.trim().is_empty())
             .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
             .collect();
-        *self.accepted_input.lock().await = Some((turn_id.to_string(), hashes));
+        // Use the current-state lock first: accepted provenance cannot change
+        // between staging a scope retirement and publishing it durably.
+        let mut current = self.current.lock().await;
+        *self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((turn_id.to_string(), hashes));
+        current.derived = Default::default();
     }
     #[cfg(test)]
     pub(crate) async fn active_requirement_count(&self) -> usize {
@@ -722,6 +732,7 @@ impl PlanStore {
         suspended: bool,
     ) -> crate::context::world_state::TaskState {
         let current = self.current.lock().await;
+        let accepted = self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         current.derived.task[usize::from(suspended)]
             .get_or_init(|| {
                 crate::context::world_state::TaskState::from_plan(
@@ -731,6 +742,13 @@ impl PlanStore {
                         .map(|plan| (plan, &current.lineage, current.revision())),
                 )
                 .with_execution_suspended(suspended)
+                .with_accepted_input_refs(accepted.as_ref().filter(|_| current.plan.is_some()).map(|(turn_id, hashes)| {
+                    let mut hashes = hashes.iter().cloned().collect::<Vec<_>>();
+                    hashes.sort();
+                    hashes.into_iter().map(|sha256| PlanInputReference {
+                        turn_id: turn_id.clone(), sha256,
+                    }).collect()
+                }).unwrap_or_default())
             })
             .clone()
     }
@@ -831,16 +849,17 @@ impl PlanStore {
             expected_step_revisions,
             resolve,
             scope_change_instructions,
+            mut scope_change_refs,
             superseded,
             workflow,
             resolved_workflow,
         } = args;
-        let accepted_input = if scope_change_instructions.is_empty() {
+        let guard = self.current.lock().await;
+        let accepted_input = if scope_change_instructions.is_empty() && scope_change_refs.is_empty() {
             None
         } else {
-            self.accepted_input.lock().await.clone()
+            self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
         };
-        let guard = self.current.lock().await;
         let revision = guard.revision().to_string();
         let unchanged_since_sampling = sampling_revision
             .as_ref()
@@ -891,6 +910,7 @@ impl PlanStore {
             && superseded.is_empty()
             && resolve.is_empty()
             && scope_change_instructions.is_empty()
+            && scope_change_refs.is_empty()
             && workflow.is_none()
             && status_next
                 .as_ref()
@@ -952,12 +972,6 @@ impl PlanStore {
             next
         };
         for (step_id, instruction) in scope_change_instructions {
-            if !superseded.iter().any(|entry| entry.step_id == step_id) {
-                return Err(
-                    "scope_change_instructions must name a superseded entry; no changes were made"
-                        .into(),
-                );
-            }
             let sha256 = hex::encode(Sha256::digest(instruction.as_bytes()));
             let Some((turn_id, _)) = accepted_input
                 .as_ref()
@@ -965,6 +979,21 @@ impl PlanStore {
             else {
                 return Err("scope change must cite exact, accepted user text; tool/context text and invented instructions are not authorization. No changes were made".into());
             };
+            let reference = PlanInputReference { turn_id: turn_id.clone(), sha256 };
+            if scope_change_refs.get(&step_id).is_some_and(|existing| existing != &reference) {
+                return Err("conflicting scope change text and reference; no changes were made".into());
+            }
+            scope_change_refs.insert(step_id, reference);
+        }
+        for (step_id, reference) in scope_change_refs {
+            if !superseded.iter().any(|entry| entry.step_id == step_id) {
+                return Err("scope change sources must name a superseded entry; no changes were made".into());
+            }
+            if !accepted_input.as_ref().is_some_and(|(turn_id, hashes)| {
+                *turn_id == reference.turn_id && hashes.contains(&reference.sha256)
+            }) {
+                return Err("scope change reference is not a currently accepted user input; no changes were made".into());
+            }
             let ids = current
                 .lineage
                 .step_requirements
@@ -979,10 +1008,7 @@ impl PlanStore {
                 {
                     lineage.accepted_supersessions.insert(
                         id,
-                        PlanInputReference {
-                            turn_id: turn_id.clone(),
-                            sha256: sha256.clone(),
-                        },
+                        reference.clone(),
                     );
                 }
             }
@@ -1632,6 +1658,61 @@ mod tests {
                 .superseded,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_scope_references_match_text_and_reject_replaced_or_foreign_inputs() {
+        use crate::context::ContextualUserFragment;
+
+        let text = format!("Cancel deployment, preserve review. λ\n{}", "scope detail ".repeat(1000));
+        let reference = serde_json::json!({"turn_id":"accepted", "sha256":hex::encode(Sha256::digest(text.as_bytes()))});
+        assert!(serde_json::to_vec(&reference).unwrap().len() < 256);
+        assert!(text.len() > 10000);
+        let mut outcomes = Vec::new();
+        for use_reference in [false, true] {
+            let store = PlanStore::default();
+            store.record_accepted_input("accepted", [text.as_str()].into_iter()).await;
+            assert!(!store.task_state(false).await.body().contains("accepted_input_refs"));
+            let original = json_update(&store, serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]})).await;
+            let id = original.lineage.step_id("Deploy");
+            let state = store.task_state(false).await.body().into_owned();
+            assert!(state.contains("accepted_input_refs"));
+            let mut args = serde_json::json!({"plan":[], "expected_revision":store.execution_snapshot().await.unwrap().revision,
+                "superseded":[{"step_id":id, "reason":"User cancelled deployment"}]});
+            args[if use_reference { "scope_change_refs" } else { "scope_change_instructions" }] =
+                if use_reference { serde_json::json!({id.clone():reference.clone()}) }
+                else { serde_json::json!({id.clone():text.clone()}) };
+            let before = store.snapshot_with_lineage().await;
+            let mut foreign = args.clone();
+            foreign["scope_change_refs"] = serde_json::json!({id.clone():{"turn_id":"foreign","sha256":reference["sha256"]}});
+            assert!(store.update_tool(serde_json::from_value(foreign).unwrap()).await.is_err());
+            assert_eq!(store.snapshot_with_lineage().await, before);
+            store.record_accepted_input("replacement", ["Keep deployment."].into_iter()).await;
+            assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
+            assert_eq!(store.snapshot_with_lineage().await, before);
+            store.record_accepted_input("accepted", [text.as_str()].into_iter()).await;
+            let update = store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap();
+            outcomes.push((update.current, update.lineage));
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[tokio::test]
+    async fn accepted_input_waits_for_staged_publication_without_lock_inversion() {
+        let store = PlanStore::default();
+        json_update(&store, serde_json::json!({"plan":[{"step":"Review","status":"pending"}]})).await;
+        store.record_accepted_input("old", ["old input"].into_iter()).await;
+        let revision = store.execution_snapshot().await.unwrap().revision;
+        let staged = store.stage_tool(serde_json::from_value(serde_json::json!({
+            "expected_revision": revision, "set":[{"index":0,"status":"completed"}]
+        })).unwrap()).await.unwrap();
+        let accepted = store.record_accepted_input("new", ["new input"].into_iter());
+        tokio::pin!(accepted);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut accepted).await.is_err());
+        assert_eq!(store.accepted_input.lock().unwrap().as_ref().unwrap().0, "old");
+        drop(staged);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut accepted).await.unwrap();
+        assert_eq!(store.accepted_input.lock().unwrap().as_ref().unwrap().0, "new");
     }
 
     #[tokio::test]

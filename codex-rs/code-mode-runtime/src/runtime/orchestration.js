@@ -195,15 +195,15 @@
       integer(max_per_file, 1, 1000, "max_per_file");
       const run = capability("exec_command");
       // Fixed flags keep the record format independent of user configuration:
-      // `path\0count` or `path\0line:text`, with a path even for a single file.
+      // Counts are NUL-framed; JSON line events preserve arbitrary path spelling
+      // and report binary detection without manufacturing a negative result.
       const args = ["--no-config", "--color", "never", "--null", "--path-separator", "/", "--with-filename"];
       if (ignore_case) args.push("--ignore-case");
       if (fixed) args.push("--fixed-strings");
       if (hidden) args.push("--hidden");
       if (no_ignore) args.push("--no-ignore");
       for (const g of globs) args.push("--glob", g);
-      args.push(...(lines ? ["--line-number", "--no-heading", "--max-count", String(max_per_file),
-        "--max-columns", "240", "--max-columns-preview"] : ["--count"]));
+      args.push(...(lines ? ["--json", "--max-count", String(max_per_file)] : ["--count"]));
       args.push("--regexp", pattern, "--", ...paths);
       const evidence = { program: "rg", args };
       try {
@@ -227,31 +227,62 @@
       const errors = (result.stderr ?? "").split("\n").map(line => line.trimEnd()).filter(Boolean);
       if (code === 2 && !result.stdout) fail(`rg error: ${errors.slice(0, 5).join(" ") || "unknown"}`, evidence);
       const files = new Map();
-      for (const record of result.stdout.split("\n")) {
-        const nul = record.indexOf("\0");
-        if (nul < 1) continue;
-        let file = record.slice(0, nul);
-        if (file.startsWith("./")) file = file.slice(2);
-        const rest = record.slice(nul + 1).replace(/\r$/, "");
-        if (!lines) {
-          if (/^\d+$/.test(rest)) files.set(file, { path: file, count: Number(rest) });
-          continue;
+      let unparsed = false;
+      let binary = false;
+      if (!lines) {
+        let offset = 0;
+        while (offset < result.stdout.length) {
+          const nul = result.stdout.indexOf("\0", offset);
+          const end = result.stdout.indexOf("\n", nul + 1);
+          if (nul <= offset || end < 0) { unparsed = true; break; }
+          const file = result.stdout.slice(offset, nul).replace(/^\.\//, "");
+          const count = result.stdout.slice(nul + 1, end).replace(/\r$/, "");
+          if (!/^\d+$/.test(count)) { unparsed = true; break; }
+          files.set(file, { path: file, count: Number(count) });
+          offset = end + 1;
         }
-        const colon = rest.indexOf(":");
-        if (colon < 1 || !/^\d+$/.test(rest.slice(0, colon))) continue;
-        const entry = files.get(file) ?? { path: file, count: 0, lines: [] };
-        entry.lines.push({ line: Number(rest.slice(0, colon)), text: rest.slice(colon + 1) });
-        entry.count = entry.lines.length;
-        files.set(file, entry);
+      } else for (const record of result.stdout.split("\n")) {
+        if (!record.trim()) continue;
+        let event;
+        try { event = JSON.parse(record); } catch { unparsed = true; continue; }
+        if (!["begin", "match", "context", "end", "summary"].includes(event?.type)) {
+          unparsed = true; continue;
+        }
+        const data = event.data;
+        if (event.type !== "match" && !(event.type === "end" && data?.binary_offset != null)) continue;
+        // Byte-encoded paths cannot be losslessly represented by the string path
+        // API. Retain their encoding as partial evidence rather than invent a path.
+        const file = typeof data?.path?.text === "string" ? data.path.text.replace(/^\.\//, "") : null;
+        if (file === null && typeof data?.path?.bytes !== "string") { unparsed = true; continue; }
+        const key = file === null ? `bytes:${data.path.bytes}` : `text:${file}`;
+        const entry = files.get(key) ?? { ...(file === null ? { path_bytes: data.path.bytes } : { path: file }), count: 0, lines: [] };
+        if (file === null) unparsed = true;
+        if (event.type === "end") {
+          binary = entry.binary = true;
+        } else if (Number.isInteger(data.line_number) && typeof data.lines?.text === "string") {
+          const text = data.lines.text.replace(/\r?\n$/, "");
+          const preview = text.slice(0, 240);
+          entry.lines.push({ line: data.line_number, text: preview, ...(preview.length < text.length ? { truncated: true } : {}) });
+          entry.count++;
+        } else {
+          unparsed = true;
+          if (typeof data.lines?.bytes === "string") entry.binary = binary = true;
+        }
+        files.set(key, entry);
       }
-      const sorted = [...files.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+      if (code === 0 && files.size === 0) unparsed = true;
+      if (unparsed) errors.push("Some positive or unsupported rg output could not be represented; this is not a complete match set.");
+      const sorted = [...files.values()].sort((a, b) => {
+        const left = a.path ?? a.path_bytes, right = b.path ?? b.path_bytes;
+        return left < right ? -1 : left > right ? 1 : 0;
+      });
       let capped = false;
       for (const entry of sorted) {
         if (lines && entry.count >= max_per_file) capped = entry.capped = true;
       }
       return { pattern, files: sorted, file_count: sorted.length,
         match_count: sorted.reduce((sum, entry) => sum + entry.count, 0),
-        complete: code !== 2 && !capped, ...(errors.length ? { errors: errors.slice(0, 20) } : {}) };
+        complete: code !== 2 && !capped && !unparsed && !binary, ...(errors.length ? { errors: errors.slice(0, 20) } : {}) };
     },
   });
 

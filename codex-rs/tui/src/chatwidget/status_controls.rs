@@ -369,12 +369,11 @@ impl ChatWidget {
 
     pub(super) fn status_line_context_remaining_percent(&self) -> Option<i64> {
         let context_window = self.status_line_context_window_size()?;
-        let default_usage = TokenUsage::default();
         let usage = self
             .token_info
             .as_ref()
-            .map(|info| &info.last_token_usage)
-            .unwrap_or(&default_usage);
+            .map(codex_protocol::protocol::TokenUsageInfo::context_usage)
+            .unwrap_or_default();
         Some(
             usage
                 .percent_of_context_window_remaining(context_window)

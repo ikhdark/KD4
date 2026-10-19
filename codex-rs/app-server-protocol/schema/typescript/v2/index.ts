@@ -539,6 +539,7 @@ export type { TurnTimingToolCallIdentity } from "./TurnTimingToolCallIdentity";
 export type { TurnTimingToolCallSource } from "./TurnTimingToolCallSource";
 export type { TurnTimingToolClosure } from "./TurnTimingToolClosure";
 export type { TurnTimingUnions } from "./TurnTimingUnions";
+export type { TurnValidationUncertainty } from "./TurnValidationUncertainty";
 export type { TurnsPage } from "./TurnsPage";
 export type { UserInput } from "./UserInput";
 export type { WarningNotification } from "./WarningNotification";

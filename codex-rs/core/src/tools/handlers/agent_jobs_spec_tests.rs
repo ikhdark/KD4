@@ -54,24 +54,24 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                     ),
                     (
                         "max_concurrency".to_string(),
-                        JsonSchema::integer(Some(
+                        JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
                             "Maximum concurrent workers for this job. Defaults to 16 and is capped by config."
                                 .to_string(),
-                        )),
+                        )) },
                     ),
                     (
                         "max_workers".to_string(),
-                        JsonSchema::integer(Some(
+                        JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
                             "Legacy alias; prefer max_concurrency and omit this field."
                                 .to_string(),
-                        )),
+                        )) },
                     ),
                     (
                         "max_runtime_seconds".to_string(),
-                        JsonSchema::integer(Some(
+                        JsonSchema { minimum: Some(1.into()), maximum: Some(u64::MAX.into()), ..JsonSchema::integer(Some(
                             "Maximum runtime per worker before failure. Defaults to 1800 seconds; config may set a different default."
                                 .to_string(),
-                        )),
+                        )) },
                     ),
                     (
                         "output_schema".to_string(),

@@ -36,6 +36,7 @@ impl RetryOn {
                     || (self.retry_5xx && status.is_server_error())
             }
             TransportError::Timeout
+            | TransportError::ConnectionTimeout
             | TransportError::Connection(_)
             | TransportError::Network(_)
             | TransportError::PreDispatch(_) => self.retry_transport,
@@ -53,7 +54,7 @@ impl RetryOn {
     ) -> bool {
         attempt < max_retries
             && self.retry_transport
-            && matches!(err, TransportError::PreDispatch(_))
+            && matches!(err, TransportError::PreDispatch(_) | TransportError::ConnectionTimeout)
     }
 }
 

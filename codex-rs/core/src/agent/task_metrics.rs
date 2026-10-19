@@ -737,6 +737,8 @@ impl TaskMetricRecorder {
 /// monotonic timestamps, so it can be dropped safely on restart without affecting task recovery.
 #[derive(Debug)]
 pub(crate) struct TaskMetricRuntime {
+    pub(super) minimum_attempt_ordinal: u8,
+    pub(super) usage_history_partial: bool,
     started_at: Instant,
     role: AgentRole,
     capability: CapabilityProfile,
@@ -750,6 +752,8 @@ impl TaskMetricRuntime {
         capacity: u32,
     ) -> Result<Self, MetricsError> {
         Ok(Self {
+            minimum_attempt_ordinal: 0,
+            usage_history_partial: false,
             started_at: Instant::now(),
             role: assignment.role,
             capability: assignment.capability_profile,
@@ -789,6 +793,7 @@ impl TaskMetricRuntime {
                 metrics.map(|metrics| TerminalTaskMetrics {
                     metrics,
                     state: task.current_attempt.state,
+                    usage_history_partial: self.usage_history_partial,
                 })
             })
     }
@@ -798,6 +803,7 @@ impl TaskMetricRuntime {
 pub(super) struct TerminalTaskMetrics {
     metrics: TaskMetrics,
     state: AttemptState,
+    usage_history_partial: bool,
 }
 
 impl TerminalTaskMetrics {
@@ -806,7 +812,8 @@ impl TerminalTaskMetrics {
         session_telemetry.counter(
             TASK_TERMINAL_STATE_METRIC,
             1,
-            &[("state", attempt_state_metric_label(self.state))],
+            &[("state", attempt_state_metric_label(self.state)),
+              ("usage_scope", if self.usage_history_partial { "partial_process_history" } else { "observed_attempt_deltas" })],
         );
     }
 }
@@ -878,7 +885,7 @@ pub(crate) fn terminal_metrics_ready(task: &AgentTask) -> bool {
 
 fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
     let receipt = task.receipt.as_ref();
-    let acceptance_total = saturating_u32(task.assignment.acceptance_criteria.len());
+    let acceptance_total = saturating_u32(task.assignment.effective_criteria(task.current_attempt.amendment.as_ref()).len());
     let acceptance_final_closed = receipt
         .map(|receipt| {
             saturating_u32(

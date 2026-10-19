@@ -198,6 +198,8 @@ async fn run_owned_command(
         }
     };
 
+    crate::mark_command_effects_possible();
+
     // Tokio's kill_on_drop only kills the root. Keep the Unix process group
     // alive as an owned cleanup obligation while this future can be cancelled.
     #[cfg(unix)]

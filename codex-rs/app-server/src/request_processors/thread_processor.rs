@@ -4199,7 +4199,11 @@ impl ThreadRequestProcessor {
             .await;
         // `excludeTurns` is the cheap fork path, so skip restored usage replay
         // instead of rebuilding history only to attribute a historical update.
-        if let Some(token_usage_snapshot) = token_usage_snapshot {
+        if let Some(mut token_usage_snapshot) = token_usage_snapshot {
+            // Ephemeral forks reconstruct the source's display history rather
+            // than reading the child's rewritten rollout. Apply the same cost
+            // boundary while retaining the inherited context estimate.
+            token_usage_snapshot.info = token_usage_snapshot.info.for_fork();
             // Mirror the resume contract for forks: the new thread is usable as soon
             // as the response arrives, so restored usage must follow immediately.
             send_thread_token_usage_update_to_connection(

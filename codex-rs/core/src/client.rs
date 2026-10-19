@@ -98,6 +98,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::TurnTimingTokenCategoryBasis;
 use codex_protocol::protocol::W3cTraceContext;
@@ -1483,6 +1484,8 @@ struct ModelAttemptGuard {
     clock: ModelAttemptClock,
     fresh_response_id_established: bool,
     emitted: bool,
+    terminal_usage: Option<TokenUsage>,
+    response_id: Option<String>,
 }
 
 impl ModelAttemptGuard {
@@ -1517,6 +1520,8 @@ impl ModelAttemptGuard {
             clock,
             fresh_response_id_established: false,
             emitted: false,
+            terminal_usage: None,
+            response_id: None,
         }
     }
 
@@ -1539,6 +1544,11 @@ impl ModelAttemptGuard {
         self.fresh_response_id_established = !response_id.is_empty()
             && self.transport == ModelAttemptTransport::ResponsesWebsocket
             && self.measurements.provider_baseline == ModelAttemptProviderBaseline::FreshFullReplay;
+    }
+
+    fn observe_terminal_usage(&mut self, response_id: Option<&str>, usage: Option<&TokenUsage>) {
+        self.response_id = response_id.map(str::to_owned);
+        self.terminal_usage = usage.cloned();
     }
 
     fn finish(
@@ -1612,6 +1622,10 @@ impl ModelAttemptGuard {
             input_tokens,
             cached_input_tokens,
             uncached_input_tokens,
+            response_id = self.response_id.as_deref(),
+            output_tokens = self.terminal_usage.as_ref().map(|usage| usage.output_tokens),
+            reasoning_output_tokens = self.terminal_usage.as_ref().map(|usage| usage.reasoning_output_tokens),
+            total_tokens = self.terminal_usage.as_ref().map(|usage| usage.total_tokens),
             "model cache diagnostics"
         );
         if !self.session_telemetry.model_attempt_logging_enabled() {
@@ -1679,6 +1693,10 @@ impl ModelAttemptGuard {
                 input_tokens,
                 cached_input_tokens,
                 uncached_input_tokens,
+                response_id: self.response_id.clone(),
+                output_tokens: self.terminal_usage.as_ref().map(|usage| usage.output_tokens),
+                reasoning_output_tokens: self.terminal_usage.as_ref().map(|usage| usage.reasoning_output_tokens),
+                total_tokens: self.terminal_usage.as_ref().map(|usage| usage.total_tokens),
                 tool_token_count: self.measurements.tool_token_count,
                 wire_request_bytes: self.measurements.wire_request_bytes,
                 logical_request_bytes: self.measurements.logical_request_bytes,
@@ -1792,7 +1810,7 @@ fn compact_prompt_context_categories(
                 // with no predecessor every category is trivially "changed",
                 // which would otherwise read as cache churn.
                 "changed": baseline_compared
-                    .then(|| !measurement.unchanged_from_previous_request),
+                    .then_some(!measurement.unchanged_from_previous_request),
             })
         })
         .collect::<Vec<_>>();
@@ -1920,12 +1938,24 @@ async fn resolve_model_attempt(
 }
 
 fn finish_failed_model_attempt(attempt: &mut Option<ModelAttemptState>, items: Vec<ResponseItem>) {
+    finish_failed_model_attempt_with_usage(attempt, items, None, None);
+}
+
+fn finish_failed_model_attempt_with_usage(
+    attempt: &mut Option<ModelAttemptState>,
+    items: Vec<ResponseItem>,
+    response_id: Option<String>,
+    usage: Option<TokenUsage>,
+) {
     if let Some(attempt) = attempt.take() {
         attempt.clock().mark_completed();
         // Diagnostics own their lifetime, but never delay transport recovery.
         tokio::spawn(async move {
             if let Some(mut attempt) = attempt.resolve().await {
-                attempt.finish(ModelAttemptOutcome::Failed, None, None, &items);
+                attempt.observe_terminal_usage(response_id.as_deref(), usage.as_ref());
+                attempt.finish(ModelAttemptOutcome::Failed,
+                    usage.as_ref().map(|usage| usage.input_tokens),
+                    usage.as_ref().map(|usage| usage.cached_input_tokens), &items);
             }
         });
     }
@@ -2466,6 +2496,7 @@ impl StreamThroughputCollapse {
 /// Output rates of completed websocket responses, judged against their recent median.
 #[derive(Debug, Default)]
 struct WebsocketStreamThroughput {
+    workload: Option<serde_json::Value>,
     recent_tokens_per_second: VecDeque<f64>,
     collapsed_streak: u8,
     latest_collapse: Option<StreamThroughputCollapse>,
@@ -2473,6 +2504,16 @@ struct WebsocketStreamThroughput {
 }
 
 impl WebsocketStreamThroughput {
+    fn select_workload(&mut self, workload: serde_json::Value) {
+        if self.workload.as_ref() != Some(&workload) {
+            self.workload = Some(workload);
+            self.recent_tokens_per_second.clear();
+            self.collapsed_streak = 0;
+            self.latest_collapse = None;
+            // A model switch must not bypass the connection-rotation cooldown.
+        }
+    }
+
     fn record(&mut self, output_tokens: i64, elapsed: Duration, input_tokens: i64) {
         if output_tokens < STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS || elapsed.is_zero() {
             return;
@@ -2847,10 +2888,10 @@ impl ModelClient {
         self
     }
 
-    fn prompt_cache_key(&self) -> String {
-        // Keep each conversation on its own cache route, including child agents
-        // with identical instructions and tools but different history prefixes.
-        self.state.thread_id.to_string()
+    fn prompt_cache_key(&self, metadata: &CodexResponsesMetadata) -> String {
+        // Match the session-id affinity sent on both transports. Child threads
+        // share the agent-tree session, not their distinct conversation IDs.
+        metadata.session_id.clone()
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -3221,7 +3262,7 @@ impl ModelClient {
         } else {
             Vec::new()
         };
-        let prompt_cache_key = Some(self.prompt_cache_key());
+        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -3389,7 +3430,7 @@ impl ModelClient {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(ApiError::Transport(TransportError::Timeout)),
+            Err(_) => Err(ApiError::Transport(TransportError::ConnectionTimeout)),
         };
         let error_message = result.as_ref().err().map(telemetry_api_error_message);
         let response_debug = result
@@ -4316,7 +4357,7 @@ impl ModelClientSession {
             {
                 Ok(new_conn) => new_conn,
                 Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
+                    if matches!(err, ApiError::Transport(TransportError::ConnectionTimeout)) {
                         self.reset_websocket_session();
                     }
                     return Err(err);
@@ -4732,8 +4773,6 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
-        // Before the request captures the turn-state token it would replay.
-        self.replace_websocket_after_throughput_collapse();
         loop {
             let websocket_epoch = self
                 .client
@@ -4799,6 +4838,24 @@ impl ModelClientSession {
                         )
                     }
                 };
+            // Judge the upcoming request only against comparable work, before
+            // a stale collapse can discard this request's healthy connection.
+            let setup = websocket_setup_fingerprint(
+                &client_setup.api_provider, client_setup.api_auth.as_ref(),
+            );
+            self.websocket_session.stream_throughput
+                .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .select_workload(serde_json::json!({
+                    "setup": setup.map(|fingerprint| fingerprint.0),
+                    "model": &request.model,
+                    "reasoning": &request.reasoning,
+                    "service_tier": &request.service_tier,
+                    "compaction": matches!(responses_metadata.request_kind,
+                        Some(crate::responses_metadata::CodexResponsesRequestKind::Compaction(_))),
+                    "warmup": warmup,
+                    "request_kind": format!("{request_kind:?}"),
+                }));
+            self.replace_websocket_after_throughput_collapse();
             let mut request = request;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -6021,6 +6078,7 @@ where
                     }
                     if let Some(attempt) = resolved_attempt.as_mut() {
                         attempt.mark_fresh_response_id_established(&response_id);
+                        attempt.observe_terminal_usage(Some(&response_id), token_usage.as_ref());
                         attempt.finish(
                             ModelAttemptOutcome::Success,
                             token_usage.as_ref().map(|usage| usage.input_tokens),
@@ -6064,11 +6122,13 @@ where
                         .record_failed(&mapped, upstream_request_id, &items_added)
                         .await;
                     session_telemetry.see_event_completed_failed(&mapped);
+                    let terminal_usage = mapped.terminal_usage().and_then(Clone::clone);
+                    let response_id = mapped.terminal_response_id().map(str::to_owned);
+                    finish_failed_model_attempt_with_usage(&mut attempt, items_added, response_id, terminal_usage);
                     if tx_event.send(Err(mapped)).await.is_err() {
                         return;
                     }
                     drop(tx_event);
-                    finish_failed_model_attempt(&mut attempt, items_added);
                     return;
                 }
             }

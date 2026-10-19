@@ -226,23 +226,15 @@ fn should_reconnect_after_close(err: &CodexErr, state: &ResponsesStreamRetryStat
 /// their callers, and Amazon Bedrock reports unrelated failures through the
 /// same error class.
 ///
-/// A post-connect idle timeout qualifies for the same treatment: the transport
-/// was healthy and the provider simply went silent, which is the sleep/wake and
-/// VPN-churn case this loop exists for. Charging it to the provider budget
-/// instead (5 attempts by default, 2 for compaction, each capped at a 5 s
-/// backoff) failed the turn after a few quick attempts on a link that would
-/// have recovered. The flag is set only for silence, so a genuinely broken or
-/// corrupt stream keeps failing fast.
+/// Post-dispatch silence is not evidence of an offline connection: the provider
+/// may already be generating. It must consume the bounded retry budget rather
+/// than regenerating indefinitely under the offline wait policy.
 fn should_wait_for_connection_recovery(
     err: &CodexErr,
     session_source: &SessionSource,
     provider: &ModelProviderInfo,
 ) -> bool {
-    let recoverable_stall = match err {
-        CodexErr::ConnectionFailed(_) => true,
-        CodexErr::ResponseStreamFailed(failed) => failed.idle_timeout,
-        _ => false,
-    };
+    let recoverable_stall = matches!(err, CodexErr::ConnectionFailed(_));
     recoverable_stall
         && matches!(
             session_source,
@@ -255,9 +247,26 @@ fn next_connection_retry_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(MAX_CONNECTION_RETRY_DELAY)
 }
 
+/// Recovery identity captured before an attempt. Do not derive Debug: API keys
+/// are compared only in memory and must never appear in retry diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum AccountChangeIdentity {
+    Account(String),
+    ApiKey(String),
+}
+
+impl AccountChangeIdentity {
+    pub(crate) fn from_auth(auth: &codex_login::CodexAuth) -> Option<Self> {
+        // Refreshing tokens for the same account does not reset its usage limit.
+        auth.get_account_id()
+            .map(Self::Account)
+            .or_else(|| auth.api_key().map(|key| Self::ApiKey(key.to_owned())))
+    }
+}
+
 /// Why a model request waits for the account to change.
 pub(crate) enum AccountChangeWait<'a> {
-    UsageLimit(&'a UsageLimitReachedError),
+    UsageLimit(&'a UsageLimitReachedError, Option<&'a AccountChangeIdentity>),
     MissingCredentials,
 }
 
@@ -288,12 +297,19 @@ pub(crate) async fn wait_for_account_change(
     // Subscribe before rechecking the predicate: a login between the caller's
     // observation and this subscription is already seen by a new receiver.
     let mut auth_changes = auth_manager.auth_change_receiver();
+    let current_account = || auth_manager.auth_cached()
+        .and_then(|auth| AccountChangeIdentity::from_auth(&auth));
+    let failed_account = match &reason {
+        AccountChangeWait::UsageLimit(_, account) => account.cloned().or_else(current_account),
+        AccountChangeWait::MissingCredentials => None,
+    };
     if matches!(reason, AccountChangeWait::MissingCredentials)
         && !turn_context.provider.missing_required_credentials()
     {
         return Ok(true);
     }
     let now = tokio::time::Instant::now();
+    let first_wait = deadline.is_none();
     let deadline = *deadline.get_or_insert(now + ACCOUNT_CHANGE_WAIT);
     let Some(_) = deadline
         .checked_duration_since(now)
@@ -301,12 +317,23 @@ pub(crate) async fn wait_for_account_change(
     else {
         return Ok(false);
     };
+    if matches!(reason, AccountChangeWait::UsageLimit(..))
+        && current_account().is_some_and(|account| Some(account) != failed_account)
+        && !turn_context.provider.missing_required_credentials()
+    {
+        return Ok(true);
+    }
     // A usage limit that resets inside the bound ends the wait at the reset.
     let known_reset_at = match &reason {
-        AccountChangeWait::UsageLimit(error) => error
+        AccountChangeWait::UsageLimit(error, _) => error
             .resets_at
-            .and_then(|resets_at| (resets_at - chrono::Utc::now()).to_std().ok())
-            .map(|delay| now + delay),
+            .map(|resets_at| {
+                let delay = (resets_at - chrono::Utc::now()).to_std().unwrap_or_default();
+                // A due reset is evidence, not an absent timestamp. Only the
+                // first wait gets an immediate retry; repeated stale responses
+                // retain the logical deadline and a cancellable reload backoff.
+                now + if first_wait { delay } else { delay.max(ACCOUNT_CHANGE_RELOAD_INTERVAL) }
+            }),
         AccountChangeWait::MissingCredentials => None,
     };
     let reset_at = known_reset_at.filter(|reset_at| *reset_at < deadline);
@@ -326,7 +353,7 @@ pub(crate) async fn wait_for_account_change(
     };
     let minutes = remaining.as_secs().div_ceil(60);
     let message = match reason {
-        AccountChangeWait::UsageLimit(error) => format!(
+        AccountChangeWait::UsageLimit(error, _) => format!(
             "{error} Waiting up to {minutes} min for an account switch{} before retrying this request; interrupt the turn to stop waiting.",
             if reset_at.is_some() {
                 " or the limit reset"
@@ -352,7 +379,15 @@ pub(crate) async fn wait_for_account_change(
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-            changed = auth_changes.changed() => return Ok(changed.is_ok()),
+            changed = auth_changes.changed() => {
+                if changed.is_err() { return Ok(false); }
+                if !turn_context.provider.missing_required_credentials()
+                    && (matches!(reason, AccountChangeWait::MissingCredentials)
+                        || current_account().is_some_and(|account| Some(account) != failed_account))
+                {
+                    return Ok(true);
+                }
+            }
             _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
                 return Ok(reset_at.is_some());
             }

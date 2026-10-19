@@ -3,6 +3,14 @@
   "definitions": {
     "ThreadTokenUsage": {
       "properties": {
+        "estimatedContextTokens": {
+          "description": "Local active-context estimate, not observed provider consumption.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "last": {
           "$ref": "#/definitions/TokenUsageBreakdown"
         },

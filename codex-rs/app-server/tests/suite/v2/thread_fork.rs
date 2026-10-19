@@ -628,12 +628,13 @@ async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()>
 
     assert_eq!(notification.thread_id, thread.id);
     assert_eq!(notification.turn_id, thread.turns[0].id);
-    assert_eq!(notification.token_usage.total.total_tokens, 150);
-    assert_eq!(notification.token_usage.total.input_tokens, 120);
-    assert_eq!(notification.token_usage.total.cached_input_tokens, 20);
-    assert_eq!(notification.token_usage.total.output_tokens, 30);
-    assert_eq!(notification.token_usage.total.reasoning_output_tokens, 10);
-    assert_eq!(notification.token_usage.last.total_tokens, 90);
+    assert_eq!(notification.token_usage.total.total_tokens, 0);
+    assert_eq!(notification.token_usage.total.input_tokens, 0);
+    assert_eq!(notification.token_usage.total.cached_input_tokens, 0);
+    assert_eq!(notification.token_usage.total.output_tokens, 0);
+    assert_eq!(notification.token_usage.total.reasoning_output_tokens, 0);
+    assert_eq!(notification.token_usage.last.total_tokens, 0);
+    assert_eq!(notification.token_usage.estimated_context_tokens, Some(90));
     assert_eq!(notification.token_usage.model_context_window, Some(200_000));
 
     Ok(())
@@ -1143,6 +1144,15 @@ async fn ephemeral_fork_preserves_completed_turn_boundary() -> Result<()> {
     .await??;
     let ThreadStartResponse { thread: source, .. } = to_response(response)?;
     let turn_id = complete_text_turn(&mut mcp, &source.id, "finished source turn").await?;
+    // turn/completed precedes the final rollout flush. Seal the source writer
+    // before snapshotting bytes so only the fork can affect this assertion.
+    mcp.shutdown().await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     let source_path = source.path.expect("persistent source path");
     let source_contents = std::fs::read(&source_path)?;
 

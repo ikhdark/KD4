@@ -10,6 +10,22 @@ mod types;
 
 pub use codex_protocol::protocol::HookEventName;
 
+tokio::task_local! {
+    static COMMAND_EFFECTS: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Observe actual command entry without changing persisted hook/wire outcomes.
+pub async fn observe_command_effects<T>(
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    COMMAND_EFFECTS.scope(entered, work).await
+}
+
+pub(crate) fn mark_command_effects_possible() {
+    let _ = COMMAND_EFFECTS.try_with(|entered| entered.store(true, std::sync::atomic::Ordering::Release));
+}
+
 pub use config_rules::hook_states_from_stack;
 pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;

@@ -1,4 +1,6 @@
 use crate::attribution::BindConnectionAttribution;
+use crate::connection_lifecycle::CancelOnShutdown;
+use rama_core::graceful::ShutdownGuard;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
@@ -98,6 +100,7 @@ pub async fn run_http_proxy(
     addr: SocketAddr,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener = TcpListener::build()
         .bind(addr)
@@ -110,7 +113,7 @@ pub async fn run_http_proxy(
         .map_err(anyhow::Error::from)
         .with_context(|| format!("bind HTTP proxy: {addr}"))?;
 
-    run_http_proxy_with_listener(state, listener, policy_decider, environment_id).await
+    run_http_proxy_with_listener(state, listener, policy_decider, environment_id, guard).await
 }
 
 pub async fn run_http_proxy_with_std_listener(
@@ -118,10 +121,11 @@ pub async fn run_http_proxy_with_std_listener(
     listener: StdTcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener =
         TcpListener::try_from(listener).context("convert std listener to HTTP proxy listener")?;
-    run_http_proxy_with_listener(state, listener, policy_decider, environment_id).await
+    run_http_proxy_with_listener(state, listener, policy_decider, environment_id, guard).await
 }
 
 async fn run_http_proxy_with_listener(
@@ -129,6 +133,7 @@ async fn run_http_proxy_with_listener(
     listener: TcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     environment_id: Option<String>,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     ensure_rustls_crypto_provider();
 
@@ -150,7 +155,19 @@ async fn run_http_proxy_with_listener(
                         http_connect_accept(policy_decider.clone(), environment_id.clone(), req)
                     }
                 }),
-                service_fn(http_connect_proxy),
+                service_fn({
+                    let guard = guard.clone_weak();
+                    move |request| {
+                        let guard = guard.clone();
+                        async move {
+                            tokio::select! {
+                                biased;
+                                _ = guard.cancelled() => Ok::<(), Infallible>(()),
+                                result = http_connect_proxy(request) => result,
+                            }
+                        }
+                    }
+                }),
             ),
             RemoveResponseHeaderLayer::hop_by_hop(),
         )
@@ -164,11 +181,11 @@ async fn run_http_proxy_with_listener(
     info!("HTTP proxy listening on {addr}");
 
     listener
-        .serve(BindConnectionAttribution::new(
+        .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(
             http_service,
             state,
             environment_id,
-        ))
+        ), &guard))
         .await;
     Ok(())
 }
@@ -1510,6 +1527,7 @@ mod tests {
                 .write_all(server_banner)
                 .await
                 .expect("target should write opaque server bytes");
+            stream
         });
 
         let state = Arc::new(network_proxy_state_for_policy({
@@ -1535,8 +1553,10 @@ mod tests {
         let proxy_addr = listener
             .local_addr()
             .expect("proxy listener should expose local addr");
+        let connections = crate::connection_lifecycle::ConnectionLifecycle::new();
         let proxy_task = tokio::spawn(run_http_proxy_with_std_listener(
             state, listener, /*policy_decider*/ None, /*environment_id*/ None,
+            connections.guard(),
         ));
 
         let mut stream = tokio::net::TcpStream::connect(proxy_addr)
@@ -1574,10 +1594,16 @@ mod tests {
             .expect("client should read opaque server bytes");
         assert_eq!(buf, server_banner);
 
-        drop(stream);
-        proxy_task.abort();
-        let _ = proxy_task.await;
-        target_task.await.expect("target task should finish");
+        let mut upstream = target_task.await.expect("target task should finish");
+        timeout(Duration::from_secs(2), connections.shutdown()).await
+            .expect("shutdown must join the accepted CONNECT tunnel");
+        proxy_task.await.unwrap().unwrap();
+        for peer in [&mut stream, &mut upstream] {
+            let mut byte = [0u8; 1];
+            let result = timeout(Duration::from_secs(2), peer.read(&mut byte)).await
+                .expect("accepted tunnel peer must close without application traffic");
+            assert!(matches!(result, Ok(0) | Err(_)));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

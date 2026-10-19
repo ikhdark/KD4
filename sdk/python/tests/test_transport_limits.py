@@ -41,6 +41,52 @@ def wait_until(predicate, timeout: float = 3.0) -> None:
         time.sleep(0.005)
 
 
+@pytest.mark.parametrize("register_late", [False, True])
+def test_received_terminal_survives_transport_failure(register_late) -> None:
+    router = MessageRouter(max_notifications=2)
+    if not register_late:
+        router.register_turn("turn")
+    answer = event("item/completed", turnId="turn", text="answer")
+    terminal = event("turn/completed", turn={"id": "turn"})
+    router.route_notification(answer)
+    router.route_notification(terminal)
+    failure = TransportClosedError("EOF after completion")
+    router.fail_all(failure)
+    router.register_turn("turn")
+    assert router.next_turn_notification("turn") is answer
+    assert router.next_turn_notification("turn") is terminal
+    assert router._budget.items == router._budget.bytes == 0
+    with pytest.raises(TransportClosedError):
+        router.next_turn_notification("turn")
+    with pytest.raises(TransportClosedError):
+        router.create_response_waiter("new-request")
+    router.unregister_turn("turn")
+    assert not router._terminal_turns and not router._turn_notifications
+
+
+def test_explicit_close_discards_completed_buffer_even_after_eof() -> None:
+    router = MessageRouter()
+    router.route_notification(event("turn/completed", turn={"id": "turn"}))
+    router.fail_all(TransportClosedError("EOF"))
+    router.fail_all(TransportClosedError("close"), discard_completed=True)
+    assert router._budget.items == router._budget.bytes == 0
+    with pytest.raises(TransportClosedError):
+        router.register_turn("turn")
+
+
+def test_completion_overflow_does_not_preserve_an_incomplete_turn() -> None:
+    router = MessageRouter(max_notifications=1)
+    router.register_turn("turn")
+    router.route_notification(event(turnId="turn"))
+    with pytest.raises(CodexError, match="buffer limit") as failure:
+        router.route_notification(event("turn/completed", turn={"id": "turn"}))
+    router.fail_all(failure.value)
+    assert not router._terminal_turns
+    assert router._budget.items == router._budget.bytes == 0
+    with pytest.raises(CodexError, match="buffer limit"):
+        router.next_turn_notification("turn")
+
+
 @pytest.mark.parametrize("notification", [False, True])
 def test_close_does_not_wait_for_a_full_stdin_pipe(notification) -> None:
     client = CodexClient(config("import time; time.sleep(30)"))

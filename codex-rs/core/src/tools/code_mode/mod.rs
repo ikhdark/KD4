@@ -442,8 +442,8 @@ fn bounded_failed_nested_text(full: &str) -> (String, bool, usize) {
     let budget = MAX_RETAINED_NESTED_RESULT_BYTES.saturating_sub(ELISION.len());
     let head_budget = budget / 2;
     let tail_budget = budget.saturating_sub(head_budget);
-    let head_end = floor_char_boundary(&full, head_budget);
-    let tail_start = ceil_char_boundary(&full, full.len().saturating_sub(tail_budget));
+    let head_end = floor_char_boundary(full, head_budget);
+    let tail_start = ceil_char_boundary(full, full.len().saturating_sub(tail_budget));
     if tail_start <= head_end {
         return (
             full[..floor_char_boundary(full, MAX_RETAINED_NESTED_RESULT_BYTES)].to_string(),
@@ -822,7 +822,7 @@ impl CodeModeService {
                         RetainedDeliveryAnswer {
                             text,
                             schema: intent.schema.clone(),
-                            input_activity: intent.input_activity.clone(),
+                            input_activity: intent.input_activity,
                         },
                     );
                 }
@@ -3890,7 +3890,7 @@ mod tests {
 
         // Input that arrived after the refusal may outdate the kept answer.
         truncated_read("c");
-        deliver("refused-c", input.clone(), "answer").unwrap_err();
+        deliver("refused-c", input, "answer").unwrap_err();
         recover("c");
         activity.send_replace(crate::session::InputQueueActivity::Steer);
         assert_eq!(

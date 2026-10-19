@@ -3228,8 +3228,21 @@ function New-CodexRuntimeBundleTransaction {
     $stageRoot = Join-Path $installParent (".$installLeaf.bundle.$transactionId")
     $rollbackRoot = Join-Path $installParent (".$installLeaf.rollback.$transactionId")
     $transactionEntries = [System.Collections.Generic.List[object]]::new()
-    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    $transaction = [pscustomobject]@{
+        SchemaVersion = 1
+        TransactionId = $transactionId
+        Phase = "Preparing"
+        JournalPath = $JournalPath
+        InstallDir = $installFullPath
+        StageRoot = $stageRoot
+        RollbackRoot = $rollbackRoot
+        HadPreviousInstall = (Test-Path -LiteralPath $installFullPath -PathType Container)
+        Entries = @()
+    }
+    # Persist ownership before creating any substantial preparation residue.
+    Write-CodexPublishTransactionJournal -Transaction $transaction
     try {
+        New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
         if (Test-Path -LiteralPath $installFullPath -PathType Container) {
             Get-ChildItem -LiteralPath $installFullPath -Force | Copy-Item -Destination $stageRoot -Recurse -Force
         }
@@ -3279,17 +3292,8 @@ function New-CodexRuntimeBundleTransaction {
                     State = "Prepared"
                 })
         }
-        $transaction = [pscustomobject]@{
-            SchemaVersion = 1
-            TransactionId = $transactionId
-            Phase = "Prepared"
-            JournalPath = $JournalPath
-            InstallDir = $installFullPath
-            StageRoot = $stageRoot
-            RollbackRoot = $rollbackRoot
-            HadPreviousInstall = (Test-Path -LiteralPath $installFullPath -PathType Container)
-            Entries = @($transactionEntries)
-        }
+        $transaction.Phase = "Prepared"
+        $transaction.Entries = @($transactionEntries)
         Write-CodexPublishTransactionJournal -Transaction $transaction
         return $transaction
     }
@@ -3297,6 +3301,7 @@ function New-CodexRuntimeBundleTransaction {
         if (Test-Path -LiteralPath $stageRoot -PathType Container) {
             Remove-Item -LiteralPath $stageRoot -Recurse -Force
         }
+        Remove-Item -LiteralPath $JournalPath -Force
         throw
     }
 }
@@ -3401,12 +3406,21 @@ function Recover-CodexRuntimeBundleTransaction {
             }
         }
     }
-    if ($transaction.Phase -ne "Committed") {
+    $failedRoot = "$($expectedPaths.StageRoot).failed"
+    if (Test-Path -LiteralPath $failedRoot) {
+        if (((Get-Item -LiteralPath $failedRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Cannot recover runtime bundle transaction through a reparse point: $failedRoot"
+        }
+    }
+    $preparationOnly = $transaction.Phase -eq "Preparing" -or $transaction.Phase -eq "Prepared"
+    if ($transaction.Phase -ne "Committed" -and -not $preparationOnly) {
         $transaction.Phase = "Recovering"
         Write-CodexPublishTransactionJournal -Transaction $transaction
         if (Test-Path -LiteralPath $transaction.RollbackRoot -PathType Container) {
             if (Test-Path -LiteralPath $transaction.InstallDir -PathType Container) {
-                $failedRoot = "$($transaction.StageRoot).failed"
+                if (Test-Path -LiteralPath $failedRoot) {
+                    throw "Cannot overwrite retained failed runtime bundle: $failedRoot"
+                }
                 [IO.Directory]::Move($transaction.InstallDir, $failedRoot)
                 Remove-Item -LiteralPath $failedRoot -Recurse -Force
             }
@@ -3425,6 +3439,9 @@ function Recover-CodexRuntimeBundleTransaction {
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$transaction.RollbackRoot) -and (Test-Path -LiteralPath $transaction.RollbackRoot -PathType Container)) {
         Remove-Item -LiteralPath $transaction.RollbackRoot -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $failedRoot -PathType Container) {
+        Remove-Item -LiteralPath $failedRoot -Recurse -Force
     }
     Remove-Item -LiteralPath $JournalPath -Force
     return $true

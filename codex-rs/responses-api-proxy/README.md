@@ -78,6 +78,9 @@ codex-responses-api-proxy [--port <PORT>] [--server-info <FILE>] [--http-shutdow
 - `--upstream-url <URL>`: Absolute URL to forward requests to. Defaults to `https://api.openai.com/v1/responses`.
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
 - Authentication is fixed to `Authorization: Bearer <key>` to match the Codex CLI expectations.
+- `--max-in-flight <COUNT>`: Maximum admitted forwarding workers (default 16); overload returns 503. A stalled upload, upstream response, or dump holds its slot rather than spawning unlimited workers.
+- `--max-request-bytes <BYTES>`: Maximum buffered upload size (default 134217728); oversized fixed-length or chunked uploads return 413 before upstream dispatch.
+- Upstream connection setup has a 30-second deadline. Active response streams have no total-duration deadline. Upload/header-idle cancellation remains dependent on the blocking HTTP stack; the admission cap bounds retained workers, not stall duration. `/shutdown` remains available at capacity.
 
 For Azure, for example (ensure your deployment accepts `Authorization: Bearer <key>`):
 

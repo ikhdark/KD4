@@ -40,7 +40,7 @@ async fn continuity_user_authored_context_wrappers_survive_rollback_boundaries()
         "the current wrapped request, not the older request, owns task-input provenance"
     );
     history.drop_last_n_user_turns(1);
-    assert_eq!(history.raw_items(), &[first.clone()]);
+    assert_eq!(history.raw_items(), std::slice::from_ref(&first));
 
     // A surviving literal wrapper directly before the removed request is not
     // a host pre-turn update and must not be trimmed with that request.
@@ -3005,13 +3005,11 @@ fn unchanged_tool_projection_preserves_prepared_sidecars() {
         items: prepared.shared_items(),
         unreplaced_items: prepared.shared_unreplaced_items(),
         substitutions: prepared.tool_history_substitutions(),
-        ..ToolHistoryProjection::default()
     };
     let fallback_projection = ToolHistoryProjection {
         items: prepared.shared_fallback_items(),
         unreplaced_items: prepared.shared_unreplaced_fallback_items(),
         substitutions: prepared.fallback_tool_history_substitutions(),
-        ..ToolHistoryProjection::default()
     };
 
     let projected = apply_tool_history_projection(prepared, projection, fallback_projection, None);

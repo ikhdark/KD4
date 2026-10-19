@@ -463,7 +463,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
             (
                 vec![],
                 sse(vec![
-                    ev_response_created("1"),
+                    ev_response_created("failed"),
                     ev_function_call("failing-check", "exec_command", FAILING_CHECK_ARGS),
                     ev_completed("failed"),
                 ]),
@@ -471,7 +471,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
             (
                 diagnosis_calls(&[("failing-check", FAILING_CHECK_ARGS)]),
                 sse(vec![
-                    ev_response_created("2"),
+                    ev_response_created("diagnosed"),
                     ev_function_call("diagnose", "test_sync_tool", DIAGNOSE_ARGS),
                     ev_completed("diagnosed"),
                 ]),
@@ -482,7 +482,7 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
                     ("diagnose", DIAGNOSE_ARGS),
                 ]),
                 sse(vec![
-                    ev_response_created("3"),
+                    ev_response_created("validated"),
                     ev_function_call(
                         "targeted-validation",
                         "test_sync_tool",
@@ -584,14 +584,14 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     let instructions = requests[0].instructions_text();
     for rule in [
         "User-sent issues, logs, findings, and sessions are requests to investigate; change files only when the request calls for implementation",
-        "Run final verification after the last relevant edit",
+        "After the last relevant edit, perform the smallest authorized verification covering requested behavior and credible regressions",
         "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
-        "Resume a live operation rather than restarting it.",
-        "Reuse evidence still in context unless a relevant change, contradiction, freshness notice, or explicit freshness requirement affects it",
-        "Choose the smallest checks that cover the requested behavior and the credible regressions introduced by the change",
-        "Re-read an edited file only when the patch result is inexact or the surrounding code matters to the next step",
-        "A display limit is not a retention guarantee",
-        "Recover missing output from its retained artifact (`read_tool_output`) before rerunning the producer",
+        "Resume live operations rather than restarting or duplicating them, including validation.",
+        "Reuse evidence in context unless affected by a relevant change, contradiction, freshness notice, or explicit freshness requirement",
+        "After code edits, run the smallest compile-only check covering every edited target, including changed test code",
+        "Re-read edited source only for an inexact patch or relevant surrounding context.",
+        "display limits do not guarantee retention.",
+        "recover truncated output from retained artifacts (`read_tool_output`), not reruns.",
     ] {
         assert_eq!(
             instructions.matches(rule).count(),

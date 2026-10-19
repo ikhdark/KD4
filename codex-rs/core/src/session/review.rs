@@ -108,8 +108,6 @@ pub(super) async fn spawn_review_thread(
 
     let review_turn_context = TurnContext {
         hook_context_budget: Default::default(),
-        mcp_runtime: Default::default(),
-        mcp_tool_snapshot: Default::default(),
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         config: per_turn_config,

@@ -117,7 +117,15 @@ def normalize_codex_version(version: str) -> str:
     return normalized
 
 
+def _validate_staging_destination(src: Path, dst: Path) -> None:
+    source = src.resolve(strict=True)
+    destination = dst.resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError(f"staging source and destination overlap: {src} -> {dst}")
+
+
 def _copy_package_tree(src: Path, dst: Path) -> None:
+    _validate_staging_destination(src, dst)
     if dst.exists():
         if dst.is_dir():
             shutil.rmtree(dst)
@@ -504,7 +512,7 @@ def _annotate_schema(value: Any, base: str | None = None) -> None:
 
     # Python integers need no Rust width annotation. Keep the schema's numeric
     # constraints while removing formats unsupported by datamodel-code-generator.
-    if value.get("format") in {"uint", "uint16", "uint32", "uint64"}:
+    if value.get("format") in {"uint", "uint8", "uint16", "uint32", "uint64"}:
         value.pop("format")
 
     owner = value.get("title")
@@ -1436,6 +1444,7 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
     if args.command == "generate-types":
         ops.generate_types()
     elif args.command == "stage-sdk":
+        _validate_staging_destination(sdk_root(), args.staging_dir)
         ops.generate_types()
         ops.stage_python_sdk_package(
             args.staging_dir,
@@ -1443,6 +1452,7 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
             normalize_codex_version(args.codex_version),
         )
     elif args.command == "stage-runtime":
+        _validate_staging_destination(python_runtime_root(), args.staging_dir)
         ops.stage_python_runtime_package(
             args.staging_dir,
             normalize_codex_version(args.codex_version),

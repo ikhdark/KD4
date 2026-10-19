@@ -123,10 +123,17 @@ async fn complete_paged_native_read_satisfies_typed_source_acquisition() {
 #[tokio::test]
 #[ignore = "bounded native read/recovery/proof wall-clock benchmark"]
 async fn paged_native_source_acquisition_wall_clock() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let mut samples = Vec::new();
     for _ in 0..3 {
         samples.push(paged_native_source_acquisition_round_trip().await.as_micros());
     }
     samples.sort_unstable();
-    eprintln!("paged_native_source_acquisition bytes=2097152 samples_us={samples:?} median_us={}", samples[1]);
+    tracing::info!(bytes = 2097152, samples_us = ?samples, median_us = %samples[1], "paged_native_source_acquisition");
 }

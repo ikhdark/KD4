@@ -10,8 +10,9 @@ from typing import AsyncIterator, Callable, ParamSpec, TypeVar
 from pydantic import BaseModel
 
 from ._goal import _GoalOperationState
+from ._run import _raise_for_failed_turn
 from .client import CodexClient, CodexConfig
-from .errors import CodexError
+from .errors import CodexError, TransportClosedError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
@@ -98,6 +99,7 @@ class AsyncCodexClient:
         on_cancel: Callable[[ReturnT], None] | None = None,
         *,
         shutdown: bool = False,
+        expected_epoch: int | None = None,
     ) -> ReturnT:
         slots = self._close_slot if shutdown else self._worker_slots
         if not slots.acquire(blocking=False):
@@ -110,6 +112,8 @@ class AsyncCodexClient:
         def run_operation() -> None:
             try:
                 with nullcontext() if shutdown else self._sync._operation(cancelled):
+                    if expected_epoch is not None and self.process_epoch != expected_epoch:
+                        raise TransportClosedError("turn handle belongs to a closed Codex process")
                     result = fn()
                 operation.set_result(result)
                 if on_cancel is not None:
@@ -472,7 +476,7 @@ class AsyncCodexClient:
         text: str,
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> AsyncIterator[AgentMessageDeltaNotification]:
-        """Stream text deltas from one turn without monopolizing the event loop."""
+        """Yield text deltas; failed turns raise, interrupted turns end normally."""
         started = await self.turn_start(thread_id, text, params)
         turn_id = started.turn.id
         try:
@@ -490,6 +494,7 @@ class AsyncCodexClient:
                     and isinstance(notification.payload, TurnCompletedNotification)
                     and notification.payload.turn.id == turn_id
                 ):
+                    _raise_for_failed_turn(notification.payload.turn)
                     break
         finally:
             self.unregister_turn_notifications(turn_id)

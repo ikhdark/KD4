@@ -288,6 +288,7 @@ helpers = ["codex", "codex-code-mode-host"]
 package = "codex-core-integration-tests"
 test = "core_code_mode_mcp"
 helpers = [
+  "codex",
   "codex-code-mode-host",
   "test_stdio_server",
   "test_streamable_http_server",
@@ -299,6 +300,7 @@ helpers = [
 package = "codex-core-integration-tests"
 test = "core_exec_permissions"
 helpers = [
+  "codex",
   "codex-code-mode-host",
   "codex-windows-sandbox-setup",
   "codex-command-runner",
@@ -694,6 +696,17 @@ tests = [
   "responses_retry::tests::provider_retry_preserves_jitter_and_prioritizes_cancellation",
   "responses_retry::tests::cancelled_retry_does_not_switch_transport_or_announce_an_attempt",
   "responses_retry::tests::owner_cancellation_interrupts_each_active_retry_wait",
+  "responses_retry::tests::reconnectable_server_close_rebuilds_the_websocket_before_falling_back",
+  "responses_retry::tests::only_reconnectable_closes_rebuild_the_transport",
+  "responses_retry::tests::provider_silence_and_broken_streams_use_bounded_recovery",
+  "responses_retry::tests::repeated_http_idle_timeouts_exhaust_the_generation_budget",
+  "responses_retry::tests::missing_credentials_wait_ends_when_a_login_lands",
+  "responses_retry::tests::usage_limit_wait_ends_at_a_reset_inside_its_bound",
+  "responses_retry::tests::owner_cancellation_interrupts_the_account_wait",
+  "responses_retry::tests::account_wait_keeps_batch_sessions_and_spent_bounds_failing_fast",
+  "responses_retry::tests::missing_credentials_wait_rechecks_a_login_that_already_completed",
+  "responses_retry::tests::usage_limit_rechecks_the_failed_attempt_account_before_waiting",
+  "responses_retry::tests::due_usage_reset_retries_once_then_backs_off_with_the_same_deadline",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 
@@ -939,7 +952,7 @@ target = "core_lib"
 helpers = []
 tests = [
   "session::turn::tests::logical_generation_budget_allows_bounded_regular_and_one_terminal_generation",
-  "session::turn::tests::retained_evidence_analysis_and_owned_polling_preserve_generation_capacity",
+  "session::turn::tests::owned_polling_credits_are_capped_so_the_forced_synthesis_stays_reachable",
   "session::turn::tests::validation_failure_at_generation_limit_keeps_repair_tools_available",
 ]
 

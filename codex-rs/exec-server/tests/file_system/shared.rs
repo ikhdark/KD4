@@ -527,6 +527,15 @@ async fn file_system_walk_returns_a_bounded_tree(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_local_sandbox_walks_keep_their_denials() -> Result<()> {
+    tokio::try_join!(
+        file_system_walk_honors_read_sandbox(FileSystemImplementation::Local),
+        file_system_walk_honors_read_sandbox(FileSystemImplementation::Local),
+    )?;
+    Ok(())
+}
+
 #[test_case(FileSystemImplementation::Local ; "local")]
 #[test_case(FileSystemImplementation::Remote ; "remote")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -568,7 +577,10 @@ async fn file_system_walk_honors_read_sandbox(
     assert!(
         denied
             .as_ref()
-            .map_or(true, |outcome| outcome.entries.is_empty()),
+            .map_or_else(
+                |error| error.kind() == std::io::ErrorKind::PermissionDenied,
+                |outcome| outcome.entries.is_empty(),
+            ),
         "mode={implementation}: walk of a denied directory returned {denied:?}"
     );
 

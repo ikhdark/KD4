@@ -155,6 +155,7 @@ mod tests {
             assert_eq!(
                 snapshot.info,
                 TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: TokenUsage {
                         input_tokens: 120,
                         cached_input_tokens: 20,
@@ -180,6 +181,7 @@ mod tests {
         let items = vec![RolloutItem::EventMsg(EventMsg::TokenCount(
             TokenCountEvent {
                 info: Some(TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: TokenUsage::default(),
                     last_token_usage: TokenUsage::default(),
                     model_context_window: None,
@@ -243,6 +245,7 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: Some(TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: TokenUsage {
                         input_tokens: 120,
                         cached_input_tokens: 20,

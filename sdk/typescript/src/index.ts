@@ -11,6 +11,7 @@ export type {
   ThreadError,
   ThreadErrorEvent,
   Usage,
+  SurfacedToolResult,
 } from "./events";
 export type {
   ThreadItem,
@@ -22,12 +23,13 @@ export type {
   FileChangeItem,
   McpToolCallItem,
   CollabToolCallItem,
+  CollabAgentState,
   WebSearchItem,
   TodoListItem,
   ErrorItem,
 } from "./items";
 
-export { Thread } from "./thread";
+export { Thread, TurnRunError } from "./thread";
 export type { RunResult, RunStreamedResult, Input, UserInput } from "./thread";
 
 export { Codex } from "./codex";

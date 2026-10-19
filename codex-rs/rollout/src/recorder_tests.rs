@@ -66,7 +66,7 @@ async fn failed_rollout_backlog_is_bounded_and_only_barriers_retry() -> std::io:
             owner.mark_failed(&error);
         }
     }));
-    let recorder = RolloutRecorder { tx, writer_task: Arc::clone(&task), rollout_path: path.clone() };
+    let recorder = RolloutRecorder { tx, writer_task: Arc::clone(&task), rollout_path: path.clone(), writer_lease: None };
     recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await?;
     assert!(recorder.flush().await.is_err(), "durability failure must be observable");
     // Repair storage, but additions must not each restart the failed episode.
@@ -817,6 +817,7 @@ async fn recorder_persists_every_sampling_request_token_count() -> std::io::Resu
         let token_count = |count| {
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: Some(codex_protocol::protocol::TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: codex_protocol::protocol::TokenUsage {
                         total_tokens: count,
                         ..Default::default()
@@ -906,6 +907,101 @@ async fn recorder_discard_waits_for_owned_cleanup_without_materializing() -> std
     assert!(!path.exists(), "acknowledged discard must not run the last-sender drain");
     assert!(recorder.record_canonical_items_ordered(&[agent_message("too late")]).await.is_err());
     recorder.discard().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintenance_rollback_preserves_order_and_lazy_records() -> std::io::Result<()> {
+    for materialized in [false, true] {
+        let home = TempDir::new()?;
+        let recorder = RolloutRecorder::new(
+            &test_config(home.path()),
+            RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
+                None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
+        ).await?;
+        let path = recorder.rollout_path().to_path_buf();
+        recorder.record_canonical_items_ordered(&[agent_message("before")]).await?;
+        if materialized { recorder.persist().await?; }
+        let pause = recorder.pause_for_maintenance().await?;
+        assert_eq!(path.is_file(), materialized, "pause must not materialize a lazy rollout");
+        let lock = compression::try_lock_rollout_for_maintenance(&path)?;
+        let staged = home.path().join("staged.jsonl");
+        if materialized { fs::rename(&path, &staged)?; }
+        let after = [agent_message("after")];
+        let append = recorder.record_canonical_items_ordered(&after);
+        tokio::pin!(append);
+        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(append.as_mut(), cx))).await, std::task::Poll::Pending));
+        if materialized { fs::rename(&staged, &path)?; }
+        drop(lock);
+        drop(pause);
+        append.await?;
+        recorder.flush().await?;
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+        assert_eq!(errors, 0);
+        let messages = items.into_iter().filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(messages, vec!["before", "after"]);
+        recorder.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_maintenance_behind_blocked_writer_resumes_admission() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
+            None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
+    ).await?;
+    recorder.record_canonical_items_ordered(&[agent_message("retained")]).await?;
+    let (entered, paused) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    recorder.tx.send(RolloutCmd::Pause { entered, resume: resumed }).await.unwrap();
+    paused.await.unwrap();
+    {
+        let maintenance = recorder.pause_for_maintenance();
+        tokio::pin!(maintenance);
+        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(maintenance.as_mut(), cx))).await, std::task::Poll::Pending));
+    }
+    resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), recorder.flush()).await.expect("cancelled pause released")?;
+    recorder.record_canonical_items_ordered(&[agent_message("after cancellation")]).await?;
+    recorder.flush().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(errors, 0);
+    let messages = items.iter().filter_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message.as_str()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(messages, vec!["retained", "after cancellation"]);
+    recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintenance_commit_or_failed_restore_never_recreates_rollout() -> std::io::Result<()> {
+    for (materialized, committed) in [(false, true), (true, true), (true, false)] {
+        let home = TempDir::new()?;
+        let recorder = RolloutRecorder::new(
+            &test_config(home.path()),
+            RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
+                None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
+        ).await?;
+        recorder.record_canonical_items_ordered(&[agent_message("pending")]).await?;
+        if materialized { recorder.persist().await?; }
+        let path = recorder.rollout_path().to_path_buf();
+        let pause = recorder.pause_for_maintenance().await?;
+        if materialized { fs::remove_file(&path)?; }
+        if committed { pause.commit(); } else { pause.restore_failed(); }
+        assert!(recorder.record_canonical_items_ordered(&[agent_message("rejected")]).await.is_err());
+        tokio::time::timeout(Duration::from_secs(5), recorder.tx.closed()).await.expect("writer exits");
+        assert!(!path.exists(), "terminal maintenance cannot run channel-close draining");
+    }
     Ok(())
 }
 
@@ -1788,6 +1884,7 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
             path: rollout_path.clone(),
             file: tokio::fs::File::from_std(read_only_file),
             _append_lock: append_lock,
+            _payload_retention: crate::payload_artifact::lock_publication(&rollout_path)?,
             write_fault: None,
             append_transaction_count: 0,
         }),
@@ -2131,7 +2228,7 @@ fn storage_overlap_recorder(home: &Path, capacity: usize) -> std::io::Result<Rol
             owner.mark_failed(&error);
         }
     }));
-    Ok(RolloutRecorder { tx, writer_task: task, rollout_path: path })
+    Ok(RolloutRecorder { tx, writer_task: task, rollout_path: path, writer_lease: None })
 }
 
 #[tokio::test]
@@ -2455,11 +2552,21 @@ async fn artifact_selection_preserves_mixed_batch_bytes_and_inline_fallback() ->
     for fail_artifact_storage in [false, true] {
         let home = TempDir::new()?;
         let path = home.path().join("rollout.jsonl");
-        if fail_artifact_storage {
-            // Storage failure must retain the complete inline record, not drop the batch.
-            fs::write(crate::payload_artifact::root(&path), b"not a directory")?;
-        }
         let mut writer = open_log_file(&path)?.into_jsonl_writer();
+        if fail_artifact_storage {
+            // The writer already owns the publication root's retention lock.
+            // Block the individual destinations instead of making writer-open fail.
+            for ((_, candidate), line) in cases.iter().zip(&expected) {
+                if !candidate || line.len() < crate::payload_artifact::INLINE_BYTES { continue; }
+                let mut value: serde_json::Value = serde_json::from_slice(line)?;
+                let fields = value.as_object_mut().expect("rollout object");
+                fields.remove("timestamp");
+                fields.remove("format_version");
+                let digest = <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&value)?);
+                let digest = hex::encode(digest);
+                fs::create_dir_all(crate::payload_artifact::root(&path).join(format!("{digest}.json")))?;
+            }
+        }
         writer.write_rollout_items(&items.iter().collect::<Vec<_>>()).await?;
         assert_eq!(writer.append_transaction_count, 1);
         let bytes = fs::read(&path)?;

@@ -1026,7 +1026,7 @@ impl ChatWidget {
 
     fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
         info.model_context_window.map(|window| {
-            info.last_token_usage
+            info.context_usage()
                 .percent_of_context_window_remaining(window)
         })
     }

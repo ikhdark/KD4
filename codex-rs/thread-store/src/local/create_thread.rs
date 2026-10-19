@@ -29,6 +29,7 @@ async fn create_thread_inner(
     known_repository_context: Option<Option<RepositoryContext>>,
 ) -> ThreadStoreResult<RolloutRecorder> {
     reject_paginated_history_mode(params.history_mode)?;
+    let lease = store.acquire_writer_lease(params.thread_id, false).await?;
     let cwd = params
         .metadata
         .cwd
@@ -42,7 +43,7 @@ async fn create_thread_inner(
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
     };
-    RolloutRecorder::new_with_repository_context(
+    RolloutRecorder::new_with_writer_lease(
         &config,
         RolloutRecorderParams::new(
             params.thread_id,
@@ -60,6 +61,7 @@ async fn create_thread_inner(
         .with_history_mode(params.history_mode)
         .with_initial_window_id(params.initial_window_id),
         known_repository_context,
+        lease,
     )
     .await
     .map_err(|err| ThreadStoreError::Internal {

@@ -36,9 +36,8 @@ describe("AbortSignal support", () => {
       await expect(
         thread.run("Hello, world!", { signal: controller.signal }),
       ).rejects.toMatchObject({
-        name: "AbortError",
-        code: "ABORT_ERR",
-        cause: "Test abort",
+        name: "TurnRunError",
+        cause: { name: "AbortError", code: "ABORT_ERR", cause: "Test abort" },
       });
     } finally {
       cleanup();
@@ -97,9 +96,8 @@ describe("AbortSignal support", () => {
 
       const runPromise = thread.run("Hello, world!", { signal: controller.signal });
       await expect(runPromise).rejects.toMatchObject({
-        name: "AbortError",
-        code: "ABORT_ERR",
-        cause: "Aborted during execution",
+        name: "TurnRunError",
+        cause: { name: "AbortError", code: "ABORT_ERR", cause: "Aborted during execution" },
       });
       expect(reachedModel).toBe(true);
     } finally {

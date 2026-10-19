@@ -206,12 +206,6 @@ fn request_body_contains(request: &wiremock::Request, text: &str) -> bool {
     request_body_text(request).is_some_and(|body| body.contains(text))
 }
 
-fn request_prompt_cache_key(request: &wiremock::Request) -> Option<String> {
-    request_body_text(request)
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .and_then(|body| body["prompt_cache_key"].as_str().map(str::to_string))
-}
-
 fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool {
     request_body_text(request)
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
@@ -1047,16 +1041,11 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     );
     test.submit_turn(SPAWN_SEED_PROMPT).await?;
     let seed_request = seed_mock.single_request();
-    let parent_prompt_cache_key = seed_request.body_json()["prompt_cache_key"]
-        .as_str()
-        .expect("parent seed request should carry a prompt cache key")
-        .to_string();
     let child_mock = responses::mount_sse_once_match(
         &server,
-        move |request: &wiremock::Request| {
-            request_prompt_cache_key(request)
-                .is_some_and(|cache_key| cache_key != parent_prompt_cache_key)
-                && request_has_last_message_input_text(request, "user", SPAWN_CHILD_PROMPT)
+        |request: &wiremock::Request| {
+            // Children share session cache affinity; their task identifies this request.
+            request_has_last_message_input_text(request, "user", SPAWN_CHILD_PROMPT)
         },
         responses::sse(vec![
             responses::ev_response_created("child-response"),
@@ -1101,6 +1090,19 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     let child_request = match child_request {
         Ok(request) => request,
         Err(_) => {
+            let child_status = child_thread.agent_status().await;
+            let child_model = child_thread.config_snapshot().await.model;
+            let mut child_terminal_events = Vec::new();
+            for _ in 0..64 {
+                let Some(Ok(event)) = futures::FutureExt::now_or_never(child_thread.next_event()) else {
+                    break;
+                };
+                match event.msg {
+                    EventMsg::Error(error) => child_terminal_events.push(format!("error: {error:?}")),
+                    EventMsg::TurnComplete(completed) => child_terminal_events.push(format!("completed: error={:?}", completed.error)),
+                    _ => {}
+                }
+            }
             let diagnostics = server
                 .received_requests()
                 .await
@@ -1127,7 +1129,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
                 })
                 .collect::<Vec<_>>();
             return Err(anyhow!(
-                "timed out waiting for the subagent request; observed requests: {diagnostics:?}"
+                "timed out waiting for the subagent request; child model={child_model}, status={child_status:?}, terminal events={child_terminal_events:?}; observed requests: {diagnostics:?}"
             ));
         }
     };

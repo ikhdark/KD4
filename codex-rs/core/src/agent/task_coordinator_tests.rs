@@ -88,6 +88,7 @@ async fn missing_receipt_for_amended_attempt_uses_effective_criteria() {
             .set_agent_gate(
                 TaskActor::Root,
                 assignment.assignment_id,
+                original_attempt.attempt_id,
                 codex_agent_task_store::GateKind::Review,
                 codex_agent_task_store::GateStatus::ChangesRequested,
                 "review requires revised acceptance criteria".to_string(),
@@ -565,6 +566,10 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
         agent_nickname: None,
         agent_role: None,
     });
+    let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+    let telemetry = test_session_telemetry().with_metrics_config(codex_otel::MetricsConfig::in_memory(
+        "test", "codex", "test", exporter.clone(),
+    )).unwrap();
     for ordinal in 0..3 {
         let binding = coordinator.binding_for_source(&source).unwrap();
         coordinator
@@ -575,6 +580,8 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
             coordinator.binding_for_source(&source).unwrap().attempt_id,
             binding.attempt_id
         );
+        assert!(coordinator.record_task_usage_for_source(&source,
+            crate::agent::task_metrics::TokenClassTotals { total: 7, ..Default::default() }, 1));
         coordinator
             .seal_missing_receipt(
                 &path,
@@ -584,12 +591,16 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
             .await
             .unwrap()
             .unwrap();
+        coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
+        coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
+        assert!(!coordinator.has_task_metric_runtime(assignment.assignment_id));
         // Delivery alone never starts a new attempt; entering the next turn does.
         coordinator
             .prepare_legacy_agent_turn(&source, thread_id)
             .await
             .unwrap();
         let next = coordinator.binding_for_source(&source).unwrap();
+        assert!(coordinator.has_task_metric_runtime(assignment.assignment_id));
         assert_ne!(next.attempt_id, binding.attempt_id);
         assert_eq!(
             coordinator
@@ -627,6 +638,12 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
             .unwrap();
         assert_eq!(persisted.attempt_id, next.attempt_id);
     }
+    // Simulate lost process-local counters while the durable attempt stays active.
+    coordinator.metrics.lock().unwrap().runtimes.remove(&assignment.assignment_id);
+    coordinator.prepare_legacy_agent_turn(&source, thread_id).await.unwrap();
+    assert!(coordinator.metrics.lock().unwrap().runtimes[&assignment.assignment_id].usage_history_partial);
+    assert!(coordinator.record_task_usage_for_source(&source,
+        crate::agent::task_metrics::TokenClassTotals { total: 11, ..Default::default() }, 1));
     let final_receipt = coordinator
         .seal_missing_receipt(
             &path,
@@ -638,6 +655,17 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
         .unwrap();
     assert_eq!(final_receipt.summary, "latest followup");
     assert!(final_receipt.validation_call_ids.is_empty());
+    coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
+    telemetry.shutdown_metrics().unwrap();
+    let exports = exporter.get_finished_metrics().unwrap();
+    let metrics = exports.last().unwrap().scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics).collect::<Vec<_>>();
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    let usage = metrics.iter().find(|metric| metric.name() == "codex.multi_agent.task.token_usage").unwrap();
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = usage.data() else { panic!("token histogram"); };
+    let totals = histogram.data_points().filter(|point| !point.attributes().any(|attribute| attribute.key.as_str() == "token_class")).collect::<Vec<_>>();
+    assert_eq!(totals.iter().map(|point| point.sum()).sum::<f64>(), 32.0);
+    assert_eq!(totals.iter().map(|point| point.count()).sum::<u64>(), 4);
 }
 
 #[tokio::test]
@@ -744,6 +772,7 @@ async fn typed_turn_preparation_rejects_sealed_or_stale_attempts_before_sampling
                 .set_agent_gate(
                     TaskActor::Root,
                     assignment.assignment_id,
+                    attempt.attempt_id,
                     codex_agent_task_store::GateKind::Review,
                     codex_agent_task_store::GateStatus::ChangesRequested,
                     "explicit bounded correction required".to_string(),

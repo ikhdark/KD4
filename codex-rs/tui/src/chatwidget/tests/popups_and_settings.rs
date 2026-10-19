@@ -3438,7 +3438,7 @@ async fn account_update_discards_previous_account_apps() {
         // AccountUpdated is an identity boundary even when visible auth fields match.
         chat.update_account_state(None, None, true, true);
         assert!(
-            chat.connectors_for_mentions().is_none_or(|apps| apps.is_empty()),
+            chat.connectors_for_mentions().is_none_or(<[codex_connectors::AppInfo]>::is_empty),
             "account update retained previous apps (is_final={is_final})"
         );
         chat.bottom_pane.set_composer_text("$".to_string(), Vec::new(), Vec::new());

@@ -472,7 +472,7 @@ async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down(
                 id: request_id(10),
                 result: WireResult::Err {
                     message: session_capacity_error(
-                        &cells.iter().map(|cell| cell.as_str()).collect::<Vec<_>>()
+                        &cells.iter().map(codex_code_mode_protocol::host::WireCellId::as_str).collect::<Vec<_>>()
                     ),
                 },
             })
@@ -986,7 +986,7 @@ async fn saturated_session_admission_releases_host_permit() {
                 id: request_id(1),
                 result: WireResult::Err {
                     message: session_capacity_error(
-                        &cells.iter().map(|cell| cell.as_str()).collect::<Vec<_>>()
+                        &cells.iter().map(codex_code_mode_protocol::CellId::as_str).collect::<Vec<_>>()
                     )
                 },
             }

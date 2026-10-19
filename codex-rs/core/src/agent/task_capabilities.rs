@@ -136,6 +136,7 @@ pub(crate) struct ColdReviewWriteEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ColdReviewContext {
     pub assignment: Assignment,
+    pub effective_contract: codex_agent_task_store::EffectiveTaskContract,
     pub attempt_id: AttemptId,
     pub applicable_instructions: Vec<String>,
     pub attempt_specific_diff: String,
@@ -149,6 +150,7 @@ pub(crate) struct ColdReviewContext {
 #[derive(Clone, Debug)]
 pub(crate) struct ColdReviewContextInput {
     pub assignment: Assignment,
+    pub amendment: Option<codex_agent_task_store::AttemptAmendment>,
     pub attempt_id: AttemptId,
     pub applicable_instructions: Vec<String>,
     pub attempt_specific_diff: String,
@@ -194,6 +196,7 @@ pub(crate) fn build_cold_review_context(
     observed_writes.sort_by(|left, right| compare_repo_paths(&left.path, &right.path));
 
     Ok(ColdReviewContext {
+        effective_contract: input.assignment.effective_contract(input.amendment.as_ref()),
         assignment: input.assignment,
         attempt_id: input.attempt_id,
         applicable_instructions: input.applicable_instructions,

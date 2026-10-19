@@ -796,6 +796,7 @@ fn build_code_mode_executors(
                     "read_file" => &["file_path", "offset", "limit"],
                     "update_plan" => &[
                         "scope_change_instructions",
+                        "scope_change_refs",
                         "superseded",
                         "workflow",
                     ],
@@ -823,7 +824,7 @@ fn build_code_mode_executors(
                     trimmed_plan_contract = &*definition.name == "update_plan";
                 }
                 if trimmed_plan_contract {
-                    definition.description = format!("{}\nRarely needed fields (superseded, scope_change_instructions, workflow) are omitted here; use resolve_tool(\"update_plan\") before retiring scope or linking task-coordinator assignments.", definition.description).into();
+                    definition.description = format!("{}\nRarely needed fields (superseded, scope_change_instructions, scope_change_refs, workflow) are omitted here; use resolve_tool(\"update_plan\") before retiring scope or linking task-coordinator assignments.", definition.description).into();
                 }
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();

@@ -300,6 +300,7 @@ pub struct PowershellDirectArgvCandidate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PowershellParseAnalysis {
     pub commands: Vec<Vec<String>>,
+    pub standalone_command: bool,
     pub direct_argv: Option<PowershellDirectArgvCandidate>,
     pub resolved_application: Option<String>,
 }
@@ -865,6 +866,8 @@ struct PowershellParserResponse {
     id: u64,
     status: String,
     commands: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    standalone_command: bool,
     direct_argv: Option<Vec<String>>,
     native_argument_mode: Option<String>,
     powershell_version: Option<String>,
@@ -900,6 +903,7 @@ impl PowershellParserResponse {
                             }
                         });
                     PowershellParseOutcome::Analysis(PowershellParseAnalysis {
+                        standalone_command: self.standalone_command && commands.len() == 1,
                         commands,
                         direct_argv,
                         resolved_application: self.resolved_application,
@@ -941,6 +945,7 @@ mod tests {
             id: 1,
             status: "ok".to_string(),
             commands: Some(vec![vec!["python".to_string()]]),
+            standalone_command: true,
             direct_argv: Some(vec!["python".to_string()]),
             native_argument_mode: Some(mode.to_string()),
             powershell_version: Some(version.to_string()),
@@ -1117,6 +1122,46 @@ mod tests {
                     powershell_version: "7.5.0".to_string(),
                 })
             );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn standalone_numeric_arguments_do_not_grant_direct_execution_proof() {
+        let host = try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let mut parser = PowershellParserProcess::spawn(host.as_path().to_str().unwrap()).unwrap();
+        let script = "cargo nextest run --no-fail-fast --retries 0";
+        let PowershellParseOutcome::Analysis(analysis) = parser.parse(script).unwrap() else {
+            panic!("expected standalone command analysis");
+        };
+        assert!(analysis.standalone_command);
+        assert_eq!(
+            analysis.commands,
+            vec![vec![
+                "cargo",
+                "nextest",
+                "run",
+                "--no-fail-fast",
+                "--retries",
+                "0"
+            ]]
+        );
+        assert_eq!(analysis.direct_argv, None);
+
+        for script in [
+            "cargo test --no-fail-fast; Write-Output done",
+            "cargo test --no-fail-fast | Out-Null",
+            "cargo test --no-fail-fast > result.txt",
+            "foreach ($i in 1,2) { cargo test --no-fail-fast }",
+            "cargo test --no-fail-fast $(cargo test --no-fail-fast)",
+        ] {
+            match parser.parse(script).unwrap() {
+                PowershellParseOutcome::Analysis(analysis) => {
+                    assert!(!analysis.standalone_command, "{script}");
+                }
+                PowershellParseOutcome::Unsupported | PowershellParseOutcome::SyntaxError(_) => {}
+                PowershellParseOutcome::Failed => panic!("parser failed: {script}"),
+            }
         }
     }
 

@@ -55,6 +55,7 @@ struct WsStream {
     rx_message: WsIngressReceiver,
     rx_failure: Option<oneshot::Receiver<WsIngressFailure>>,
     pending_failure: Option<WsError>,
+    response_history: crate::responses_stream::ConnectionResponseHistory,
     pump_task: tokio::task::JoinHandle<()>,
 }
 
@@ -298,6 +299,7 @@ impl WsStream {
             rx_message,
             rx_failure: Some(rx_failure),
             pending_failure: None,
+            response_history: Default::default(),
             pump_task,
         }
     }
@@ -351,6 +353,7 @@ impl WsStream {
 
     fn is_closed(&self) -> bool {
         self.pending_failure.is_some() || self.pump_task.is_finished()
+            || self.response_history.must_retire()
     }
 }
 
@@ -941,7 +944,9 @@ async fn run_websocket_response_stream(
     metadata: ResponsesStreamMetadata,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> Result<(), ApiError> {
-    let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
+    let history = std::mem::take(&mut ws_stream.response_history);
+    let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state)
+        .with_connection_history(history);
     let mut progress_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
         if tokio::time::Instant::now() >= progress_deadline {
@@ -1004,6 +1009,7 @@ async fn run_websocket_response_stream(
                     }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
                 };
+                let mut completed = false;
                 for event in events {
                     let advances = event.advances_model_response();
                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
@@ -1018,9 +1024,11 @@ async fn run_websocket_response_stream(
                     } else {
                         progress_deadline += delivery_start.elapsed();
                     }
-                    if is_completed {
-                        return Ok(());
-                    }
+                    completed |= is_completed;
+                }
+                if completed {
+                    ws_stream.response_history = interpreter.into_connection_history();
+                    return Ok(());
                 }
             }
             Message::Binary(_) => {
@@ -1206,13 +1214,14 @@ mod tests {
         let (tx_message, rx_message) = ws_ingress_channel(4, 4096);
         for payload in [
             r#"{"type":"response.created","response":{"id":"same"}}"#,
-            r#"{"type":"response.created","response":{"id":"same"}}"#,
-            r#"{"type":"response.completed","response":{"id":"done"}}"#,
+            r#"{"type":"response.metadata","response":{"id":"same","headers":{"OpenAI-Model":"test-model"}}}"#,
+            r#"{"type":"response.completed","response":{"id":"same"}}"#,
         ] {
             tx_message.try_send(Message::Text(payload.into())).unwrap();
         }
         let mut ws_stream = WsStream {
             tx_command, rx_message, rx_failure: None, pending_failure: None,
+            response_history: Default::default(),
             pump_task: tokio::spawn(std::future::pending()),
         };
         let (tx, mut rx) = mpsc::channel(1);
@@ -1224,7 +1233,7 @@ mod tests {
         assert_eq!(rx.len(), 1, "producer must reach backpressure before time advances");
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
-        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::ServerModel(model))) if model == "test-model"));
         assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. }))));
         producer.await.unwrap().unwrap();
         assert!(rx.recv().await.is_none());
@@ -1243,7 +1252,7 @@ mod tests {
                     } else if productive {
                         json!({"type":"response.reasoning_text.delta","delta":"thinking","content_index":0})
                     } else {
-                        json!({"type":"response.created","response":{"id":"same"}})
+                        json!({"type":"response.in_progress","response":{"id":"done"}})
                     };
                     let _ = tx_message.try_send(Message::Text(payload.to_string().into()));
                     let _ = tx_message.try_send(Message::Ping(Vec::new().into()));
@@ -1251,6 +1260,7 @@ mod tests {
             });
             let mut ws_stream = WsStream {
                 tx_command, rx_message, rx_failure: None, pending_failure: None,
+                response_history: Default::default(),
                 pump_task: tokio::spawn(std::future::pending()),
             };
             let (tx, _rx) = mpsc::channel(32);
@@ -1290,6 +1300,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    response_history: Default::default(),
                     pump_task,
                 },
                 Duration::from_millis(100),
@@ -1522,6 +1533,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task,
             },
             Duration::from_secs(1),
@@ -1560,6 +1572,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task,
             },
             Duration::from_secs(1),
@@ -1662,6 +1675,7 @@ mod tests {
                 let websocket = tokio_tungstenite::accept_async_with_config(socket, Some(websocket_config())).await.unwrap();
                 let (mut sink, mut source) = websocket.split();
                 let burst = async {
+                    sink.feed(Message::Text(json!({"type":"response.created", "response":{"id":"burst"}}).to_string().into())).await.unwrap();
                     for index in 0..5000 {
                         sink.feed(Message::Text(json!({"type":"response.output_text.delta", "delta": index.to_string()}).to_string().into())).await.unwrap();
                     }
@@ -1670,6 +1684,7 @@ mod tests {
                 let request = async { assert!(matches!(source.next().await, Some(Ok(Message::Text(_))))); };
                 tokio::join!(burst, request);
                 assert!(matches!(source.next().await, Some(Ok(Message::Text(_)))));
+                sink.send(Message::Text(json!({"type":"response.created", "response":{"id":"reused"}}).to_string().into())).await.unwrap();
                 sink.send(Message::Text(json!({"type":"response.completed", "response":{"id":"reused"}}).to_string().into())).await.unwrap();
                 let _ = rx_done.await;
             });
@@ -1744,6 +1759,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task,
             },
             Duration::from_secs(60),
@@ -1835,6 +1851,7 @@ mod tests {
                         "live-request"
                     );
                     let _ = tx_result.send(Ok(()));
+                    tx_message.try_send(Message::Text(json!({"type":"response.created", "response":{"id":"live-response"}}).to_string().into())).unwrap();
                     tx_message
                         .try_send(Message::Text(
                             json!({"type": "response.completed", "response": {"id": "live-response"}})
@@ -1850,6 +1867,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    response_history: Default::default(),
                     pump_task,
                 },
                 Duration::from_millis(50),
@@ -1890,6 +1908,7 @@ mod tests {
                 matches!(live.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
                 if snapshot.limit_id.as_deref() == Some("codex"))
             );
+            assert!(matches!(live.next().await, Some(Ok(ResponseEvent::Created))));
             let event = tokio::time::timeout(Duration::from_secs(1), live.next())
                 .await
                 .unwrap()
@@ -1921,6 +1940,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task,
             },
             Duration::from_secs(60),
@@ -1941,6 +1961,57 @@ mod tests {
             .await
             .expect("consumer loss must dispose of the idle socket promptly");
         assert!(connection.is_closed().await);
+    }
+
+    #[tokio::test]
+    async fn reused_socket_rejects_old_terminal_and_item_before_or_after_next_created() {
+        for stale_after_created in [false, true] {
+            for stale_item in [false, true] {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+                    let (tx_message, rx_message) = ws_ingress_channel(16, 16 * 1024);
+                    let dispatches = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&dispatches);
+                    let old_item = json!({"type":"message","id":"old-item","role":"assistant","content":[{"type":"output_text","text":"old answer"}]});
+                    let pump_task = tokio::spawn(async move {
+                        while let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
+                            let index = observed.fetch_add(1, Ordering::SeqCst);
+                            let _ = tx_result.send(Ok(()));
+                            let frames = if index == 0 {
+                                vec![json!({"type":"response.created","response":{"id":"a"}}),
+                                    json!({"type":"response.output_item.done","item":old_item}),
+                                    json!({"type":"response.completed","response":{"id":"a"}})]
+                            } else {
+                                let stale = if stale_item {
+                                    json!({"type":"response.output_item.done","item":old_item})
+                                } else {
+                                    json!({"type":"response.completed","response":{"id":"a"}})
+                                };
+                                let created = json!({"type":"response.created","response":{"id":"b"}});
+                                if stale_after_created { vec![created, stale] } else { vec![stale, created] }
+                            };
+                            for frame in frames {
+                                tx_message.try_send(Message::Text(frame.to_string().into())).unwrap();
+                            }
+                        }
+                    });
+                    let connection = ResponsesWebsocketConnection::new(WsStream {
+                        tx_command, rx_message, rx_failure: None, pending_failure: None,
+                        response_history: Default::default(), pump_task,
+                    }, Duration::from_secs(1), ResponsesStreamMetadata::default(), None);
+                    let first = connection.stream_request(test_response_request("test"), false, None).await.unwrap()
+                        .collect::<Vec<_>>().await;
+                    assert!(first.iter().any(|event| matches!(event, Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "a")));
+                    assert!(!connection.is_closed().await);
+                    let second = connection.stream_request(test_response_request("test"), true, None).await.unwrap()
+                        .collect::<Vec<_>>().await;
+                    assert!(second.iter().any(Result::is_err));
+                    assert!(!second.iter().any(|event| matches!(event, Ok(ResponseEvent::Completed { .. } | ResponseEvent::OutputItemDone(_)))));
+                    assert!(connection.is_closed().await);
+                    assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+                }).await.expect("stale socket frames must fail without a hang");
+            }
+        }
     }
 
     fn test_response_request(model: &str) -> ResponsesWsRequest {
@@ -2055,6 +2126,7 @@ mod tests {
             rx_message,
             rx_failure: Some(rx_failure),
             pending_failure: None,
+            response_history: Default::default(),
             pump_task,
         };
 
@@ -2131,6 +2203,7 @@ mod tests {
                     rx_message,
                     rx_failure: Some(rx_failure),
                     pending_failure: None,
+                    response_history: Default::default(),
                     pump_task,
                 },
                 Duration::from_secs(1),
@@ -2203,6 +2276,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task: tokio::spawn(std::future::pending()),
             };
             let (tx_event, mut rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(2);
@@ -2313,6 +2387,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                response_history: Default::default(),
                 pump_task: tokio::spawn(std::future::pending()),
             };
             let (tx_event, mut rx_event) = mpsc::channel(2);
@@ -2414,6 +2489,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    response_history: Default::default(),
                     pump_task,
                 },
                 Duration::from_secs(1),
@@ -2486,6 +2562,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    response_history: Default::default(),
                     pump_task,
                 },
                 Duration::from_millis(1250),
@@ -2819,6 +2896,7 @@ mod tests {
         }
         let mut ws_stream = WsStream {
             tx_command, rx_message, rx_failure: None, pending_failure: None,
+            response_history: Default::default(),
             pump_task: tokio::spawn(std::future::pending()),
         };
         let (tx, mut rx) = mpsc::channel(1);

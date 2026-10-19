@@ -1237,7 +1237,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     let cache_key = request_body["prompt_cache_key"]
         .as_str()
         .expect("prefix cache key");
-    assert_eq!(cache_key, thread_id_string);
+    assert_eq!(cache_key, session_id_string);
     assert_codex_client_metadata(
         &request_body,
         installation_id.as_str(),
@@ -3412,8 +3412,8 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
             event,
             EventMsg::TokenCount(payload)
                 if payload.info.as_ref().is_some_and(|info| {
-                    info.model_context_window == Some(info.total_token_usage.total_tokens)
-                        && info.total_token_usage.total_tokens > 0
+                    info.model_context_window == info.estimated_context_tokens
+                        && info.estimated_context_tokens.is_some_and(|tokens| tokens > 0)
                 })
         )
     })
@@ -3429,9 +3429,10 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     assert_eq!(info.model_context_window, Some(EFFECTIVE_CONTEXT_WINDOW));
     assert_eq!(
-        info.total_token_usage.total_tokens,
-        EFFECTIVE_CONTEXT_WINDOW
+        info.estimated_context_tokens,
+        Some(EFFECTIVE_CONTEXT_WINDOW)
     );
+    assert_eq!(info.total_token_usage.total_tokens, 0, "overflow is not billed usage");
 
     let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     let expected_context_window_message = CodexErr::ContextWindowExceeded.to_string();

@@ -2693,7 +2693,7 @@ fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
 }
 
 #[test]
-fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
+fn blocking_post_tool_hook_preserves_completed_result_and_delivers_verdict() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
     };
@@ -2719,7 +2719,10 @@ fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
         },
     );
 
-    assert!(contexts.is_empty());
+    assert_eq!(contexts.len(), 1);
+    assert!(contexts[0].contains("reject completed mutation"));
+    assert!(contexts[0].contains("after the tool completed"));
+    assert!(!contexts[0].contains("must not be injected"));
     assert!(result.result.success_for_logging());
     assert_eq!(
         result.result.to_response_item("call-1", &payload),
@@ -3235,6 +3238,7 @@ async fn verified10_external_dispatch_rejects_invalid_and_hook_rewritten_argumen
                     cancellation_cause: None,
                 };
             }
+            let mutation_tracker = Arc::clone(&invocation.tracker);
             let error = match registry
                 .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
                 .await
@@ -3248,6 +3252,8 @@ async fn verified10_external_dispatch_rejects_invalid_and_hook_rewritten_argumen
                 registry.code_mode_argument_preflight_counts(&name),
                 Some((1, if rewrite { 2 } else { 1 }))
             );
+            assert_eq!(mutation_tracker.lock().await.current_mutation_revision() > 0, rewrite,
+                "only an actually entered hook invalidates evidence, even when rewritten arguments fail");
             errors.push(error);
         }
     }

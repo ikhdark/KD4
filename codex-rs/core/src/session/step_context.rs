@@ -34,7 +34,7 @@ async fn bounded_mcp_snapshot(
             tracing::warn!("MCP catalog did not stabilize before the sampling deadline");
             // Advertise no MCP capabilities when a coherent catalog is unavailable.
             // This distinct identity prevents reuse of a router from a real catalog.
-            // The next turn gets a new capture attempt.
+            // The next sampling step gets a new capture attempt.
             McpToolSnapshot {
                 temporarily_unavailable: true,
                 revision: u64::MAX,
@@ -56,7 +56,7 @@ pub(crate) struct StepContext {
     pub(crate) selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
     /// The exact MCP config and manager used to advertise and execute tools for this step.
     pub(crate) mcp: Arc<McpRuntimeSnapshot>,
-    /// Shared by all steps and retries of the turn.
+    /// Shared by accepted calls and retries of this sampling step only.
     mcp_tool_snapshot: Arc<OnceCell<McpToolSnapshot>>,
     /// The finalized tool plan advertised and executed for this exact sampling request.
     tool_router: OnceLock<Arc<ToolRouter>>,
@@ -111,8 +111,7 @@ impl StepContext {
         agents_md_stable_context: Option<RepositoryStableContextBundle>,
         agents_md_freshness: AgentsMdFreshness,
     ) -> Self {
-        let mcp = Arc::clone(turn.mcp_runtime.get_or_init(|| mcp));
-        let mcp_tool_snapshot = Arc::clone(&turn.mcp_tool_snapshot);
+        let mcp_tool_snapshot = Arc::new(OnceCell::new());
         Self {
             turn,
             plan_sampling_revision: None,
@@ -202,7 +201,7 @@ mod snapshot_deadline_tests {
     use super::*;
 
     #[tokio::test]
-    async fn catalog_is_shared_across_steps_but_not_turns() {
+    async fn catalog_refreshes_between_steps_but_not_retries() {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let turn = Arc::new(turn);
@@ -214,11 +213,16 @@ mod snapshot_deadline_tests {
             .seed_mcp_tool_snapshot_for_test(17, Vec::new(), true)
             .await;
         let next = session.capture_step_context(turn).await.unwrap();
+        next.seed_mcp_tool_snapshot_for_test(18, Vec::new(), false).await;
+        let retry = first.for_retry_attempt();
         assert!(std::ptr::eq(
             first.mcp_tool_snapshot().await,
-            next.mcp_tool_snapshot().await
+            retry.mcp_tool_snapshot().await
         ));
-        assert!(next.mcp_tool_snapshot().await.resources_available);
+        assert_eq!(next.mcp_tool_snapshot().await.revision, 18);
+        assert_eq!(first.mcp_tool_snapshot().await.revision, 17);
+        assert!(!next.mcp_tool_snapshot().await.resources_available);
+        assert!(!Arc::ptr_eq(&first.mcp_tool_snapshot, &next.mcp_tool_snapshot));
         let (_, other_turn) = crate::session::tests::make_session_and_context().await;
         let other = session
             .capture_step_context(Arc::new(other_turn))

@@ -471,6 +471,32 @@ def test_runtime_archive_extraction_rejects_unsafe_members(
     assert not (tmp_path / "escaped.txt").exists()
 
 
+@pytest.mark.parametrize("destination", ["same", "parent", "child"])
+def test_staging_overlap_preserves_source(tmp_path: Path, destination: str) -> None:
+    script = _load_update_script_module()
+    source = tmp_path / "source"
+    source.mkdir()
+    valuable = source / "valuable.py"
+    valuable.write_bytes(b"uncommitted work")
+    target = {"same": source, "parent": tmp_path, "child": source / "stage"}[destination]
+    with pytest.raises(ValueError, match="overlap"):
+        script._copy_package_tree(source, target)
+    assert valuable.read_bytes() == b"uncommitted work"
+    assert not (source / "stage").exists()
+
+
+def test_stage_sdk_overlap_rejected_before_generation(tmp_path: Path, monkeypatch) -> None:
+    script = _load_update_script_module()
+    monkeypatch.setattr(script, "sdk_root", lambda: tmp_path)
+
+    def forbidden(*args):
+        raise AssertionError("preflight must precede every mutation")
+    ops = script.CliOps(forbidden, forbidden, forbidden, forbidden)
+    args = SimpleNamespace(command="stage-sdk", staging_dir=tmp_path)
+    with pytest.raises(ValueError, match="overlap"):
+        script.run_command(args, ops)
+
+
 def test_stage_sdk_release_pins_matching_runtime_version(tmp_path: Path) -> None:
     script = _load_update_script_module()
     staging_dir = tmp_path / "sdk-stage"

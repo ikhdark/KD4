@@ -20,6 +20,9 @@ pub enum TransportError {
     RetryLimit,
     #[error("timeout")]
     Timeout,
+    /// The connection deadline elapsed before any model request was sent.
+    #[error("connection establishment timed out")]
+    ConnectionTimeout,
     #[error("connection failed: {0}")]
     Connection(#[source] HttpError),
     #[error("network error: {0}")]
@@ -31,6 +34,9 @@ pub enum TransportError {
     PreDispatch(String),
     #[error("request build error: {0}")]
     Build(String),
+    /// The server accepted the request; repeating it is not size recovery.
+    #[error("successful response exceeded the {limit} byte receive limit")]
+    ResponseTooLarge { limit: usize },
 }
 
 impl TransportError {

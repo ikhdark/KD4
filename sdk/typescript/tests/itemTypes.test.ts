@@ -1,4 +1,5 @@
 import { expect, it } from "@jest/globals";
+import type { CollabAgentState, SurfacedToolResult } from "../src/index";
 
 import type { CodexExec } from "../src/exec";
 import type { ThreadEvent } from "../src/events";
@@ -55,6 +56,7 @@ it("preserves nullable outcomes and search actions through the event stream", as
     { type: "item.completed", item: { ...patch, status: "declined" } },
     { type: "item.started", item: mcp },
     ...searches.map((item) => ({ type: "item.completed" as const, item })),
+    { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } },
   ];
   const exec = {
     async *run(): AsyncGenerator<string> {
@@ -98,3 +100,17 @@ const missingMcpOutcomes: McpToolCallItem = {
   status: "in_progress",
 };
 void missingMcpOutcomes;
+
+it("exposes optional authoritative child results through public types", () => {
+  const surface: SurfacedToolResult = {
+    adapter: "clock", value: { utc: "2026-10-18T00:00:00Z" }, canonicalMessage: "midnight",
+  };
+  const current: CollabAgentState = {
+    status: "completed", message: null, surfaced_result: surface, last_agent_message: "working",
+  };
+  const legacy: CollabAgentState = { status: "completed", message: "done" };
+  expect(current.surfaced_result?.value).toEqual({ utc: "2026-10-18T00:00:00Z" });
+  expect(current.surfaced_result?.canonicalMessage).toBe("midnight");
+  expect(current.last_agent_message).toBe("working");
+  expect(legacy.surfaced_result).toBeUndefined();
+});

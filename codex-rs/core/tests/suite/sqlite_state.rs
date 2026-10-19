@@ -146,6 +146,8 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     .await;
 
     started.thread.flush_rollout().await?;
+    started.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&started.thread, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     let mut resume_builder = test_codex();
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)

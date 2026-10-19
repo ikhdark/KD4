@@ -70,6 +70,57 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+const MAX_PENDING_REMOTE_EVENTS: usize = 1024;
+const MAX_PENDING_REMOTE_EVENT_BYTES: usize = 16 << 20;
+
+#[derive(Default)]
+struct PendingRemoteEvents {
+    events: VecDeque<(AppServerEvent, usize)>,
+    bytes: usize,
+}
+
+impl PendingRemoteEvents {
+    fn is_empty(&self) -> bool { self.events.is_empty() }
+
+    #[cfg(test)]
+    fn len(&self) -> usize { self.events.len() }
+
+    fn pop_front(&mut self) -> Option<AppServerEvent> {
+        let (event, bytes) = self.events.pop_front()?;
+        self.bytes -= bytes;
+        Some(event)
+    }
+
+    fn push_back(&mut self, event: AppServerEvent) -> IoResult<()> {
+        // Count serialized content without allocating a second payload. Charge
+        // conservatively for decoded strings/containers as well as the enum.
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> IoResult<()> { Ok(()) }
+        }
+        let mut count = Counter(0);
+        match &event {
+            AppServerEvent::ServerNotification(value) => serde_json::to_writer(&mut count, value),
+            AppServerEvent::ServerRequest(value) => serde_json::to_writer(&mut count, value),
+            AppServerEvent::Disconnected { message } => serde_json::to_writer(&mut count, message),
+            AppServerEvent::Lagged { skipped } => serde_json::to_writer(&mut count, skipped),
+        }.map_err(IoError::other)?;
+        let bytes = count.0.saturating_mul(8).saturating_add(std::mem::size_of::<AppServerEvent>());
+        if self.events.len() >= MAX_PENDING_REMOTE_EVENTS
+            || bytes > MAX_PENDING_REMOTE_EVENT_BYTES.saturating_sub(self.bytes)
+        {
+            return Err(IoError::new(ErrorKind::OutOfMemory,
+                "remote app-server required event retention budget exceeded; connection retired"));
+        }
+        self.bytes += bytes;
+        self.events.push_back((event, bytes));
+        Ok(())
+    }
+}
 // Tungstenite still needs an HTTP request URI for the WebSocket handshake;
 // the bytes travel over the Unix socket, not TCP.
 const UDS_WEBSOCKET_HANDSHAKE_URL: &str = "ws://localhost/rpc";
@@ -265,7 +316,7 @@ impl RemoteAppServerClient {
             }
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
-            let mut pending_delivery = VecDeque::<AppServerEvent>::new();
+            let mut pending_delivery = PendingRemoteEvents::default();
             let mut skipped_events = 0usize;
             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
             loop {
@@ -419,7 +470,14 @@ impl RemoteAppServerClient {
                                         }
                                     }
                                     Ok(JSONRPCMessage::Notification(notification)) => {
-                                        if let Some(event) = app_server_event_from_notification(notification)
+                                        let event = match app_server_event_from_notification(notification) {
+                                            Ok(event) => event,
+                                            Err(err) => {
+                                                worker_exit_error = Some((err.kind(), err.to_string()));
+                                                break;
+                                            }
+                                        };
+                                        if let Some(event) = event
                                             && let Err(err) = forward_remote_event(
                                                 &event_tx,
                                                 &mut pending_delivery,
@@ -427,6 +485,7 @@ impl RemoteAppServerClient {
                                                 event,
                                             ) {
                                                 warn!(%err, "failed to deliver remote app-server event");
+                                                worker_exit_error = Some((err.kind(), err.to_string()));
                                                 break;
                                         }
                                     }
@@ -467,6 +526,7 @@ impl RemoteAppServerClient {
                                                     Ok(None) => {}
                                                     Err(err) => {
                                                         warn!(%err, "failed to deliver remote app-server server request");
+                                                        worker_exit_error = Some((err.kind(), err.to_string()));
                                                         break;
                                                     }
                                                 }
@@ -967,7 +1027,7 @@ where
                             )));
                         }
                         JSONRPCMessage::Notification(notification) => {
-                            if let Some(event) = app_server_event_from_notification(notification) {
+                            if let Some(event) = app_server_event_from_notification(notification)? {
                                 if pending_events.len() >= pending_event_capacity {
                                     break Err(IoError::new(
                                         ErrorKind::InvalidData,
@@ -1068,11 +1128,15 @@ where
     })?
 }
 
-fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
-    match ServerNotification::try_from(notification) {
-        Ok(notification) => Some(AppServerEvent::ServerNotification(notification)),
-        Err(_) => None,
+fn app_server_event_from_notification(notification: JSONRPCNotification) -> IoResult<Option<AppServerEvent>> {
+    if !ServerNotification::is_known_method(&notification.method) {
+        return Ok(None);
     }
+    let method = notification.method.clone();
+    ServerNotification::try_from(notification)
+        .map(|notification| Some(AppServerEvent::ServerNotification(notification)))
+        .map_err(|_| IoError::new(ErrorKind::InvalidData,
+            format!("invalid payload for known app-server notification `{method}`")))
 }
 
 fn remote_event_requires_delivery(event: &AppServerEvent) -> bool {
@@ -1087,7 +1151,7 @@ fn remote_event_requires_delivery(event: &AppServerEvent) -> bool {
 
 fn forward_remote_event(
     event_tx: &mpsc::Sender<AppServerEvent>,
-    pending_delivery: &mut VecDeque<AppServerEvent>,
+    pending_delivery: &mut PendingRemoteEvents,
     skipped_events: &mut usize,
     event: AppServerEvent,
 ) -> IoResult<Option<ServerRequest>> {
@@ -1118,10 +1182,10 @@ fn forward_remote_event(
         if *skipped_events > 0 {
             pending_delivery.push_back(AppServerEvent::Lagged {
                 skipped: *skipped_events,
-            });
+            })?;
             *skipped_events = 0;
         }
-        pending_delivery.push_back(event);
+        pending_delivery.push_back(event)?;
         return Ok(None);
     }
 
@@ -1173,12 +1237,12 @@ fn forward_remote_event(
 
 async fn deliver_event(
     event_tx: &mpsc::Sender<AppServerEvent>,
-    pending_delivery: &mut VecDeque<AppServerEvent>,
+    pending_delivery: &mut PendingRemoteEvents,
     skipped_events: &mut usize,
     event: AppServerEvent,
 ) -> IoResult<()> {
-    let rejected = forward_remote_event(event_tx, pending_delivery, skipped_events, event)?;
-    debug_assert!(rejected.is_none());
+    // This terminal path runs only after RPCs and the socket are retired. Drain
+    // the bounded queue before sending disconnect, even when it was saturated.
     while let Some(event) = pending_delivery.pop_front() {
         event_tx.send(event).await.map_err(|_| {
             IoError::new(
@@ -1187,6 +1251,13 @@ async fn deliver_event(
             )
         })?;
     }
+    if *skipped_events > 0 {
+        event_tx.send(AppServerEvent::Lagged { skipped: *skipped_events }).await
+            .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
+        *skipped_events = 0;
+    }
+    event_tx.send(event).await
+        .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
     Ok(())
 }
 
@@ -1236,10 +1307,40 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn notification_decoder_distinguishes_unknown_from_invalid_known_methods() {
+        let notification = |method: &str| JSONRPCNotification {
+            method: method.into(), params: Some(serde_json::json!({})),
+        };
+        assert!(app_server_event_from_notification(notification("future/extension")).unwrap().is_none());
+        for method in ["turn/completed", "item/agentMessage/delta", "thread/closed"] {
+            assert_eq!(app_server_event_from_notification(notification(method)).unwrap_err().kind(), ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn required_event_backlog_has_count_and_byte_bounds() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut pending = PendingRemoteEvents::default();
+        let mut skipped = 0;
+        for _ in 0..=MAX_PENDING_REMOTE_EVENTS {
+            forward_remote_event(&sender, &mut pending, &mut skipped,
+                AppServerEvent::Disconnected { message: "small".into() }).unwrap();
+        }
+        assert_eq!(pending.len(), MAX_PENDING_REMOTE_EVENTS);
+        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
+            AppServerEvent::Disconnected { message: "overflow".into() }).is_err());
+        while pending.pop_front().is_some() {}
+        assert_eq!(pending.bytes, 0);
+        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
+            AppServerEvent::Disconnected { message: "x".repeat(MAX_PENDING_REMOTE_EVENT_BYTES / 8) }).is_err());
+        assert!(pending.is_empty());
+    }
+
     #[tokio::test]
     async fn lossless_forwarding_reuses_available_capacity() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
-        let mut pending_delivery = VecDeque::new();
+        let mut pending_delivery = PendingRemoteEvents::default();
         let mut skipped_events = 0;
         for _ in 0..4 {
             assert!(
@@ -1297,7 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn lossless_fast_path_preserves_retained_event_order() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
-        let mut pending_delivery = VecDeque::new();
+        let mut pending_delivery = PendingRemoteEvents::default();
         let mut skipped_events = 0;
         for message in ["first", "second", "third"] {
             forward_remote_event(
@@ -1336,7 +1437,7 @@ mod tests {
     #[tokio::test]
     async fn lossless_fast_path_does_not_reject_server_request_when_capacity_is_available() {
         let (event_tx, mut event_rx) = mpsc::channel(2);
-        let mut pending_delivery = VecDeque::new();
+        let mut pending_delivery = PendingRemoteEvents::default();
         let mut skipped_events = 0;
         let request = ServerRequest::ToolRequestUserInput {
             request_id: RequestId::Integer(1),

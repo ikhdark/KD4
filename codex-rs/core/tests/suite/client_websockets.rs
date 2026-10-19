@@ -997,7 +997,7 @@ async fn responses_lite_websocket_disables_parallel_tool_calls_for_prewarm_and_t
 
     for use_responses_lite in [false, true] {
         let server = start_websocket_server(vec![vec![
-            vec![ev_completed("resp-prewarm")],
+            vec![ev_response_created("resp-prewarm"), ev_completed("resp-prewarm")],
             vec![ev_response_created("resp-1"), ev_completed("resp-1")],
         ]])
         .await;
@@ -1852,7 +1852,7 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
 
     let server = start_websocket_server(vec![
         vec![
-            vec![ev_completed("resp-prewarm")],
+            vec![ev_response_created("resp-prewarm"), ev_completed("resp-prewarm")],
             vec![websocket_connection_limit_error],
         ],
         vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],

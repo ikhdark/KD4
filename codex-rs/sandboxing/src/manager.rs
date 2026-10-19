@@ -323,7 +323,7 @@ pub fn transform_for_direct_spawn(
     transform_for_direct_spawn_with_codex_home(request, codex_home.as_path())
 }
 
-fn transform_for_direct_spawn_with_codex_home(
+pub fn transform_for_direct_spawn_with_codex_home(
     request: SandboxDirectSpawnTransformRequest<'_>,
     codex_home: &Path,
 ) -> Result<SandboxExecRequest, SandboxTransformError> {

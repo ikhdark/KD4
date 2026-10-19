@@ -46,6 +46,8 @@ const CODEX_NPM_NAME = "@openai/codex";
 const CHILD_TERMINATION_GRACE_MS = 1_000;
 const STDERR_TAIL_MAX_BYTES = 64 * 1024;
 const STDERR_DRAIN_GRACE_MS = 1_000;
+// Descendants may inherit stdout after the owned executor exits.
+const STDOUT_DRAIN_GRACE_MS = 1_000;
 const STDERR_TRUNCATION_MARKER = `[stderr truncated; showing last ${STDERR_TAIL_MAX_BYTES} bytes]\n`;
 
 type NativeTarget = {
@@ -56,6 +58,7 @@ type NativeTarget = {
 
 type CodexPackageManifest = {
   codexNativeTargets?: Record<string, unknown>;
+  optionalDependencies?: Record<string, unknown>;
 };
 
 const moduleRequire = createRequire(import.meta.url);
@@ -229,10 +232,18 @@ export class CodexExec {
       });
     }
 
+    let stdoutDrainTimer: ReturnType<typeof setTimeout> | undefined;
+    let stdoutClosed = false;
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve) => {
         child.once("exit", (code, signal) => {
           processExited = true;
+          if (!stdoutClosed) {
+            stdoutDrainTimer = setTimeout(() => {
+              rl.close();
+              child.stdout?.destroy();
+            }, STDOUT_DRAIN_GRACE_MS);
+          }
           resolve({ code, signal });
         });
       },
@@ -241,6 +252,10 @@ export class CodexExec {
     const rl = readline.createInterface({
       input: child.stdout,
       crlfDelay: Infinity,
+    });
+    rl.once("close", () => {
+      stdoutClosed = true;
+      clearTimeout(stdoutDrainTimer);
     });
 
     try {
@@ -258,6 +273,7 @@ export class CodexExec {
       }
       if (stdinError) throw stdinError;
     } finally {
+      clearTimeout(stdoutDrainTimer);
       rl.close();
       try {
         if (!processExited) child.kill("SIGTERM");
@@ -280,6 +296,8 @@ export class CodexExec {
           }
         }
       }
+      child.stdout.destroy();
+      child.stderr?.destroy();
       child.removeAllListeners();
     }
   }
@@ -456,17 +474,30 @@ function findCodexPath(): CodexPathResolution {
     throw new Error(`Unsupported platform: ${platform} (${arch})`);
   }
 
-  let vendorRoot: string;
+  let platformPackageJsonPath: string;
+  const codexRequire = createRequire(codexPackageJsonPath);
   try {
-    const codexRequire = createRequire(codexPackageJsonPath);
-    const platformPackageJsonPath = codexRequire.resolve(`${nativeTarget.package}/package.json`);
-    vendorRoot = path.join(path.dirname(platformPackageJsonPath), "vendor");
+    platformPackageJsonPath = codexRequire.resolve(`${nativeTarget.package}/package.json`);
   } catch {
     throw new Error(
       `Unable to locate Codex CLI binaries. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
     );
   }
 
+  const dependency = manifest.optionalDependencies?.[nativeTarget.package];
+  const expectedVersion = typeof dependency === "string" && dependency.startsWith("npm:")
+    ? dependency.slice(dependency.lastIndexOf("@") + 1)
+    : dependency;
+  if (typeof expectedVersion !== "string" || !expectedVersion) {
+    throw new Error(`Invalid native dependency metadata for ${nativeTarget.package}`);
+  }
+  const installedVersion = (codexRequire(platformPackageJsonPath) as { version?: unknown }).version;
+  if (installedVersion !== expectedVersion) {
+    throw new Error(
+      `Native package version mismatch for ${nativeTarget.package}: expected ${expectedVersion}, found ${installedVersion ?? "no version"}. Reinstall this KD4 package from the same fork release artifact.`,
+    );
+  }
+  const vendorRoot = path.join(path.dirname(platformPackageJsonPath), "vendor");
   const nativePackage = resolveNativePackage(
     vendorRoot,
     nativeTarget.targetTriple,

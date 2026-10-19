@@ -5790,6 +5790,7 @@ async fn proactive_retirement_waits_until_resending_outputs_pays_for_the_cache_m
         .lock()
         .await
         .set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
+            estimated_context_tokens: None,
             total_token_usage: reported.clone(),
             last_token_usage: reported,
             model_context_window: None,
@@ -8117,15 +8118,10 @@ async fn accountingless_completion_preserves_sampling_reasoning_pressure() {
         session.get_estimated_token_count(&turn).await,
         Some(expected)
     );
-    assert_eq!(
-        session
-            .token_usage_info()
-            .await
-            .unwrap()
-            .last_token_usage
-            .total_tokens,
-        expected
-    );
+    let info = session.token_usage_info().await.unwrap();
+    assert_eq!(info.estimated_context_tokens, Some(expected));
+    assert_eq!(info.last_token_usage.total_tokens, 0);
+    assert_eq!(info.total_token_usage.total_tokens, 0);
     let pending = PendingTokenEstimate {
         total_tokens: 20,
         body_growth_tokens: 10,

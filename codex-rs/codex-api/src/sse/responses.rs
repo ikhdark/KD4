@@ -549,7 +549,7 @@ mod tests {
                 } else if productive {
                     json!({"type":"response.reasoning_text.delta","delta":"thinking","content_index":0})
                 } else {
-                    json!({"type":"response.created","response":{"id":"same"}})
+                    json!({"type":"response.in_progress","response":{"id":"done"}})
                 };
                 Some((Ok(Bytes::from(format!("data: {payload}\n\n"))), index + 1))
             });
@@ -801,8 +801,8 @@ mod tests {
     async fn transport_audit_metadata_backpressure_is_not_provider_silence() {
         let chunks = [
             r#"{"type":"response.created","response":{"id":"same"}}"#,
-            r#"{"type":"response.created","response":{"id":"same"}}"#,
-            r#"{"type":"response.completed","response":{"id":"done"}}"#,
+            r#"{"type":"response.metadata","response":{"id":"same","headers":{"OpenAI-Model":"test-model"}}}"#,
+            r#"{"type":"response.completed","response":{"id":"same"}}"#,
         ]
         .map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
         let (tx, mut rx) = mpsc::channel(1);
@@ -820,7 +820,7 @@ mod tests {
         );
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
-        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::ServerModel(model))) if model == "test-model");
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
         producer.await.unwrap();
         assert!(rx.recv().await.is_none());
@@ -1150,7 +1150,12 @@ mod tests {
                 delta,
             } if item_id == "ctc_1" && call_id == "call_1" && delta == "*** Begin"
         );
-        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+        assert_matches!(
+            &events[1],
+            ResponseEvent::ToolCallInputDelta { item_id, call_id: None, delta }
+                if item_id == "fc_1" && delta == "{\"input\":\""
+        );
+        assert_matches!(&events[2], ResponseEvent::Completed { .. });
     }
 
     #[tokio::test]
@@ -1217,6 +1222,18 @@ mod tests {
             .expect("SSE task should exit cleanly");
     }
 
+    fn terminal_error_source<'a>(
+        event: &'a Result<ResponseEvent, ApiError>,
+        expected_response_id: &str,
+    ) -> &'a ApiError {
+        let Err(ApiError::TerminalResponse { source, response_id, token_usage }) = event else {
+            panic!("expected terminal response error: {event:?}");
+        };
+        assert_eq!(response_id.as_deref(), Some(expected_response_id));
+        assert!(token_usage.is_none(), "these failed responses contain no usage");
+        source
+    }
+
     #[tokio::test(start_paused = true)]
     async fn error_when_error_event() {
         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894","object":"response","created_at":1755041560,"status":"failed","background":false,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5.1 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."}, "usage":null,"user":null,"metadata":{}}}"#;
@@ -1227,8 +1244,8 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        match &events[0] {
-            Err(ApiError::Retryable { message, delay }) => {
+        match terminal_error_source(&events[0], "resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894") {
+            ApiError::Retryable { message, delay } => {
                 assert_eq!(
                     message,
                     "Rate limit reached for gpt-5.1 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
@@ -1276,7 +1293,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        assert_matches!(events[0], Err(ApiError::ContextWindowExceeded));
+        assert_matches!(
+            terminal_error_source(&events[0], "resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b"),
+            ApiError::ContextWindowExceeded
+        );
     }
 
     #[tokio::test]
@@ -1289,7 +1309,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        assert_matches!(events[0], Err(ApiError::ContextWindowExceeded));
+        assert_matches!(terminal_error_source(&events[0], "resp_fatal_newline"), ApiError::ContextWindowExceeded);
     }
 
     #[tokio::test]
@@ -1302,7 +1322,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        assert_matches!(events[0], Err(ApiError::QuotaExceeded));
+        assert_matches!(terminal_error_source(&events[0], "resp_fatal_quota"), ApiError::QuotaExceeded);
     }
 
     #[tokio::test]
@@ -1315,8 +1335,8 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        match &events[0] {
-            Err(ApiError::CyberPolicy { message }) => {
+        match terminal_error_source(&events[0], "resp_fatal_cyber") {
+            ApiError::CyberPolicy { message } => {
                 assert_eq!(message, "This request was flagged for cyber policy.");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1333,8 +1353,8 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        match &events[0] {
-            Err(ApiError::CyberPolicy { message }) => {
+        match terminal_error_source(&events[0], "resp_fatal_cyber") {
+            ApiError::CyberPolicy { message } => {
                 assert_eq!(
                     message,
                     "This request has been flagged for possible cybersecurity risk."
@@ -1375,8 +1395,8 @@ mod tests {
             let events = collect_events(&[sse1.as_bytes()]).await;
 
             assert_eq!(events.len(), 1);
-            match &events[0] {
-                Err(ApiError::InvalidRequest { message }) => {
+            match terminal_error_source(&events[0], "resp_content_policy_no_type") {
+                ApiError::InvalidRequest { message } => {
                     assert_eq!(message, expected_message);
                 }
                 other => panic!("unexpected event for {code}: {other:?}"),
@@ -1449,8 +1469,12 @@ mod tests {
         ];
 
         for case in cases {
+            let mut completed = completed.clone();
+            if case.name == "output_item.done" {
+                completed["response"]["output"] = json!([case.event["item"].clone()]);
+            }
             let mut evs = vec![case.event];
-            evs.push(completed.clone());
+            evs.push(completed);
 
             let out = run_sse(evs).await;
             assert_eq!(out.len(), case.expected_len, "case {}", case.name);

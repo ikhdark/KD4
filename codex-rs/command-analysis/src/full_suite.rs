@@ -63,6 +63,21 @@ fn check_command(
     }
     let shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
     if let Some(shell_type) = shell_type {
+        // Execution adds this exact UTF-8 prelude to PowerShell scripts. It
+        // configures output, not launch count; inspect the original script.
+        let normalized_command = match shell_type {
+            ShellType::PowerShell => codex_shell_command::powershell::extract_powershell_command(
+                command,
+            )
+            .and_then(|(shell, script)| {
+                script
+                    .trim_start()
+                    .strip_prefix(codex_shell_command::powershell::UTF8_OUTPUT_PREFIX)
+                    .map(|script| vec![shell.to_owned(), "-Command".into(), script.to_owned()])
+            }),
+            _ => None,
+        };
+        let command = normalized_command.as_deref().unwrap_or(command);
         let commands = argv_commands(command, Some(shell_type));
         let Some(commands) = commands else {
             // Fail closed for visibly test-bearing opaque scripts, not for all
@@ -86,7 +101,7 @@ fn check_command(
                 _ => None,
             };
             let standalone = if let Some((_, script)) = script {
-                codex_shell_command::validation::standalone_powershell_argv(script).is_some()
+                codex_shell_command::powershell::is_standalone_powershell_command(script)
             } else if matches!(shell_type, ShellType::Bash | ShellType::Sh | ShellType::Zsh) {
                 command
                     .last()
@@ -117,18 +132,16 @@ fn check_command(
         if let Some(index) = args
             .iter()
             .position(|arg| basename(arg) == "rust_build_status.py")
+            && let Some(separator) = args[index + 1..].iter().position(|arg| arg == "--")
         {
-            if let Some(separator) = args[index + 1..].iter().position(|arg| arg == "--") {
-                return check_command(&args[index + separator + 2..], None, depth + 1);
-            }
+            return check_command(&args[index + separator + 2..], None, depth + 1);
         }
         if let Some(index) = args
             .iter()
             .position(|arg| basename(arg) == "rust_test_runner.py")
+            && let Some(run) = args[index + 1..].iter().position(|arg| arg == "run-target")
         {
-            if let Some(run) = args[index + 1..].iter().position(|arg| arg == "run-target") {
-                return check_test_args(&args[index + run + 2..], 1, false);
-            }
+            return check_test_args(&args[index + run + 2..], 1, false);
         }
         return Ok(false);
     }
@@ -236,7 +249,7 @@ fn just_recipe_index(args: &[String]) -> Option<usize> {
 /// filter, `rg core-test justfile`) launches nothing and stays inspectable.
 fn visibly_runs_tests(script: &str) -> bool {
     script
-        .split(|ch: char| matches!(ch, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '\n' | '\r'))
+        .split([';', '|', '&', '(', ')', '{', '}', '\n', '\r'])
         .any(|statement| {
             let tokens = statement
                 .split_whitespace()
@@ -726,22 +739,45 @@ mod tests {
                 false,
             ),
             ("foreach ($i in 1,2) { cargo test --no-fail-fast }", false),
+            (
+                "cargo nextest run --workspace --profile local --no-fail-fast --retries 0",
+                true,
+            ),
+            (
+                "python -B scripts/build/rust_build_status.py run-lane --lane core-tests -- cargo nextest run --workspace --profile local --no-fail-fast --retries 0",
+                true,
+            ),
+            ("cargo nextest run --workspace --retries 0", false),
+            ("cargo test --no-fail-fast | Out-Null", false),
+            (
+                "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch { cargo test --no-fail-fast }; cargo test --no-fail-fast",
+                false,
+            ),
         ] {
-            let result = check_full_suite_command(
-                &[
+            // Shell execution adds this prefix before either handler checks
+            // admission. It must not turn a single launch into a compound one.
+            let command = codex_shell_command::powershell::prefix_powershell_script_with_utf8(&[
+                "pwsh".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                script.into(),
+            ]);
+            for command in [
+                vec![
                     "pwsh".into(),
                     "-NoProfile".into(),
                     "-Command".into(),
                     script.into(),
                 ],
-                Some(ShellType::PowerShell),
-                None,
-            )
-            .await;
-            if allowed {
-                assert_eq!(result, Ok(true), "{script}");
-            } else {
-                assert!(result.is_err(), "{script}: {result:?}");
+                command,
+            ] {
+                let result =
+                    check_full_suite_command(&command, Some(ShellType::PowerShell), None).await;
+                if allowed {
+                    assert_eq!(result, Ok(true), "{command:?}");
+                } else {
+                    assert!(result.is_err(), "{command:?}: {result:?}");
+                }
             }
         }
     }

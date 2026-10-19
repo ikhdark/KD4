@@ -227,7 +227,10 @@ impl ModelProviderInfo {
         let mut headers = HeaderMap::with_capacity(capacity);
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
-                if let (Ok(name), Ok(value)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
+                if let (Ok(name), Ok(mut value)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
+                    // Arbitrary provider headers may contain credentials. Keep
+                    // their origin binding through transport and diagnostics.
+                    value.set_sensitive(true);
                     headers.insert(name, value);
                 }
             }
@@ -237,9 +240,10 @@ impl ModelProviderInfo {
             for (header, env_var) in env_headers {
                 if let Ok(val) = std::env::var(env_var)
                     && !val.trim().is_empty()
-                    && let (Ok(name), Ok(value)) =
+                    && let (Ok(name), Ok(mut value)) =
                         (HeaderName::try_from(header), HeaderValue::try_from(val))
                 {
+                    value.set_sensitive(true);
                     headers.insert(name, value);
                 }
             }

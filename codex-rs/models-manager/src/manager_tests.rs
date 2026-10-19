@@ -391,10 +391,11 @@ async fn in_flight_refresh_does_not_publish_after_account_identity_changes() {
         endpoint.release_one();
         timeout(Duration::from_secs(5), refresh).await.unwrap().unwrap();
         // Inspect publication before a public read could reset stale state.
-        let state = manager.state.read().await;
-        assert!(!state.remote_models.iter().any(|model| model.slug == "old-account-only"));
-        assert_eq!(state.etag, None);
-        drop(state);
+        {
+            let state = manager.state.read().await;
+            assert!(!state.remote_models.iter().any(|model| model.slug == "old-account-only"));
+            assert_eq!(state.etag, None);
+        }
         assert!(manager.get_remote_models().await.iter().all(|model| model.slug != "old-account-only"));
         assert!(!home.path().join(MODEL_CACHE_FILE).exists(), "old identity must not publish to disk");
         assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);

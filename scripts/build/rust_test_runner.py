@@ -1015,16 +1015,22 @@ def _nextest_events(result: subprocess.CompletedProcess[str]) -> Iterable[dict[s
 
 def _nextest_results(
     result: subprocess.CompletedProcess[str],
+    *,
+    completeness: list[bool] | None = None,
 ) -> Iterable[tuple[str, str, str]]:
     binaries: dict[str, str | None] = {}
     completions: list[tuple[str, str, str]] = []
+    suites: dict[str, dict[str, Any]] = {}
+    framed = True
     for event in _nextest_events(result):
         if event.get("type") == "suite" and event.get("event") == "started":
             metadata = event.get("nextest")
             if not isinstance(metadata, dict):
+                framed = False
                 continue
             package, binary, kind = (metadata.get(key) for key in ("crate", "test_binary", "kind"))
             if not isinstance(package, str) or not package or not isinstance(binary, str) or not binary:
+                framed = False
                 continue
             if kind in ("lib", "proc-macro"):
                 identity = package
@@ -1033,22 +1039,125 @@ def _nextest_results(
             elif kind == "bin":
                 identity = f"{package}::bin/{binary}"
             else:
+                framed = False
                 continue
             owner = f"{package}::{binary}"
+            if owner in suites:
+                suite = suites[owner]
+                # libtest-json-plus can close/reopen a binary around an ignored
+                # case before all declared tests have been reported. Its
+                # count/identity stay global; passed/failed are per fragment,
+                # while ignored is repeated. Never reset execution identities.
+                if (suite["terminal"] is None or metadata != suite["metadata"]
+                        or type(event.get("test_count")) is not int
+                        or event.get("test_count") != suite["count"]
+                        or type(suite["count"]) is not int
+                        or len(suite["names"]) >= suite["count"]
+                        or not suite["ignored_count"]):
+                    framed = False
+                suite["terminal"] = None
+                suite["fragment"] = {"ok": 0, "failed": 0}
+                suite["fragment_started"] = set()
+            else:
+                suites[owner] = {"count": event.get("test_count"), "terminal": None,
+                                 "observed": {"ok": 0, "failed": 0, "ignored": 0},
+                                 "fragment": {"ok": 0, "failed": 0},
+                                 "fragment_started": set(), "ignored_count": None,
+                                 "started": set(), "ignored": set(), "names": set(), "metadata": metadata}
             if owner not in binaries:
                 binaries[owner] = identity
             elif binaries[owner] != identity:
                 # The wire test name omits target kind. A colliding lib/bin
                 # owner cannot be disambiguated, even for earlier records.
                 binaries[owner] = None
-        elif event.get("type") == "test" and event.get("event") in ("ok", "failed"):
+        elif event.get("type") == "suite":
+            metadata = event.get("nextest")
+            if not isinstance(metadata, dict):
+                framed = False
+                continue
+            owner = f"{metadata.get('crate')}::{metadata.get('test_binary')}"
+            suite = suites.get(owner)
+            if (suite is None or suite["terminal"] is not None
+                    or metadata != suite["metadata"] or event.get("event") not in ("ok", "failed")):
+                framed = False
+            else:
+                suite["terminal"] = event
+                counts = [event.get(key) for key in
+                          ("passed", "failed", "ignored", "measured", "filtered_out")]
+                if any(type(count) is not int or count < 0 for count in counts):
+                    framed = False
+                    continue
+                passed, failed, ignored, measured, _filtered = counts
+                if suite["ignored_count"] is None:
+                    suite["ignored_count"] = ignored
+                elif ignored != suite["ignored_count"]:
+                    framed = False
+                # Some native reporters emit one skipped fixture as a started
+                # name plus an empty terminal, without a per-test ignored event.
+                # Reconcile only that unambiguous skip-only shape. It cannot
+                # create an execution receipt, and the final aggregate must
+                # still account for every declared test and every ignored name.
+                pending = suite["fragment_started"] - suite["names"]
+                if (passed == failed == 0 and len(suite["fragment_started"]) == 1
+                        and len(pending) == 1 and ignored > suite["observed"]["ignored"]):
+                    suite["ignored"].update(pending)
+                    suite["names"].update(pending)
+                    suite["observed"]["ignored"] += 1
+                if (suite["fragment"] != {"ok": passed, "failed": failed}
+                        or ignored < suite["observed"]["ignored"] or measured != 0
+                        or (event["event"] == "ok") != (failed == 0)):
+                    framed = False
+        elif event.get("type") == "test" and event.get("event") == "started":
             name = event.get("name")
             if not isinstance(name, str):
+                framed = False
+                continue
+            owner, separator, test = name.partition("$")
+            if not separator or not test or owner not in suites:
+                framed = False
+                continue
+            suite = suites[owner]
+            if (suite["terminal"] is not None or test in suite["started"]
+                    or test in suite["names"]):
+                framed = False
+            suite["started"].add(test)
+            suite["fragment_started"].add(test)
+        elif event.get("type") == "test" and event.get("event") in ("ok", "failed", "ignored"):
+            name = event.get("name")
+            if not isinstance(name, str):
+                framed = False
                 continue
             owner, separator, test = name.partition("$")
             if separator and test and owner in binaries:
+                suite = suites[owner]
+                if (suite["terminal"] is not None or test in suite["names"]
+                        or (event["event"] != "ignored" and test not in suite["started"])):
+                    framed = False
+                suite["names"].add(test)
+                suite["observed"][event["event"]] += 1
+                if event["event"] == "ignored":
+                    # Skipped tests need not start and never yield execution receipts.
+                    suite["ignored"].add(test)
                 # Keep duplicate completions: callers require exactly once.
-                completions.append(("PASS" if event["event"] == "ok" else "FAIL", owner, test))
+                if event["event"] != "ignored":
+                    suite["fragment"][event["event"]] += 1
+                    completions.append(("PASS" if event["event"] == "ok" else "FAIL", owner, test))
+            else:
+                framed = False
+        elif event.get("type") == "test" and event.get("event") != "started":
+            framed = False
+    for owner, suite in suites.items():
+        terminal = suite["terminal"]
+        if terminal is None or binaries.get(owner) is None:
+            framed = False
+            continue
+        if (type(suite["count"]) is not int or suite["count"] < 0
+                or suite["count"] != sum(suite["observed"].values())
+                or suite["ignored_count"] != suite["observed"]["ignored"]
+                or suite["started"] | suite["ignored"] != suite["names"]):
+            framed = False
+    if completeness is not None:
+        completeness.append(framed and bool(suites))
     for status, owner, test in completions:
         if (identity := binaries.get(owner)) is not None:
             yield status, identity, test
@@ -1709,7 +1818,8 @@ class RustTestRunner:
             result = error.result
         binary_id = _nextest_binary_id(target)
         outcomes: dict[str, list[str]] = {}
-        for status, binary, test in _nextest_results(result):
+        completeness: list[bool] = []
+        for status, binary, test in _nextest_results(result, completeness=completeness):
             if binary == binary_id:
                 outcomes.setdefault(test, []).append(status)
         passed = sorted(
@@ -1723,7 +1833,11 @@ class RustTestRunner:
             ((binary_id, helper_ids, test) for test in receipts.get(binary_id, [])),
             ((binary_id, helper_ids, test) for test in required_ids) if required_ids is not None else None)
         missing = sorted(set(required_ids or ()) - set(passed))
-        if failure is None and required_ids is not None and missing:
+        if failure is None and completeness != [True]:
+            failure = RunnerError(
+                f"target {name!r} has incomplete or inconsistent nextest reporter evidence",
+                outcome="evidence_incomplete", result=result)
+        elif failure is None and required_ids is not None and missing:
             failure = RunnerError(
                 f"target {name!r} has unfulfilled exact test IDs: {missing}",
                 outcome="not_executed", result=result)
@@ -1744,8 +1858,10 @@ class RustTestRunner:
             failure.completed_tests = receipts
             failed = sorted(test for test, statuses in outcomes.items()
                             if any(status not in {"PASS", "LEAK"} for status in statuses))
-            self._report_failed_tests(name, passed, failed, selected,
-                                      selected_count=_nextest_selected_count(result) if selected is None else None)
+            self._report_failed_tests(
+                name, passed, failed, selected if completeness == [True] else None,
+                selected_count=_nextest_selected_count(result)
+                if completeness == [True] and selected is None else None)
             raise failure
         return receipts
 

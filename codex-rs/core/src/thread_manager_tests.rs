@@ -2353,6 +2353,7 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
     let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
         sampling_request_id: "request-1".to_string(),
         physical_attempt_id: "attempt-1".to_string(),
+        workspace_freshness_notices: Vec::new(),
         turn_id: Some("turn-1".to_string()),
         unresolved_context: true,
         timing_checkpoint: None,
@@ -2371,6 +2372,7 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
         RolloutItem::SamplingBoundary(SamplingBoundaryItem {
             sampling_request_id: "previous-request".to_string(),
             physical_attempt_id: "previous-attempt".to_string(),
+            workspace_freshness_notices: Vec::new(),
             turn_id: Some("turn-1".to_string()),
             unresolved_context: false,
             timing_checkpoint: None,

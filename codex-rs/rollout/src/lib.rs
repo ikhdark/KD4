@@ -17,6 +17,10 @@ pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_integration;
 mod tool_manifest;
+mod writer_lock;
+pub use writer_lock::acquire_thread_writer;
+pub use payload_artifact::reclaim_payload_artifacts;
+pub use compression::try_lock_rollout_for_maintenance;
 
 pub(crate) use codex_protocol::protocol;
 
@@ -70,6 +74,7 @@ pub use policy::persisted_rollout_items;
 pub use policy::persisted_rollout_items_with_activity;
 pub use policy::should_persist_event_msg;
 pub use recorder::RolloutRecorder;
+pub use recorder::RolloutMaintenanceGuard;
 pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
 pub use recorder::current_harness_build_info;

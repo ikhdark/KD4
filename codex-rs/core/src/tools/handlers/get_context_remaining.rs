@@ -79,6 +79,7 @@ mod tests {
                 .lock_history_state_for_test()
                 .await
                 .set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
+                    estimated_context_tokens: None,
                     total_token_usage: Default::default(),
                     last_token_usage: codex_protocol::protocol::TokenUsage {
                         input_tokens: used,

@@ -457,7 +457,7 @@ fn unified_exec_output_schema() -> Value {
             },
             "streams_complete": {
                 "type": "boolean",
-                "description": "True only when both entire streams are available separately without loss. False means merged (PTY or exec-server), partial, oversized, or non-UTF-8 streams; never parse output as a substitute for exact stdout."
+                "description": "True only when both entire streams are available separately without loss, including pipe-backed exec-server commands. False means merged (for example PTY), partial, oversized, or non-UTF-8 streams; never parse output as a substitute for exact stdout."
             },
             "session_capabilities": {
                 "type": "object",

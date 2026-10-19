@@ -687,6 +687,8 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
         "the instructions must be active before the transition"
     );
 
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
         .codex

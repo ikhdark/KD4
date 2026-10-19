@@ -40,6 +40,50 @@ fn create_test_cache(codex_home: &Path) -> CloudConfigBundleCache {
     CloudConfigBundleCache::new(AbsolutePathBuf::resolve_path_against_base(codex_home, "/"))
 }
 
+#[tokio::test]
+async fn failed_cache_replacement_retains_valid_offline_bundle() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let home = tempdir().unwrap();
+    let cache = create_test_cache(home.path());
+    let bundle = test_bundle();
+    cache.save(Some("user-12345".into()), Some("account-12345".into()), bundle.clone()).await.unwrap();
+    let original = std::fs::read(cache.path()).unwrap();
+    let reader = std::fs::OpenOptions::new().read(true).share_mode(3).open(cache.path()).unwrap();
+    assert!(cache.save(Some("user-12345".into()), Some("account-12345".into()), bundle.clone()).await.is_err());
+    assert_eq!(std::fs::read(cache.path()).unwrap(), original);
+    let fetcher = Arc::new(SequenceBundleClient::new(vec![Err(request_error())]));
+    let service = CloudConfigBundleService::new(auth_manager_with_plan("business").await,
+        fetcher.clone(), home.path().to_path_buf(), CLOUD_CONFIG_BUNDLE_TIMEOUT);
+    assert_eq!(service.load_startup_bundle().await, Ok(Some(bundle)));
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
+    drop(reader);
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_loader_retries_a_timed_out_service_attempt() {
+    struct FirstPendingClient(AtomicUsize);
+    impl BundleClient for FirstPendingClient {
+        async fn get_bundle(&self, _auth: &CodexAuth) -> Result<CloudConfigBundle, BundleRequestError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                pending().await
+            } else {
+                Ok(test_bundle())
+            }
+        }
+    }
+    let home = tempdir().unwrap();
+    let client = Arc::new(FirstPendingClient(AtomicUsize::new(0)));
+    let service = CloudConfigBundleService::new(auth_manager_with_plan("business").await,
+        client.clone(), home.path().to_path_buf(), Duration::from_secs(1));
+    let loader = crate::bundle_loader::retryable_service_loader(service);
+    assert_eq!(loader.get().await.unwrap_err().code(), CloudConfigBundleLoadErrorCode::Timeout);
+    let (first, second) = tokio::join!(loader.get(), loader.get());
+    assert_eq!(first, Ok(Some(test_bundle())));
+    assert_eq!(second, first);
+    assert_eq!(loader.get().await, first);
+    assert_eq!(client.0.load(Ordering::SeqCst), 2);
+}
+
 async fn auth_manager_with_api_key() -> Arc<AuthManager> {
     let tmp = tempdir().expect("tempdir");
     let auth_json = json!({

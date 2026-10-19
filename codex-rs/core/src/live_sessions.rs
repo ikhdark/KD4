@@ -38,7 +38,7 @@ pub(crate) struct LiveSessionRecord {
     updated_at_ms: u64,
 }
 
-/// This session's record for one turn. Dropping it removes the record.
+/// This session's record for one turn. Drop schedules best-effort removal.
 pub(crate) struct LiveSessionTurn {
     directory: PathBuf,
     path: PathBuf,
@@ -52,7 +52,8 @@ impl LiveSessionTurn {
     pub(crate) fn begin(codex_home: &Path, thread_id: &str, workspace: &Path, intent: &str) -> Self {
         let directory = codex_home.join(DIRECTORY);
         Self {
-            path: directory.join(format!("{thread_id}.json")),
+            // A late write/delete from this turn must never replace/remove its successor.
+            path: directory.join(format!("{thread_id}-{}.json", uuid::Uuid::new_v4())),
             directory,
             record: LiveSessionRecord {
                 version: RECORD_VERSION,
@@ -125,9 +126,28 @@ impl Drop for LiveSessionTurn {
     fn drop(&mut self) {
         // A record left behind by an overrun write expires on its own.
         if self.written_at.is_some() && !self.unavailable {
-            let _ = std::fs::remove_file(&self.path);
+            static CLEANUP_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+                std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+            let path = self.path.clone();
+            let _ = schedule_cleanup(std::sync::Arc::clone(&CLEANUP_SLOTS), move || {
+                let _ = std::fs::remove_file(path);
+            });
         }
     }
+}
+
+// Never queue unbounded blocking work behind stalled storage. Skipped cleanup
+// uses the existing expiry policy, including when dropped outside a runtime.
+fn schedule_cleanup(
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    cleanup: impl FnOnce() + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let permit = slots.try_acquire_owned().ok()?;
+    Some(runtime.spawn_blocking(move || {
+        let _permit = permit;
+        cleanup();
+    }))
 }
 
 /// Other root sessions running a turn whose workspace contains or lies
@@ -188,7 +208,7 @@ fn read_others(directory: &Path, thread_id: &str, workspace: &Path) -> Vec<LiveS
             records.push(record);
         }
     }
-    records.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
     records
 }
 
@@ -363,18 +383,44 @@ mod tests {
         assert!(notice.contains("Request: Optimize the scanner's CPU use."));
         assert!(notice.contains("Edited: lib.rs"));
         assert!(notice.contains("do not report them as your work"));
-        let overlap = overlapping_edits(&others, &[edited.clone()], &checkout).unwrap();
+        let overlap = overlapping_edits(&others, std::slice::from_ref(&edited), &checkout).unwrap();
         assert!(overlap.contains("src/lib.rs (request: Optimize the scanner's CPU use.)"));
         assert_eq!(
             overlapping_edits(&others, &[checkout.join("README.md")], &checkout),
             None
         );
 
-        // Its own record is not "other", and a finished turn disappears.
+        // Its own record is not "other". Removal is best effort under the
+        // process-wide cleanup budget; the isolated stalled-cleanup test below
+        // checks actual deletion without relying on other tests' admission.
         assert!(first.others().await.is_empty());
         drop(first);
-        assert!(second.others().await.is_empty());
         assert_eq!(concurrent_sessions_notice(&[], &checkout), "");
+    }
+
+    #[tokio::test]
+    async fn stalled_cleanup_does_not_block_async_work_or_remove_successor() {
+        let home = tempfile::tempdir().unwrap();
+        let mut first = LiveSessionTurn::begin(home.path(), "same-thread", home.path(), "first");
+        first.publish(Vec::new()).await;
+        let old_path = first.path.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let cleanup = schedule_cleanup(std::sync::Arc::clone(&slots), move || {
+            let _ = entered.send(());
+            let _ = blocked.recv();
+            let _ = std::fs::remove_file(old_path);
+        }).unwrap();
+        ready.await.unwrap();
+        assert!(schedule_cleanup(slots, || panic!("must not queue")).is_none());
+        let mut successor = LiveSessionTurn::begin(home.path(), "same-thread", home.path(), "second");
+        successor.publish(Vec::new()).await;
+        assert_ne!(first.path, successor.path);
+        release.send(()).unwrap();
+        cleanup.await.unwrap();
+        assert!(!first.path.exists());
+        assert!(successor.path.exists());
     }
 
     #[tokio::test]

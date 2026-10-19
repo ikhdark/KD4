@@ -582,8 +582,14 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         return;
     }
 
+    // Automatic idle work can start outside the submission loop. Keep admission
+    // through snapshot loading and transfer it to the cancellation-shielded commit.
+    let Ok(task_start_permit) = Arc::clone(&sess.task_start_gate).acquire_owned().await else {
+        unreachable!("session-owned task-start semaphore is never closed");
+    };
     let has_active_turn = { sess.active_turn.lock().await.is_some() };
     if has_active_turn {
+        drop(task_start_permit);
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
@@ -599,6 +605,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     let live_thread = match sess.live_thread_for_persistence("rollback thread") {
         Ok(live_thread) => live_thread,
         Err(_) => {
+            drop(task_start_permit);
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
@@ -611,6 +618,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         }
     };
     if let Err(err) = live_thread.flush().await {
+        drop(task_start_permit);
         sess.send_event_raw(Event {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
@@ -625,6 +633,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     let stored_history = match live_thread.load_history(/*include_archived*/ false).await {
         Ok(history) => history,
         Err(err) => {
+            drop(task_start_permit);
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
@@ -645,7 +654,12 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
     if let Err(err) = sess
-        .commit_rollback_history(&turn_context, replay_items, rollback_msg.clone())
+        .commit_rollback_history(
+            &turn_context,
+            replay_items,
+            rollback_msg.clone(),
+            task_start_permit,
+        )
         .await
     {
         sess.send_event_raw(Event {

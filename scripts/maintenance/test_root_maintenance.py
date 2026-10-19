@@ -242,7 +242,7 @@ class RootMaintenanceTest(unittest.TestCase):
                 )
                 self.assertIn(module, run.call_args.args[0])
 
-        # Retiring a script and its test leaves nothing to verify or import.
+        # Retiring every selected script leaves no test execution to verify.
         retired = [
             "scripts/benchmark_scripts/benchmark_code_mode_handoffs.mjs",
             "scripts/retired_example_tool.py",
@@ -250,16 +250,18 @@ class RootMaintenanceTest(unittest.TestCase):
         ]
         self.assertFalse(any((REPO_ROOT / path).exists() for path in retired))
         with (
-            mock.patch.object(root_maintenance, "run_python_tests", return_value=0) as run,
+            mock.patch.object(root_maintenance, "_run_json_worker") as worker,
             contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
             self.assertEqual(
                 root_maintenance.main(
                     ["test-python", *(f"--changed={path}" for path in retired)]
                 ),
-                0,
+                2,
             )
-        run.assert_not_called()
+        self.assertIn("No matching Python tests selected", stderr.getvalue())
+        worker.assert_not_called()
 
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -515,6 +517,7 @@ class RootMaintenanceTest(unittest.TestCase):
         with (
             self.temporary_script_tree(root_maintenance) as scripts,
             mock.patch.object(root_maintenance, "run") as run,
+            mock.patch.object(root_maintenance, "_run_json_worker") as worker,
             mock.patch.object(
                 root_maintenance, "script_inventory",
                 side_effect=AssertionError("broad discovery"),
@@ -544,14 +547,15 @@ class RootMaintenanceTest(unittest.TestCase):
                 root_maintenance.main(
                     ["test-python", "--changed", "scripts/unmapped_helper.py"]
                 ),
-                0,
+                2,
             )
             self.assertEqual(
                 root_maintenance.main(["test-python", "--changed", "docs/example.md"]),
-                0,
+                2,
             )
 
         run.assert_not_called()
+        worker.assert_not_called()
 
     def test_root_maintenance_missing_command_is_reported(self) -> None:
         root_maintenance = load_root_maintenance_module()

@@ -244,3 +244,28 @@ fn redirect_credentials_are_retained_only_for_the_same_origin() {
         );
     }
 }
+
+#[test]
+fn redirect_strips_provider_bound_credentials_without_guessing_header_names() {
+    let original = reqwest::Url::parse("https://provider.example/start").unwrap();
+    for target in [
+        "https://other.example/next",
+        "http://provider.example/next",
+        "https://provider.example:8443/next",
+        "https://provider.example/next",
+    ] {
+        let target = reqwest::Url::parse(target).unwrap();
+        let mut headers = HeaderMap::new();
+        for name in ["api-key", "x-api-key", "arbitrary-provider-credential"] {
+            let mut secret = HeaderValue::from_static("fake-test-secret");
+            secret.set_sensitive(true);
+            headers.append(name, secret);
+        }
+        headers.insert(http::header::ACCEPT, HeaderValue::from_static("application/json"));
+        remove_sensitive_headers(&mut headers, &original, &target);
+        for name in ["api-key", "x-api-key", "arbitrary-provider-credential"] {
+            assert_eq!(headers.contains_key(name), same_origin(&original, &target));
+        }
+        assert!(headers.contains_key(http::header::ACCEPT));
+    }
+}

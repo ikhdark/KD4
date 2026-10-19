@@ -273,6 +273,14 @@ fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+/// Exclude append handles and compression before discovering representations.
+/// Maintenance is nonblocking to avoid waiting on a live writer it must stop first.
+pub fn try_lock_rollout_for_maintenance(path: &Path) -> io::Result<File> {
+    try_lock_rollout_for_compression(path)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::WouldBlock, "rollout has a live writer or compressor")
+    })
+}
+
 fn open_rollout_lock_file(path: &Path) -> io::Result<File> {
     open_lock_file(rollout_lock_path(path).as_path())
 }
@@ -693,6 +701,9 @@ mod worker {
                 );
             }
             tokio::time::sleep(interval).await;
+            if let Err(error) = crate::payload_artifact::reclaim_payload_artifacts(&codex_home).await {
+                warn!(%error, "rollout payload reclamation incomplete; blobs retained");
+            }
         }
     }
 

@@ -29,7 +29,7 @@ use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thre
 
 const RECEIPT_VERSION: u8 = 2;
 const LEGACY_RECEIPT_VERSION: u8 = 1;
-pub(crate) const TOOL_SEARCH_RECEIPT_VERSION: u8 = 2;
+pub(crate) const TOOL_SEARCH_RECEIPT_VERSION: u8 = 3;
 const RECEIPT_MAX_TOKENS: usize = 256;
 const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
 pub(crate) const COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET: usize = 2_000;
@@ -172,6 +172,8 @@ pub(crate) struct ToolSearchReceiptV1 {
     pub(crate) arguments: serde_json::Value,
     pub(crate) result_set_sha256: String,
     pub(crate) result_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) callable_count: Option<usize>,
     pub(crate) omitted_result_count: Option<usize>,
     pub(crate) complete: bool,
     pub(crate) ordered_tool_identities: Vec<String>,
@@ -180,7 +182,8 @@ pub(crate) struct ToolSearchReceiptV1 {
 
 impl ToolSearchReceiptV1 {
     pub(crate) fn is_valid(&self, call_id: &str, status: &str, execution: &str) -> bool {
-        self.version == TOOL_SEARCH_RECEIPT_VERSION
+        ((self.version == 2 && self.callable_count.is_none())
+            || (self.version == TOOL_SEARCH_RECEIPT_VERSION && self.callable_count.is_some()))
             && self.call_id == call_id
             && self.status == status
             && self.execution == execution
@@ -193,6 +196,7 @@ impl ToolSearchReceiptV1 {
                     &self.arguments,
                     &self.result_set_sha256,
                     self.result_count,
+                    self.callable_count,
                     self.omitted_result_count,
                     self.complete,
                     self.omitted_identity_count,
@@ -202,7 +206,10 @@ impl ToolSearchReceiptV1 {
                 .ordered_tool_identities
                 .len()
                 .checked_add(self.omitted_identity_count)
-                .is_some_and(|count| count <= self.result_count)
+                .is_some_and(|count| match self.callable_count {
+                    Some(expected) => count == expected,
+                    None => count <= self.result_count,
+                })
             && (!self.complete
                 || (status == "completed" && self.omitted_result_count.unwrap_or(0) == 0))
     }
@@ -872,14 +879,7 @@ impl WorkspaceEvidenceObservation {
             .and_then(|value| value.get("environment_id"))
             .and_then(serde_json::Value::as_str)
             .filter(|value| value.len() <= 256);
-        let same_root = self
-            .revision
-            .as_ref()
-            .and_then(|identity| identity.repository_root.as_ref())
-            .is_some_and(|root| {
-                workspace_identity.and_then(|identity| identity.repository_root.as_ref())
-                    == Some(root)
-            });
+        let same_root = self.source_workspace_matches(workspace_identity);
         // The list is bounded, so name the dependencies that changed before the others.
         let changed = git_workspace
             .map(|cache| {
@@ -994,18 +994,31 @@ impl WorkspaceEvidenceObservation {
         self
     }
 
+    fn source_workspace_matches(
+        &self,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+    ) -> bool {
+        match (self.revision.as_ref(), workspace_identity) {
+            // None is a successful non-Git capture, not a failed capture. This
+            // matches scope only: live, complete dependency watches still have
+            // to prove freshness, including external writes and watcher epochs.
+            (None, None) => true,
+            (Some(captured), Some(current)) => {
+                !captured.unavailable && !current.unavailable
+                    && captured.repository_root.as_ref().is_some_and(|root| {
+                        current.repository_root.as_ref() == Some(root)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn source_paths_are_current(
         &self,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&GitWorkspaceCache>,
     ) -> bool {
-        self.revision
-            .as_ref()
-            .and_then(|identity| identity.repository_root.as_ref())
-            .is_some_and(|captured_root| {
-                workspace_identity.and_then(|identity| identity.repository_root.as_ref())
-                    == Some(captured_root)
-            })
+        self.source_workspace_matches(workspace_identity)
             && !self.source_dependencies.is_empty()
             && self.source_path_observations.len() == self.source_dependencies.len()
             && git_workspace.is_some_and(|cache| {
@@ -1521,14 +1534,7 @@ fn compact_current_carrier_notice(notice: &mut serde_json::Value) {
         || notice["source_scope"]["source_scope_complete"] != false
         || notice.get("failure_applicability").is_some()
         || notice.get("stale_nested_results").is_some()
-        || !matches!(
-            notice["reason_code"].as_str(),
-            Some("workspace_freshness_unverified" | "workspace_identity_changed")
-        )
-        || !notice["source_scope"]["dependencies"]
-            .as_array()
-            .is_some_and(|paths| paths.iter().all(|path| path["freshness"] == "current"))
-        || notice["source_scope"]["omitted_dependencies"].as_u64() != Some(0)
+        || notice["reason_code"] != "carrier_scope_incomplete"
         || !notice["current_nested_results"]
             .as_array()
             .is_some_and(|results| !results.is_empty())
@@ -2984,7 +2990,23 @@ impl ToolHistoryState {
                     }
                     continue;
                 }
-                let (reason_code, reason) = if observation.is_none() {
+                // Decide from the complete watched scope, not dependency_notice's
+                // bounded display. Omitted display rows are not unknown evidence.
+                let carrier_scope_only = output_matches && origin_call_id == call_id
+                    && observation.is_some_and(|observation| {
+                        !observation.source_scope_complete
+                            && observation.source_dependencies_current
+                            && observation.successful
+                            && (observation.source_dependencies.is_empty()
+                                || observation.source_paths_are_current(workspace_identity, git_workspace))
+                    })
+                    && nested.is_some_and(|results| !results.is_empty() && results.values().all(|result| {
+                        result.observation.successful
+                            && result.observation.is_current(workspace_identity, git_workspace)
+                    }));
+                let (reason_code, reason) = if carrier_scope_only {
+                    ("carrier_scope_incomplete", "Only aggregate provenance is incomplete; all recorded nested results and watched dependencies remain current.")
+                } else if observation.is_none() {
                     (
                         "missing_observation",
                         "no workspace observation is available for this tool result; it may be unrecorded or evicted; current workspace freshness is unverified",
@@ -5318,6 +5340,7 @@ pub(crate) fn tool_search_receipt_id(
     arguments: &serde_json::Value,
     result_set_sha256: &str,
     result_count: usize,
+    callable_count: Option<usize>,
     omitted_result_count: Option<usize>,
     complete: bool,
     omitted_identity_count: usize,
@@ -5338,7 +5361,14 @@ pub(crate) fn tool_search_receipt_id(
         ordered_tool_identities,
     ))
     .expect("tool search receipt fields serialize");
-    format!("tsr2-{}", &sha256(&semantic_identity)[..16])
+    match callable_count {
+        None => format!("tsr2-{}", &sha256(&semantic_identity)[..16]),
+        Some(count) => {
+            let mut bytes = semantic_identity;
+            bytes.extend_from_slice(format!(":callables:{count}").as_bytes());
+            format!("tsr3-{}", &sha256(&bytes)[..16])
+        }
+    }
 }
 
 pub(crate) fn item_call_id(item: &ResponseItem) -> Option<&str> {

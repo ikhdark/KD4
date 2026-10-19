@@ -310,15 +310,12 @@ fn remote_tool_search_receipt_group(
         Some(receipt) => receipt.result_set_sha256.clone(),
         None => hex::encode(Sha256::digest(serde_json::to_vec(tools).ok()?)),
     };
-    let ordered_tool_identities = prior_receipt.as_ref().map_or_else(
-        || {
-            tools
-                .iter()
-                .filter_map(tool_search_result_identity)
-                .collect()
-        },
-        |receipt| receipt.ordered_tool_identities.clone(),
-    );
+    let ordered_tool_identities = match &prior_receipt {
+        Some(receipt) => receipt.ordered_tool_identities.clone(),
+        None => tools.iter()
+            .map(codex_tools::LoadableToolSpec::callable_names_from_value)
+            .collect::<Option<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>(),
+    };
     let total_identity_count =
         prior_receipt
             .as_ref()
@@ -331,6 +328,9 @@ fn remote_tool_search_receipt_group(
     let result_count = prior_receipt
         .as_ref()
         .map_or(tools.len(), |receipt| receipt.result_count);
+    // Old receipts may contain container names: never upgrade that lost knowledge.
+    let callable_count = prior_receipt.as_ref().map_or(
+        Some(total_identity_count), |receipt| receipt.callable_count);
     let receipt_arguments = prior_receipt.as_ref().map_or_else(
         || compact_tool_search_arguments(arguments),
         |receipt| receipt.arguments.clone(),
@@ -361,13 +361,15 @@ fn remote_tool_search_receipt_group(
             &receipt_arguments,
             &result_set_sha256,
             result_count,
+            callable_count,
             prior_omitted_result_count,
             complete,
             omitted_identity_count,
             &ordered_tool_identities[..retained],
         );
         let receipt = RemoteToolSearchReceiptV1 {
-            version: crate::tool_history::TOOL_SEARCH_RECEIPT_VERSION,
+            version: prior_receipt.as_ref().map_or(
+                crate::tool_history::TOOL_SEARCH_RECEIPT_VERSION, |receipt| receipt.version),
             receipt_id,
             call_id: call_id.clone(),
             status: status.clone(),
@@ -375,6 +377,7 @@ fn remote_tool_search_receipt_group(
             arguments: receipt_arguments.clone(),
             result_set_sha256: result_set_sha256.clone(),
             result_count,
+            callable_count,
             omitted_result_count: prior_omitted_result_count,
             complete,
             ordered_tool_identities: ordered_tool_identities[..retained].to_vec(),
@@ -460,24 +463,6 @@ fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::V
     } else {
         serde_json::Value::Object(compact)
     }
-}
-
-fn tool_search_result_identity(tool: &serde_json::Value) -> Option<String> {
-    let name = tool
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            tool.pointer("/function/name")
-                .and_then(serde_json::Value::as_str)
-        })?;
-    let namespace = tool
-        .get("namespace")
-        .and_then(serde_json::Value::as_str)
-        .filter(|namespace| !namespace.is_empty());
-    Some(match namespace {
-        Some(namespace) => format!("{namespace}.{name}"),
-        None => name.to_string(),
-    })
 }
 
 fn tool_receipt_identity(item: &ResponseItem) -> Option<(ToolReceiptKind, ToolReceiptSide, &str)> {

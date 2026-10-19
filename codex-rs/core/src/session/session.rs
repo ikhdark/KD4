@@ -585,6 +585,8 @@ pub(crate) struct Session {
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
+    /// Serializes ownership checks with watch publication, never across I/O.
+    pub(super) agent_status_turn: std::sync::Mutex<Option<String>>,
     pub(super) state: Mutex<SessionState>,
     /// Serializes cancellation-shielded rollout/history commits.
     pub(super) durable_history_commit_gate: Semaphore,
@@ -611,8 +613,9 @@ pub(crate) struct Session {
     pub(super) features: ManagedFeatures,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<Arc<McpServerRefreshConfig>>>,
-    /// Serializes turn replacement and startup through RunningTask installation.
-    pub(crate) task_start_gate: Semaphore,
+    /// Serializes turn replacement/startup and rollback history publication.
+    /// Owned permits keep rollback admission protected after observer cancellation.
+    pub(crate) task_start_gate: Arc<Semaphore>,
     /// Bounds ordinary submissions across channels and deferred preparation,
     /// without preventing controls from reaching a blocked preparation.
     pub(crate) submission_preparation_slots: Arc<Semaphore>,
@@ -1996,6 +1999,7 @@ impl Session {
                 installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
+                agent_status_turn: std::sync::Mutex::new(None),
                 state: Mutex::new(state),
                 durable_history_commit_gate: Semaphore::new(1),
                 durable_history_commits_in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -2011,7 +2015,7 @@ impl Session {
                 features: config.features.clone(),
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
-                task_start_gate: Semaphore::new(/*permits*/ 1),
+                task_start_gate: Arc::new(Semaphore::new(/*permits*/ 1)),
                 submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
                 task_start_state: Mutex::new(TaskStartState::default()),
                 active_turn: Mutex::new(None),

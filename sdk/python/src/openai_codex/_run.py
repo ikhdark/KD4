@@ -7,6 +7,7 @@ from .generated.v2_all import (
     AgentMessageThreadItem,
     ItemCompletedNotification,
     MessagePhase,
+    SurfacedToolResult,
     ThreadItem,
     ThreadTokenUsage,
     ThreadTokenUsageUpdatedNotification,
@@ -31,6 +32,7 @@ class TurnResult:
     final_response: str | None
     items: list[ThreadItem]
     usage: ThreadTokenUsage | None
+    surfaced_result: SurfacedToolResult | None = None
 
 
 def _agent_message_item_from_thread_item(
@@ -86,6 +88,7 @@ def _collect_turn_result(stream: Iterator[Notification], *, turn_id: str) -> Tur
 
     _raise_for_failed_turn(completed.turn)
     turn = completed.turn
+    surfaced_result = completed.surfaced_result or turn.surfaced_result
     return TurnResult(
         id=turn.id,
         status=turn.status,
@@ -93,9 +96,13 @@ def _collect_turn_result(stream: Iterator[Notification], *, turn_id: str) -> Tur
         started_at=turn.started_at,
         completed_at=turn.completed_at,
         duration_ms=turn.duration_ms,
-        final_response=_final_assistant_response_from_items(items),
+        final_response=(
+            surfaced_result.canonical_message if surfaced_result is not None
+            else _final_assistant_response_from_items(items)
+        ),
         items=items,
         usage=usage,
+        surfaced_result=surfaced_result,
     )
 
 
@@ -122,6 +129,7 @@ async def _collect_async_turn_result(
 
     _raise_for_failed_turn(completed.turn)
     turn = completed.turn
+    surfaced_result = completed.surfaced_result or turn.surfaced_result
     return TurnResult(
         id=turn.id,
         status=turn.status,
@@ -129,7 +137,11 @@ async def _collect_async_turn_result(
         started_at=turn.started_at,
         completed_at=turn.completed_at,
         duration_ms=turn.duration_ms,
-        final_response=_final_assistant_response_from_items(items),
+        final_response=(
+            surfaced_result.canonical_message if surfaced_result is not None
+            else _final_assistant_response_from_items(items)
+        ),
         items=items,
         usage=usage,
+        surfaced_result=surfaced_result,
     )

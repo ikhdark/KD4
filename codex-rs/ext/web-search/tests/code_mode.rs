@@ -46,20 +46,33 @@ async fn code_mode_can_call_standalone_web_search() -> Result<()> {
         (WebSearchMode::Live, serde_json::json!(true)),
         (WebSearchMode::Indexed, serde_json::json!("indexed")),
     ] {
-        assert_code_mode_standalone_web_search(mode, expected).await?;
+        assert_code_mode_standalone_web_search(mode, expected, false).await?;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_web_search_follows_system_route_redirects() -> Result<()> {
+    assert_code_mode_standalone_web_search(WebSearchMode::Live, serde_json::json!(true), true).await
 }
 
 async fn assert_code_mode_standalone_web_search(
     web_search_mode: WebSearchMode,
     expected_external_web_access: Value,
+    redirect: bool,
 ) -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
+    let accepted_path = if redirect { "/v1/redirected-search" } else { "/v1/alpha/search" };
+    if redirect {
+        Mock::given(method("POST"))
+            .and(path("/v1/alpha/search"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", accepted_path))
+            .expect(1).mount(&server).await;
+    }
     Mock::given(method("POST"))
-        .and(path("/v1/alpha/search"))
+        .and(path(accepted_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "output": "Search result",
         })))
@@ -103,6 +116,7 @@ text(result);
         .with_extensions(Arc::new(extension_builder.build()))
         .with_model("test-gpt-5.1-codex")
         .with_config(move |config| {
+            config.respect_system_proxy = redirect;
             config
                 .features
                 .enable(Feature::CodeMode)
@@ -125,7 +139,7 @@ text(result);
         .await
         .expect("received requests should be available")
         .into_iter()
-        .find(|request| request.url.path() == "/v1/alpha/search")
+        .find(|request| request.url.path() == accepted_path)
         .expect("standalone search request should be sent");
     let search_body = search_request
         .body_json::<Value>()

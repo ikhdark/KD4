@@ -716,6 +716,10 @@ impl ToolRouter {
         ))
     }
 
+    pub(crate) fn post_tool_use_hook_may_run(&self, invocation: &ToolInvocation) -> bool {
+        self.registry.post_tool_use_hook_may_run(invocation)
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(

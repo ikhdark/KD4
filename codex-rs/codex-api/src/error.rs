@@ -14,6 +14,12 @@ pub enum ApiError {
     Stream(String),
     #[error("{0}")]
     IncompleteResponse(Box<codex_protocol::error::IncompleteResponse>),
+    #[error("{source}")]
+    TerminalResponse {
+        source: Box<ApiError>,
+        response_id: Option<String>,
+        token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    },
     #[error("provider error {code:?}: {message}")]
     ProviderFailure {
         code: Option<String>,
@@ -62,9 +68,8 @@ impl ApiError {
 
     /// True when this is a provider-silence timeout rather than a broken stream.
     ///
-    /// Used to route the failure to the connection-recovery loop, which waits
-    /// with an exponential backoff and does not consume the bounded provider
-    /// retry budget (5 by default, 2 for compaction).
+    /// A post-dispatch stall consumes the bounded generation retry budget; it
+    /// is not proof that no provider work occurred.
     pub fn is_stream_idle_timeout(&self) -> bool {
         matches!(self, Self::Stream(message) if is_stream_idle_timeout_message(message))
     }

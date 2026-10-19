@@ -163,6 +163,26 @@ impl TestAppServer {
         drop(self.stdin.take());
     }
 
+    /// Request EOF shutdown and prove a successful exit before inspecting durable output.
+    /// Timeout or cancellation still lets the existing process owner clean up, but
+    /// forced cleanup is never reported as a successful persistence barrier.
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.close_stdin();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let drain_stdout = async {
+                while self.stdout.next_line().await?.is_some() {}
+                Ok::<_, std::io::Error>(())
+            };
+            let (status, ()) = tokio::try_join!(self.process.wait(), drain_stdout)?;
+            Ok::<_, std::io::Error>(status)
+        })
+        .await
+        .context("app-server did not shut down gracefully within 10 seconds")?
+        .context("waiting for graceful app-server shutdown")?;
+        ensure!(status.success(), "app-server graceful shutdown failed: {status}");
+        Ok(())
+    }
+
     /// Returns the automatically selected test environment retained by this server.
     ///
     /// Tests can use the environment to arrange target-native filesystem fixtures before starting
@@ -1828,6 +1848,44 @@ impl Drop for TestAppServer {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_slow_output_and_rejects_failure() -> anyhow::Result<()> {
+        for exit_code in [0, 7] {
+            // Exceed both Drop's grace period and the stdout pipe capacity.
+            #[cfg(unix)]
+            let (program, script) = (
+                Path::new("/bin/sh"),
+                format!("cat >/dev/null; sleep 0.3; printf '%262144s' ''; exit {exit_code}"),
+            );
+            #[cfg(windows)]
+            let (program, script) = (
+                Path::new("powershell.exe"),
+                format!("[Console]::In.ReadToEnd() | Out-Null; Start-Sleep -Milliseconds 300; [Console]::Write(('x' * 262144)); exit {exit_code}"),
+            );
+            #[cfg(unix)]
+            let args = ["-c", script.as_str()];
+            #[cfg(windows)]
+            let args = ["-NoProfile", "-NonInteractive", "-Command", script.as_str()];
+            let server = TestAppServer::builder()
+                .without_auto_env()
+                .with_plugin_startup_tasks()
+                .with_program(program)
+                .with_args(&args)
+                .build()
+                .await?;
+            let result = server.shutdown().await;
+            if exit_code == 0 {
+                result?;
+            } else {
+                assert!(
+                    result.unwrap_err().to_string().contains("graceful shutdown failed"),
+                    "a failed process must not establish a persistence barrier"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn response_wait_preserves_server_requests_with_colliding_ids() -> anyhow::Result<()> {

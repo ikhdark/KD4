@@ -7116,6 +7116,13 @@ async fn raw_capture_completeness_is_required_for_snapshot_protection_and_remint
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn binary_continuation_bytes_recover_without_zero_progress() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     let home = tempfile::tempdir().unwrap();
     let original = vec![0x80; 256 * 1024];
     let canonical = CanonicalToolResult::bytes(original.clone());
@@ -7185,9 +7192,10 @@ async fn binary_continuation_bytes_recover_without_zero_progress() {
         continuations > 0,
         "the fixture must exercise byte-prefix sizing, not only inline recovery"
     );
-    eprintln!(
-        "binary_recovery bytes={} calls={calls} wall_us={}",
-        original.len(),
-        started.elapsed().as_micros()
+    tracing::info!(
+        bytes = original.len(),
+        calls,
+        wall_us = %started.elapsed().as_micros(),
+        "binary_recovery"
     );
 }

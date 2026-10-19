@@ -4,6 +4,7 @@ mod attribution;
 mod certs;
 mod config;
 mod connect_policy;
+mod connection_lifecycle;
 mod credential_broker;
 mod http_proxy;
 mod mitm;

@@ -961,10 +961,15 @@ fn apply_post_tool_use_outcome(
 ) -> Vec<String> {
     // A post hook observes a call whose side effects have already happened. Its
     // block decision cannot undo the call, so returning a failed tool result
-    // would only invite the model to repeat the mutation. Likewise, context
-    // from a rejecting hook must not influence the next sampling request.
+    // would only invite the model to repeat the mutation. Deliver the rejecting
+    // owner's verdict separately; do not accept its optional additional context.
     if outcome.should_block {
-        return Vec::new();
+        let reason = outcome.feedback_message.unwrap_or_else(|| {
+            "The PostToolUse hook rejected the result without a reason.".to_string()
+        });
+        return vec![format!(
+            "PostToolUse rejected this result after the tool completed. Its effects have not been undone; do not repeat the operation merely because of this rejection. Resolve the hook's objection: {reason}"
+        )];
     }
     if let Some(feedback_message) = outcome.feedback_message {
         let mut model_visible =
@@ -1416,6 +1421,13 @@ impl ToolRegistry {
         self.tool(name)?.create_diff_consumer()
     }
 
+    pub(crate) fn post_tool_use_hook_may_run(&self, invocation: &ToolInvocation) -> bool {
+        if !invocation.session.hooks().has_handler_for(HookEventName::PostToolUse) { return false; }
+        self.tools.get(&invocation.tool_name)
+            .and_then(|tool| tool.runtime().post_tool_use_hook_name(invocation))
+            .is_some_and(|name| !invocation.session.hooks().plan_post_tool_use(name.name(), name.matcher_aliases()).is_empty())
+    }
+
     /// Whether a configured PreToolUse handler can select this call. Matcher
     /// aware, so a hook scoped to one tool leaves every other tool's dispatch
     /// shortcuts enabled. Unregistered tools never reach PreToolUse.
@@ -1603,14 +1615,15 @@ impl ToolRegistry {
             return Ok((invocation, expansion_notice));
         };
         let started = Instant::now();
-        let result = run_pre_tool_use_hooks(
-            &invocation.session,
-            &invocation.step_context.turn,
-            invocation.call_id.clone(),
-            &payload.tool_name,
-            &payload.tool_input,
-        )
-        .await;
+        let hook_invocation = invocation.clone();
+        let result = crate::tools::parallel::run_workspace_hook(
+            Arc::clone(&invocation.session), Arc::clone(&invocation.step_context.turn),
+            Arc::clone(&invocation.tracker), invocation.cancellation_token.clone(),
+            async move {
+                run_pre_tool_use_hooks(&hook_invocation.session, &hook_invocation.step_context.turn,
+                    hook_invocation.call_id, &payload.tool_name, &payload.tool_input).await
+            },
+        ).await?;
         record_lifecycle_phase(&invocation, "pre_hooks", started);
         match result {
             PreToolUseHookResult::Blocked(message) => {
@@ -1960,17 +1973,21 @@ impl ToolRegistry {
         let post_tool_use_outcome =
             if let Some((plan, post_tool_use_payload)) = post_tool_use_payload {
                 let phase_started = Instant::now();
-                let outcome = run_post_tool_use_hooks(
-                    &invocation.session,
-                    &invocation.step_context.turn,
-                    plan,
-                    post_tool_use_payload.tool_use_id,
-                    post_tool_use_payload.tool_name.name().to_string(),
-                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
-                    post_tool_use_payload.tool_input,
-                    post_tool_use_payload.tool_response,
-                )
-                .await;
+                let hook_invocation = invocation.clone();
+                let outcome = crate::tools::parallel::run_workspace_hook(
+                    Arc::clone(&invocation.session), Arc::clone(&invocation.step_context.turn),
+                    Arc::clone(&invocation.tracker), invocation.cancellation_token.clone(),
+                    async move {
+                        run_post_tool_use_hooks(&hook_invocation.session, &hook_invocation.step_context.turn,
+                            plan, post_tool_use_payload.tool_use_id,
+                            post_tool_use_payload.tool_name.name().to_string(),
+                            post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                            post_tool_use_payload.tool_input, post_tool_use_payload.tool_response).await
+                    },
+                ).await.unwrap_or_else(|error| PostToolUseOutcome {
+                    hook_events: Vec::new(), should_block: true, additional_contexts: Vec::new(),
+                    feedback_message: Some(format!("PostToolUse could not finish: {error}")),
+                });
                 record_lifecycle_phase(&invocation, "post_hooks", phase_started);
                 Some(outcome)
             } else {

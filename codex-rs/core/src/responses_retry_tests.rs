@@ -512,12 +512,8 @@ fn connection_recovery_wait_is_limited_to_user_facing_sessions() {
 }
 
 #[test]
-fn provider_silence_waits_for_recovery_while_a_broken_stream_still_fails_fast() {
-    // A post-connect idle timeout means the transport was healthy and the
-    // provider stopped sending: the sleep/wake and VPN-churn case this loop
-    // exists for. Charging it to the bounded provider budget (2 retries for
-    // compaction, each capped at a 5s backoff) failed turns on links that
-    // would have recovered.
+fn provider_silence_and_broken_streams_use_bounded_recovery() {
+    // Silence after dispatch may hide provider work, not just an offline link.
     for message in [
         "idle timeout waiting for SSE after 300000ms",
         "idle timeout waiting for websocket after 300000ms",
@@ -530,12 +526,12 @@ fn provider_silence_waits_for_recovery_while_a_broken_stream_still_fails_fast() 
             "{message} must be classified as provider silence"
         );
         assert!(
-            should_wait_for_connection_recovery(
+            !should_wait_for_connection_recovery(
                 &err,
                 &SessionSource::VSCode,
                 &ModelProviderInfo::default(),
             ),
-            "{message} must wait for recovery"
+            "{message} must spend the bounded retry budget"
         );
     }
 
@@ -561,6 +557,32 @@ fn provider_silence_waits_for_recovery_while_a_broken_stream_still_fails_fast() 
         );
         // The transport fallback must still fire on the first such failure.
         assert!(should_switch_fallback_transport(&err), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn repeated_http_idle_timeouts_exhaust_the_generation_budget() {
+    for max_retries in [0, 2] {
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        std::sync::Arc::get_mut(&mut turn).unwrap().session_source = SessionSource::VSCode;
+        session.services.model_client.force_http_fallback(&turn.session_telemetry);
+        let mut client = session.services.model_client.new_session();
+        let mut state = ResponsesStreamRetryState::default();
+        tokio::time::pause();
+        for attempt in 0..=max_retries {
+            let error = codex_api::map_api_error(codex_api::ApiError::Stream(
+                "idle timeout waiting for SSE after 100ms".into(),
+            ));
+            let result = handle_retryable_response_stream_error(
+                &mut state, max_retries, error, &mut client, &session, &turn,
+                ResponsesStreamRequest::Sampling, &CancellationToken::new(),
+            ).await;
+            assert_eq!(result.is_ok(), attempt < max_retries);
+        }
+        assert_eq!(state.retries, max_retries);
+        assert_eq!(state.connection_retries, 0);
+        tokio::time::resume();
     }
 }
 
@@ -1001,7 +1023,7 @@ async fn usage_limit_wait_ends_at_a_reset_inside_its_bound() {
     let started = tokio::time::Instant::now();
     let mut deadline = None;
     let retry = wait_for_account_change(
-        AccountChangeWait::UsageLimit(&error),
+        AccountChangeWait::UsageLimit(&error, None),
         &mut deadline,
         &session,
         &turn,
@@ -1042,7 +1064,7 @@ async fn owner_cancellation_interrupts_the_account_wait() {
     let mut deadline = None;
     tokio::time::pause();
     let wait = wait_for_account_change(
-        AccountChangeWait::UsageLimit(&error),
+        AccountChangeWait::UsageLimit(&error, None),
         &mut deadline,
         &session,
         &turn,
@@ -1078,7 +1100,7 @@ async fn account_wait_keeps_batch_sessions_and_spent_bounds_failing_fast() {
     let mut spent = Some(tokio::time::Instant::now());
     assert!(
         !wait_for_account_change(
-            AccountChangeWait::UsageLimit(&error),
+            AccountChangeWait::UsageLimit(&error, None),
             &mut spent,
             &session,
             &turn,
@@ -1098,7 +1120,7 @@ async fn account_wait_keeps_batch_sessions_and_spent_bounds_failing_fast() {
         let mut deadline = None;
         assert!(
             !wait_for_account_change(
-                AccountChangeWait::UsageLimit(&error),
+                AccountChangeWait::UsageLimit(&error, None),
                 &mut deadline,
                 &session,
                 &turn,
@@ -1171,5 +1193,65 @@ async fn missing_credentials_wait_rechecks_a_login_that_already_completed() {
         assert!(deadline.is_none(), "no account wait was needed");
         assert!(events.try_recv().is_err(), "do not announce a stale wait");
     }
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn usage_limit_rechecks_the_failed_attempt_account_before_waiting() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, _) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"), Vec::new(), home.path(), |_| {},
+        ).await;
+    let credentials = tempfile::tempdir().unwrap();
+    let manager = interactive_turn_with_account(&mut turn, credentials.path());
+    let failed_account = AccountChangeIdentity::from_auth(&manager.auth_cached().unwrap()).unwrap();
+    store_test_login(credentials.path(), "replacement-account");
+    manager.reload().await;
+    assert_eq!(manager.auth_cached().unwrap().api_key(), Some("replacement-account"));
+    let error = usage_limit(None);
+    let mut deadline = None;
+    let cancellation = CancellationToken::new();
+    assert!(tokio::time::timeout(Duration::from_millis(100), wait_for_account_change(
+        AccountChangeWait::UsageLimit(&error, Some(&failed_account)), &mut deadline,
+        &session, &turn, &cancellation,
+    )).await.expect("already completed switch must not wait").unwrap());
+    // Repeated errors under the replacement cannot reuse the old switch.
+    let replacement = AccountChangeIdentity::from_auth(&manager.auth_cached().unwrap()).unwrap();
+    let wait = wait_for_account_change(AccountChangeWait::UsageLimit(&error, Some(&replacement)),
+        &mut deadline, &session, &turn, &cancellation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    manager.reload().await;
+    assert!(futures::poll!(wait.as_mut()).is_pending(), "unchanged credentials must not replay");
+    cancellation.cancel();
+    assert!(matches!(wait.await, Err(CodexErr::TurnAborted)));
+}
+
+#[tokio::test]
+async fn due_usage_reset_retries_once_then_backs_off_with_the_same_deadline() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, mut turn, _) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"), Vec::new(), home.path(), |_| {},
+        ).await;
+    let credentials = tempfile::tempdir().unwrap();
+    let _manager = interactive_turn_with_account(&mut turn, credentials.path());
+    let error = usage_limit(Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    let mut deadline = None;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let cancellation = CancellationToken::new();
+    assert!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
+        &mut deadline, &session, &turn, &cancellation).await.unwrap());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let original_deadline = deadline;
+    assert!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
+        &mut deadline, &session, &turn, &cancellation).await.unwrap());
+    assert!(started.elapsed() >= ACCOUNT_CHANGE_RELOAD_INTERVAL);
+    assert_eq!(deadline, original_deadline);
+    cancellation.cancel();
+    assert!(matches!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
+        &mut deadline, &session, &turn, &cancellation).await, Err(CodexErr::TurnAborted)));
     tokio::time::resume();
 }

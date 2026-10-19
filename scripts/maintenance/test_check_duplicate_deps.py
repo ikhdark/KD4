@@ -10,6 +10,25 @@ from scripts.maintenance import check_duplicate_deps
 
 
 class CheckDuplicateDepsTest(unittest.TestCase):
+    def test_aggregate_runs_every_check_after_any_failure(self) -> None:
+        for failed_index in range(4):
+            for missing in (False, True):
+                with self.subTest(failed_index=failed_index, missing=missing):
+                    calls = []
+
+                    def runner(command, **kwargs):
+                        calls.append(command)
+                        if len(calls) - 1 == failed_index:
+                            if missing:
+                                raise FileNotFoundError(command[0])
+                            return subprocess.CompletedProcess(command, 7)
+                        return subprocess.CompletedProcess(command, 0)
+
+                    self.assertEqual(check_duplicate_deps.check_dependency_policy([], runner=runner), 1)
+                    self.assertEqual(len(calls), 4)
+                    self.assertIn("--locked", calls[1])
+                    self.assertIn("--locked", calls[2])
+
     def test_empty_duplicate_report_passes(self) -> None:
         def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(

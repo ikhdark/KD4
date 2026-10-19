@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn terminal_local_compaction_preserves_provider_consumption() -> anyhow::Result<()> {
+    use crate::test_harness::responses;
+    crate::test_harness::require_network!();
+    for kind in ["response.incomplete", "response.failed"] {
+    let server = responses::start_mock_server().await;
+    let home = tempfile::tempdir()?;
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(),
+            |config| {
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                config.model_provider.supports_websockets = false;
+            },
+        ).await;
+    let metadata = turn.turn_metadata_state.to_responses_metadata(
+        session.installation_id.clone(), session.current_window_id().await,
+        CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+            CompactionTrigger::Manual, CompactionReason::UserRequested,
+            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn,
+        )),
+    );
+    let log = responses::mount_sse_once(&server, responses::sse(vec![serde_json::json!({
+        "type": kind, "response": {
+            "error": {"code":"insufficient_quota","message":"quota"},
+            "id": "partial-compaction", "incomplete_details": {"reason":"max_output_tokens"},
+            "usage": {"input_tokens":100,"output_tokens":20,"total_tokens":120,
+                "input_tokens_details":{"cached_tokens":30},
+                "output_tokens_details":{"reasoning_tokens":10}}
+        }
+    })])).await;
+    let mut client = session.services.model_client.new_session();
+    let result = drain_to_completed(&session, &turn, &mut client, &metadata,
+        &Prompt::default(), &CancellationToken::new()).await;
+    if kind == "response.failed" {
+        assert!(matches!(result, Err(CodexErr::QuotaExceeded)));
+    } else {
+        assert!(matches!(result, Err(CodexErr::IncompleteResponse(_))));
+    }
+    assert_eq!(session.total_token_usage().await, Some(TokenUsage {
+        input_tokens:100, cached_input_tokens:30, output_tokens:20,
+        reasoning_output_tokens:10, total_tokens:120,
+    }));
+    assert_eq!(log.requests().len(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
     use crate::test_harness::responses::{
         ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
@@ -3427,6 +3475,15 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
     // Compaction is a sampling request: stale turn settings must not bypass
     // the current preference, FastMode gate, or the selected model's support.
     Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
+    use codex_protocol::openai_models::{ReasoningEffort, ReasoningEffortPreset};
+    turn.reasoning_effort = Some(ReasoningEffort::Medium);
+    turn.configured_reasoning_effort = Some(ReasoningEffort::Ultra);
+    turn.model_info.supports_reasoning_summaries = true;
+    turn.model_info.supported_reasoning_levels =
+        [ReasoningEffort::XHigh, ReasoningEffort::Low, ReasoningEffort::High]
+            .into_iter()
+            .map(|effort| ReasoningEffortPreset { effort, description: String::new() })
+            .collect();
     let metadata = turn.turn_metadata_state.to_responses_metadata(
         session.installation_id.clone(),
         session.current_window_id().await,
@@ -3499,10 +3556,28 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
             expected,
             "fast={fast}, supported={supported}, configured={configured:?}"
         );
+        assert_eq!(log.single_request().body_json()["reasoning"]["effort"], "xhigh");
     }
     // The newly sampled preference must not make cancellation wait for a
     // contended session state lock (for example during slow persistence).
-    let _state = session.lock_history_state_for_test().await;
+    let session = Arc::new(session);
+    let locked_session = Arc::clone(&session);
+    let runtime = tokio::runtime::Handle::current();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        let state = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                locked_session.lock_history_state_for_test(),
+            ).await.expect("history lock acquired")
+        });
+        let _ = held_tx.send(());
+        let released = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(state);
+        released
+    });
+    held_rx.await.expect("history holder ready");
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let mut client = session.services.model_client.new_session();
@@ -3517,8 +3592,10 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
             &cancellation,
         ),
     )
-    .await
-    .expect("cancellation must not wait for the state lock");
+    .await;
+    release_tx.send(()).expect("release history holder");
+    holder.await.expect("history holder joined").expect("history holder released");
+    let result = result.expect("cancellation must not wait for the state lock");
     assert!(matches!(result, Err(CodexErr::TurnAborted)));
     Ok(())
 }
@@ -3580,4 +3657,57 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
     );
     assert!(request.completed_ms.is_some());
     Ok(())
+}
+#[test]
+fn successive_new_inputs_bound_inherited_recovery_metadata() {
+    for remote in [false, true] {
+        let mut history = Vec::new();
+        let mut archives = std::collections::HashMap::new();
+        for epoch in 0..16 {
+            let sentinel = format!("epoch-{epoch}-sentinel");
+            history.push(user_message(&format!("{} {sentinel}", "large input ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4))));
+            let source = task_compaction_items(&history);
+            let (mut retained, omitted) = if remote {
+                let (items, _, omitted) = build_task_input_checkpoint(&history);
+                (items, omitted)
+            } else {
+                let (items, _, _, _, omitted) = build_local_task_input_checkpoint(&history);
+                (items, omitted)
+            };
+            assert!(omitted);
+            let canonical = compaction_text_recovery_for_items(source);
+            let value = canonical.value.unwrap();
+            assert!(value.to_string().contains(&sentinel));
+            let artifact_id = format!("epoch-{epoch}");
+            archives.insert(artifact_id.clone(), value);
+            let sidecar = serde_json::json!({"kind":"local_compaction_text_recovery", "artifact_id":artifact_id}).to_string();
+            bind_omission_receipts_to_recovery(&mut retained, &sidecar);
+            retained.push(compaction_context_message(sidecar));
+            assert!(retained.iter().filter(|item| is_compaction_text_bookkeeping_item(item))
+                .map(response_item_text_tokens).sum::<usize>() < 1400);
+            history = retained;
+        }
+        // Follow only the surviving recovery graph, not every stored artifact.
+        let mut pending = vec![serde_json::to_value(&history).unwrap()];
+        let mut recovered = String::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(value) = pending.pop() {
+            recovered.push_str(&value.to_string());
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(id) = object.get("artifact_id").and_then(serde_json::Value::as_str)
+                        && seen.insert(id.to_string()) {
+                        pending.push(archives.get(id).expect("exact artifact remains retained").clone());
+                    }
+                    pending.extend(object.into_values());
+                }
+                serde_json::Value::Array(array) => pending.extend(array),
+                serde_json::Value::String(text) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) { pending.push(value); }
+                }
+                _ => {}
+            }
+        }
+        for epoch in 0..16 { assert!(recovered.contains(&format!("epoch-{epoch}-sentinel"))); }
+    }
 }

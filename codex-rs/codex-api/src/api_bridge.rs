@@ -26,6 +26,9 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
         ApiError::IncompleteResponse(response) => CodexErr::IncompleteResponse(response),
+        ApiError::TerminalResponse { source, response_id, token_usage } => CodexErr::TerminalResponse {
+            source: Box::new(map_api_error(*source)), response_id, token_usage,
+        },
         ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
         ApiError::Stream(message) => {
             // Provider silence is recoverable by waiting, and a close that
@@ -155,6 +158,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 request_id: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
+            TransportError::ConnectionTimeout => CodexErr::ConnectionFailed(ConnectionFailedError {
+                message: "connection establishment timed out before model dispatch".into(),
+                status: None,
+            }),
             TransportError::Connection(source) => {
                 let status = source.status();
                 CodexErr::ConnectionFailed(ConnectionFailedError {
@@ -177,6 +184,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 })
             }
             TransportError::Build(msg) => CodexErr::RequestBuild(msg),
+            TransportError::ResponseTooLarge { limit } => CodexErr::ProviderFailure {
+                code: Some("response_body_too_large".into()),
+                message: format!("Successful response exceeded the {limit} byte receive limit; the request was not replayed."),
+            },
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
     }

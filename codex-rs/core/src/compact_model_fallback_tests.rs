@@ -21,20 +21,8 @@ fn current_model_fallback_matches_model_specific_failures() {
             identity_error_code: None,
         }),
         CodexErr::ContextWindowExceeded,
-        CodexErr::UsageLimitReached(UsageLimitReachedError {
-            plan_type: None,
-            resets_at: None,
-            rate_limits: None,
-            promo_message: None,
-            rate_limit_reached_type: None,
-        }),
         CodexErr::ServerOverloaded { retry_after: None },
         CodexErr::InternalServerError { retry_after: None },
-        CodexErr::RetryLimit(RetryLimitReachedError {
-            retry_after: None,
-            status: StatusCode::TOO_MANY_REQUESTS,
-            request_id: None,
-        }),
     ];
     for error in &fallback_errors {
         assert!(
@@ -44,6 +32,18 @@ fn current_model_fallback_matches_model_specific_failures() {
     }
 
     let non_fallback_errors = [
+        CodexErr::UsageLimitReached(UsageLimitReachedError {
+            plan_type: None,
+            resets_at: None,
+            rate_limits: None,
+            promo_message: None,
+            rate_limit_reached_type: None,
+        }),
+        CodexErr::RetryLimit(RetryLimitReachedError {
+            retry_after: None,
+            status: StatusCode::TOO_MANY_REQUESTS,
+            request_id: None,
+        }),
         CodexErr::RegionRestricted(UnexpectedResponseError {
             retry_after: None,
             status: StatusCode::FORBIDDEN,
@@ -79,4 +79,26 @@ fn current_model_fallback_matches_model_specific_failures() {
             "unexpected current-model fallback for {error:?}"
         );
     }
+}
+
+#[test]
+fn local_compaction_does_not_bypass_provider_or_storage_failures() {
+    use super::should_retry_with_local_compaction;
+    for error in [
+        CodexErr::QuotaExceeded,
+        CodexErr::UsageNotIncluded,
+        CodexErr::Fatal("recovery artifact unavailable".into()),
+        CodexErr::Io(std::io::Error::other("recovery write failed")),
+        CodexErr::RequestTimeout,
+        CodexErr::ProviderFailure {
+            code: Some("dispatch_outcome_unknown".into()),
+            message: "accepted upload then reset".into(),
+        },
+        CodexErr::TurnAborted,
+    ] {
+        assert!(!should_retry_with_local_compaction(&error));
+    }
+    assert!(should_retry_with_local_compaction(&CodexErr::InvalidRequest(
+        "unsupported compaction format".into(),
+    )));
 }

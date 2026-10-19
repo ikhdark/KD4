@@ -33,7 +33,6 @@ pub fn cloud_config_bundle_loader(
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
     let refresh_service = service.clone();
-    let task = tokio::spawn(async move { service.load_startup_bundle_with_timeout().await });
     let refresh_task =
         tokio::spawn(async move { refresh_service.refresh_cache_in_background().await });
     let mut refresher_guard = refresher_task_slot().lock().unwrap_or_else(|err| {
@@ -43,15 +42,27 @@ pub fn cloud_config_bundle_loader(
     if let Some(existing_task) = refresher_guard.replace(refresh_task) {
         existing_task.abort();
     }
-    CloudConfigBundleLoader::new(async move {
-        task.await.map_err(|err| {
-            tracing::error!(error = %err, "Cloud config bundle task failed");
-            CloudConfigBundleLoadError::new(
-                CloudConfigBundleLoadErrorCode::Internal,
-                /*status_code*/ None,
-                format!("cloud config bundle load failed: {err}"),
-            )
-        })?
+    retryable_service_loader(service)
+}
+
+pub(crate) fn retryable_service_loader<C: crate::backend::BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+) -> CloudConfigBundleLoader {
+    CloudConfigBundleLoader::retryable(move || {
+        let service = service.clone();
+        // Spawn at attempt creation, not first polling: admitted work remains
+        // owned even if its first observer goes away.
+        let task = tokio::spawn(async move { service.load_startup_bundle_with_timeout().await });
+        async move {
+            task.await.map_err(|err| {
+                tracing::error!(error = %err, "Cloud config bundle task failed");
+                CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Internal,
+                    /*status_code*/ None,
+                    format!("cloud config bundle load failed: {err}"),
+                )
+            })?
+        }
     })
 }
 

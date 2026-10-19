@@ -114,6 +114,26 @@ fn truncates_rollout_after_terminal_canonical_turn_id() {
 }
 
 #[test]
+fn fork_rejects_late_terminal_prefix_containing_successor() {
+    for completed_successor in [false, true] {
+        for aborted in [false, true] {
+            let mut rollout = vec![turn_started("a"), turn_started("b"),
+                RolloutItem::ResponseItem(user_msg("B must not enter fork A"))];
+            if completed_successor { rollout.push(turn_completed("b")); }
+            rollout.push(if aborted {
+                RolloutItem::EventMsg(EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                    turn_id: Some("a".into()),
+                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                    completed_at: None, duration_ms: None, timing: None,
+                }))
+            } else { turn_completed("a") });
+            let error = truncate_rollout_after_turn_id(&rollout, "a").unwrap_err();
+            assert!(matches!(error, CodexErr::InvalidRequest(message) if message.contains("interleaved successor")));
+        }
+    }
+}
+
+#[test]
 fn truncation_excludes_events_recorded_after_selected_turn_completed() {
     let rollout = vec![
         turn_started("turn-1"),
@@ -640,6 +660,13 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
 }
 #[test]
 fn last_n_fork_trims_each_checkpoint_without_losing_checkpoint_only_content() {
+    let _tracing = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .finish(),
+    );
     for stable_ids in [false, true] {
         let mut old = user_msg(if stable_ids {
             "same request"
@@ -680,7 +707,7 @@ fn last_n_fork_trims_each_checkpoint_without_losing_checkpoint_only_content() {
         let started = std::time::Instant::now();
         let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, 1).unwrap();
         let history = crate::session::Session::reconstruct_model_history_from_rollout(&truncated);
-        eprintln!("last_n_checkpoint_replay_elapsed={:?}", started.elapsed());
+        tracing::info!(elapsed = ?started.elapsed(), "last_n_checkpoint_replay");
         assert_eq!(
             history,
             vec![

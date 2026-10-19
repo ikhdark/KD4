@@ -45,6 +45,25 @@ fn parse_mcp_tool_inserts_empty_properties() {
 }
 
 #[test]
+fn mcp_projection_keeps_conditional_tools_discoverable_without_narrowing_branches() {
+    let input = serde_json::json!({
+        "type":"object",
+        "properties":{"mode":{"type":"string"}, "literal":{"enum":[{"not":"data"}]}},
+        "patternProperties":{"^x-":{"type":"string"}}, "additionalProperties":false,
+        "dependentSchemas":{"mode":{"required":["literal"]}},
+        "oneOf":[{"not":{"required":["mode"]}}, {"required":["mode"]}]
+    });
+    let tool = mcp_tool("conditional", "Conditional tool", input.clone());
+    let projected = serde_json::to_value(parse_mcp_tool(&tool).unwrap().input_schema).unwrap();
+    assert!(projected.get("dependentSchemas").is_none());
+    assert!(projected.get("oneOf").is_none());
+    assert!(projected.get("anyOf").is_some());
+    assert!(projected.get("additionalProperties").is_none());
+    assert_eq!(projected["properties"]["literal"]["enum"], input["properties"]["literal"]["enum"]);
+    assert_eq!(serde_json::Value::Object(tool.input_schema.as_ref().clone()), input);
+}
+
+#[test]
 fn parse_mcp_tool_preserves_top_level_output_schema() {
     let mut tool = mcp_tool(
         "with_output",

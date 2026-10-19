@@ -720,11 +720,9 @@ async fn run_process(params: RunProcessParams) {
     let stderr = stderr_handle.await.unwrap_or_default();
     timeout_handle.abort();
 
-    if let Some(cleanup) = terminal_cleanup {
-        cleanup.sessions.lock().await.remove(&cleanup.process_key);
-    }
-
-    outgoing
+    // Keep the client handle reserved until the terminal is accepted or its
+    // connection explicitly fails; a successor must not overtake this result.
+    let delivered = outgoing
         .send_server_notification_to_connection_bounded(
             request_id.connection_id,
             ServerNotification::ProcessExited(ProcessExitedNotification {
@@ -738,6 +736,12 @@ async fn run_process(params: RunProcessParams) {
             &connection_cancellation,
         )
         .await;
+    if !delivered {
+        outgoing.fail_connection_delivery(request_id.connection_id).await;
+    }
+    if let Some(cleanup) = terminal_cleanup {
+        cleanup.sessions.lock().await.remove(&cleanup.process_key);
+    }
 }
 
 fn collect_spawn_process_output(
@@ -833,6 +837,45 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_backpressure_explicitly_fails_the_connection() {
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx, codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let failed = CancellationToken::new();
+        let initialized = Arc::new(AtomicBool::new(true));
+        outgoing.connection_opened_with_runtime(ConnectionId(42), Arc::clone(&initialized), failed.clone()).await;
+        assert!(outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
+            codex_app_server_protocol::ThreadClosedNotification { thread_id: "full".into() },
+        )));
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
+        let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
+        stdout_tx.send(b"retained fallback".to_vec()).unwrap();
+        drop(stdout_tx);
+        drop(stderr_tx);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx, stdout_rx: stdout_rx.into(), stderr_rx: Some(stderr_rx.into()),
+            exit_rx, terminator: None, writer_handle: None, resizer: None,
+        });
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (_write_tx, write_rx) = mpsc::channel(1);
+        exit_tx.send(7).unwrap();
+        run_process(RunProcessParams {
+            outgoing, request_id: ConnectionRequestId {
+                connection_id: ConnectionId(42), request_id: codex_app_server_protocol::RequestId::Integer(42),
+            }, process_handle: "terminal".into(), spawned, control_rx, write_rx,
+            stream_stdin: false, stream_stdout_stderr: true,
+            expiration: ExecExpiration::Cancellation(CancellationToken::new()),
+            output_bytes_cap: Some(1024), connection_cancellation: CancellationToken::new(),
+            terminal_cleanup: None,
+        }).await;
+        assert!(failed.is_cancelled(), "a forgotten terminal must not leave a live connection");
+        assert!(!initialized.load(Ordering::Acquire));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn output_backpressure_preserves_capped_bytes_without_blocking_pipe_drain() {

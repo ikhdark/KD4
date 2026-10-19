@@ -750,25 +750,13 @@ async fn run_compact_task_inner_impl(
                         }
                         Err(e @ CodexErr::ContextWindowExceeded) => {
                             sess.set_total_tokens_full(turn_context.as_ref()).await;
-                            sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                            if emit_error_event {
-                                let event =
-                                    EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                                sess.send_event(&turn_context, event).await;
-                            }
                             return Err(e);
                         }
                         Err(e) if !e.is_retryable() => {
-                            sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                            if emit_error_event {
-                                let event =
-                                    EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                                sess.send_event(&turn_context, event).await;
-                            }
                             return Err(e);
                         }
                         Err(e) => {
-                            if let Err(e) = handle_retryable_response_stream_error(
+                            handle_retryable_response_stream_error(
                                 &mut retry_state,
                                 max_retries,
                                 e,
@@ -778,16 +766,7 @@ async fn run_compact_task_inner_impl(
                                 ResponsesStreamRequest::LocalCompaction,
                                 cancellation_token,
                             )
-                            .await
-                            {
-                                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                                if emit_error_event {
-                                    let event =
-                                        EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                                    sess.send_event(&turn_context, event).await;
-                                }
-                                return Err(e);
-                            }
+                            .await?;
                             turn_context.turn_timing_state.record_model_retry();
                         }
                     }
@@ -808,6 +787,7 @@ async fn run_compact_task_inner_impl(
     };
     let summary_text = match summary_text_result {
         Ok(summary_text) => summary_text,
+        Err(error @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => return Err(error),
         Err(error) => {
             sess.track_turn_codex_error(turn_context.as_ref(), &error);
             if emit_error_event {
@@ -2009,7 +1989,12 @@ fn build_bounded_input_history(
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut omission_receipts = Vec::new();
+    // Old selectors remain exact in the mandatory recovery archive. Budget their
+    // model-visible envelope together with new receipts, never outside the cap.
+    let mut omission_receipts = unresolved.iter().enumerate()
+        .filter(|(_, item)| is_compaction_text_bookkeeping_item(item))
+        .map(|(index, item)| (index, item.clone())).collect::<Vec<_>>();
+    let inherited_receipt_count = omission_receipts.len();
     // Preserve the runtime boundary in source order. Moving it after post-resume
     // command receipts could incorrectly invalidate a newly returned handle.
     indexed_items.extend(
@@ -2020,9 +2005,6 @@ fn build_bounded_input_history(
                 crate::session::is_unified_exec_resume_invalidation(item)
                     || codex_rollout::is_rollout_reconstruction_notice(item)
                     || is_selected_skill_item(item)
-                    // Earlier receipts and sidecars stay the only exact path to
-                    // text an earlier compaction cut; carry them outside the budget.
-                    || is_compaction_text_bookkeeping_item(item)
             })
             .map(|(index, item)| (index, item.clone())),
     );
@@ -2139,7 +2121,7 @@ fn build_bounded_input_history(
 
     // Detailed provenance is useful, but its envelope must also fit a fixed
     // budget. Exact text remains recoverable from the mandatory sidecar.
-    let omitted_text = !omission_receipts.is_empty();
+    let new_omissions = omission_receipts.len() > inherited_receipt_count;
     let mut receipt_tokens = 0usize;
     let mut omitted_receipt_count = 0usize;
     let mut first_omitted_index = None;
@@ -2153,6 +2135,9 @@ fn build_bounded_input_history(
             first_omitted_index.get_or_insert(index);
         }
     }
+    // Evicted inherited metadata forces retention before either publication path
+    // replaces history. /items contains the prior sidecars and exact selectors.
+    let omitted_text = new_omissions || omitted_receipt_count > 0;
     if let Some(index) = first_omitted_index {
         indexed_items.push((
             index,
@@ -2849,10 +2834,7 @@ async fn drain_to_completed(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            crate::client::request_effort_for_model(
-                &turn_context.model_info,
-                turn_context.reasoning_effort.clone(),
-            ),
+            turn_context.request_reasoning_effort(),
             turn_context.reasoning_summary,
             service_tier,
             responses_metadata,
@@ -2879,7 +2861,19 @@ async fn drain_to_completed(
                 None,
             ));
         };
-        let event = event?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                if let Some(token_usage) = error.terminal_usage() {
+                    turn_context.turn_timing_state
+                        .record_generation_token_usage(token_usage.as_ref());
+                    if let Some(usage) = token_usage.as_ref() {
+                        sess.update_token_usage_info(turn_context, Some(usage)).await?;
+                    }
+                }
+                return Err(error.into_response_error());
+            }
+        };
         let _model_stream_processing_timing_guard = turn_context
             .turn_timing_state
             .begin_model_stream_processing(&event);

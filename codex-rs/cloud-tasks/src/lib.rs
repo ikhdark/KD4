@@ -68,8 +68,8 @@ fn apply_details_diff(
         ov.title = title;
         {
             let base = ov.base_attempt_mut();
-            base.diff_lines = diff_lines.clone();
-            base.diff_raw = Some(diff.clone());
+            base.diff_lines = diff_lines;
+            base.diff_raw = Some(diff);
         }
         ov.base_can_apply = true;
         ov.apply_selection_to_fields();
@@ -1098,8 +1098,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             let _ = frame_tx.send(Instant::now());
                         }
                         app::AppEvent::EnvironmentAutodetected(result) => {
-                            if let Ok(sel) = result {
-                                if apply_autodetected_environment(&mut app, sel) {
+                            if let Ok(sel) = result
+                                && apply_autodetected_environment(&mut app, sel)
+                            {
                             // reset spinner state
                                     needs_redraw = true;
                                     {
@@ -1126,7 +1127,6 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                         });
                                     }
                                     let _ = frame_tx.send(Instant::now());
-                                }
                             }
                             // on Err, silently continue with All
                         }

@@ -21,6 +21,41 @@ from openai_codex import AsyncCodex, Codex
 from openai_codex.generated.v2_all import MessagePhase
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("canonical_message", [None, "2026-10-18 00:00:00 UTC"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_collectors_preserve_authoritative_surface(asynchronous, canonical_message, nested):
+    from openai_codex._run import _collect_async_turn_result, _collect_turn_result
+    from openai_codex.generated.v2_all import ItemCompletedNotification, TurnCompletedNotification
+    from openai_codex.models import Notification
+
+    surface = {
+        "adapter": "clock", "value": {"utc": "2026-10-18T00:00:00Z"},
+        "canonicalMessage": canonical_message,
+    }
+    terminal = {"threadId": "thread", "turn": {"id": "turn", "status": "completed", "items": []}}
+    (terminal["turn"] if nested else terminal)["surfacedResult"] = surface
+    events = [
+        Notification("item/completed", ItemCompletedNotification.model_validate({
+            "threadId": "thread", "turnId": "turn",
+            "completedAtMs": 0,
+            "item": {"id": "message", "type": "agentMessage", "text": "not authoritative"},
+        })),
+        Notification("turn/completed", TurnCompletedNotification.model_validate(terminal)),
+    ]
+
+    async def collect():
+        async def stream():
+            for event in events:
+                yield event
+        return await _collect_async_turn_result(stream(), turn_id="turn")
+
+    result = asyncio.run(collect()) if asynchronous else _collect_turn_result(iter(events), turn_id="turn")
+    assert result.surfaced_result is not None
+    assert result.surfaced_result.model_dump(by_alias=True) == surface
+    assert result.final_response == canonical_message
+
+
 def test_sync_thread_run_uses_mock_responses(
     tmp_path,
 ) -> None:

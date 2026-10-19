@@ -32,6 +32,7 @@ from ._login import (
     start_chatgpt_login,
     start_device_code_login,
 )
+from ._message_router import MessageRouter
 from ._run import (
     TurnResult,
     _collect_async_turn_result,
@@ -338,9 +339,10 @@ class AsyncCodex:
         return self._init
 
     async def close(self) -> None:
-        await self._client.close()
-        self._init = None
-        self._initialized = False
+        async with self._init_lock:
+            self._init = None
+            self._initialized = False
+            await self._client.close()
 
     async def login_api_key(self, api_key: str) -> None:
         """Authenticate Codex with an API key."""
@@ -803,12 +805,18 @@ class AsyncTurnHandle:
     id: str
     _closed: bool = field(default=False, init=False, repr=False)
     _epoch: int = field(init=False, repr=False)
+    _router: MessageRouter = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._epoch = self._codex._client.process_epoch
+        self._router = self._codex._client._sync._router
 
     def _ensure_current(self) -> None:
-        if self._codex._client.process_epoch != self._epoch:
+        if (
+            self._closed
+            or not self._codex._initialized
+            or self._codex._client.process_epoch != self._epoch
+        ):
             raise TransportClosedError("turn handle belongs to a closed Codex process")
 
     async def close(self) -> None:
@@ -816,43 +824,46 @@ class AsyncTurnHandle:
         if self._closed:
             return
         self._closed = True
-        if self._codex._client.process_epoch == self._epoch:
-            self._codex._client.unregister_turn_notifications(self.id)
+        self._router.unregister_turn(self.id)
 
     abandon = close
 
     def __del__(self) -> None:
         try:
-            if not self._closed and self._codex._client.process_epoch == self._epoch:
+            if not self._closed:
                 self._closed = True
-                self._codex._client.unregister_turn_notifications(self.id)
+                self._router.unregister_turn(self.id)
         except Exception:
             pass
 
     async def steer(self, input: RunInput) -> TurnSteerResponse:
         """Send additional input to this active turn."""
         self._ensure_current()
-        await self._codex._ensure_initialized()
-        return await self._codex._client.turn_steer(
-            self.thread_id,
-            self.id,
-            _to_wire_input(_normalize_run_input(input)),
+        items = _to_wire_input(_normalize_run_input(input))
+        return await self._codex._client._run_sync(
+            lambda: self._codex._client._sync.turn_steer(self.thread_id, self.id, items),
+            expected_epoch=self._epoch,
         )
 
     async def interrupt(self) -> TurnInterruptResponse:
         """Request interruption of this active turn."""
         self._ensure_current()
-        await self._codex._ensure_initialized()
-        return await self._codex._client.turn_interrupt(self.thread_id, self.id)
+        return await self._codex._client._run_sync(
+            lambda: self._codex._client._sync.turn_interrupt(self.thread_id, self.id),
+            expected_epoch=self._epoch,
+        )
 
     async def stream(self) -> AsyncIterator[Notification]:
         """Yield only notifications routed to this async turn handle."""
         self._ensure_current()
-        await self._codex._ensure_initialized()
-        self._codex._client.register_turn_notifications(self.id)
+        self._router.register_turn(self.id)
         try:
             while True:
-                event = await self._codex._client.next_turn_notification(self.id)
+                self._ensure_current()
+                event = await self._codex._client._poll_notification(
+                    lambda: self._router.next_turn_notification(self.id, 0.0)
+                )
+                self._ensure_current()
                 yield event
                 if (
                     event.method == "turn/completed"

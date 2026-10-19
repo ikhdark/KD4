@@ -27,6 +27,7 @@ where
     F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
 {
     let thread_id = params.thread_id;
+    let _lease = store.acquire_writer_lease(thread_id, false).await?;
     let state_db_ctx = store.state_db().await;
     let archived_path = find_archived_thread_path_by_id_str(
         store.config.codex_home.as_path(),

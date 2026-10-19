@@ -1712,9 +1712,7 @@ impl AgentControl {
             }
         }
         if matches!(fork_mode, SpawnAgentForkMode::LastNTurns(_))
-            && let Some(limit) = config
-                .model_auto_compact_token_limit
-                .or(config.model_context_window)
+            && let Some(limit) = state.fork_context_token_limit(&config).await?
         {
             Self::validate_forked_rollout_token_limit(&forked_rollout_items, limit)?;
         }

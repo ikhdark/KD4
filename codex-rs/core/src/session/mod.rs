@@ -1433,6 +1433,7 @@ fn response_item_needs_turn_id(item: &ResponseItem) -> bool {
 }
 
 struct StartupRolloutFacts {
+    validation_uncertainty: turn_execution::SessionValidationUncertainty,
     initial_messages: Option<Vec<EventMsg>>,
     mailbox_communication_ids: Vec<codex_protocol::ResponseItemId>,
     has_prior_user_turns: bool,
@@ -1448,6 +1449,7 @@ impl StartupRolloutFacts {
         let mut mailbox_communication_ids = Vec::new();
         let mut prior_user_turns = PriorUserTurnTracker::default();
         let mut last_token_info = None;
+        let mut validation_uncertainty = turn_execution::SessionValidationUncertainty::default();
         let mut persisted_settings =
             PersistedThreadSettingsReducer::new(PersistedThreadSettings::default());
 
@@ -1456,6 +1458,7 @@ impl StartupRolloutFacts {
             prior_user_turns.observe(items, idx, item);
             match item {
                 RolloutItem::EventMsg(event) => {
+                    validation_uncertainty.observe_durable_event(event);
                     if let Some(initial_messages) = initial_messages.as_mut() {
                         initial_messages.push(event.clone());
                     }
@@ -1478,6 +1481,7 @@ impl StartupRolloutFacts {
         }
 
         Self {
+            validation_uncertainty,
             initial_messages,
             mailbox_communication_ids,
             has_prior_user_turns: prior_user_turns.has_prior_user_turns(),
@@ -2052,6 +2056,8 @@ impl Session {
         let has_prior_user_turns = startup_rollout_facts.has_prior_user_turns;
         let last_token_info = startup_rollout_facts.last_token_info;
         let reconstructed_provider_id = startup_rollout_facts.reconstructed_provider_id;
+        *self.services.validation_uncertainty.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = startup_rollout_facts.validation_uncertainty;
         {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
@@ -2136,6 +2142,14 @@ impl Session {
                     if let RolloutItem::ResponseItem(response_item) = rollout_item {
                         Self::assign_missing_response_item_id(response_item);
                     }
+                    // Rewrite only the child's copied observations. This keeps
+                    // their turn attribution and makes every inherited prefix
+                    // safe to resume without billing the parent's work again.
+                    if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = rollout_item
+                        && let Some(info) = event.info.as_mut()
+                    {
+                        *info = info.for_fork();
+                    }
                 }
                 self.apply_rollout_reconstruction_with_provider(
                     &turn_context,
@@ -2144,11 +2158,10 @@ impl Session {
                     reconstructed_provider_id.as_deref(),
                 )
                 .await;
-                // Seed usage info from the recorded rollout so UIs can show token counts
-                // immediately on resume/fork.
+                // Parent usage informs inherited context pressure, never child cost.
                 if let Some(info) = last_token_info {
                     let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
+                    state.set_token_info(Some(info.for_fork()));
                 }
 
                 // Persist the fork history with any missing item IDs assigned above
@@ -2883,7 +2896,7 @@ impl Session {
         let mut status = match turn_context.terminal_error.lock().await.clone() {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
-                self.agent_status.send_replace(status.clone());
+                self.update_agent_status(&turn_context.sub_id, msg, status.clone());
                 status
             }
             None => {
@@ -2903,6 +2916,17 @@ impl Session {
             .get()
             .and_then(Option::as_ref)
         {
+            if let EventMsg::TurnComplete(event) = msg
+                && let Some(summary) = event.timing.as_ref()
+                    .and_then(|timing| timing.completion_assessment.as_ref())
+                    .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
+                && let Err(error) = task_coordinator.record_host_completion_observation(
+                    binding, self.thread_id, &event.turn_id, summary,
+                ).await
+            {
+                warn!(%error, "failed to retain host completion observations");
+                return false;
+            }
             if let Err(error) = task_coordinator
                 .seal_missing_receipt_for_attempt(
                     child_agent_path,
@@ -2925,7 +2949,7 @@ impl Session {
                         agent_status_from_task(&task, Some((binding.attempt_id, &status)))
                     {
                         status = durable_status;
-                        self.agent_status.send_replace(status.clone());
+                        self.update_agent_status(&turn_context.sub_id, msg, status.clone());
                     }
                 }
                 Err(error) => {
@@ -2998,6 +3022,24 @@ impl Session {
             .await
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");
+            // The execution is finished. Retain a parent-visible recovery fact
+            // in the existing typed receipt owner instead of resampling the child
+            // or relying on this finalizer being entered again. A separate key
+            // keeps this idempotent without overwriting completion diagnostics.
+            if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
+                let summary = format!(
+                    "Automatic completion delivery to parent {parent_thread_id} failed. Read get_agent_task({{\"assignment_id\":\"{}\"}}) to recover the retained outcome; do not re-execute the child.",
+                    binding.assignment_id,
+                );
+                if let Err(error) = self.services.agent_control.task_coordinator()
+                    .record_host_completion_observation(
+                        binding, self.thread_id,
+                        &format!("{}:parent-delivery", turn_context.sub_id), summary,
+                    ).await
+                {
+                    warn!(%error, "failed to retain parent completion delivery recovery state");
+                }
+            }
             return false;
         }
         if let Some(message) = trace_message {
@@ -3090,6 +3132,30 @@ impl Session {
         self.deliver_event_raw_with_receipt(event, None).await;
     }
 
+    fn update_agent_status(&self, event_id: &str, msg: &EventMsg, status: AgentStatus) {
+        let mut owner = self.agent_status_turn.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*self.agent_status.borrow(), AgentStatus::Shutdown) {
+            return;
+        }
+        let turn_id = match msg {
+            EventMsg::TurnStarted(event) => {
+                *owner = Some(event.turn_id.clone());
+                event.turn_id.as_str()
+            }
+            EventMsg::TurnComplete(event) => event.turn_id.as_str(),
+            EventMsg::TurnAborted(event) => event.turn_id.as_deref().unwrap_or(event_id),
+            EventMsg::ShutdownComplete => {
+                self.agent_status.send_replace(status);
+                return;
+            }
+            _ => event_id,
+        };
+        if owner.as_deref().is_none_or(|owner| owner == turn_id) {
+            self.agent_status.send_replace(status);
+        }
+    }
+
     async fn deliver_event_raw_with_receipt(
         &self,
         event: Event,
@@ -3097,7 +3163,7 @@ impl Session {
     ) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+            self.update_agent_status(&event.id, &event.msg, status);
         }
         let published_msg = publication_receipt.as_ref().map(|_| event.msg.clone());
         if let Some(metrics) = codex_otel::global() {
@@ -3139,7 +3205,7 @@ impl Session {
     /// Offers a live-only event without waiting for a consumer or persisting it.
     pub(crate) fn try_send_live_event(&self, event: Event) {
         if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+            self.update_agent_status(&event.id, &event.msg, status);
         }
         if let Err(err) = self.tx_event.try_send(event) {
             debug!("dropping live event because channel is unavailable: {err}");
@@ -4512,12 +4578,9 @@ impl Session {
             let selected_capability_roots = self
                 .resolve_selected_capability_roots_for_step(&environments)
                 .await;
-            let mcp = if let Some(mcp) = turn.mcp_runtime.get() {
-                Arc::clone(mcp)
-            } else {
-                self.mcp_runtime_for_step(turn.as_ref(), &environments, &selected_capability_roots)
-                    .await?
-            };
+            let mcp = self
+                .mcp_runtime_for_step(turn.as_ref(), &environments, &selected_capability_roots)
+                .await?;
             Ok::<_, CodexErr>((selected_capability_roots, mcp))
         };
         // Keep the turn-frozen environment view unless deferred executors are enabled, but refresh
@@ -4680,6 +4743,7 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         replay_items: Vec<RolloutItem>,
         rollback_msg: EventMsg,
+        task_start_permit: tokio::sync::OwnedSemaphorePermit,
     ) -> std::io::Result<()> {
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
@@ -4713,7 +4777,13 @@ impl Session {
             session.apply_rollout_reconstruction(
                 turn_context.as_ref(), &replay_items, false,
             ).await;
-            session.recompute_token_usage(turn_context.as_ref()).await;
+            let token_count = session.recompute_token_usage_state(turn_context.as_ref()).await;
+            // State publication is complete. A stalled event consumer must not
+            // retain task admission (which shutdown also needs).
+            drop(task_start_permit);
+            if let Some(event) = token_count {
+                session.send_event(turn_context.as_ref(), EventMsg::TokenCount(event)).await;
+            }
             Ok(())
         }).await.map_err(std::io::Error::other)?
     }
@@ -6831,46 +6901,38 @@ impl Session {
         let Some(mut info) = state.token_info() else {
             return;
         };
-        let usage = &mut info.last_token_usage;
-        usage.total_tokens = usage.total_tokens.saturating_sub(retired_tokens).max(0);
-        usage.input_tokens = usage.input_tokens.saturating_sub(retired_tokens).max(0);
-        usage.cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+        info.estimated_context_tokens = Some(info.context_tokens().saturating_sub(retired_tokens.max(0)).max(0));
         state.set_token_info(Some(info));
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
-        let (history, base_instructions) = {
-            let state = self.state.lock().await;
-            (
-                state.history.clone(),
-                BaseInstructions {
-                    text: state.session_configuration.base_instructions.clone(),
-                },
-            )
-        };
-        let Some(estimated_total_tokens) = history
+        if let Some(event) = self.recompute_token_usage_state(turn_context).await {
+            self.send_event(turn_context, EventMsg::TokenCount(event)).await;
+        }
+    }
+
+    /// Update all token state and capture its notification before releasing admission.
+    async fn recompute_token_usage_state(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<TokenCountEvent> {
+        let history = self.state.lock().await.history.clone();
+        let base_instructions = &turn_context.base_instructions;
+        let estimated_total_tokens = history
             .estimate_prepared_token_count_with_base_instructions(
                 &turn_context.model_info.input_modalities,
-                &base_instructions,
-            )
-        else {
-            return;
-        };
+                base_instructions,
+            )?;
         {
             let mut state = self.state.lock().await;
             let mut info = state.token_info().unwrap_or(TokenUsageInfo {
+                estimated_context_tokens: None,
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
                 model_context_window: None,
             });
 
-            info.last_token_usage = TokenUsage {
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-                reasoning_output_tokens: 0,
-                total_tokens: estimated_total_tokens.max(0),
-            };
+            info.estimated_context_tokens = Some(estimated_total_tokens.max(0));
 
             if let Some(model_context_window) = turn_context.model_context_window() {
                 info.model_context_window = Some(model_context_window);
@@ -6883,7 +6945,8 @@ impl Session {
             estimated_total_tokens,
         )
         .await;
-        self.send_token_count_event(turn_context).await;
+        let (info, rate_limits) = self.state.lock().await.token_info_and_rate_limits();
+        Some(TokenCountEvent { info, rate_limits })
     }
 
     pub(crate) async fn update_rate_limits(

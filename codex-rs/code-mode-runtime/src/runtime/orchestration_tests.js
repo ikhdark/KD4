@@ -453,7 +453,7 @@ try {
       ({ execution_state: "exited", process_exited: true, exit_code, output: stdout, stdout, stderr, streams_complete: true });
     let calls = [], reply;
     globalThis.tools = { exec_command: async request => { calls.push(request); return reply(request); } };
-    reply = () => exited("b.rs\u00002\n./a.md\u00001\nWARNING: not a record\n");
+    reply = () => exited("b.rs\u00002\n./a.md\u00001\n");
     const counted = await search_files("prompt|template", { glob: ["*.md", "!target/**"], ignore_case: true,
       hidden: true, no_ignore: true, fixed: true, path: ["src", "docs dir"] });
     const sent = calls[0];
@@ -470,15 +470,35 @@ try {
       counted.errors === undefined && counted.pattern === "prompt|template", "count records misparsed or unsorted");
 
     calls = [];
-    reply = () => exited("src/x.rs\u00003:let prompt = 1;\r\nsrc/x.rs\u000012:a:b\nsrc/y.rs\u00001:x\n");
+    const match = (path, line_number, text) => JSON.stringify({ type: "match", data: { path: { text: path }, line_number, lines: { text } } });
+    reply = () => exited([match("src/x.rs", 3, "let prompt = 1;\r\n"), match("src/x.rs", 12, "a:b\n"), match("src/y.rs", 1, "x\n")].join("\n"));
     const listed = await search_files("prompt", { lines: true, max_per_file: 2 });
-    check(calls[0].args.includes("--line-number") && !calls[0].args.includes("--count") &&
+    check(calls[0].args.includes("--json") && !calls[0].args.includes("--count") &&
       calls[0].args.join("|").includes("--max-count|2") && calls[0].args.at(-1) === ".", "line search arguments");
     const [x, y] = listed.files;
     check(x.path === "src/x.rs" && x.count === 2 && x.capped === true &&
       JSON.stringify(x.lines) === JSON.stringify([{ line: 3, text: "let prompt = 1;" }, { line: 12, text: "a:b" }]) &&
       y.count === 1 && y.capped === undefined && listed.match_count === 3 && listed.complete === false,
       "line records misparsed, or a capped file reported complete");
+
+    for (const path of ["prefix\nsuffix.rs", "tab\tname.rs", "space name.rs", "colon:name.rs"]) {
+      reply = () => exited(`${path}\u00001\n`);
+      check((await search_files("x")).files[0].path === path, "count lost path framing");
+      reply = () => exited(match(path, 1, "x\n"));
+      check((await search_files("x", { lines: true })).files[0].path === path, "line event lost path framing");
+    }
+    reply = () => exited("binary.dat\u00003\n");
+    check((await search_files("x")).match_count === 3, "binary count lost");
+    reply = () => exited(JSON.stringify({ type: "end", data: { path: { text: "binary.dat" }, binary_offset: 1 } }));
+    const binary = await search_files("x", { lines: true });
+    check(binary.files[0].path === "binary.dat" && binary.files[0].binary && !binary.complete, "binary match became absence");
+    for (const lines of [false, true]) {
+      reply = () => exited("unsupported positive output\n");
+      check(!(await search_files("x", { lines })).complete, "discarded output claimed complete");
+    }
+    reply = () => exited(match("long.rs", 1, "x".repeat(400)));
+    const preview = await search_files("x", { lines: true });
+    check(preview.complete && preview.files[0].lines[0].truncated && preview.files[0].lines[0].text.length === 240, "preview fidelity lost");
 
     reply = () => exited("", 1);
     const none = await search_files("absent");

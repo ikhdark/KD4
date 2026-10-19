@@ -7,6 +7,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -56,6 +57,14 @@ pub struct Args {
     /// Directory where request/response dumps should be written as JSON.
     #[arg(long, value_name = "DIR")]
     pub dump_dir: Option<PathBuf>,
+
+    /// Maximum admitted forwarding workers; excess requests receive 503.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..))]
+    pub max_in_flight: u16,
+
+    /// Maximum buffered upload bytes, including chunked request bodies.
+    #[arg(long, default_value_t = 134_217_728, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_request_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -67,6 +76,29 @@ struct ServerInfo {
 struct ForwardConfig {
     upstream_url: Url,
     host_header: HeaderValue,
+    max_request_bytes: u64,
+}
+
+struct ForwardPermit(Arc<AtomicUsize>);
+
+impl ForwardPermit {
+    fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active.try_update(Ordering::AcqRel, Ordering::Acquire,
+            |count| (count < limit).then_some(count + 1)).ok()?;
+        Some(Self(Arc::clone(active)))
+    }
+}
+
+impl Drop for ForwardPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn read_bounded_upload(reader: &mut dyn Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut body)?;
+    Ok((body.len() as u64 <= limit).then_some(body))
 }
 
 /// Entry point for the library main, for parity with other crates.
@@ -85,6 +117,7 @@ pub fn run_main(args: Args) -> Result<()> {
     let forward_config = Arc::new(ForwardConfig {
         upstream_url,
         host_header,
+        max_request_bytes: args.max_request_bytes,
     });
     let dump_dir = args
         .dump_dir
@@ -103,6 +136,7 @@ pub fn run_main(args: Args) -> Result<()> {
         Client::builder()
             // Disable reqwest's 30s default so long-lived response streams keep flowing.
             .timeout(None::<Duration>)
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .context("building reqwest client")?,
     );
@@ -110,15 +144,22 @@ pub fn run_main(args: Args) -> Result<()> {
     eprintln!("responses-api-proxy listening on {bound_addr}");
 
     let http_shutdown = args.http_shutdown;
+    let active = Arc::new(AtomicUsize::new(0));
     for request in server.incoming_requests() {
+        // Keep shutdown reachable even when every forwarding slot is stalled.
+        if http_shutdown && request.method() == &Method::Get && request.url() == "/shutdown" {
+            let _ = request.respond(Response::new_empty(StatusCode(200)));
+            std::process::exit(0);
+        }
+        let Some(permit) = ForwardPermit::try_acquire(&active, usize::from(args.max_in_flight)) else {
+            let _ = request.respond(Response::new_empty(StatusCode(503)));
+            continue;
+        };
         let client = client.clone();
         let forward_config = forward_config.clone();
         let dump_dir = dump_dir.clone();
         std::thread::spawn(move || {
-            if http_shutdown && request.method() == &Method::Get && request.url() == "/shutdown" {
-                let _ = request.respond(Response::new_empty(StatusCode(200)));
-                std::process::exit(0);
-            }
+            let _permit = permit;
 
             if let Err(e) = forward_request(
                 &client,
@@ -178,10 +219,14 @@ fn forward_request(
         return Ok(());
     }
 
-    // Read request body
-    let mut body = Vec::new();
-    let reader = req.as_reader();
-    reader.read_to_end(&mut body)?;
+    if req.body_length().is_some_and(|length| length as u64 > config.max_request_bytes) {
+        let _ = req.respond(Response::new_empty(StatusCode(413)));
+        return Ok(());
+    }
+    let Some(body) = read_bounded_upload(req.as_reader(), config.max_request_bytes)? else {
+        let _ = req.respond(Response::new_empty(StatusCode(413)));
+        return Ok(());
+    };
 
     let exchange_dump = dump_dir.and_then(|dump_dir| {
         dump_dir
@@ -272,4 +317,35 @@ fn forward_request(
 
     let _ = req.respond(response);
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_worker_retains_one_slot_without_unbounded_admission() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = ForwardPermit::try_acquire(&active, 1).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _permit = permit;
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        for _ in 0..1000 { assert!(ForwardPermit::try_acquire(&active, 1).is_none()); }
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(ForwardPermit::try_acquire(&active, 1).is_some());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn upload_limit_accepts_exact_boundary_and_reads_only_one_excess_byte() {
+        let mut exact = std::io::Cursor::new(b"12345678");
+        assert_eq!(read_bounded_upload(&mut exact, 8).unwrap(), Some(b"12345678".to_vec()));
+        let mut excess = std::io::Cursor::new(b"123456789abcdef");
+        assert!(read_bounded_upload(&mut excess, 8).unwrap().is_none());
+        assert_eq!(excess.position(), 9);
+    }
 }

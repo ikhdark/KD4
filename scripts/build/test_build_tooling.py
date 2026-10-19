@@ -999,7 +999,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "toolchain"
         ]
 
-        self.assertEqual(toolchain["channel"], "1.98.1")
+        self.assertEqual(toolchain["channel"], "1.99.1")
         self.assertEqual(toolchain["components"], ["clippy", "rustfmt", "rust-src"])
         self.assertNotIn("profile", toolchain)
         self.assertNotIn("targets", toolchain)
@@ -1250,7 +1250,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
 
-        self.assertIn("just deps-duplicates-check {args}", recipe)
+        self.assertIn(
+            'scripts/maintenance/check_duplicate_deps.py" --policy {args}', recipe
+        )
         self.assertNotIn("just deps-duplicates {args}", recipe)
 
 
