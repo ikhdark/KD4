@@ -97,19 +97,28 @@ impl PathUri {
             && !localhost_unc
             && let Ok(url) = Url::from_file_path(path.as_path())
             && let Ok(uri) = Self::try_from(url)
+            && uri.infer_path_convention() == Some(PathConvention::native())
         {
             return uri;
         }
 
-        let path_bytes = {
-            use std::os::windows::ffi::OsStrExt;
-            path.as_path()
-                .as_os_str()
-                .encode_wide()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>()
-        };
-        Self::from_windows_opaque_path_bytes(&path_bytes)
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Self::from_opaque_path_bytes(path.as_path().as_os_str().as_bytes())
+        }
+        #[cfg(windows)]
+        {
+            let path_bytes = {
+                use std::os::windows::ffi::OsStrExt;
+                path.as_path()
+                    .as_os_str()
+                    .encode_wide()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            };
+            Self::from_windows_opaque_path_bytes(&path_bytes)
+        }
     }
 
     /// Parses an absolute native path using the specified path convention.
@@ -184,12 +193,29 @@ impl PathUri {
         }
         // An opaque child can have an ordinary, representable parent. Reuse
         // native producer eligibility instead of forging an opaque spelling.
-        use std::os::windows::ffi::OsStringExt;
-        let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
-        let Ok(uri) = Self::from_host_native_path(path) else {
-            unreachable!("validated ordinary UNC components form an absolute path");
-        };
-        uri
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+            let Ok(uri) = Self::from_host_native_path(path) else {
+                unreachable!("validated ordinary UNC components form an absolute path");
+            };
+            uri
+        }
+        #[cfg(not(windows))]
+        {
+            if let Ok(path) = String::from_utf16(&wide)
+                && let Some(uri) = parse_windows_path(&path)
+            {
+                return uri;
+            }
+            Self::from_windows_opaque_path_bytes(
+                &wide
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+        }
     }
 
     /// Converts a path on the current host to a `file:` URI.
@@ -512,6 +538,12 @@ impl PathUri {
             ));
         }
         if let Some(path_bytes) = decode_bad_path_uri(&self.0) {
+            #[cfg(unix)]
+            let decoded_path = {
+                use std::os::unix::ffi::OsStringExt;
+                Some(PathBuf::from(std::ffi::OsString::from_vec(path_bytes)))
+            };
+            #[cfg(windows)]
             let decoded_path = {
                 use std::os::windows::ffi::OsStringExt;
                 path_bytes.len().is_multiple_of(2).then(|| {
@@ -783,11 +815,14 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
                 && matches!(*namespace, b'.' | b'?')
     );
     if uses_namespace {
+        #[cfg(windows)]
         return Some(
             AbsolutePathBuf::from_absolute_path_checked(path)
                 .map(|path| PathUri::from_abs_path(&path))
                 .unwrap_or_else(|_| windows_opaque_path_uri(path)),
         );
+        #[cfg(not(windows))]
+        return Some(windows_opaque_path_uri(path));
     }
 
     if matches!(
@@ -829,6 +864,7 @@ fn windows_opaque_path_uri(path: &str) -> PathUri {
     // Exceptional string ingress must use the same checked lexical spelling
     // as native ingress, including mixed UNC separators and the share root.
     // Otherwise the native inverse correctly rejects a noncanonical fallback.
+    #[cfg(windows)]
     if let Ok(native) = AbsolutePathBuf::from_absolute_path_checked(path) {
         return PathUri::from_abs_path(&native);
     }
@@ -912,7 +948,11 @@ pub enum PathConvention {
 impl PathConvention {
     /// Returns the path convention used by the current process.
     pub const fn native() -> Self {
-        Self::Windows
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
     }
 
     /// Splits absolute or relative native path text into lexical segments.

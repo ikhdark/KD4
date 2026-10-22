@@ -167,10 +167,9 @@ impl HostPeer {
                 ..
             }
         );
-        let bytes = EncodedFrame::encoded_len(message)
-            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        // Vec growth may retain up to twice the encoded length. Admission is
-        // held through physical delivery (also for a stalled current frame).
+        // Capacity is admitted during a single serialization, before every
+        // allocation. Charge twice the capacity to cover both buffers during
+        // reallocation, and hold it through delivery of a stalled current frame.
         // Overload receipts have a separate small byte budget, but still use
         // ordinary frame slots. They cannot exhaust cancellation/closure room.
         let budget = if control {
@@ -180,13 +179,9 @@ impl HostPeer {
         } else {
             &self.outgoing_bytes
         };
-        let permit = Arc::clone(budget)
-            .try_acquire_many_owned(bytes.saturating_mul(2).max(256) as u32)
-            .map_err(|_| {
-                PeerSendError::Payload(
-                    "outgoing IPC byte budget exhausted; result was not delivered".into(),
-                )
-            })?;
+        let mut permit = Arc::clone(budget)
+            .try_acquire_many_owned(0)
+            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
         let slot = if control {
             None
         } else {
@@ -198,8 +193,23 @@ impl HostPeer {
                     })?,
             )
         };
-        let frame =
-            EncodedFrame::encode(message).map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        let frame = EncodedFrame::encode_with_admission(message, |capacity| {
+            let additional = capacity
+                .saturating_mul(2)
+                .max(256)
+                .saturating_sub(permit.num_permits());
+            let additional = u32::try_from(additional).map_err(std::io::Error::other)?;
+            let extra = Arc::clone(budget)
+                .try_acquire_many_owned(additional)
+                .map_err(|_| {
+                    std::io::Error::other(
+                        "outgoing IPC byte budget exhausted; result was not delivered",
+                    )
+                })?;
+            permit.merge(extra);
+            Ok(())
+        })
+        .map_err(|err| PeerSendError::Payload(err.to_string()))?;
         Ok(OutgoingFrame {
             frame,
             _bytes: permit,

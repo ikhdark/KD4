@@ -13,8 +13,8 @@ export RUST_TEST_THREADS := rust_test_threads
 nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "8") # Match nextest.toml.
 export NEXTEST_TEST_THREADS := nextest_test_threads
 python := "python"
-# One reserved Cargo lane shared by every named core test target and gate, so
-# they never compile against a target directory another build can invalidate.
+# Named core test targets and gates reserve lanes of this one family, so they
+# never compile against a target directory another build can invalidate.
 core_test_lane := "core-tests"
 # Admission never queues by default; opt in with --set rust_validation_wait_seconds 5.
 rust_validation_wait_seconds := "0"
@@ -237,15 +237,18 @@ test-fast *args:
 # Every one of these runs takes a reserved Cargo lane. Sharing `codex-rs/target`
 # with another build invalidates the whole graph whenever the two disagree on a
 # compiler setting, which costs far more than the tests themselves. They share
-# one lane rather than taking one each, so compatible codex-core artifacts and
-# dependencies stay warm between targets. Feature/profile differences can still
-# require separate artifacts. A concurrent run
-# reuses an idle warm sibling lane with matching build settings (such as
-# `core-tests-2`); without one it reports busy immediately rather than quietly
-# queuing another validation. Exit 75 leaves validation pending, not passed.
-# Default wait: 0 seconds. `just --set rust_validation_wait_seconds 5 core-gate ...`
-# opts into a short wait in the same invocation; never loop on busy results.
-# No background resumption is scheduled. Cold overflow remains opt-in.
+# one lane family rather than taking a lane each, so compatible codex-core
+# artifacts and dependencies stay warm between targets. Feature/profile
+# differences can still require separate artifacts. A concurrent run takes an
+# idle warm sibling with matching build settings (such as `core-tests-2`), or
+# starts a new sibling (a cold build the first time) while fewer than
+# CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE (default 2) lanes of the family are
+# building; maintenance keeps that many warm. At the bound it reports busy
+# rather than quietly queuing another validation. Exit 75 leaves validation
+# pending, not passed. Default wait: 0 seconds. `just --set
+# rust_validation_wait_seconds 5 core-gate ...` opts into a short wait in the
+# same invocation; never loop on busy results. No background resumption is
+# scheduled.
 
 # Run a named core target in the shared core lane; finish the whole selection.
 [script("python")]
@@ -253,7 +256,7 @@ test-fast *args:
 core-test target *args:
     import runpy, sys
     adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "local", sys.argv[1], "--no-fail-fast", *sys.argv[2:]]))
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--allow-cold-overflow", "--", "just", "_core-test-reserved", "local", sys.argv[1], "--no-fail-fast", *sys.argv[2:]]))
 
 # Fast local loop for a named core target: finish the selection, no retries.
 [script("python")]
@@ -261,7 +264,7 @@ core-test target *args:
 core-test-fast target *args:
     import runpy, sys
     adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--allow-cold-overflow", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
 
 # Opt-in symbol-free builds; keep separate artifacts for a fair dev/dev-small comparison.
 [script("python")]
@@ -295,7 +298,7 @@ _core-test-reserved profile target *args:
 core-gate +gates:
     import runpy, sys
     adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-gate-reserved", *sys.argv[1:]]))
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--allow-cold-overflow", "--", "just", "_core-gate-reserved", *sys.argv[1:]]))
 
 [windows]
 _core-gate-reserved +gates:

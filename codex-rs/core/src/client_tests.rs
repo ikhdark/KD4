@@ -906,25 +906,41 @@ async fn websocket_connection_deadline_uses_transient_fallback_cooldown() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn websocket_fallback_timeout_server_error_and_upgrade_rejection_are_permanent() {
+async fn websocket_fallback_server_errors_recover_but_timeout_and_rejection_stay_permanent() {
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::UnexpectedResponseError;
 
-    for error in [
-        CodexErr::RequestTimeout,
-        CodexErr::UnexpectedStatus(UnexpectedResponseError {
-            retry_after: None,
-            status: http::StatusCode::BAD_GATEWAY,
-            body: String::new(),
-            user_message: None,
-            url: None,
-            cf_ray: None,
-            request_id: None,
-            identity_authorization_error: None,
-            identity_error_code: None,
-        }),
-    ] {
+    for error in [CodexErr::RequestTimeout] {
         let client = websocket_test_model_client();
+        let mut session = client.new_session();
+        session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+        assert!(
+            session.try_switch_fallback_transport_after_error(&test_session_telemetry(), &error)
+        );
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        assert!(!client.responses_websocket_enabled());
+    }
+    let error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        retry_after: None,
+        status: http::StatusCode::BAD_GATEWAY,
+        body: String::new(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    });
+    {
+        let client = websocket_test_model_client();
+        let mut session = client.new_session();
+        session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+        assert!(
+            session.try_switch_fallback_transport_after_error(&test_session_telemetry(), &error)
+        );
+        assert!(!client.responses_websocket_enabled());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(client.responses_websocket_enabled());
         let mut session = client.new_session();
         session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
         assert!(
@@ -1242,6 +1258,7 @@ async fn turn_preconnect_for_spawned_agents_waits_for_attestation_readiness() {
         .take()
         .unwrap()
         .await
+        .unwrap()
         .unwrap();
     assert!(transport.is_none());
     assert_eq!(started.elapsed(), super::SPAWNED_AGENT_ATTESTATION_WAIT);
@@ -1271,6 +1288,40 @@ async fn turn_preconnect_skips_http_fallback_and_non_websocket_clients() {
             .await;
         assert!(session.pending_websocket_preconnect.is_none());
     }
+}
+
+#[tokio::test]
+async fn turn_preconnect_join_reports_failure_once_without_another_connection() {
+    let client = websocket_test_model_client();
+    let mut session = client.new_session();
+    session.pending_websocket_preconnect = Some(tokio_util::task::AbortOnDropHandle::new(
+        tokio::spawn(async { Err(codex_protocol::error::CodexErr::RequestTimeout) }),
+    ));
+    assert!(matches!(
+        session.finish_websocket_preconnect().await,
+        Err(codex_protocol::error::CodexErr::RequestTimeout)
+    ));
+    assert_eq!(
+        session.last_stream_transport,
+        Some(ModelAttemptTransport::ResponsesWebsocket)
+    );
+    assert!(session.pending_websocket_preconnect.is_none());
+    // Joining again is empty; dispatch owns the ordinary connection attempt.
+    session.finish_websocket_preconnect().await.unwrap();
+    assert!(session.websocket_session.connection.is_none());
+}
+
+#[tokio::test]
+async fn turn_preconnect_failure_yields_to_an_already_selected_http_transport() {
+    let client = websocket_test_model_client();
+    let mut session = client.new_session();
+    session.pending_websocket_preconnect = Some(tokio_util::task::AbortOnDropHandle::new(
+        tokio::spawn(async { Err(codex_protocol::error::CodexErr::RequestTimeout) }),
+    ));
+    client.force_http_fallback(&test_session_telemetry());
+    session.finish_websocket_preconnect().await.unwrap();
+    assert!(session.pending_websocket_preconnect.is_none());
+    assert!(!client.responses_websocket_enabled());
 }
 
 #[tokio::test]

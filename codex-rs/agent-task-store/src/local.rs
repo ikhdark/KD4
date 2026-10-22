@@ -2857,7 +2857,9 @@ LIMIT 1
                         return Err(error.into());
                     }
                 };
-                if capsule.schema_version != 1 || serde_json::to_string(&capsule)? != payload {
+                if capsule.schema_version != 1
+                    || !is_canonical_persisted_task_capsule(&capsule, &payload)?
+                {
                     invalid_payload = true;
                     return Err(StoreError::CorruptData("invalid or noncanonical capsule".into()));
                 }
@@ -5481,7 +5483,7 @@ async fn hydrate_task_capsule(
             "persisted TaskCapsuleV1 identity or schema version is invalid".to_string(),
         ));
     }
-    if serde_json::to_string(&capsule)?.as_bytes() != canonical_payload.as_bytes() {
+    if !is_canonical_persisted_task_capsule(&capsule, &canonical_payload)? {
         return Err(StoreError::CorruptData(
             "persisted TaskCapsuleV1 payload is not canonical".to_string(),
         ));
@@ -5497,6 +5499,27 @@ async fn hydrate_task_capsule(
     }
     assignment.task_capsule = Some(canonical_payload);
     Ok(())
+}
+
+fn is_canonical_persisted_task_capsule(
+    capsule: &TaskCapsuleV1,
+    payload: &str,
+) -> StoreResult<bool> {
+    let canonical = serde_json::to_string(capsule)?;
+    if canonical == payload {
+        return Ok(true);
+    }
+
+    // Capsules written before integration_plan was added are immutable. Their
+    // assignments deserialize the missing field as SingleWriter too. Accept
+    // exactly that earlier compact serialization without rewriting either copy.
+    if capsule.integration_plan == IntegrationPlan::SingleWriter {
+        const DEFAULT_PLAN_FIELD: &str = ",\"integration_plan\":\"single_writer\"";
+        if let Some((before, after)) = canonical.split_once(DEFAULT_PLAN_FIELD) {
+            return Ok(payload == format!("{before}{after}"));
+        }
+    }
+    Ok(false)
 }
 
 async fn durable_wake_watermark(connection: &mut sqlx::SqliteConnection) -> StoreResult<i64> {

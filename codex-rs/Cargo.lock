@@ -2547,6 +2547,7 @@ dependencies = [
  "async-channel",
  "base64 0.23.1",
  "chrono",
+ "codex-agent-task-store",
  "codex-api",
  "codex-app-server-protocol",
  "codex-code-mode",

@@ -157,6 +157,19 @@ RUST_PROCESS_TOKEN_RE = re.compile(
 RUST_MIN_STACK_BYTES = "8388608"
 RUST_ADMISSION_BUSY_EXIT_CODE = 75
 LANE_COORDINATION_GRACE_SECONDS = 1.0
+# Lanes of one family (`core-tests`, `core-tests-2`, ...) that may build at
+# once when cold overflow is allowed. Each lane holds a whole Cargo target, so
+# the bound limits memory and disk; maintenance keeps as many lanes warm.
+DEFAULT_MAX_ACTIVE_LANES_PER_BASE = 2
+
+
+def max_active_lanes_per_base(env: Mapping[str, str] = os.environ) -> int:
+    """`CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE`, at least one lane."""
+    try:
+        value = int(env.get("CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE", "").strip())
+    except ValueError:
+        return DEFAULT_MAX_ACTIVE_LANES_PER_BASE
+    return max(1, value)
 
 
 class RustAdmissionBusy(RuntimeError):
@@ -712,14 +725,19 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
             # sharing violation at open means the lane is ACTIVE. Treating it
             # as "not held" here would mark a live lane prunable.
             return True
-        import msvcrt
-
         handle.seek(0)
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return True
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        _release_binary_file_lock(handle)
         return False
     except OSError:
         return True
@@ -764,11 +782,16 @@ def cargo_lane_coordination_lock(
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        import msvcrt
-
         while True:
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
             except OSError as exc:
@@ -783,10 +806,7 @@ def cargo_lane_coordination_lock(
     finally:
         try:
             if acquired:
-                handle.seek(0)
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                _release_binary_file_lock(handle)
         finally:
             handle.close()
 
@@ -1274,6 +1294,19 @@ def _nonnegative_wait_seconds(value: str | float) -> float:
     return seconds
 
 
+def _lanes_in_use(candidates: Sequence[LaneReservationCandidate]) -> int:
+    """Existing lanes of one family that hold a reservation or a Cargo lock."""
+    return sum(
+        1
+        for candidate in candidates
+        if candidate.path.is_dir()
+        and (
+            lane_active_lock_is_held(candidate.path)
+            or cargo_lock_is_busy(candidate.path)
+        )
+    )
+
+
 @contextmanager
 def reserve_cargo_lane(
     *,
@@ -1285,9 +1318,12 @@ def reserve_cargo_lane(
     warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
     build_context: Mapping[str, object] | None = None,
+    max_active_lanes: int | None = None,
 ) -> Iterator[tuple[str, Path]]:
     warm_wait_seconds = _nonnegative_wait_seconds(warm_wait_seconds)
     lock_timeout_seconds = _nonnegative_wait_seconds(lock_timeout_seconds)
+    if max_active_lanes is not None and max_active_lanes < 1:
+        raise ValueError("max active lanes must be at least 1")
     explicit = requested_lane != "auto"
     base_lane = _safe_lane_name(
         requested_lane if explicit else _auto_lane_base(command)
@@ -1349,7 +1385,22 @@ def reserve_cargo_lane(
                     else int(candidate.name.removeprefix(base_lane + "-")),
                 )
             )
-            for candidate in candidates:
+            # Bound how many lanes of this family build at once, warm or cold:
+            # at the bound, wait for one to finish or report busy.
+            at_capacity = (
+                max_active_lanes is not None
+                and _lanes_in_use(candidates) >= max_active_lanes
+            )
+            if at_capacity:
+                if time.monotonic() >= deadline:
+                    raise RustAdmissionBusy(
+                        f"all {max_active_lanes} allowed Cargo lanes for "
+                        f"{base_lane!r} are busy; validation remains pending",
+                        resource=root / base_lane,
+                        wait_option="--warm-wait-seconds",
+                    )
+                deferred_cold = True
+            for candidate in () if at_capacity else candidates:
                 candidate_name = _safe_lane_name(candidate.name)
                 candidate_dir = candidate.path
                 observation = _lane_path_observation(candidate_dir)
@@ -1846,9 +1897,18 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
     )
 
 
-def _is_named_runner_command(command: Sequence[str]) -> bool:
+def _is_named_runner_command(
+    command: Sequence[str], *, allow_interpreter_flags: bool = False
+) -> bool:
+    script_index = 1
+    if allow_interpreter_flags:
+        # Recognize only non-consuming interpreter switches. Keep module/code
+        # execution, launcher selectors and options with values opaque, and do
+        # not broaden the separate admission preflight's argument contract.
+        while script_index < len(command) and command[script_index] in {"-I", "-B"}:
+            script_index += 1
     return (
-        len(command) >= 3
+        len(command) > script_index + 1
         and Path(command[0]).stem.lower()
         in {
             "python",
@@ -1856,7 +1916,7 @@ def _is_named_runner_command(command: Sequence[str]) -> bool:
             "py",
             Path(sys.executable).stem.lower(),
         }
-        and Path(command[1]).resolve()
+        and Path(command[script_index]).resolve()
         == Path(__file__).with_name("rust_test_runner.py").resolve()
     )
 
@@ -2076,7 +2136,9 @@ def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
         os.environ["CODEX_CARGO_LANES_ROOT"] = str(lane_root)
         prune_stale_lanes(
             repo_root=repo_root,
-            keep_warm_per_base=1,
+            # Keep every lane that may build at once warm, so overflow
+            # siblings are not rebuilt cold after each maintenance pass.
+            keep_warm_per_base=max_active_lanes_per_base(),
             max_age_days=setting("CODEX_CARGO_LANE_MAX_AGE_DAYS", 7, 1),
             max_lane_bytes=setting("CODEX_CARGO_LANE_MAX_LANE_BYTES", 0) or None,
             max_total_lane_bytes=setting("CODEX_CARGO_LANE_MAX_TOTAL_BYTES", 0) or None,
@@ -2237,7 +2299,7 @@ def cargo_build_context(
     nextest = (
         cargo_index is not None
         and command[cargo_index] == "nextest"
-        or _is_named_runner_command(command)
+        or _is_named_runner_command(command, allow_interpreter_flags=True)
         or reserved_recipe
         in {
             "_core-test-reserved",
@@ -2312,6 +2374,7 @@ def run_in_cargo_lane(
     warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
     admission_invocation: Sequence[str] | None = None,
+    max_active_lanes: int | None = None,
 ) -> int:
     if not command:
         raise ValueError("run-lane requires a command after --")
@@ -2378,6 +2441,7 @@ def run_in_cargo_lane(
             warm_wait_seconds=warm_wait_seconds,
             allow_cold_overflow=allow_cold_overflow,
             build_context=build_context,
+            max_active_lanes=max_active_lanes,
         ) as (resolved_lane, target_dir):
             next_phase("setup")
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
@@ -3232,7 +3296,15 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument(
         "--allow-cold-overflow",
         action="store_true",
-        help="Allow a cold sibling build after the warm-lane wait; may duplicate compilation.",
+        help="Allow a cold sibling build after the warm-lane wait; may duplicate compilation. "
+        "Lanes of the family that build at once stay within --max-active-lanes.",
+    )
+    run_lane_parser.add_argument(
+        "--max-active-lanes",
+        type=positive_int,
+        help="Lanes of this family that may build at once (default with "
+        "--allow-cold-overflow: CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE, or "
+        f"{DEFAULT_MAX_ACTIVE_LANES_PER_BASE}).",
     )
     run_lane_parser.add_argument(
         "--timing-json",
@@ -3318,6 +3390,8 @@ def main(argv: list[str] | None = None) -> int:
                 timing_path=args.timing_json,
                 warm_wait_seconds=args.warm_wait_seconds,
                 allow_cold_overflow=args.allow_cold_overflow,
+                max_active_lanes=args.max_active_lanes
+                or (max_active_lanes_per_base() if args.allow_cold_overflow else None),
                 admission_invocation=[
                     sys.executable,
                     str(Path(__file__).resolve()),

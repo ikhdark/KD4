@@ -48,6 +48,7 @@ assert_cmd = { workspace = true }
 async-channel = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+codex-agent-task-store = { workspace = true }
 codex-api = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-code-mode = { workspace = true }

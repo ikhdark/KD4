@@ -249,6 +249,32 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
     turn_context: &TurnContext,
     git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
+    with_sampling_workspace_identity(
+        history,
+        turn_context,
+        git_workspace,
+        |history, workspace_identity| {
+            prepare_sampling_prompt_with_workspace_identity(
+                history,
+                turn_context,
+                workspace_identity,
+                git_workspace,
+            )
+        },
+    )
+    .await
+}
+
+/// Capture once for synchronous planning of one request. The callback cannot
+/// await work or retain a borrowed identity for another request. Its history
+/// rewrites must preserve workspace evidence requirements (for example, trimming
+/// tool-search schemas); new evidence or a changed environment needs a new call.
+pub(crate) async fn with_sampling_workspace_identity<R>(
+    history: ContextManager,
+    turn_context: &TurnContext,
+    git_workspace: &crate::git_workspace::GitWorkspaceCache,
+    prepare: impl FnOnce(ContextManager, Option<&crate::git_workspace::WorkspaceEvidenceIdentity>) -> R,
+) -> R {
     let workspace_identity = if history.requires_workspace_evidence_validation() {
         if history.can_use_root_only_workspace_identity()
             && !turn_context
@@ -268,15 +294,10 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
     } else {
         None
     };
-    prepare_sampling_prompt_with_workspace_identity(
-        history,
-        turn_context,
-        workspace_identity.as_ref(),
-        git_workspace,
-    )
+    prepare(history, workspace_identity.as_ref())
 }
 
-fn prepare_sampling_prompt_with_workspace_identity(
+pub(crate) fn prepare_sampling_prompt_with_workspace_identity(
     history: ContextManager,
     turn_context: &TurnContext,
     workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
@@ -1539,7 +1560,7 @@ pub(crate) fn run_turn(
                             {
                                 sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
                                     id: None, role: "developer".into(), content: vec![ContentItem::InputText {
-                                        text: format!("Known current work prevents final acceptance: {}. Continue only authorized obtainable work. Do not run tests without permission, relaunch existing validation, or treat a stored process number as a capability. Reconcile legitimate blockers and user-approved scope changes through the current task state.", remaining.join(" ")),
+                                        text: format!("Known current work prevents final acceptance: {}. Continue only obtainable work the task already authorizes; this notice adds no authorization. When test execution is authorized, resolve a failed check by rerunning it, after any needed fix, through its runner or test command itself, not a wrapper script; otherwise record why it is blocked. Do not launch a duplicate of validation that is still running, or treat a stored process number as a capability. Reconcile legitimate blockers and user-approved scope changes through the current task state.", remaining.join(" ")),
                                     }], phase: None, internal_chat_message_metadata_passthrough: None,
                                 }]).await?;
                                 output_state.invalidate_for_repair();

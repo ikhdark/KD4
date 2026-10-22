@@ -1,5 +1,15 @@
 use anyhow::Context;
 use anyhow::Result;
+use codex_agent_task_store::AcceptanceCriterion;
+use codex_agent_task_store::AgentRole;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
+use codex_agent_task_store::AssignmentDraft;
+use codex_agent_task_store::CapabilityProfile;
+use codex_agent_task_store::IntegrationPlan;
+use codex_agent_task_store::LocalAgentTaskStore;
+use codex_agent_task_store::RepoScope;
+use codex_agent_task_store::TaskCapsuleV1;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_features::Feature;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
@@ -13,6 +23,7 @@ use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::request_has_last_message_input_text;
 use core_test_support::responses::sse;
@@ -22,7 +33,110 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_capsule_allows_new_simple_thread_and_turn() -> Result<()> {
+    core_test_support::require_network!();
+    let home = Arc::new(TempDir::new()?);
+    let sqlite_home = home.path().join("sqlite");
+    let repo = TempDir::new()?;
+    let state = codex_state::StateRuntime::init(sqlite_home.clone(), "openai".into()).await?;
+    let store = LocalAgentTaskStore::initialize(&state).await?;
+    let (assignment, attempt) = store
+        .create_assignment(
+            repo.path(),
+            AssignmentDraft {
+                root_session_id: "earlier-thread".into(),
+                admission_origin: AssignmentAdmissionOrigin::Typed,
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "Complete an earlier task".into(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: None,
+                    id: "report".into(),
+                    text: "Report the result".into(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: vec![RepoScope {
+                    path: "src".into(),
+                    recursive: true,
+                }],
+                stop_condition: "Stop after reporting".into(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Auto,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await?;
+    assert_eq!(assignment.integration_plan, IntegrationPlan::SingleWriter);
+    let capsule = TaskCapsuleV1 {
+        schema_version: 1,
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        role: assignment.role,
+        capability_profile: assignment.capability_profile,
+        requirements: assignment.acceptance_criteria.clone(),
+        objective: assignment.objective.clone(),
+        read_scope: assignment.read_scope.clone(),
+        write_scope: assignment.write_scope.clone(),
+        stop_condition: String::new(),
+        dependencies: Vec::new(),
+        risk_hints: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: None,
+        relation: None,
+        architecture_contract_ref: None,
+        integration_plan: IntegrationPlan::SingleWriter,
+        relevant_handles: Vec::new(),
+        workspace_epoch: assignment.start_epoch,
+        workspace_manifest_hash: "earlier-manifest".into(),
+        prohibited_changes: assignment.prohibited_changes.clone(),
+        required_evidence: assignment.required_evidence.clone(),
+    };
+    let current = serde_json::to_string(&capsule)?;
+    let legacy = current.replacen(",\"integration_plan\":\"single_writer\"", "", 1);
+    assert_ne!(legacy, current);
+    let capsule_path = sqlite_home
+        .join("agent-task-coordination/task_capsules")
+        .join(format!("{}.json", assignment.assignment_id));
+    std::fs::write(&capsule_path, &legacy)?;
+    store.close().await;
+    state.close().await;
+
+    let server = start_mock_server().await;
+    let request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("simple-response"),
+            ev_assistant_message("simple-answer", "ready"),
+            ev_completed("simple-response"),
+        ]),
+    )
+    .await;
+    let test = test_codex()
+        .with_home(home)
+        .with_config(move |config| {
+            config.sqlite_home = sqlite_home;
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+        })
+        .build(&server)
+        .await?;
+    let completed = test.submit_turn_and_capture_completion("Say ready").await?;
+    assert_eq!(completed.error, None);
+    assert_eq!(completed.last_agent_message.as_deref(), Some("ready"));
+    assert_eq!(request.requests().len(), 1);
+    assert_eq!(std::fs::read_to_string(capsule_path)?, legacy);
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
 
 const FIRST_PROMPT: &str = "spawn the first agent";
 const FIRST_TASK: &str = "spawn the second agent";

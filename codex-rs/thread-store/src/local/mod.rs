@@ -1047,6 +1047,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_fork_snapshot_reuses_prefix_and_refreshes_after_ordered_append() {
+        let home = TempDir::new().unwrap();
+        let store = Arc::new(LocalThreadStore::new(test_config(home.path()), None));
+        let id = ThreadId::new();
+        let live = LiveThread::create(store, create_thread_params(id))
+            .await
+            .unwrap();
+        live.append_items_ordered(&[user_message_item("first durable prefix")])
+            .await
+            .unwrap();
+        let first = live.fork_history_snapshot().await.unwrap();
+        let sibling = live.fork_history_snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&first, &sibling));
+        assert!(first.items.iter().any(|item| matches!(item,
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)) if event.message == "first durable prefix")));
+        live.append_items_ordered(&[user_message_item("later accepted prefix")])
+            .await
+            .unwrap();
+        let next = live.fork_history_snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(next.items.len(), first.items.len() + 1);
+        live.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn ordered_live_append_defers_rollout_and_metadata_until_flush() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());

@@ -2597,8 +2597,9 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             self.assertIn(reserved, body, recipe)
             self.assertNotIn('rust_test_runner.py" run-', body, recipe)
 
-        # Shared-lane recipes must name the one lane variable, and only the
-        # explicit per-target escape hatch may open a lane of its own.
+        # Shared-lane recipes must name the one lane family variable and may
+        # overflow to a sibling within the active-lane bound; only the explicit
+        # per-target escape hatch may open a lane of its own.
         for recipe in (
             "core-test target *args:",
             "core-test-fast target *args:",
@@ -2606,6 +2607,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn('"--lane", "{{ core_test_lane }}"', body, recipe)
+            self.assertIn('"--allow-cold-overflow"', body, recipe)
         lane_body = justfile.split("\ncore-test-lane target *args:\n", 1)[1].split(
             "\n\n", 1
         )[0]

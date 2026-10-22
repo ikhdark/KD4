@@ -33,6 +33,132 @@ mod model_info_overrides_tests;
 const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
+#[tokio::test]
+async fn fresh_current_catalog_consumers_do_not_wait_for_initial_refresh() {
+    let home = tempdir().unwrap();
+    let endpoint = TestModelsEndpoint::new(vec![]);
+    let manager = openai_manager_for_tests(home.path().into(), endpoint.clone());
+    let identity = manager.ensure_current_cache_identity().await;
+    let model = remote_model("fresh-catalog", "Fresh", 1);
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(vec![model.clone()], None, &identity)
+            .await
+    );
+    manager
+        .mark_memory_fresh(&identity, Duration::from_secs(60))
+        .await;
+    manager
+        .model_catalog_activity
+        .arm_initial_refresh(Instant::now());
+    timeout(Duration::from_secs(1), async {
+        assert!(
+            manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY
+                )
+                .await
+                .unwrap()
+                .iter()
+                .any(|model| model.model == "fresh-catalog")
+        );
+        assert_models_contain(
+            &ModelsManager::raw_model_catalog(
+                &manager,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .unwrap()
+            .models,
+            std::slice::from_ref(&model),
+        );
+        assert_models_contain(
+            &manager.get_remote_models().await,
+            std::slice::from_ref(&model),
+        );
+        assert!(
+            !manager
+                .get_model_info("fresh-catalog", &ModelsManagerConfig::default())
+                .await
+                .used_fallback_model_metadata
+        );
+    })
+    .await
+    .expect("eligible consumers must finish while refresh remains blocked");
+    assert!(
+        !*manager
+            .model_catalog_activity
+            .initial_refresh_ready
+            .borrow()
+    );
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
+    manager.model_catalog_activity.finish_initial_refresh();
+}
+
+#[tokio::test]
+async fn initial_refresh_still_gates_cold_expired_changed_identity_and_online_consumers() {
+    for scenario in ["cold", "expired", "changed-identity", "online"] {
+        let home = tempdir().unwrap();
+        let identity = Arc::new(Mutex::new("first-account".to_string()));
+        let current = Arc::clone(&identity);
+        let manager = OpenAiModelsManager::new(
+            home.path().into(),
+            TestModelsEndpoint::new(vec![]),
+            None,
+            Arc::new(move || current.lock().unwrap().clone()),
+        );
+        let initial = manager.ensure_current_cache_identity().await;
+        assert!(
+            manager
+                .apply_remote_models_and_etag_for_identity(
+                    vec![remote_model("old-account-only", "Old", 1)],
+                    None,
+                    &initial
+                )
+                .await
+        );
+        if scenario != "cold" {
+            manager
+                .mark_memory_fresh(&initial, Duration::from_secs(60))
+                .await;
+        }
+        if scenario == "expired" {
+            manager.state.write().await.fresh_until = Some(Instant::now());
+        } else if scenario == "changed-identity" {
+            *identity.lock().unwrap() = "second-account".into();
+        }
+        manager
+            .model_catalog_activity
+            .arm_initial_refresh(Instant::now());
+        let strategy = if scenario == "online" {
+            RefreshStrategy::Online
+        } else {
+            RefreshStrategy::Offline
+        };
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                manager.note_catalog_activity(strategy)
+            )
+            .await
+            .is_err(),
+            "{scenario} must retain its gate"
+        );
+        manager.model_catalog_activity.finish_initial_refresh();
+        if scenario == "changed-identity" {
+            assert!(
+                manager
+                    .get_remote_models()
+                    .await
+                    .iter()
+                    .all(|model| model.slug != "old-account-only")
+            );
+        }
+    }
+}
+
 #[test]
 fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
     let a = remote_model("stable-a", "A", 1);

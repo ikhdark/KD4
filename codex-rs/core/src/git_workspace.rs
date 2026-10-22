@@ -659,46 +659,56 @@ async fn capture_remote_workspace_evidence(
     let (status, paths) = reader.finish()?;
     let head_identity = workspace_head_identity(&status)?;
     let mut manifest = format!("total_paths={}\n", paths.len()).into_bytes();
-    let mut remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES as usize;
+    let remaining = AtomicU64::new(WORKSPACE_GENERATION_MAX_DECLARED_BYTES);
     let mut deletions = Vec::new();
-    for observation in paths {
-        let path = root.join(&observation.path).ok()?;
-        let metadata = match fs.get_metadata(&path, None).await {
-            Ok(metadata) if !observation.deleted => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
-                manifest.extend_from_slice(observation.path.as_bytes());
-                manifest.extend_from_slice(b"\0deleted\0\n");
-                deletions.push(path);
-                continue;
+    // Only independent files overlap. Each file retains its metadata/read/
+    // metadata chain, and all workers share one allowance. Return digests rather
+    // than file bodies so ordered assembly cannot retain N large buffers.
+    let mut observations = futures::stream::iter(paths)
+        .map(|observation| {
+            let fs = &fs;
+            let root = &root;
+            let remaining = &remaining;
+            async move {
+                let path = root.join(&observation.path).ok()?;
+                let mut entry = observation.path.into_bytes();
+                let metadata = match fs.get_metadata(&path, None).await {
+                    Ok(metadata) if !observation.deleted => metadata,
+                    Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
+                        entry.extend_from_slice(b"\0deleted\0\n");
+                        return Some((entry, Some(path)));
+                    }
+                    _ => return None,
+                };
+                // Links cannot supply a complete identity through this protocol.
+                if metadata.is_symlink || !metadata.is_file {
+                    return None;
+                }
+                let size = usize::try_from(metadata.size).ok()?;
+                remaining
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                        available.checked_sub(metadata.size)
+                    })
+                    .ok()?;
+                let contents = fs.read_file_bounded(&path, size, None).await.ok()??;
+                if contents.len() != size || fs.get_metadata(&path, None).await.ok()? != metadata {
+                    return None;
+                }
+                entry.extend_from_slice(b"\0file\0");
+                entry.extend_from_slice(metadata.size.to_string().as_bytes());
+                entry.push(0);
+                entry.extend_from_slice(hex::encode(Sha256::digest(&contents)).as_bytes());
+                entry.push(b'\n');
+                Some((entry, None))
             }
-            _ => return None,
-        };
-        // The filesystem protocol cannot read symlink targets without following them.
-        // Never publish a complete identity when that evidence is unavailable.
-        if metadata.is_symlink || !metadata.is_file {
-            return None;
+        })
+        .buffered(8);
+    while let Some(observation) = observations.next().await {
+        let (entry, deletion) = observation?;
+        manifest.extend_from_slice(&entry);
+        if let Some(path) = deletion {
+            deletions.push(path);
         }
-        manifest.extend_from_slice(observation.path.as_bytes());
-        manifest.push(0);
-        manifest.extend_from_slice(if metadata.is_file {
-            b"file"
-        } else {
-            b"directory"
-        });
-        manifest.push(0);
-        manifest.extend_from_slice(metadata.size.to_string().as_bytes());
-        manifest.push(0);
-        if metadata.is_file {
-            let contents = fs.read_file_bounded(&path, remaining, None).await.ok()??;
-            remaining = remaining.checked_sub(contents.len())?;
-            if contents.len() as u64 != metadata.size
-                || fs.get_metadata(&path, None).await.ok()? != metadata
-            {
-                return None;
-            }
-            manifest.extend_from_slice(hex::encode(Sha256::digest(&contents)).as_bytes());
-        }
-        manifest.push(b'\n');
     }
     for path in deletions {
         if !matches!(fs.get_metadata(&path, None).await, Err(error) if error.kind() == ErrorKind::NotFound)

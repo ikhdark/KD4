@@ -434,15 +434,37 @@ pub(crate) async fn load_project_instructions_with_fallback(
         .collect::<Vec<_>>();
     let environment_labels_required = loaded.environment_labels_required;
     let mut first_project_environment = true;
-    for (
+    // Prefetch environment bodies with a bounded speculative allowance. Shared
+    // source/rendered budgets are committed below in the selected order.
+    let mut environment_reads = futures::stream::iter(environments)
+        .map(|(discovery, retained)| async move {
+            let prefetched = match &discovery.result {
+                Ok(candidates) => Some(
+                    read_discovered_project_docs(
+                        discovery.filesystem.as_ref(),
+                        candidates.clone(),
+                        config.project_doc_max_bytes,
+                        previous.map(|(_, sources)| {
+                            (sources, discovery.environment_id.as_str(), &discovery.cwd)
+                        }),
+                    )
+                    .await,
+                ),
+                Err(_) => None,
+            };
+            (discovery, retained, prefetched)
+        })
+        .buffered(4);
+    while let Some((
         EnvironmentProjectInstructionsDiscovery {
             environment_id,
             cwd,
-            filesystem,
+            filesystem: _,
             result,
         },
         retained,
-    ) in environments
+        prefetched,
+    )) = environment_reads.next().await
     {
         let (candidates, retained) = match result {
             Ok(candidates) => (candidates, None),
@@ -490,26 +512,20 @@ pub(crate) async fn load_project_instructions_with_fallback(
             .iter()
             .map(|candidate| candidate.path.clone())
             .collect::<Vec<_>>();
-        let project_docs = if let Some(mut retained) = retained {
-            // Match healthy nearest-first source allocation without any I/O.
-            let mut remaining = remaining_source_bytes;
-            for doc in retained.iter_mut().rev() {
-                truncate_project_doc_to_budget(&mut doc.read, remaining);
-                remaining = remaining.saturating_sub(doc.read.retained_data.len());
-            }
+        let mut project_docs = if let Some(retained) = retained {
             retained
         } else {
-            let (project_docs, failed_sources) = read_discovered_project_docs(
-                filesystem.as_ref(),
-                candidates,
-                remaining_source_bytes,
-                /*prefetch_utf8_boundary_slack*/ false,
-                previous.map(|(_, sources)| (sources, environment_id.as_str(), &cwd)),
-            )
-            .await;
+            let (project_docs, failed_sources) = prefetched.unwrap_or_default();
             complete &= failed_sources.is_empty();
             project_docs
         };
+        // Allocation uses actual retained prefixes, including fallback bodies
+        // and UTF-8 boundary slack, rather than discovery metadata estimates.
+        let mut remaining = remaining_source_bytes;
+        for doc in project_docs.iter_mut().rev() {
+            truncate_project_doc_to_budget(&mut doc.read, remaining);
+            remaining = remaining.saturating_sub(doc.read.retained_data.len());
+        }
         let environment_load = render_project_docs(
             &environment_id,
             &cwd,
@@ -626,10 +642,8 @@ async fn read_discovered_agents_md(
     paths: Vec<ProjectDocCandidate>,
     max_total: usize,
 ) -> io::Result<EnvironmentProjectInstructions> {
-    let (project_docs, failed_sources) = read_discovered_project_docs(
-        fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false, None,
-    )
-    .await;
+    let (project_docs, failed_sources) =
+        read_discovered_project_docs(fs, paths, max_total, None).await;
     if !failed_sources.is_empty() {
         return Err(io::Error::other("instruction source read failed"));
     }
@@ -662,7 +676,6 @@ async fn read_discovered_project_docs(
     fs: &dyn ExecutorFileSystem,
     paths: Vec<ProjectDocCandidate>,
     max_total: usize,
-    prefetch_utf8_boundary_slack: bool,
     fallback: Option<(&[RetainedProjectDoc], &str, &PathUri)>,
 ) -> (Vec<LoadedProjectDoc>, Vec<PathUri>) {
     if paths.is_empty() {
@@ -673,20 +686,18 @@ async fn read_discovered_project_docs(
     let mut project_docs = Vec::new();
     let mut failed_sources = Vec::new();
 
-    // Allocate the byte budget from the nearest scope outward, then restore the
-    // root-to-cwd order used when the aggregate environment budget is applied.
-    for candidate in paths.into_iter().rev() {
-        // Retain up to one UTF-8 boundary's lookahead beyond this environment's current
-        // allocation. A smaller aggregate allocation can trim a split code point and pass those
-        // bytes to a broader document without requiring a second filesystem read.
-        let prefetch_bytes = if prefetch_utf8_boundary_slack {
-            remaining
-                .saturating_add(MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES)
-                .min(max_total)
-        } else {
-            remaining
-        };
-        let mut project_doc = match read_project_doc(fs, &candidate, prefetch_bytes).await {
+    // Acquire bounded prefixes concurrently, but admit their actual retained
+    // bytes nearest-first. Reserving discovered sizes would mishandle growth,
+    // empty documents, failed reads and split UTF-8 characters. `buffered`
+    // keeps both admission order and speculative memory bounded.
+    let mut reads = futures::stream::iter(paths.into_iter().rev())
+        .map(|candidate| async move {
+            let read = read_project_doc(fs, &candidate, max_total).await;
+            (candidate, read)
+        })
+        .buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES);
+    while let Some((candidate, read)) = reads.next().await {
+        let mut project_doc = match read {
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(err) => {

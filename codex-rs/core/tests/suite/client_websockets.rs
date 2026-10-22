@@ -26,6 +26,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -45,6 +46,7 @@ use codex_rollout_trace::replay_bundle;
 use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::load_default_config_for_test;
 use core_test_support::require_network;
+use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
 use core_test_support::responses::ev_assistant_message;
@@ -65,6 +67,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tracing::Instrument;
 use tracing_test::traced_test;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::http::Method;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const MODEL: &str = "gpt-5.4";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
@@ -461,6 +468,224 @@ async fn responses_websocket_preconnect_reuses_connection() {
     assert_eq!(connection.len(), 1);
 
     server.shutdown().await;
+}
+
+#[test_case::test_case("dispatch", false; "dispatch recovers")]
+#[test_case::test_case("preconnect", false; "preconnect recovers")]
+#[test_case::test_case("prewarm", false; "prewarm recovers")]
+#[test_case::test_case("dispatch", true; "dispatch preserves http denial")]
+#[test_case::test_case("preconnect", true; "preconnect preserves http denial")]
+#[test_case::test_case("prewarm", true; "prewarm preserves http denial")]
+#[test_case::test_case("owned", false; "owned preconnect recovers")]
+#[test_case::test_case("owned", true; "owned preconnect preserves http denial")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_forbidden_handshake_uses_http(setup: &str, http_denied: bool) {
+    require_network!();
+
+    let server = responses::start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(403).insert_header("cf-ray", "websocket-ray"))
+        .mount(&server)
+        .await;
+    let response = if http_denied {
+        ResponseTemplate::new(403)
+            .insert_header("cf-ray", "http-ray")
+            .set_body_string("HTTP permission denied")
+    } else {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(responses::sse(vec![
+                ev_response_created("resp-http"),
+                ev_assistant_message("msg-http", "HTTP answer"),
+                ev_completed("resp-http"),
+            ]))
+    };
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let harness = websocket_harness_with_provider_options(
+        ModelProviderInfo {
+            name: "mock-ws".into(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            wire_api: WireApi::Responses,
+            supports_websockets: true,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            ..ModelProviderInfo::default()
+        },
+        false,
+        false,
+        &[],
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    match setup {
+        "owned" => {
+            client_session
+                .start_websocket_preconnect(
+                    &harness.model_info,
+                    None,
+                    &harness.session_telemetry,
+                    &websocket_connection_metadata(&harness),
+                )
+                .await
+        }
+        "preconnect" => client_session
+            .preconnect_websocket(
+                &harness.model_info,
+                None,
+                &harness.session_telemetry,
+                &websocket_connection_metadata(&harness),
+            )
+            .await
+            .expect("a rejected upgrade must fall back without sending a prompt"),
+        "prewarm" => client_session
+            .prewarm_websocket(
+                &prompt,
+                &harness.model_info,
+                &harness.session_telemetry,
+                harness.effort.clone(),
+                harness.summary,
+                None,
+                &prewarm_metadata(&harness, None),
+            )
+            .await
+            .expect("a rejected warmup upgrade must fall back"),
+        "dispatch" => {}
+        _ => panic!("unknown setup"),
+    }
+    if http_denied {
+        let result = client_session
+            .stream(
+                &prompt,
+                &harness.model_info,
+                &harness.session_telemetry,
+                harness.effort.clone(),
+                harness.summary,
+                None,
+                &turn_metadata(&harness, None),
+                &InferenceTraceContext::disabled(),
+            )
+            .await;
+        let Err(CodexErr::UnexpectedStatus(error)) = result else {
+            panic!("the HTTP permission failure must remain terminal");
+        };
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN);
+        assert_eq!(error.body, "HTTP permission denied");
+        assert_eq!(error.cf_ray.as_deref(), Some("http-ray"));
+    } else {
+        for _ in 0..2 {
+            stream_until_complete_with_model_info(
+                &mut client_session,
+                &harness,
+                &prompt,
+                &harness.model_info,
+                "resp-http",
+            )
+            .await;
+            client_session = harness.client.new_session();
+        }
+    }
+    assert!(!harness.client.responses_websocket_enabled());
+    let requests = server.received_requests().await.expect("captured requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|req| req.method == Method::GET)
+            .count(),
+        1
+    );
+    let http_requests = requests
+        .iter()
+        .filter(|req| req.method == Method::POST)
+        .collect::<Vec<_>>();
+    assert_eq!(http_requests.len(), if http_denied { 1 } else { 2 });
+    for request in http_requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert!(body.get("previous_response_id").is_none());
+    }
+}
+
+#[test_case::test_case(false; "server error")]
+#[test_case::test_case(true; "connection timeout")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_owned_preconnect_preserves_zero_retry_recovery(timeout: bool) {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+    use tokio_util::task::AbortOnDropHandle;
+
+    require_network!();
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("answer", "recovered"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+    let upstream = server.uri().strip_prefix("ws://").unwrap().to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let forwarding = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(request.len() < 16_384);
+            request.push(first.read_u8().await.unwrap());
+        }
+        assert!(request.starts_with(b"GET "));
+        if !timeout {
+            first.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            first.shutdown().await.unwrap();
+        }
+        // Keep a timed-out first connection open while admitting its successor.
+        // A second attempt must succeed even when the stream retry budget is zero.
+        let (mut second, _) = listener.accept().await.unwrap();
+        drop(first);
+        let mut backend = TcpStream::connect(upstream).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut second, &mut backend).await;
+    }));
+    let harness = websocket_harness_with_provider_options(
+        ModelProviderInfo {
+            name: "transient-ws".into(),
+            base_url: Some(format!("http://{address}/v1")),
+            wire_api: WireApi::Responses,
+            supports_websockets: true,
+            websocket_connect_timeout_ms: Some(500),
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            ..ModelProviderInfo::default()
+        },
+        false,
+        false,
+        &[],
+    )
+    .await;
+    let mut session = harness.client.new_session();
+    session
+        .start_websocket_preconnect(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &websocket_connection_metadata(&harness),
+        )
+        .await;
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    stream_until_complete(&mut session, &harness, &prompt).await;
+    assert!(harness.client.responses_websocket_enabled());
+    assert_eq!(server.handshakes().len(), 1);
+    assert_eq!(server.single_connection().len(), 1);
+    drop(session);
+    server.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), forwarding)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[test_case::test_case(true; "handshake precedes request")]

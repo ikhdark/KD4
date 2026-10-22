@@ -214,6 +214,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_forks_share_history_until_an_append_or_last_consumer_retires() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let id = ThreadId::new();
+        let live = LiveThread::create(
+            store.clone(),
+            create_thread_params(id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .unwrap();
+        let message = |text: &str| {
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: text.into(),
+                    ..Default::default()
+                },
+            ))
+        };
+        live.append_items_ordered(&[message("first")])
+            .await
+            .unwrap();
+        let first = live.fork_history_snapshot().await.unwrap();
+        let mut siblings = Vec::new();
+        for _ in 0..8 {
+            siblings.push(live.fork_history_snapshot().await.unwrap());
+        }
+        assert!(siblings.iter().all(|history| Arc::ptr_eq(history, &first)));
+        assert_eq!(store.calls().await.read_thread_with_history, 1);
+        live.append_items_ordered(&[message("second")])
+            .await
+            .unwrap();
+        let next = live.fork_history_snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(next.items.len(), first.items.len() + 1);
+        assert_eq!(store.calls().await.read_thread_with_history, 2);
+        let weak = Arc::downgrade(&next);
+        drop(next);
+        assert!(
+            weak.upgrade().is_none(),
+            "cache must not retain a completed fork's history"
+        );
+        let _fresh = live.fork_history_snapshot().await.unwrap();
+        assert_eq!(store.calls().await.read_thread_with_history, 3);
+    }
+
+    #[tokio::test]
     async fn live_thread_rejects_transient_items_before_calling_the_store() {
         let store = Arc::new(InMemoryThreadStore::default());
         let thread_id = ThreadId::default();

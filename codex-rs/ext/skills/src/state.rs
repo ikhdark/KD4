@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -17,6 +18,7 @@ use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillPackageId;
 use crate::catalog::SkillProviderError;
+use crate::catalog::SkillProviderErrorKind;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
@@ -27,6 +29,16 @@ use crate::sources::SkillProviders;
 
 const MAX_CACHED_ORCHESTRATOR_RESOURCES: usize = 100;
 const MAX_CACHED_ORCHESTRATOR_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+// Settle an optional discovery result before the host's five-second phase
+// deadline can drop the initializer. Keep the deadline across cancellation so
+// another projection cannot restart a full wait. Explicit cancellation still
+// leaves the cell retryable, and no background task survives its caller.
+const CATALOG_DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+fn discovery_timeout() -> SkillProviderError {
+    SkillProviderError::new("Skill discovery timed out; retry discovery to try again.")
+        .with_kind(SkillProviderErrorKind::Timeout)
+}
 
 pub(crate) struct SkillsThreadState {
     config: Mutex<SkillsExtensionConfig>,
@@ -130,7 +142,20 @@ impl SkillsThreadState {
         if let Some(catalog) = continued.as_ref() {
             return catalog.clone();
         }
-        catalog_or_warning(cache.catalog.get_or_init(|| initialize).await.clone())
+        let deadline = *cache
+            .discovery_deadline
+            .get_or_init(|| tokio::time::Instant::now() + CATALOG_DISCOVERY_BUDGET);
+        catalog_or_warning(
+            cache
+                .catalog
+                .get_or_init(|| async {
+                    tokio::time::timeout_at(deadline, initialize)
+                        .await
+                        .unwrap_or_else(|_| Err(discovery_timeout()))
+                })
+                .await
+                .clone(),
+        )
     }
 
     #[expect(
@@ -286,6 +311,7 @@ impl SkillsThreadState {
         let next_cache = Arc::new(OrchestratorGenerationCache {
             mcp_cache_key: cache_key,
             catalog: OnceCell::new(),
+            discovery_deadline: OnceLock::new(),
             continued_catalog: tokio::sync::Mutex::new(None),
             resources: Mutex::new(OrchestratorResourceCache::default()),
         });
@@ -305,7 +331,7 @@ impl SkillsThreadState {
             .iter()
             .find(|bound| bound.selected_root() == &root)
             .cloned();
-        let slot = {
+        let (slot, deadline) = {
             let mut cache = self
                 .executor_cache
                 .lock()
@@ -316,25 +342,31 @@ impl SkillsThreadState {
                     && (matches!(cached.catalog.get(), Some(Ok(_)))
                         || cached.turn_id == query.turn_id)
             }) {
-                Arc::clone(&cached.catalog)
+                (Arc::clone(&cached.catalog), cached.discovery_deadline)
             } else {
                 cache.retain(|cached| cached.root != root);
                 let slot = Arc::new(OnceCell::new());
+                let deadline = tokio::time::Instant::now() + CATALOG_DISCOVERY_BUDGET;
                 cache.push(CachedExecutorCatalog {
                     root,
                     binding,
                     turn_id: query.turn_id.clone(),
                     catalog: Arc::clone(&slot),
+                    discovery_deadline: deadline,
                 });
-                slot
+                (slot, deadline)
             }
         };
         // Publish the slot before discovery, without holding the cache mutex
         // across I/O. Cancellation leaves it empty for the next observer.
         catalog_or_warning(
-            slot.get_or_init(|| providers.list_executor_for_turn(query))
-                .await
-                .clone(),
+            slot.get_or_init(|| async {
+                tokio::time::timeout_at(deadline, providers.list_executor_for_turn(query))
+                    .await
+                    .unwrap_or_else(|_| Err(discovery_timeout()))
+            })
+            .await
+            .clone(),
         )
     }
 
@@ -367,11 +399,13 @@ struct CachedExecutorCatalog {
     binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     turn_id: String,
     catalog: Arc<OnceCell<SkillProviderResult<SkillCatalog>>>,
+    discovery_deadline: tokio::time::Instant,
 }
 
 struct OrchestratorGenerationCache {
     mcp_cache_key: Option<McpResourceServerCacheKey>,
     catalog: OnceCell<SkillProviderResult<SkillCatalog>>,
+    discovery_deadline: OnceLock<tokio::time::Instant>,
     continued_catalog: tokio::sync::Mutex<Option<SkillCatalog>>,
     resources: Mutex<OrchestratorResourceCache>,
 }
@@ -631,6 +665,74 @@ mod tests {
             executor_catalog("root")
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_budget_settles_once_per_turn_and_recovers_next_turn() {
+        let state = executor_state();
+        let provider = Arc::new(CountingCatalog {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+            pause_first: Some(Arc::new(tokio::sync::Notify::new())),
+        });
+        let providers = SkillProviders::new().with_executor_provider(provider.clone());
+        let start = tokio::time::Instant::now();
+        let first = state
+            .executor_catalog_snapshot(&providers, executor_query("one", "root"))
+            .await;
+        assert_eq!(start.elapsed(), CATALOG_DISCOVERY_BUDGET);
+        assert_eq!(first.warnings, [discovery_timeout().message]);
+        assert_eq!(
+            state
+                .executor_catalog_snapshot(&providers, executor_query("one", "root"))
+                .await,
+            first
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .executor_catalog_snapshot(&providers, executor_query("two", "root"))
+                .await,
+            executor_catalog("root")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_orchestrator_discovery_keeps_its_budget_and_explicit_retry_recovers() {
+        let state = executor_state();
+        let calls = AtomicUsize::new(0);
+        let initialize = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<SkillProviderResult<SkillCatalog>>().await
+        };
+        let start = tokio::time::Instant::now();
+        let interrupted = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.orchestrator_catalog_snapshot(None, initialize()),
+        )
+        .await;
+        assert!(interrupted.is_err());
+        let timed_out = state
+            .orchestrator_catalog_snapshot(None, initialize())
+            .await;
+        assert_eq!(start.elapsed(), CATALOG_DISCOVERY_BUDGET);
+        assert_eq!(timed_out.warnings, [discovery_timeout().message]);
+        assert_eq!(
+            state
+                .orchestrator_catalog_snapshot(None, initialize())
+                .await,
+            timed_out
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        state.retry_failed_orchestrator_catalog();
+        let expected = executor_catalog("recovered");
+        assert_eq!(
+            state
+                .orchestrator_catalog_snapshot(None, async { Ok(expected.clone()) })
+                .await,
+            expected
+        );
     }
 
     #[tokio::test]

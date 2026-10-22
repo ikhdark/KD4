@@ -77,6 +77,27 @@ async fn outgoing_bytes_remain_charged_until_delivery_with_reserved_control() {
     assert!(peer.send(message()).is_ok());
 }
 
+#[test]
+fn rejected_encoding_releases_every_partial_reservation() {
+    let (tx, _rx) = mpsc::channel(super::super::OUTGOING_FRAME_CAPACITY);
+    let mut peer = HostPeer::new(tx);
+    peer.outgoing_bytes = Arc::new(Semaphore::new(256));
+    let slots = peer.outgoing_slots.available_permits();
+    let message = HostToClient::DelegateRequest {
+        id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+        session_id: session_id("s"),
+        request: DelegateRequest::Notify {
+            call_id: "call".into(),
+            cell_id: CellId::new("cell".into()).into(),
+            text: "x".repeat(4096),
+        },
+    };
+    assert!(peer.send(message).is_err());
+    assert_eq!(peer.outgoing_bytes.available_permits(), 256);
+    assert_eq!(peer.outgoing_slots.available_permits(), slots);
+    assert!(!peer.is_disconnected());
+}
+
 #[tokio::test]
 async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
     tokio::time::timeout(Duration::from_secs(1), async {

@@ -645,6 +645,8 @@ function Invoke-CargoLanePrune {
         }
 
         $maxAgeDays = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_AGE_DAYS" -DefaultValue 7 -MinimumValue 1
+        # Keep as many warm lanes per family as may build at once (rust_build_status.py).
+        $keepWarmPerBase = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE" -DefaultValue 2 -MinimumValue 1
         $maxLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_LANE_BYTES" -DefaultValue 0 -MinimumValue 0
         # Recursive disk accounting is opt-in on the build path. Use target-prune
         # with aggregate limits for explicit disk maintenance.
@@ -684,7 +686,7 @@ function Invoke-CargoLanePrune {
             }
             else {
                 $global:LASTEXITCODE = $null
-                & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs @maxTotalLaneArgs @maxTotalTargetArgs | Out-Null
+                & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base $keepWarmPerBase --max-age-days $maxAgeDays @maxLaneArgs @maxTotalLaneArgs @maxTotalTargetArgs | Out-Null
                 $pruneSucceeded = $LASTEXITCODE -eq 0
                 if (-not $pruneSucceeded) {
                     $pruneFailure = "prune command exited with code $LASTEXITCODE"

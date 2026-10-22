@@ -412,6 +412,72 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
     session.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn read_only_durable_cell_publishes_a_recoverable_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let program = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").unwrap();
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(program.clone());
+    let delegate = Arc::new(RecordingDelegate::default());
+    let session = provider.create_session(delegate.clone()).await.unwrap();
+    let mut write = execute_request(r#"store("kept", "x".repeat(65536));"#);
+    write.state_path = Some(path.clone());
+    write.yield_time_ms = Some(60_000);
+    assert!(matches!(
+        execute(&session, write).await,
+        RuntimeResponse::Result {
+            error_text: None,
+            ..
+        }
+    ));
+    // Persistence remains active after opt-in, even without state_path or writes.
+    let mut read = execute_request(r#"text(String(load("kept").length));"#);
+    read.tool_call_id = "read-only-receipt".into();
+    read.yield_time_ms = Some(60_000);
+    let original = execute(&session, read).await;
+    let id = response_cell_id(&original);
+    assert_eq!(
+        original,
+        RuntimeResponse::Result {
+            cell_id: id.clone(),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "65536".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
+    session.shutdown().await.unwrap();
+    drop(session);
+    drop(provider);
+    let replacement = ProcessOwnedCodeModeSessionProvider::with_host_program(program);
+    let session = replacement.create_session(delegate.clone()).await.unwrap();
+    assert_eq!(
+        session
+            .wait(WaitRequest {
+                cell_id: id,
+                yield_time_ms: 1,
+                recovery: Some(codex_code_mode::ReceiptRecovery {
+                    path: path.clone(),
+                    terminal_only: false
+                }),
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(original)
+    );
+    let mut verify = execute_request(r#"text(String(load("kept").length));"#);
+    verify.state_path = Some(path);
+    verify.yield_time_ms = Some(60_000);
+    assert!(
+        matches!(execute(&session, verify).await, RuntimeResponse::Result {
+        content_items, error_text: None, output_loss: None, ..
+    } if content_items == vec![FunctionCallOutputContentItem::InputText { text: "65536".into() }])
+    );
+    assert!(delegate.invocations.lock().unwrap().is_empty());
+    session.shutdown().await.unwrap();
+}
+
 async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
     let started = session.execute(request).await.expect("start execution");
     let expected_id = started.cell_id.clone();

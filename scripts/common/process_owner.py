@@ -266,7 +266,19 @@ def run_owned(
     """
     check_operation()
     if prepare_sccache:
-        prepare_shared_sccache(env=kwargs.get("env"), cwd=kwargs.get("cwd"))
+        try:
+            prepare_shared_sccache(env=kwargs.get("env"), cwd=kwargs.get("cwd"))
+        except (OSError, subprocess.SubprocessError) as error:
+            # Run this command once without the cache rather than abort it. An
+            # empty wrapper keeps Cargo from auto-starting a server inside the
+            # owned job; the caller's environment and shared server are untouched.
+            inherited = os.environ if kwargs.get("env") is None else kwargs["env"]
+            kwargs["env"] = {**inherited, "RUSTC_WRAPPER": ""}
+            print(
+                f"warning: shared compiler cache preparation failed: {error}; "
+                "running this command without sccache.",
+                file=sys.stderr,
+            )
         check_operation()
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)

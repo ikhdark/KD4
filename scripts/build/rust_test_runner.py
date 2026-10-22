@@ -50,6 +50,7 @@ from scripts.common.process_owner import (
 from scripts.build.rust_tool_env import (
     CORE_TEST_PACKAGES,
     cargo_package_specs,
+    is_sccache_wrapper,
     local_rust_env,
     prepare_shared_sccache,
 )
@@ -121,6 +122,10 @@ class RunnerError(RuntimeError):
         self.completed_gates = completed_gates if completed_gates is not None else {}
         self.completed_tests: dict[str, list[str]] = {}
         self.admission_status = admission_status
+
+
+class CompilerCacheStartupError(RunnerError):
+    """Cache preparation failed before the compiler or any tests were started."""
 
 
 @dataclass(frozen=True)
@@ -1327,17 +1332,28 @@ def _nextest_results(
                     suite["ignored_count"] = ignored
                 elif ignored != suite["ignored_count"]:
                     framed = False
-                # Native reporters can emit skipped names plus an empty terminal,
-                # without per-test ignored events. An independent exact selection
-                # also binds multiple unselected names in one skip-only fragment.
+                # Native reporters can emit skipped starts without per-test
+                # ignored events, even alongside completed selected tests. An
+                # independent selection binds those unselected names to the
+                # repeated ignored count; without it, only a single-name,
+                # skip-only fragment is unambiguous.
                 # Without that selection, retain the single-name bound. This cannot
                 # create an execution receipt, and the final aggregate must
                 # still account for every declared test and every ignored name.
                 pending = suite["fragment_started"] - suite["names"]
+                if requested is not None:
+                    # Selected tests can remain in flight across a reporter
+                    # fragment. Only unselected starts are candidates for
+                    # ignored accounting; selected starts still require their
+                    # own unique completion before the aggregate can pass.
+                    pending -= requested
                 if (
-                    passed == failed == 0
-                    and pending
-                    and (len(suite["fragment_started"]) == 1 or requested is not None)
+                    pending
+                    and (
+                        requested is not None
+                        or passed == failed == 0
+                        and len(suite["fragment_started"]) == 1
+                    )
                     and len(pending) <= ignored - suite["observed"]["ignored"]
                     and (requested is None or pending.isdisjoint(requested))
                     and (catalog is None or pending <= catalog)
@@ -1599,13 +1615,20 @@ def _default_executor(
         )
     )
     if compiles:
+        preparation_started = time.monotonic()
         try:
             prepare_shared_sccache(env=env, cwd=cwd)
         except (OSError, subprocess.SubprocessError) as error:
-            raise RunnerError(
+            raise CompilerCacheStartupError(
                 f"shared compiler cache preparation failed: {error}",
                 outcome="could_not_start",
             ) from error
+        finally:
+            # Inside this phase's wall time, before Cargo starts.
+            if timings is not None:
+                timings["cache_preparation_seconds"] = (
+                    time.monotonic() - preparation_started
+                )
     paths: dict[str, Path] = {}
     cleanup_started = None
 
@@ -2698,7 +2721,7 @@ class RustTestRunner:
             passed: dict[tuple[str, str], int] = {}
             failed: set[tuple[str, str]] = set()
             unexpected = False
-            parsed = _nextest_results(result)
+            parsed = _nextest_results(result, expected=expected)
             for status, binary, test in parsed:
                 if test in expected.get(binary, ()):
                     key = (binary, test)
@@ -3321,6 +3344,23 @@ class RustTestRunner:
                     capture=capture,
                     timings=command_metrics,
                 )
+            except CompilerCacheStartupError as error:
+                if command_metrics is not None:
+                    command_metrics["outcome"] = error.outcome
+                if attempt or not is_sccache_wrapper(effective_env.get("RUSTC_WRAPPER", "")):
+                    raise
+                # Preparation failed before Cargo was launched. This consumes
+                # the existing one-retry budget, never replays executed tests,
+                # and never stops a cache server owned by another invocation.
+                print(
+                    f"Compiler cache startup failed: {error}; "
+                    "attempting compilation once without sccache.",
+                    file=sys.stderr,
+                )
+                self._sccache_disabled = True
+                self.base_env["RUSTC_WRAPPER"] = ""
+                effective_env["RUSTC_WRAPPER"] = ""
+                continue
             except BaseException as error:
                 if command_metrics is not None:
                     command_metrics["outcome"] = (
@@ -4267,9 +4307,88 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
         return 2
 
 
+def _without_target_dir(argv: Sequence[str]) -> list[str]:
+    """Drop `--target-dir` options; arguments after a bare `--` stay intact."""
+    kept: list[str] = []
+    tokens = iter(argv)
+    for token in tokens:
+        if token == "--":
+            kept.append(token)
+            kept.extend(tokens)
+            break
+        if token == "--target-dir":
+            next(tokens, None)
+        elif not token.startswith("--target-dir="):
+            kept.append(token)
+    return kept
+
+
+def _run_in_lane_family(args: argparse.Namespace, argv: Sequence[str]) -> int | None:
+    """Treat an explicit managed lane as its family, as the `just` recipes do.
+
+    A busy `codex-rs/target/lanes/core-tests` then yields a sibling lane, within
+    the active-lane bound, instead of leaving validation pending on that one
+    directory. The reserved child inherits CODEX_CARGO_LANE_TARGET_DIR and runs
+    without `--target-dir`, so it never delegates again. Other targets keep
+    exact admission. Returns None when the invocation is not delegated.
+    """
+    if args.command not in {"run-target", "run-gate", "check-gates"}:
+        return None
+    if not args.target_dir:
+        return None
+    from scripts.build import rust_build_status as lanes
+
+    requested = Path(args.target_dir)
+    target = (requested if requested.is_absolute() else Path.cwd() / requested).resolve()
+    try:
+        managed = (
+            (target.parent / lanes.CARGO_LANES_ROOT_MARKER)
+            .read_text(encoding="utf-8")
+            .strip()
+            == lanes.CARGO_LANES_ROOT_MARKER_CONTENT
+        )
+    except (OSError, UnicodeError):
+        managed = False
+    inherited = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
+    if not managed or (inherited and Path(inherited).resolve() == target):
+        return None
+    child_argv = _without_target_dir(argv)
+    try:
+        if build_parser().parse_args(child_argv).target_dir is not None:
+            return None
+    except SystemExit:
+        return None
+    runner = str(Path(__file__).resolve())
+    try:
+        return lanes.run_in_cargo_lane(
+            repo_root=REPO_ROOT,
+            requested_lane=lanes.warm_lane_base(target.name),
+            command=[sys.executable, "-I", "-B", runner, *child_argv],
+            lane_root=target.parent,
+            warm_wait_seconds=args.admission_timeout_seconds,
+            allow_cold_overflow=True,
+            max_active_lanes=lanes.max_active_lanes_per_base(),
+            admission_invocation=[sys.executable, runner, *argv],
+        )
+    except lanes.RustAdmissionBusy:
+        # run_in_cargo_lane already published the pending admission record.
+        return lanes.RUST_ADMISSION_BUSY_EXIT_CODE
+    except (
+        lanes.CargoLanesRootValidationError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        print(f"rust_test_runner: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(actual_argv)
+    delegated = _run_in_lane_family(args, actual_argv)
+    if delegated is not None:
+        return delegated
     metrics = (
         ValidationMetrics(actual_argv)
         if args.command in {"run-target", "run-gate", "check-gates"}

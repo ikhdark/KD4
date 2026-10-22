@@ -657,7 +657,7 @@ impl ModelsManager for OpenAiModelsManager {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
-            self.model_catalog_activity.note_activity().await;
+            self.note_catalog_activity(refresh_strategy).await;
             self.refresh_available_models(refresh_strategy, &http_client_factory)
                 .await?;
             self.ensure_current_cache_identity().await;
@@ -679,7 +679,7 @@ impl ModelsManager for OpenAiModelsManager {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
         Box::pin(async move {
-            self.model_catalog_activity.note_activity().await;
+            self.note_catalog_activity(refresh_strategy).await;
             OpenAiModelsManager::raw_model_catalog(self, refresh_strategy, http_client_factory)
                 .await
         })
@@ -687,7 +687,7 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
-            self.model_catalog_activity.note_activity().await;
+            self.note_catalog_activity(RefreshStrategy::Offline).await;
             self.ensure_current_cache_identity().await;
             self.state.read().await.remote_models.clone()
         })
@@ -719,7 +719,7 @@ impl ModelsManager for OpenAiModelsManager {
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(
             async move {
-                self.model_catalog_activity.note_activity().await;
+                self.note_catalog_activity(RefreshStrategy::Offline).await;
                 self.ensure_current_cache_identity().await;
                 let state = self.state.read().await;
                 construct_model_info_with_rejections(
@@ -1022,6 +1022,19 @@ impl OpenAiModelsManager {
             && state
                 .fresh_until
                 .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    async fn note_catalog_activity(&self, strategy: RefreshStrategy) {
+        // A periodic refresh must not hold up a consumer that can already use
+        // an unexpired snapshot for the current account/provider. Identity
+        // changes reset freshness before this check; explicit online requests
+        // and cold/expired caches still join the first-refresh gate.
+        self.ensure_current_cache_identity().await;
+        if strategy != RefreshStrategy::Online && self.memory_is_fresh().await {
+            self.model_catalog_activity.note_activity_without_waiting();
+        } else {
+            self.model_catalog_activity.note_activity().await;
+        }
     }
 
     async fn mark_memory_fresh(&self, identity: &str, remaining: Duration) {

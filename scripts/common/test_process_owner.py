@@ -1,6 +1,7 @@
 """Process/output lifetime regressions using real child processes."""
 
 import contextlib
+import io
 import os
 import shutil
 import socket
@@ -344,27 +345,62 @@ class ProcessOwnerTest(unittest.TestCase):
             )
         )
 
-    def test_shared_cache_setup_is_opt_in_and_failure_does_not_launch_work(self):
+    def test_shared_cache_setup_is_opt_in_and_failure_runs_command_uncached(self):
         with mock.patch.object(rust_tool_env.subprocess, "run") as run:
             for env in ({}, {"RUSTC_WRAPPER": ""}, {"RUSTC_WRAPPER": "custom-wrapper"}):
                 rust_tool_env.prepare_shared_sccache(env=env)
             run.assert_not_called()
+        # Validation 1cf1b745: a cache startup failure aborted the lane before
+        # any work. Run this command once without the wrapper instead, so Cargo
+        # cannot auto-start a server inside the owned job, and leave the
+        # caller's environment and any shared server untouched.
+        caller = {"RUSTC_WRAPPER": "C:/tools/sccache.exe", "KEEP": "same"}
+        for env, failure in (
+            (caller, OSError("cache unavailable")),
+            (None, subprocess.TimeoutExpired(["sccache", "--start-server"], 10)),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.dict(os.environ, caller),
+                mock.patch.object(
+                    process_owner, "prepare_shared_sccache", side_effect=failure
+                ),
+                mock.patch.object(process_owner, "owned_process") as launch,
+                contextlib.redirect_stderr(io.StringIO()) as notice,
+            ):
+                child = launch.return_value.__enter__.return_value
+                child.communicate.return_value = (None, None)
+                child.returncode = 0
+                result = process_owner.run_owned(
+                    ["cargo", "build"], env=env, prepare_sccache=True
+                )
+                launched = launch.call_args.kwargs["env"]
+                self.assertEqual(os.environ["RUSTC_WRAPPER"], caller["RUSTC_WRAPPER"])
+            self.assertEqual(result.returncode, 0)
+            launch.assert_called_once()
+            self.assertEqual(launched["RUSTC_WRAPPER"], "")
+            self.assertEqual(launched["KEEP"], "same")
+            self.assertEqual(caller["RUSTC_WRAPPER"], "C:/tools/sccache.exe")
+            self.assertIn("without sccache", notice.getvalue())
+        # Cancellation is not a cache failure: nothing launches.
         with (
             mock.patch.object(
-                process_owner,
-                "prepare_shared_sccache",
-                side_effect=OSError("cache unavailable"),
+                process_owner, "prepare_shared_sccache", side_effect=KeyboardInterrupt
             ),
             mock.patch.object(process_owner, "owned_process") as launch,
-            self.assertRaisesRegex(OSError, "cache unavailable"),
+            self.assertRaises(KeyboardInterrupt),
         ):
-            process_owner.run_owned(["cargo", "build"], prepare_sccache=True)
+            process_owner.run_owned(["cargo", "build"], env=caller, prepare_sccache=True)
         launch.assert_not_called()
 
     def test_existing_shared_cache_is_not_restarted_and_other_errors_propagate(self):
         for code, error in ((2, "Address in use"), (2, "permission denied")):
             with (
                 self.subTest(error=error),
+                # The spawn path: keep a live local server out of this fixture.
+                mock.patch.object(
+                    rust_tool_env, "sccache_server_reachable", return_value=False
+                ) as probe,
                 mock.patch.object(
                     rust_tool_env.subprocess,
                     "run",
@@ -382,6 +418,10 @@ class ProcessOwnerTest(unittest.TestCase):
                         )
                 self.assertEqual(run.call_count, 1)
                 self.assertEqual(run.call_args.args[0][1:], ["--start-server"])
+                # A failed start checks once more for a concurrent winner.
+                self.assertEqual(
+                    probe.call_count, 1 if error == "Address in use" else 2
+                )
 
     @unittest.skipUnless(os.name == "nt", "Windows job lifetime")
     def test_shared_sccache_survives_owned_command_without_restart(self):

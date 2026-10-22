@@ -13,7 +13,8 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn::build_projected_prompt;
 use crate::session::turn::built_tools;
-use crate::session::turn::prepare_sampling_prompt_for_client;
+use crate::session::turn::prepare_sampling_prompt_with_workspace_identity;
+use crate::session::turn::with_sampling_workspace_identity;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -48,56 +49,95 @@ pub(super) async fn run_remote_compact_v2_attempt(
         Some(client_session) => client_session,
         None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
-    let mut prepared = prepare_sampling_prompt_for_client(
-        history.clone(),
-        turn_context,
-        sess.services.git_workspace.as_ref(),
-    )
-    .await;
-    let mut prompt = build_projected_prompt(
-        sess.as_ref(),
-        &prepared,
-        &tool_router,
-        step_context.as_ref(),
-        base_instructions.clone(),
-    );
-    prompt.output_schema = None;
-    prompt.output_schema_strict = true;
-    append_compaction_trigger(&mut prompt);
-    let measured_input = largest_compaction_request_input(&prompt);
-    let tool_tokens =
-        i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
-    let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window_for_prompt(
-            &mut history,
-            turn_context.as_ref(),
-            &base_instructions,
-            Some(&measured_input),
-            tool_tokens,
-        );
-    if rewritten_outputs > 0 {
-        info!(
-            turn_id = %turn_context.sub_id,
-            rewritten_outputs,
-            "rewrote history outputs before remote compaction v2"
-        );
-        prepared = prepare_sampling_prompt_for_client(
-            history.clone(),
-            turn_context,
-            sess.services.git_workspace.as_ref(),
-        )
-        .await;
-        prompt = build_projected_prompt(
+    let build_prompt = |prepared: &crate::context_manager::PreparedPromptInput| {
+        let mut prompt = build_projected_prompt(
             sess.as_ref(),
-            &prepared,
+            prepared,
             &tool_router,
             step_context.as_ref(),
-            base_instructions,
+            base_instructions.clone(),
         );
         prompt.output_schema = None;
         prompt.output_schema_strict = true;
         append_compaction_trigger(&mut prompt);
-    }
+        prompt
+    };
+    // Only tool-search schemas can be rewritten by this trimmer. Size those
+    // before observing the workspace: preliminary sizing does not authorize
+    // source-evidence reuse and must not freeze an early workspace identity.
+    let preliminary_deleted_tokens = if history
+        .raw_items()
+        .iter()
+        .any(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
+    {
+        let prepared = history
+            .clone()
+            .prepare_for_prompt(&turn_context.model_info.input_modalities);
+        let sizing_prompt = build_prompt(&prepared);
+        let measured_input = largest_compaction_request_input(&sizing_prompt);
+        let tool_tokens =
+            i64::try_from(sizing_prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
+        let (rewritten_outputs, deleted_tokens) =
+            trim_function_call_history_to_fit_context_window_for_prompt(
+                &mut history,
+                turn_context.as_ref(),
+                &base_instructions,
+                Some(&measured_input),
+                tool_tokens,
+            );
+        if rewritten_outputs > 0 {
+            info!(
+                turn_id = %turn_context.sub_id,
+                rewritten_outputs,
+                "rewrote history outputs while sizing remote compaction v2"
+            );
+        }
+        deleted_tokens
+    } else {
+        0
+    };
+    let (history, mut prompt, final_deleted_tokens) = with_sampling_workspace_identity(
+        history,
+        turn_context,
+        sess.services.git_workspace.as_ref(),
+        |mut history, workspace_identity| {
+            let project = |history| {
+                let prepared = prepare_sampling_prompt_with_workspace_identity(
+                    history,
+                    turn_context,
+                    workspace_identity,
+                    sess.services.git_workspace.as_ref(),
+                );
+                build_prompt(&prepared)
+            };
+            let mut prompt = project(history.clone());
+            let measured_input = largest_compaction_request_input(&prompt);
+            let tool_tokens =
+                i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
+            let (rewritten_outputs, estimated_deleted_tokens) =
+                trim_function_call_history_to_fit_context_window_for_prompt(
+                    &mut history,
+                    turn_context.as_ref(),
+                    &base_instructions,
+                    Some(&measured_input),
+                    tool_tokens,
+                );
+            if rewritten_outputs > 0 {
+                info!(
+                    turn_id = %turn_context.sub_id,
+                    rewritten_outputs,
+                    "rewrote history outputs before remote compaction v2"
+                );
+                // Freshness notices can make the authoritative request larger
+                // than the preliminary estimate. Recheck that exact projection;
+                // only tool-search schemas change, with no intervening await.
+                prompt = project(history.clone());
+            }
+            (history, prompt, estimated_deleted_tokens)
+        },
+    )
+    .await;
+    let estimated_deleted_tokens = preliminary_deleted_tokens.saturating_add(final_deleted_tokens);
     if estimated_deleted_tokens > 0 {
         let max_local_deleted_tokens = sess
             .estimated_tokens_after_last_model_generated_item()
@@ -238,6 +278,270 @@ fn append_compaction_trigger(prompt: &mut Prompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replace_source_preserving_metadata(
+        path: &std::path::Path,
+        text: &str,
+    ) -> std::io::Result<()> {
+        let before = std::fs::metadata(path)?;
+        assert_eq!(before.len(), text.len() as u64);
+        let modified = before.modified()?;
+        std::fs::write(path, text)?;
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        assert_eq!(std::fs::metadata(path)?.modified()?, modified);
+        Ok(())
+    }
+
+    #[test_case::test_case(false, false, false; "no evidence without trimming")]
+    #[test_case::test_case(false, true, false; "no evidence with trimming")]
+    #[test_case::test_case(true, false, false; "digest evidence without trimming")]
+    #[test_case::test_case(true, true, false; "digest evidence with trimming")]
+    #[test_case::test_case(true, true, true; "source edit after sizing")]
+    #[tokio::test]
+    async fn remote_compaction_captures_workspace_once_per_request(
+        evidence: bool,
+        trim: bool,
+        edit_after_sizing: bool,
+    ) -> anyhow::Result<()> {
+        use crate::session::turn::prepare_sampling_prompt_for_client;
+        use crate::test_harness::responses;
+        use crate::tool_history::WorkspaceEvidenceObservation;
+        use codex_analytics::CompactionImplementation;
+        use codex_analytics::CompactionPhase;
+        use codex_analytics::CompactionReason;
+        use codex_analytics::CompactionTrigger;
+        use codex_protocol::models::FunctionCallOutputPayload;
+
+        crate::test_harness::require_network!();
+        let server = responses::start_mock_server().await;
+        let home = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()?
+                .success()
+        );
+        let source = workspace.path().join("source.txt");
+        std::fs::write(&source, "original evidence")?;
+        let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())?;
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.cwd = cwd;
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                },
+            )
+            .await;
+        let turn_mut = Arc::get_mut(&mut turn).unwrap();
+        turn_mut.model_info.context_window = Some(32_000);
+        turn_mut.model_info.effective_context_window_percent = 100;
+        let mut items = Vec::new();
+        if evidence {
+            let output = ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "read-source".into(),
+                output: FunctionCallOutputPayload::from_text("original evidence".into()),
+                internal_chat_message_metadata_passthrough: None,
+            };
+            let revision = session
+                .services
+                .git_workspace
+                .workspace_evidence_for_turn(&turn, workspace.path())
+                .await
+                .identity;
+            assert!(
+                revision
+                    .as_ref()
+                    .is_some_and(|revision| !revision.unavailable)
+            );
+            let observation = WorkspaceEvidenceObservation::from_response_item(
+                revision,
+                &output,
+                Default::default(),
+            )
+            .unwrap();
+            session.register_workspace_evidence(observation, ()).await;
+            items.push(ResponseItem::FunctionCall {
+                id: None,
+                name: "read_file".into(),
+                namespace: None,
+                arguments: r#"{"path":"source.txt"}"#.into(),
+                call_id: "read-source".into(),
+                internal_chat_message_metadata_passthrough: None,
+            });
+            items.push(output);
+        }
+        items.extend([
+            ResponseItem::ToolSearchCall {
+                id: None,
+                call_id: Some("search".into()),
+                status: Some("completed".into()),
+                execution: "client".into(),
+                arguments: serde_json::json!({"query":"calendar", "namespace":"apps"}),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::ToolSearchOutput {
+                id: None,
+                call_id: Some("search".into()),
+                status: "completed".into(),
+                execution: "client".into(),
+                tools: vec![serde_json::json!({
+                    "namespace":"apps", "name":"calendar.search",
+                    "description": if trim { "schema detail ".repeat(30_000) } else { "small".into() },
+                })],
+                omitted_result_count: Some(0),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ]);
+        // Preserve the oversized input until the actual compaction owner trims it.
+        session.replace_history(items, None).await;
+        let original = session.clone_history().await;
+        assert_eq!(original.requires_workspace_evidence_validation(), evidence);
+        assert!(!original.can_use_root_only_workspace_identity());
+        let step = session.capture_step_context(Arc::clone(&turn)).await?;
+        let log = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                serde_json::json!({"type":"response.output_item.done",
+                    "item":{"type":"compaction","encrypted_content":"opaque"}}),
+                responses::ev_completed("compacted"),
+            ]),
+        )
+        .await;
+        let captures_before = session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count();
+        let source_edit = edit_after_sizing.then(|| {
+            let pause = session
+                .services
+                .git_workspace
+                .pause_next_workspace_evidence_capture();
+            let source = source.clone();
+            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    pause.wait_until_started(),
+                )
+                .await?;
+                let result = replace_source_preserving_metadata(&source, "modified evidence");
+                pause.release();
+                result.map_err(anyhow::Error::from)
+            }))
+        });
+        let result = run_remote_compact_v2_attempt(
+            &session,
+            &step,
+            None,
+            &CompactionTraceContext::disabled(),
+            CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2,
+                CompactionPhase::StandaloneTurn,
+            ),
+            &mut CompactionAnalyticsDetails::default(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        if let Some(source_edit) = source_edit {
+            source_edit.await??;
+        }
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_count()
+                - captures_before,
+            u64::from(evidence),
+            "sizing and trimming one request must share one observation"
+        );
+        let search = result
+            .retention_input
+            .iter()
+            .find_map(|item| match item {
+                ResponseItem::ToolSearchOutput { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .expect("retained search output");
+        assert_eq!(search[0].get("description").is_none(), trim);
+        let mut rewritten = original.clone();
+        rewritten.replace(result.retention_input.clone());
+        assert_eq!(rewritten.requires_workspace_evidence_validation(), evidence);
+        assert!(!rewritten.can_use_root_only_workspace_identity());
+        assert!(matches!(
+            result.compaction_output,
+            ResponseItem::Compaction { .. }
+        ));
+        assert!(
+            !log.single_request()
+                .body_json()
+                .to_string()
+                .contains("schema detail")
+        );
+        let request = log.single_request();
+        let notices = request
+            .input()
+            .iter()
+            .filter(|item| item["role"] == "developer")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter_map(|part| part["text"].as_str())
+            .filter(|text| text.starts_with("<workspace_evidence_invalidation>\n"))
+            .flat_map(str::lines)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .flat_map(crate::tool_history::expand_workspace_notices)
+            .filter(|notice| notice["call_id"] == "read-source")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), usize::from(evidence));
+        if evidence {
+            // Legacy digest-only provenance is unverified even without an edit.
+            // The final capture must distinguish that from an actual change
+            // made after sizing, without upgrading either to current proof.
+            assert_eq!(notices[0]["valid_for_current_workspace"], false);
+            assert_eq!(
+                notices[0]["reason_code"],
+                if edit_after_sizing {
+                    "workspace_identity_changed"
+                } else {
+                    "workspace_freshness_unverified"
+                }
+            );
+        }
+        session.flush_tool_history_persistence().await?;
+
+        if evidence {
+            // A later request must capture again, including equal-length edits.
+            replace_source_preserving_metadata(&source, "changed! evidence")?;
+            let next = prepare_sampling_prompt_for_client(
+                original,
+                &turn,
+                session.services.git_workspace.as_ref(),
+            )
+            .await;
+            assert_eq!(
+                session
+                    .services
+                    .git_workspace
+                    .workspace_evidence_capture_count()
+                    - captures_before,
+                2
+            );
+            assert!(next.items().iter().any(|item| matches!(item,
+                ResponseItem::Message { content, .. } if content.iter().any(|content| matches!(content,
+                    codex_protocol::models::ContentItem::InputText { text }
+                        if text.contains("<workspace_evidence_invalidation>"))))));
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn remote_compaction_sends_the_selected_turn_base() -> anyhow::Result<()> {

@@ -243,6 +243,65 @@ class WarmLaneReservationTest(unittest.TestCase):
         self.assertFalse((link.parent / ".lane-active.lock").exists())
         self.assertFalse((external / ".lane-active.lock").exists())
 
+    def test_cold_overflow_takes_siblings_up_to_the_active_lane_bound(self):
+        self.warm("core-tests")
+        with self.reserve() as (first, _):
+            self.assertEqual(first, "core-tests")
+            with self.reserve(allow_cold_overflow=True, max_active_lanes=2) as (
+                second,
+                _,
+            ):
+                self.assertEqual(second, "core-tests-2")
+                with self.assertRaisesRegex(
+                    rust_build_status.RustAdmissionBusy, "all 2 allowed Cargo lanes"
+                ):
+                    with self.reserve(allow_cold_overflow=True, max_active_lanes=2):
+                        self.fail("must not start a third lane")
+            # A finished overflow lane frees its slot for the next run.
+            with self.reserve(allow_cold_overflow=True, max_active_lanes=2) as (
+                again,
+                _,
+            ):
+                self.assertEqual(again, "core-tests-2")
+        self.assertFalse((self.root / "core-tests-3").exists())
+
+    def test_active_lane_bound_waits_for_a_released_lane_without_coordination(
+        self,
+    ):
+        base = self.warm("core-tests")
+        sibling = self.warm("core-tests-2")
+        owners = [
+            rust_build_status._try_acquire_binary_file_lock(lane / ".lane-active.lock")
+            for lane in (base, sibling)
+        ]
+        self.assertNotIn(None, owners)
+
+        def release_sibling(_delay):
+            # Fails if the waiter still holds the coordination lock while asleep.
+            with rust_build_status.cargo_lane_coordination_lock(
+                self.root, timeout_seconds=0.01
+            ):
+                rust_build_status._release_binary_file_lock(owners[1])
+                owners[1].close()
+
+        try:
+            with (
+                mock.patch.object(
+                    rust_build_status.time, "sleep", side_effect=release_sibling
+                ) as sleep,
+                self.reserve(
+                    warm_wait_seconds=1, allow_cold_overflow=True, max_active_lanes=2
+                ) as (name, target),
+            ):
+                self.assertEqual((name, target), ("core-tests-2", sibling))
+            self.assertEqual(sleep.call_count, 1)
+            self.assertFalse((self.root / "core-tests-3").exists())
+        finally:
+            for owner in owners:
+                if not owner.closed:
+                    rust_build_status._release_binary_file_lock(owner)
+                    owner.close()
+
     def test_wait_deadline_falls_back_to_cold_lane(self):
         self.warm("core-tests")
         now = [0.0]
@@ -509,6 +568,25 @@ class WarmLaneReservationTest(unittest.TestCase):
             [sys.executable, "-X", "utf8", runner[1], "--profile", "local"]
         )
         self.assertEqual(opaque["options"], ["--profile", "local"])
+
+        for interpreter_flags in (["-I", "-B"], ["-B", "-I"], ["-I"], ["-B"]):
+            flagged_runner = [runner[0], *interpreter_flags, runner[1]]
+            for policy in ("fast", "local"):
+                with self.subTest(interpreter_flags=interpreter_flags, policy=policy):
+                    self.assertEqual(
+                        plain,
+                        context([*flagged_runner, "run-target", "--profile", policy, "app_server_lib"]),
+                    )
+                    self.assertEqual(
+                        small,
+                        context([*flagged_runner, "--cargo-profile=dev-small", "run-target", "--profile=" + policy, "app_server_lib"]),
+                    )
+                    self.assertFalse(rust_build_status._is_named_runner_command(flagged_runner + ["run-target"]))
+        for prefix in (["-c", "pass"], ["-m", "module"], ["-I", "foreign.py"]):
+            self.assertEqual(
+                context([runner[0], *prefix, runner[1], "--profile", "local"])["options"],
+                ["--profile", "local"],
+            )
 
     def test_named_test_policy_change_uses_idle_compatible_lane(self):
         runner = [
@@ -914,6 +992,53 @@ class BuildToolingStorageTest(unittest.TestCase):
                     self.assertEqual(
                         run.call_args.kwargs["env"]["RUST_MIN_STACK"], expected
                     )
+
+    def test_lane_cache_start_failure_runs_uncached_and_keeps_recorded_settings(self):
+        # Validation 1cf1b745 aborted on `sccache --start-server` before any
+        # work. The lane runs its command once without the wrapper instead; a
+        # transient fallback is not a settings change for warm-lane ranking.
+        from scripts.common import process_owner
+
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            command = ["cargo", "check", "-p", "example"]
+            target = repo / "codex-rs" / "target" / "lanes" / "unit"
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    rust_build_status.shutil,
+                    "which",
+                    side_effect=lambda name, **_kwargs: f"/tools/{name}",
+                ),
+                mock.patch.object(rust_build_status, "request_cargo_lane_maintenance"),
+                mock.patch.object(
+                    process_owner,
+                    "prepare_shared_sccache",
+                    side_effect=subprocess.TimeoutExpired(
+                        ["sccache", "--start-server"], 10
+                    ),
+                ) as prepare,
+                mock.patch.object(process_owner, "owned_process") as launch,
+                contextlib.redirect_stderr(io.StringIO()) as notice,
+            ):
+                child = launch.return_value.__enter__.return_value
+                child.communicate.return_value = (None, None)
+                child.returncode = 0
+                self.assertEqual(
+                    rust_build_status.run_in_cargo_lane(
+                        repo_root=repo, requested_lane="unit", command=command
+                    ),
+                    0,
+                )
+            prepare.assert_called_once()
+            self.assertEqual(
+                prepare.call_args.kwargs["env"]["RUSTC_WRAPPER"], "/tools/sccache"
+            )
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.kwargs["env"]["RUSTC_WRAPPER"], "")
+            self.assertIn("without sccache", notice.getvalue())
+            recorded = json.loads((target / ".lane-build-context.json").read_text())
+            self.assertEqual(recorded["environment"]["RUSTC_WRAPPER"], "/tools/sccache")
 
     def test_lane_timing_cli_separates_phases_and_preserves_failed_child(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1347,6 +1472,24 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertTrue((lanes / ".gc-stamp").is_file())
             lane_sizes.assert_not_called()
             target_size.assert_not_called()
+
+    def test_maintenance_keeps_as_many_warm_lanes_as_may_build_at_once(self):
+        for env, expected in (
+            ({}, 2),
+            ({"CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE": "3"}, 3),
+            ({"CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE": "0"}, 1),
+            ({"CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE": "many"}, 2),
+        ):
+            with (
+                self.subTest(env=env),
+                tempfile.TemporaryDirectory() as temp,
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
+            ):
+                rust_build_status.maintain_cargo_lanes(Path(temp), Path(temp))
+                self.assertEqual(
+                    prune.call_args.kwargs["keep_warm_per_base"], expected
+                )
 
     def test_maintenance_honors_budgets_interval_and_failure(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3493,6 +3636,105 @@ function Get-CimInstance {
             )
 
         self.assertIn("active lanes: reserved", report)
+
+
+class LaneFamilyRunnerTest(unittest.TestCase):
+    """Direct runner calls naming a managed lane reserve through its family."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.root = self.repo / "codex-rs" / "target" / "lanes"
+        rust_build_status.initialize_cargo_lanes_root(self.repo, self.root)
+        self.lane = self.root / "core-tests"
+
+    def main(self, argv, *, inherited=None, run_result=0):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {"CODEX_CARGO_LANE_TARGET_DIR", "CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE"}
+        }
+        if inherited is not None:
+            env["CODEX_CARGO_LANE_TARGET_DIR"] = str(inherited)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                rust_build_status,
+                "run_in_cargo_lane",
+                **(
+                    {"side_effect": run_result}
+                    if isinstance(run_result, BaseException)
+                    else {"return_value": run_result}
+                ),
+            ) as run,
+            mock.patch.object(rust_test_runner, "_main", return_value=0) as direct,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            code = rust_test_runner.main(argv)
+        return code, run, direct
+
+    def test_explicit_lane_target_reserves_any_lane_of_its_family(self):
+        selection = ["run-target", "--profile", "fast", "core_lib", "-E", "test(x)"]
+        for target_args in (
+            ["--target-dir", str(self.lane)],
+            [f"--target-dir={self.root / 'core-tests-2'}"],
+        ):
+            with self.subTest(target_args=target_args):
+                code, run, direct = self.main(
+                    [*target_args, "--admission-timeout-seconds", "5", *selection],
+                    run_result=7,
+                )
+                self.assertEqual(code, 7)
+                direct.assert_not_called()
+                kwargs = run.call_args.kwargs
+                self.assertEqual(kwargs["requested_lane"], "core-tests")
+                self.assertEqual(kwargs["lane_root"], self.root.resolve())
+                self.assertTrue(kwargs["allow_cold_overflow"])
+                self.assertEqual(kwargs["max_active_lanes"], 2)
+                self.assertEqual(kwargs["warm_wait_seconds"], 5.0)
+                runner = str(Path(rust_test_runner.__file__).resolve())
+                self.assertEqual(
+                    kwargs["command"],
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        runner,
+                        "--admission-timeout-seconds",
+                        "5",
+                        *selection,
+                    ],
+                )
+
+    def test_busy_family_leaves_validation_pending(self):
+        busy = rust_build_status.RustAdmissionBusy(
+            "all 2 allowed Cargo lanes for 'core-tests' are busy",
+            resource=self.lane,
+            wait_option="--warm-wait-seconds",
+        )
+        code, run, direct = self.main(
+            ["--target-dir", str(self.lane), "run-gate", "demo"], run_result=busy
+        )
+        self.assertEqual(code, rust_build_status.RUST_ADMISSION_BUSY_EXIT_CODE)
+        run.assert_called_once()
+        direct.assert_not_called()
+
+    def test_inherited_unmanaged_and_untargeted_runs_keep_exact_admission(self):
+        unmanaged = self.repo / "plain-target"
+        unmanaged.mkdir()
+        for argv, inherited in (
+            (["--target-dir", str(self.lane), "run-gate", "demo"], self.lane),
+            (["--target-dir", str(unmanaged), "run-gate", "demo"], None),
+            (["--target-dir", str(self.lane), "plan", "core_lib"], None),
+            (["run-gate", "demo"], self.lane),
+        ):
+            with self.subTest(argv=argv, inherited=inherited):
+                code, run, direct = self.main(argv, inherited=inherited)
+                self.assertEqual(code, 0)
+                run.assert_not_called()
+                direct.assert_called_once()
 
 
 if __name__ == "__main__":

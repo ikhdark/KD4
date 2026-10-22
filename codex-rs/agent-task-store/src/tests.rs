@@ -463,6 +463,72 @@ async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_s
 }
 
 #[tokio::test]
+async fn legacy_single_writer_capsule_reconciles_without_changing_its_bytes() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("legacy-capsule", "src"))
+        .await
+        .unwrap();
+    assert_eq!(assignment.integration_plan, IntegrationPlan::SingleWriter);
+    let mut capsule = audit_capsule(&assignment, &attempt);
+    capsule.stop_condition.clear();
+    capsule.dependencies.clear();
+    capsule.risk_hints.clear();
+    capsule.contract_claims.clear();
+    capsule.workspace_strategy = None;
+    capsule.relation = None;
+    capsule.architecture_contract_ref = None;
+    let current = serde_json::to_string(&capsule).unwrap();
+    let legacy = current.replacen(",\"integration_plan\":\"single_writer\"", "", 1);
+    assert_ne!(legacy, current);
+    let path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules")
+        .join(format!("{}.json", assignment.assignment_id));
+    std::fs::write(&path, &legacy).unwrap();
+    fixture.store.close().await;
+
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("legacy capsule reconciles");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    assert_eq!(
+        restarted
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("legacy task loads")
+            .assignment
+            .task_capsule
+            .as_deref(),
+        Some(legacy.as_str())
+    );
+    restarted.close().await;
+
+    let again = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("backfilled legacy capsule reloads");
+    assert_eq!(
+        again
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("legacy task reloads")
+            .assignment
+            .task_capsule
+            .as_deref(),
+        Some(legacy.as_str())
+    );
+    again.close().await;
+
+    std::fs::write(&path, format!("{legacy}\n")).unwrap();
+    assert!(matches!(
+        LocalAgentTaskStore::initialize(&fixture.state).await,
+        Err(StoreError::CorruptData(_))
+    ));
+}
+
+#[tokio::test]
 async fn ma009_incomplete_stages_do_not_block_healthy_capsules_or_reattachment() {
     let fixture = Fixture::new().await;
     let (healthy, healthy_attempt) = fixture

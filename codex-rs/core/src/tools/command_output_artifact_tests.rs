@@ -4339,6 +4339,38 @@ fn artifact_file_sync_empty_and_single_file_stay_inline() {
     assert_eq!(error.to_string(), "single sync failed");
 }
 
+#[test]
+fn empty_artifact_barrier_does_not_wait_for_blocking_pool_capacity() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held = runtime.spawn_blocking(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let result = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sync_tool_output_artifacts(home.path(), "empty-barrier"),
+        )
+        .await
+    });
+    // Always release the worker, including when the regression fails.
+    release_tx.send(()).unwrap();
+    runtime.block_on(held).unwrap();
+    result
+        .expect("an empty durability barrier must not queue blocking work")
+        .unwrap();
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn artifact_durability_parallel_failure_retains_batch_for_retry() {

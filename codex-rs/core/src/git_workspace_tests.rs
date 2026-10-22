@@ -2912,9 +2912,13 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
     let address = listener.local_addr().unwrap();
     let stage = Arc::new(AtomicUsize::new(0));
     let server_stage = Arc::clone(&stage);
+    let overlapped_reads = Arc::new(AtomicBool::new(false));
+    let server_overlapped_reads = Arc::clone(&overlapped_reads);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut pending_read = None;
+        let mut released_reads = false;
         while let Some(frame) = socket.next().await {
             let frame = frame.unwrap();
             if frame.is_close() {
@@ -2939,7 +2943,29 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                         socket.send(Message::Text(json!({"id": request["id"], "error": {"code": if current == 3 { -32000 } else { -32004 }, "message": "fixture metadata failure"}}).to_string().into())).await.unwrap();
                         continue;
                     }
-                    let file = path.ends_with("/tracked.txt");
+                    let file = path.ends_with("/tracked.txt") || path.ends_with("/extra.txt");
+                    // Gate only the first per-file metadata request. Another
+                    // file chain must be able to start before it is released.
+                    if current == 0 && file && !released_reads {
+                        if let Some(id) = pending_read.take() {
+                            server_overlapped_reads.store(true, Ordering::SeqCst);
+                            socket
+                                .send(Message::Text(
+                                    json!({"id": id, "result": {
+                                        "isDirectory": false, "isFile": true, "isSymlink": false,
+                                        "size": 3, "createdAtMs": 0, "modifiedAtMs": 0
+                                    }})
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            released_reads = true;
+                        } else {
+                            pending_read = Some(request["id"].clone());
+                            continue;
+                        }
+                    }
                     json!({"isDirectory": !file, "isFile": file, "isSymlink": false, "size": if file { 3 } else { 0 }, "createdAtMs": 0, "modifiedAtMs": 0})
                 }
                 // Session process handles start with the incarnation-bound
@@ -2955,8 +2981,9 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                     } else {
                         "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
                     };
+                    let status = format!("{status}? extra.txt\0");
                     let chunks = if request["params"]["afterSeq"].is_null() {
-                        json!([{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}])
+                        json!([{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(&status)}])
                     } else {
                         json!([])
                     };
@@ -3005,6 +3032,10 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
         .identity
         .unwrap();
     assert!(!first.unavailable);
+    assert!(
+        overlapped_reads.load(Ordering::SeqCst),
+        "independent remote read chains must overlap"
+    );
     assert!(
         first
             .repository_root

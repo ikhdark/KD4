@@ -1,12 +1,54 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+#[cfg(windows)]
 use std::ffi::OsString;
 
+#[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
+#[cfg(unix)]
 #[test]
+fn posix_native_paths_round_trip_without_reinterpreting_bytes_or_drive_shapes() {
+    use std::os::unix::ffi::OsStringExt;
+    for bytes in [
+        b"/tmp/non-utf8-\xff".as_slice(),
+        b"/C:/drive-shaped",
+        b"/tmp/with\0null",
+    ] {
+        let native = AbsolutePathBuf::from_absolute_path_checked(std::ffi::OsString::from_vec(
+            bytes.to_vec(),
+        ))
+        .unwrap();
+        let uri = PathUri::from_abs_path(&native);
+        assert_eq!(uri.infer_path_convention(), Some(PathConvention::Posix));
+        assert_eq!(uri.to_abs_path().unwrap(), native);
+    }
+    assert_eq!(PathConvention::native(), PathConvention::Posix);
+}
+
+#[test]
+fn foreign_opaque_unc_parent_retains_lexical_hierarchy_on_every_host() {
+    let mut wide = r"\\server\share\".encode_utf16().collect::<Vec<_>>();
+    wide.push(0xd800);
+    let child = PathUri::from_windows_opaque_path_bytes(
+        &wide
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let parent = child.parent().unwrap();
+    assert_eq!(parent.to_url().host_str(), Some("server"));
+    assert!(!parent.as_str().starts_with(BAD_PATH_URI_PREFIX));
+    assert_eq!(parent.parent(), None);
+    if !cfg!(windows) {
+        assert!(parent.to_abs_path().is_err());
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn windows_namespace_constructors_agree_without_erasing_unsafe_prefixes() {
     let cwd = PathUri::parse("file:///C:/audit").unwrap();
     for (extended, ordinary) in [
@@ -63,7 +105,11 @@ fn file_uri_round_trips_an_absolute_path() {
 
 #[test]
 fn non_native_uri_io_conversion_is_invalid_input() {
-    let uris = ["file:///usr/local/file.txt"];
+    let uris = [if cfg!(windows) {
+        "file:///usr/local/file.txt"
+    } else {
+        "file:///C:/file.txt"
+    }];
 
     for uri in uris {
         let uri = PathUri::parse(uri).expect("valid file URI");
@@ -182,7 +228,10 @@ fn escaped_windows_drives_keep_windows_lexical_semantics() {
         );
         let root = uri.parent().unwrap();
         assert_eq!(root.parent(), None);
+        #[cfg(windows)]
         assert_eq!(root.to_abs_path().unwrap().as_path(), Path::new(r"C:\"));
+        #[cfg(not(windows))]
+        assert!(root.to_abs_path().is_err());
         assert!(uri.starts_with(&PathUri::parse("file:///C:/workspace").unwrap()));
         let escaped_separator = PathUri::parse(&format!("{spelling}/%5C..%5Coutside")).unwrap();
         assert!(!escaped_separator.starts_with(&uri));
@@ -198,6 +247,7 @@ fn escaped_windows_drives_keep_windows_lexical_semantics() {
 }
 
 #[test]
+#[cfg(windows)]
 fn escaped_windows_drive_opens_the_same_native_file() {
     let path = AbsolutePathBuf::from_absolute_path_checked(env!("CARGO_MANIFEST_DIR"))
         .unwrap()
@@ -250,6 +300,7 @@ fn inferred_native_path_string_uses_the_inferred_convention() {
 }
 
 #[test]
+#[cfg(windows)]
 fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation() {
     for (native_path, expected_uri) in [
         (r"\\.\COM1", "file:///%00/bad/path/XABcAC4AXABDAE8ATQAxAFwA"),
@@ -276,6 +327,7 @@ fn file_uri_falls_back_for_windows_prefixes_without_a_uri_representation() {
 }
 
 #[test]
+#[cfg(windows)]
 fn file_uri_fallback_round_trips_non_unicode_windows_paths() {
     let path_wide = r"C:\bad\"
         .encode_utf16()
@@ -370,7 +422,7 @@ fn file_uri_preserves_paths_that_resemble_windows_paths() {
 }
 
 #[test]
-
+#[cfg(windows)]
 fn file_uri_round_trips_windows_unc_paths() {
     let path = AbsolutePathBuf::from_absolute_path_checked(r"\\server\share\src\main.rs")
         .expect("absolute UNC path");
@@ -586,6 +638,7 @@ fn ancestors_include_self_and_stop_at_native_path_roots() {
 }
 
 #[test]
+#[cfg(windows)]
 fn lexical_drive_roots_convert_to_the_native_drive_root() {
     let child = PathUri::parse("file:///C:/Users").expect("valid drive URI");
     let root = AbsolutePathBuf::from_absolute_path_checked(r"C:\").expect("absolute drive root");
@@ -946,6 +999,7 @@ fn relative_windows_null_paths_remain_relative() {
 }
 
 #[test]
+#[cfg(windows)]
 fn native_localhost_unc_keeps_its_share_and_convention() {
     for raw in [r"\\localhost\share\file.rs", r"\\LOCALHOST\share\file.rs"] {
         let legacy = LegacyAppPathString::from_path(Path::new(raw));
@@ -971,7 +1025,7 @@ fn legacy_posix_drive_shaped_paths_keep_posix_display() {
         "file:///C:/workspace/file.rs"
     );
     assert_eq!(legacy.render_for_ui(), "/C:/workspace/file.rs");
-    assert!(legacy.to_inferred_abs_path().is_none());
+    assert_eq!(legacy.to_inferred_abs_path().is_some(), cfg!(unix));
 }
 
 #[test]
@@ -987,6 +1041,7 @@ fn absolute_join_can_replace_an_opaque_windows_base() {
 }
 
 #[test]
+#[cfg(windows)]
 fn safe_extended_aliases_share_native_constructor_identity() {
     for raw in [r"\\?\C:\repo\file.rs", r"\\?\UNC\server\share\file.rs"] {
         let native = AbsolutePathBuf::from_absolute_path_checked(raw).unwrap();
@@ -1008,6 +1063,7 @@ fn safe_extended_aliases_share_native_constructor_identity() {
 }
 
 #[test]
+#[cfg(windows)]
 fn localhost_unc_hierarchy_preserves_share_and_exact_components() {
     for raw in [
         r"\\localhost\share\repo",
@@ -1063,7 +1119,7 @@ fn tagged_windows_fallback_does_not_reinterpret_legacy_posix_bytes() {
     let posix =
         PathUri::from_opaque_path_bytes(b"/\0/\0l\0o\0c\0a\0l\0h\0o\0s\0t\0/\0s\0h\0a\0r\0e\0");
     assert_eq!(posix.infer_path_convention(), Some(PathConvention::Posix));
-    assert!(posix.to_abs_path().is_err());
+    assert_eq!(posix.to_abs_path().is_ok(), cfg!(unix));
     for bytes in [
         vec![47, 0, 47],
         vec![47, 0, 47, 0, 0, 0],
@@ -1078,6 +1134,7 @@ fn tagged_windows_fallback_does_not_reinterpret_legacy_posix_bytes() {
 }
 
 #[test]
+#[cfg(windows)]
 fn opaque_unc_parent_becomes_an_addressable_ordinary_uri_when_representable() {
     use std::os::windows::ffi::OsStringExt;
     let mut wide = r"\\server\share\".encode_utf16().collect::<Vec<_>>();
@@ -1094,6 +1151,7 @@ fn opaque_unc_parent_becomes_an_addressable_ordinary_uri_when_representable() {
 }
 
 #[test]
+#[cfg(windows)]
 fn namespace_sensitive_native_roundtrip_keeps_distinct_io_targets() {
     let temp = tempfile::tempdir().unwrap();
     let ordinary = temp.path().join("name");

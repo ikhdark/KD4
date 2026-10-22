@@ -55,15 +55,16 @@ impl JsonDepth {
     }
 }
 
-struct LimitedPayload {
+struct LimitedPayload<F> {
     bytes: Vec<u8>,
     /// Leading bytes, such as the length prefix, outside the payload limit.
     reserved: usize,
     limit: usize,
     depth: JsonDepth,
+    admit_capacity: F,
 }
 
-impl io::Write for LimitedPayload {
+impl<F: FnMut(usize) -> io::Result<()>> io::Write for LimitedPayload<F> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.limit - (self.bytes.len() - self.reserved) {
             return Err(io::Error::new(
@@ -72,6 +73,17 @@ impl io::Write for LimitedPayload {
             ));
         }
         self.depth.admit(bytes)?;
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let capacity = needed
+                .next_power_of_two()
+                .max(128)
+                .min(MAX_FRAME_BYTES + LENGTH_PREFIX_BYTES);
+            // Obtain capacity before allocating, including on the first write.
+            // Exact reservation avoids Vec's implicit growth escaping admission.
+            (self.admit_capacity)(capacity)?;
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -118,14 +130,25 @@ impl EncodedFrame {
     where
         T: Serialize,
     {
-        // Preserve serde_json::to_vec's small-message allocation behavior.
-        let mut bytes = Vec::with_capacity(LENGTH_PREFIX_BYTES + 128);
+        Self::encode_with_admission(message, |_| Ok(()))
+    }
+
+    /// Encode once, admitting each increase in total buffer capacity before
+    /// allocation. Admission is cumulative and includes the length prefix.
+    /// Callers retain their reservation until delivery or discard of the frame.
+    pub fn encode_with_admission<T: Serialize>(
+        message: &T,
+        mut admit_capacity: impl FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        admit_capacity(128)?;
+        let mut bytes = Vec::with_capacity(128);
         bytes.extend_from_slice(&[0; LENGTH_PREFIX_BYTES]);
         let mut frame = LimitedPayload {
             bytes,
             reserved: LENGTH_PREFIX_BYTES,
             limit: MAX_FRAME_BYTES,
             depth: JsonDepth::default(),
+            admit_capacity,
         };
         serde_json::to_writer(&mut frame, message).map_err(|err| {
             io::Error::new(
@@ -320,6 +343,7 @@ mod tests {
             reserved: 0,
             limit: 4,
             depth: super::JsonDepth::default(),
+            admit_capacity: |_| Ok(()),
         };
         payload.write_all(b"ab").expect("first chunk");
         let err = payload.write_all(b"cde").expect_err("oversized chunk");
@@ -343,6 +367,7 @@ mod tests {
             reserved: 0,
             limit: 4,
             depth: super::JsonDepth::default(),
+            admit_capacity: |_| Ok(()),
         };
         serde_json::to_writer(&mut exact, "\n").expect("exact serialized limit");
         assert_eq!(exact.bytes, br#""\n""#);
@@ -352,8 +377,46 @@ mod tests {
             reserved: 0,
             limit: 3,
             depth: super::JsonDepth::default(),
+            admit_capacity: |_| Ok(()),
         };
         assert!(serde_json::to_writer(&mut short, "\n").is_err());
         assert_eq!(short.bytes, b"\"\\n");
+    }
+
+    #[test]
+    fn single_pass_encoding_admits_capacity_and_rejects_growth_before_appending() {
+        use std::cell::Cell;
+        struct Once<'a>(&'a Cell<usize>);
+        impl serde::Serialize for Once<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.set(self.0.get() + 1);
+                serializer.serialize_str(&"x".repeat(4096))
+            }
+        }
+        let calls = Cell::new(0);
+        let mut capacities = Vec::new();
+        let frame = EncodedFrame::encode_with_admission(&Once(&calls), |capacity| {
+            capacities.push(capacity);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(capacities.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(frame.bytes.capacity() <= *capacities.last().unwrap());
+        assert_eq!(
+            serde_json::from_slice::<String>(frame.payload()).unwrap(),
+            "x".repeat(4096)
+        );
+
+        let mut payload = LimitedPayload {
+            bytes: Vec::new(),
+            reserved: 0,
+            limit: MAX_FRAME_BYTES,
+            depth: super::JsonDepth::default(),
+            admit_capacity: |_| Err(std::io::Error::other("budget exhausted")),
+        };
+        assert!(payload.write_all(b"\"undelivered\"").is_err());
+        assert_eq!(payload.bytes.len(), 0);
+        assert_eq!(payload.bytes.capacity(), 0);
     }
 }

@@ -782,7 +782,6 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
                 size: contents.len() as u64,
             }],
             limit,
-            /*prefetch_utf8_boundary_slack*/ false,
             None,
         )
         .await;
@@ -825,7 +824,6 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
             size: CONTENTS.len() as u64,
         }],
         LIMIT,
-        /*prefetch_utf8_boundary_slack*/ false,
         None,
     )
     .await;
@@ -1316,8 +1314,10 @@ async fn exhausted_source_budget_reports_a_broader_doc_within_rendered_bound() {
         )
     );
     assert!(loaded.text().len() <= project_doc_rendered_max_bytes(3));
-    assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 1);
-    assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 1);
+    // Concurrent reads each prefetch at most the source budget; admission still
+    // gives the nearest document all three bytes and only a notice to its parent.
+    assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
+    assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -1617,7 +1617,7 @@ async fn multiple_environment_docs_use_labeled_layout_and_preserve_source_order(
 }
 
 #[tokio::test]
-async fn independent_environment_reads_are_budgeted_sequentially_and_preserve_selection_order() {
+async fn independent_environment_reads_overlap_and_preserve_budget_and_selection_order() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     let primary_doc = primary.path().join("AGENTS.md");
@@ -1670,22 +1670,17 @@ async fn independent_environment_reads_are_budgeted_sequentially_and_preserve_se
     )
     .await
     .expect("primary read should start");
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            secondary_control.stream_started.notified(),
-        )
-        .await
-        .is_err(),
-        "secondary read must wait for the primary read to consume its budget"
-    );
-    primary_control.stream_release.notify_one();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         secondary_control.stream_started.notified(),
     )
     .await
-    .expect("secondary read should start after the primary read completes");
+    .expect("secondary acquisition must overlap the blocked primary read");
+    assert!(
+        !load.is_finished(),
+        "ordered admission still waits for the primary"
+    );
+    primary_control.stream_release.notify_one();
 
     let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load)
         .await

@@ -1669,19 +1669,36 @@ impl AgentControl {
             parent_thread.flush_rollout().await?;
         }
 
-        let parent_history = state
-            .read_stored_thread(ReadThreadParams {
-                thread_id: parent_thread_id,
-                include_archived: true,
-                include_history: true,
-            })
-            .await?
-            .history
-            .ok_or_else(|| {
-                CodexErr::Fatal(format!(
-                    "parent thread history unavailable for fork: {parent_thread_id}"
-                ))
-            })?;
+        let shared_history = match parent_thread.as_ref() {
+            Some(parent_thread) => {
+                parent_thread
+                    .fork_history_snapshot()
+                    .await
+                    .map_err(|error| {
+                        CodexErr::Fatal(format!("failed to snapshot parent history: {error}"))
+                    })?
+            }
+            None => None,
+        };
+        let parent_history = if let Some(history) = shared_history {
+            history
+        } else {
+            Arc::new(
+                state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id: parent_thread_id,
+                        include_archived: true,
+                        include_history: true,
+                    })
+                    .await?
+                    .history
+                    .ok_or_else(|| {
+                        CodexErr::Fatal(format!(
+                            "parent thread history unavailable for fork: {parent_thread_id}"
+                        ))
+                    })?,
+            )
+        };
 
         let selected_capability_roots = parent_history
             .items
@@ -1693,11 +1710,12 @@ impl AgentControl {
                 Some(meta_line.meta.selected_capability_roots.clone())
             })
             .unwrap_or_default();
-        let mut forked_rollout_items = parent_history.items;
-        if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
-            forked_rollout_items =
-                truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns)?;
-        }
+        let mut forked_rollout_items = match fork_mode {
+            SpawnAgentForkMode::LastNTurns(last_n_turns) => {
+                truncate_rollout_to_last_n_fork_turns(&parent_history.items, *last_n_turns)?
+            }
+            _ => parent_history.items.clone(),
+        };
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if let Some(parent_thread) = parent_thread.as_ref() {
                 if multi_agent_version == MultiAgentVersion::V2 {

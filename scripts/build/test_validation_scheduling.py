@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import io
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from unittest import mock
 
 from scripts.build import rust_build_status
 from scripts.build import rust_test_runner as runner_module
+from scripts.build import rust_tool_env
 from scripts.build.test_rust_test_runner import (
     FakeExecutor,
     MANIFEST_DATA,
@@ -244,6 +246,80 @@ class ValidationSchedulingTest(RunnerTestCase):
                     capture=runner_module.CAPTURE_BOTH,
                 )
         owner.assert_not_called()
+
+    def test_reachable_shared_cache_compiles_without_start_server_spawn(self):
+        # Validation f6ed4cdc: the lane had started the shared server, but the
+        # runner's below-normal `--start-server` spawn timed out (15 s helper
+        # phase) and aborted before Cargo. A listening server needs no spawn.
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            env = {
+                "RUSTC_WRAPPER": "sccache",
+                "SCCACHE_SERVER_PORT": str(server.getsockname()[1]),
+                "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+            }
+            with (
+                mock.patch.object(rust_tool_env.subprocess, "run") as start,
+                mock.patch.object(runner_module, "owned_process") as owner,
+            ):
+                owner.return_value.__enter__.return_value.wait.return_value = 0
+                for args in (["cargo", "build"], ["cargo", "nextest", "run"]):
+                    timings = {}
+                    result = runner_module._default_executor(
+                        args,
+                        cwd=self.temp_dir,
+                        env=env,
+                        capture=runner_module.CAPTURE_BOTH,
+                        timings=timings,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    # The ledger separates cache preparation from Cargo's wait.
+                    self.assertGreaterEqual(timings["cache_preparation_seconds"], 0)
+                timings = {}
+                runner_module._default_executor(
+                    ["cargo", "metadata"],
+                    cwd=self.temp_dir,
+                    env=env,
+                    capture=runner_module.CAPTURE_BOTH,
+                    timings=timings,
+                )
+                self.assertNotIn("cache_preparation_seconds", timings)
+        start.assert_not_called()
+        self.assertEqual(owner.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs["env"]["RUSTC_WRAPPER"] == "sccache"
+                for call in owner.call_args_list
+            )
+        )
+
+    def test_failed_cache_start_still_falls_back_once_through_real_preparation(self):
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+        runner, _ = self.pure_runner()
+        runner.executor = runner_module._default_executor
+        env = {
+            "RUSTC_WRAPPER": "sccache",
+            "SCCACHE_SERVER_PORT": str(port),
+            "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+        }
+        with (
+            mock.patch.object(
+                rust_tool_env.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["sccache", "--start-server"], 10),
+            ) as start,
+            mock.patch.object(runner_module, "owned_process") as owner,
+        ):
+            owner.return_value.__enter__.return_value.wait.return_value = 0
+            runner._checked(
+                ["cargo", "build"], env=env, capture=runner_module.CAPTURE_BOTH
+            )
+        self.assertEqual(start.call_count, 1, "a failed start is never retried")
+        owner.assert_called_once()
+        self.assertEqual(owner.call_args.kwargs["env"]["RUSTC_WRAPPER"], "")
 
     def test_staging_failure_preserves_proof_and_only_blocks_dependent_batch(self):
         data = copy.deepcopy(MANIFEST_DATA)

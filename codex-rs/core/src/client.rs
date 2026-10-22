@@ -2485,7 +2485,7 @@ pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
     websocket_cache_publication: Option<WebsocketCachePublicationPermit>,
-    pending_websocket_preconnect: Option<AbortOnDropHandle<Option<WebsocketSession>>>,
+    pending_websocket_preconnect: Option<AbortOnDropHandle<Result<Option<WebsocketSession>>>>,
     prepared_startup_websocket_attempt: Option<PreparedStartupWebsocketAttempt>,
     /// A receipt-bearing request invalidated provider inheritance. Subsequent
     /// requests must keep using the unreplaced logical history while those
@@ -4452,40 +4452,46 @@ impl ModelClientSession {
                     .await
                     .is_err()
                 {
-                    return None;
+                    return Ok(None);
                 }
-                if let Err(err) = session
+                session
                     .preconnect_websocket(
                         &model_info,
                         service_tier,
                         &session_telemetry,
                         &responses_metadata,
                     )
-                    .await
-                {
-                    warn!("turn websocket preconnect failed; retrying at dispatch: {err:#}");
-                    return None;
-                }
-                Some(std::mem::take(&mut session.websocket_session).into_transport_only())
+                    .await?;
+                Ok(Some(
+                    std::mem::take(&mut session.websocket_session).into_transport_only(),
+                ))
             }
             .in_current_span(),
         )));
     }
 
-    async fn finish_websocket_preconnect(&mut self) {
+    async fn finish_websocket_preconnect(&mut self) -> Result<()> {
         let Some(task) = self.pending_websocket_preconnect.take() else {
-            return;
+            return Ok(());
         };
         match task.await {
-            Ok(Some(transport)) if self.client.responses_websocket_enabled() => {
+            Ok(Ok(Some(transport))) if self.client.responses_websocket_enabled() => {
                 // A startup-prewarm claim may have won while preparation was running.
                 if self.websocket_session.connection.is_none() {
                     self.websocket_session = transport;
                 }
             }
+            Ok(Err(error)) if self.client.responses_websocket_enabled() => {
+                // Count this connection attempt under the ordinary retry owner.
+                // Discarding it would start another unaccounted connection wait
+                // before that owner sees any failure. No prompt was dispatched.
+                self.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+                return Err(error);
+            }
             Ok(_) => {}
             Err(err) => warn!("turn websocket preconnect join failed: {err}"),
         }
+        Ok(())
     }
 
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
@@ -4498,7 +4504,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        self.finish_websocket_preconnect().await;
+        self.finish_websocket_preconnect().await?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -4544,8 +4550,10 @@ impl ModelClientSession {
             {
                 Ok(_) => return Ok(()),
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if status == StatusCode::UPGRADE_REQUIRED =>
+                    if matches!(status, StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED) =>
                 {
+                    // An upgrade can be blocked even when ordinary HTTPS works. No prompt
+                    // was sent; let HTTP report any actual authorization failure.
                     self.client.force_http_fallback(session_telemetry);
                     return Ok(());
                 }
@@ -5233,8 +5241,10 @@ impl ModelClientSession {
             match connection_result {
                 Ok(_) => {}
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if status == StatusCode::UPGRADE_REQUIRED =>
+                    if matches!(status, StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED) =>
                 {
+                    // Only a rejected handshake is replayable here, never a 403 from an
+                    // established response stream or the subsequent HTTP request.
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
                 Err(ApiError::Transport(unauthorized_transport))
@@ -5828,7 +5838,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        self.finish_websocket_preconnect().await;
+        self.finish_websocket_preconnect().await?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -5898,6 +5908,13 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        // Standalone callers have no turn retry owner. Preserve their ordinary
+        // connection attempt after transport-only speculation, including when
+        // stream retries are disabled. Turn dispatch calls the prepared path
+        // directly and accounts for the speculative failure in its retry budget.
+        if let Err(error) = self.finish_websocket_preconnect().await {
+            warn!("standalone websocket preconnect failed; connecting at dispatch: {error:#}");
+        }
         self.stream_with_attempt_prepared(
             prompt,
             model_info,
@@ -5931,7 +5948,12 @@ impl ModelClientSession {
             // Resolve before auth setup and transport selection: preconnect can refresh auth or
             // discover that the endpoint requires HTTP. The normal connection path still checks
             // provider/auth compatibility, expiry, and closure before reusing the socket.
-            self.finish_websocket_preconnect().await;
+            if let Err(error) = self.finish_websocket_preconnect().await {
+                // A speculative handshake has not dispatched a model request.
+                // Preserve the ordinary connection attempt, including callers
+                // with no stream retries and refreshed authentication/setup.
+                warn!("turn websocket preconnect failed; retrying at dispatch: {error:#}");
+            }
             let sampling_request_id = new_sampling_request_id();
             let request_kind = if self.logical_sampling_request_count == 0 {
                 ModelAttemptRequestKind::Initial
@@ -6021,6 +6043,9 @@ impl ModelClientSession {
         let recoverable = match err {
             CodexErr::ResponseStreamFailed(error) => error.status.is_none(),
             CodexErr::ConnectionFailed(error) => error.status.is_none(),
+            // An exhausted retryable upgrade failure can recover on a later
+            // turn. The shared cooldown still makes a second failure permanent.
+            CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
             _ => false,
         };
         self.switch_fallback_transport(session_telemetry, recoverable)

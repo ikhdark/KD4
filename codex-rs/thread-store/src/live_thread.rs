@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
@@ -40,6 +41,7 @@ pub struct LiveThread {
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     terminal_events: Arc<StdMutex<TerminalEventIndex>>,
+    fork_history: Arc<StdMutex<Weak<StoredThreadHistory>>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
@@ -211,6 +213,7 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::trusted_empty())),
+            fork_history: Arc::default(),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -237,6 +240,7 @@ impl LiveThread {
             terminal_events: Arc::new(StdMutex::new(
                 terminal_events.unwrap_or_else(TerminalEventIndex::trusted_empty),
             )),
+            fork_history: Arc::default(),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         };
         let mut init_guard = LiveThreadInitGuard::new(Some(live_thread.clone()));
@@ -342,6 +346,12 @@ impl LiveThread {
         // per-thread critical section, shared with explicit updates and barriers.
         let mut metadata_sync = self.metadata_sync.lock().await;
         let observation_was_uncertain = metadata_sync.history_observation_uncertain;
+        // Invalidate before submitting: cancellation or an uncertain append
+        // must never leave a reusable snapshot of an older accepted prefix.
+        *self
+            .fork_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
         if observation_was_uncertain {
             // Settle any previously admitted write before submitting a successor,
             // even when rebuilding its metadata projection is unavailable.
@@ -542,6 +552,42 @@ impl LiveThread {
             .await
     }
 
+    /// Share one flushed immutable history among overlapping sibling forks.
+    /// The weak entry retains no history once consumers retire. The canonical
+    /// append lock binds reuse to the accepted prefix, including failed or
+    /// cancelled append attempts; filesystem timestamps are not involved.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Binds a fork snapshot to the canonical accepted history prefix"
+    )]
+    pub async fn fork_history_snapshot(&self) -> ThreadStoreResult<Arc<StoredThreadHistory>> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
+        self.thread_store.flush_thread(self.thread_id).await?;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
+            .await?;
+        if let Some(history) = self
+            .fork_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+        {
+            return Ok(history);
+        }
+        let history = self.read_thread(true, true).await?.history.ok_or_else(|| {
+            crate::ThreadStoreError::Internal {
+                message: format!("thread history unavailable for fork: {}", self.thread_id),
+            }
+        })?;
+        let history = Arc::new(history);
+        *self
+            .fork_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&history);
+        Ok(history)
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
@@ -557,6 +603,10 @@ impl LiveThread {
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await?;
         let explicit_patch = patch.clone();
+        *self
+            .fork_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
         let thread = self
             .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {

@@ -1786,6 +1786,22 @@ impl ThreadManagerState {
         self.agent_subtree(root, extra_edges, false).await
     }
 
+    /// Retain loaded usage owners before publishing a completion that can
+    /// trigger subtree teardown. This uses local membership only; durable graph
+    /// reconciliation remains in the accounting branch.
+    pub(crate) async fn loaded_agent_subtree_snapshot(
+        &self,
+        root: ThreadId,
+        extra_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> CodexResult<HashMap<ThreadId, Arc<CodexThread>>> {
+        let ids = self.retained_agent_subtree(root, extra_edges).await?;
+        let threads = self.threads.read().await;
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| threads.get(&id).map(|thread| (id, Arc::clone(thread))))
+            .collect())
+    }
+
     async fn agent_subtree(
         &self,
         root: ThreadId,

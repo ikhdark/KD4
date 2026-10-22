@@ -1478,6 +1478,16 @@ pub(crate) async fn sync_tool_output_artifacts(
     thread_id: &str,
 ) -> std::io::Result<()> {
     let directory = codex_home.join("tool-output").join(thread_id);
+    // Preserve the full dirty-snapshot durability contract. The common empty
+    // barrier needs no blocking worker; writes arriving after this observation
+    // remain pending for the next barrier, just as with the worker snapshot.
+    if !lock_retention_registry()
+        .pending_sync
+        .keys()
+        .any(|path| path.starts_with(&directory))
+    {
+        return Ok(());
+    }
     run_blocking_artifact_io(move || {
         let pending = lock_retention_registry()
             .pending_sync

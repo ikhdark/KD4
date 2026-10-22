@@ -4,6 +4,7 @@
 use super::PlanInputReference;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AttemptId;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -317,8 +318,20 @@ impl super::PlanStore {
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
-        for (assignment_id, attempt_id) in assignments {
-            if let Ok(task) = coordinator.get_agent_task(assignment_id, Some(0)).await
+        // Leave half of the four-connection store pool available to coordinator
+        // traffic. Ordered buffering preserves deterministic evidence aggregation
+        // and cancellation drops every in-flight read with this closure future.
+        let mut tasks = futures::stream::iter(assignments)
+            .map(|(assignment_id, attempt_id)| async move {
+                (
+                    assignment_id,
+                    attempt_id,
+                    coordinator.get_agent_task(assignment_id, Some(0)).await,
+                )
+            })
+            .buffered(2);
+        while let Some((assignment_id, attempt_id, task)) = tasks.next().await {
+            if let Ok(task) = task
                 && child_integrated(&task, attempt_id)
             {
                 use sha2::Digest;

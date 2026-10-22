@@ -1196,6 +1196,93 @@ class WallClockRunnerTest(RunnerTestCase):
             runner.run_target("core_lib", ["missing"])
         self.assertEqual(len(executor.calls), 1)
 
+    def test_cache_startup_timeout_falls_back_before_launch_and_disables_later_cache_use(self):
+        runner, _ = self.runner()
+        runner.executor = rust_test_runner._default_executor
+        env = {
+            "RUSTC_WRAPPER": "sccache",
+            "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+        }
+        prepared = []
+
+        def prepare(*, env, cwd):
+            prepared.append(env["RUSTC_WRAPPER"])
+            if env["RUSTC_WRAPPER"]:
+                raise subprocess.TimeoutExpired(["sccache", "--start-server"], 10)
+
+        with (
+            mock.patch.object(
+                rust_test_runner, "prepare_shared_sccache", side_effect=prepare
+            ),
+            mock.patch.object(rust_test_runner, "owned_process") as launch,
+            contextlib.redirect_stderr(io.StringIO()) as notice,
+        ):
+            launch.return_value.__enter__.return_value.wait.return_value = 0
+            for args in (["cargo", "build"], ["cargo", "nextest", "run"]):
+                runner._checked(args, env=env, capture=rust_test_runner.CAPTURE_BOTH)
+
+        self.assertEqual(prepared, ["sccache", "", ""])
+        self.assertEqual(
+            launch.call_count, 2, "cache failure must happen before Cargo starts"
+        )
+        self.assertTrue(
+            all(call.kwargs["env"]["RUSTC_WRAPPER"] == "" for call in launch.call_args_list)
+        )
+        self.assertEqual(
+            env["RUSTC_WRAPPER"], "sccache", "caller environment must remain unchanged"
+        )
+        self.assertIn("startup", notice.getvalue())
+        self.assertIn("without sccache", notice.getvalue())
+
+    def test_cache_startup_fallback_preserves_compiler_failure_without_replaying(self):
+        runner, _ = self.runner()
+        runner.executor = rust_test_runner._default_executor
+
+        def prepare(*, env, cwd):
+            if env["RUSTC_WRAPPER"]:
+                raise OSError("cache server unavailable")
+
+        with (
+            mock.patch.object(
+                rust_test_runner, "prepare_shared_sccache", side_effect=prepare
+            ),
+            mock.patch.object(rust_test_runner, "owned_process") as launch,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            launch.return_value.__enter__.return_value.wait.return_value = 101
+            with self.assertRaisesRegex(RunnerError, "exit code 101"):
+                runner._checked(
+                    ["cargo", "nextest", "run"],
+                    env={
+                        "RUSTC_WRAPPER": "sccache",
+                        "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                    },
+                    capture=rust_test_runner.CAPTURE_BOTH,
+                )
+        self.assertEqual(
+            launch.call_count, 1, "the failed compilation must not be replayed"
+        )
+
+    def test_cache_startup_cancellation_does_not_launch_or_retry_cargo(self):
+        runner, _ = self.runner()
+        runner.executor = rust_test_runner._default_executor
+        with (
+            mock.patch.object(
+                rust_test_runner, "prepare_shared_sccache", side_effect=KeyboardInterrupt
+            ) as prepare,
+            mock.patch.object(rust_test_runner, "owned_process") as launch,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            runner._checked(
+                ["cargo", "build"],
+                env={"RUSTC_WRAPPER": "sccache"},
+                capture=rust_test_runner.CAPTURE_BOTH,
+            )
+        self.assertEqual(prepare.call_count, 1)
+        launch.assert_not_called()
+        self.assertFalse(runner._sccache_disabled)
+
     def test_cache_transport_failure_retries_once_and_disables_later_cache_use(self):
         runner, _ = self.runner()
         failed = subprocess.CompletedProcess(
@@ -4731,7 +4818,7 @@ class RunGateTest(RunnerTestCase):
         runner.no_fail_fast = True
         with self.assertRaisesRegex(RunnerError, "passed exactly once") as raised:
             runner.run_gates(["shards"], quiet=True)
-        self.assertEqual(raised.exception.outcome, "not_executed")
+        self.assertEqual(raised.exception.outcome, "evidence_incomplete")
         self.assertIn("unexpected=True", str(raised.exception))
         runs = executor.commands(["cargo", "nextest", "run"])
         self.assertEqual([run.count("--no-fail-fast") for run in runs], [1, 1, 1])
@@ -4857,18 +4944,18 @@ class RunGateTest(RunnerTestCase):
                 )
 
     def test_success_exit_without_exact_completed_results_is_rejected(self) -> None:
-        # As for run_target: absent or duplicated reporter evidence is
-        # incomplete; a complete report without the required pass is not run.
+        # As for run_target: absent, duplicated, or selection-inconsistent
+        # reporter evidence is incomplete. An unrelated binary proves no run.
         for output, outcome in (
             ("", "evidence_incomplete"),
-            (nextest_run_payload([("wrong::test", "ok")]), "not_executed"),
+            (nextest_run_payload([("wrong::test", "ok")]), "evidence_incomplete"),
             (
                 nextest_run_payload(
                     [("mod::tests::alpha", "ok")], package="wrong-binary"
                 ),
                 "not_executed",
             ),
-            (nextest_run_payload([("mod::tests::alpha", "ignored")]), "not_executed"),
+            (nextest_run_payload([("mod::tests::alpha", "ignored")]), "evidence_incomplete"),
             (
                 nextest_run_payload([("mod::tests::alpha", "ok")] * 2),
                 "evidence_incomplete",

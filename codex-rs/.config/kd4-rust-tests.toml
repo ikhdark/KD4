@@ -375,6 +375,11 @@ package = "codex-agent-task-store"
 lib = true
 helpers = []
 
+[targets.models_manager_lib]
+package = "codex-models-manager"
+lib = true
+helpers = []
+
 [targets.app_server_protocol_lib]
 package = "codex-app-server-protocol"
 lib = true
@@ -601,6 +606,11 @@ filter = "test(description::exec_prompt::tests::)"
 
 [targets.pty_lib]
 package = "codex-utils-pty"
+lib = true
+helpers = []
+
+[targets.path_uri_lib]
+package = "codex-utils-path-uri"
 lib = true
 helpers = []
 
@@ -1287,3 +1297,69 @@ tests = [
   "tests::test_update_line_with_unicode_dash",
   "tests::unicode_space_matching_preserves_nested_content_and_rejects_ambiguity",
 ]
+
+[gates.wall-clock-runtime]
+description = "Audit 140 compaction freshness, bounded discovery, IPC admission, durable recovery and final acceptance."
+
+[[gates.wall-clock-runtime.steps]]
+target = "core_lib"
+helpers = []
+filter = "test(compact::tests::) | test(plan_store::acceptance::tests::) | test(session::turn::tests::request_latency::) | test(session::turn_execution::tests::partial_runner_repairs_without_common_applicability_never_union) | test(session::turn_execution::tests::later_full_runner_pass_after_fix_supersedes_failure_from_another_command)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "skills_extension_lib"
+filter = "test(state::tests::) | test(extension::tests::)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "code_mode_protocol_lib"
+filter = "test(host::codec::tests::)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "core_transport_telemetry"
+filter = "test(suite::client_websockets::responses_websocket_owned_preconnect_preserves_zero_retry_recovery) | test(suite::client_websockets::responses_websocket_turn_preconnect_is_owned_and_reused) | test(suite::client_websockets::responses_websocket_forbidden_handshake_uses_http)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "code_mode_host_lib"
+filter = "test(peer::tests::)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "code_mode_host_stdio"
+filter = "test(read_only_durable_cell_publishes_a_recoverable_receipt) | test(first_wait_in_replacement_host_recovers_original_receipt) | test(oversized_) | test(escape_heavy_output_) | test(host_process_exits_on_broken_output_) | test(remote_session_persists_values_) | test(stalled_notification_at_session_shutdown_)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "code_mode_lib"
+tests = [
+  "session_runtime::tests::durable_cells_restore_values_and_terminal_receipts_without_reexecution",
+  "session_runtime::tests::slow_snapshot_io_does_not_hold_readers_or_hide_late_publication",
+  "session_runtime::tests::snapshot_staging_does_not_block_independent_cell_execution",
+]
+
+[[gates.wall-clock-runtime.steps]]
+target = "path_uri_lib"
+filter = "test(tests::)"
+
+[[gates.wall-clock-runtime.steps]]
+target = "pty_lib"
+filter = "test(process_group::) | test(pipe::tests::) | test(pipe::capture_tests::) | test(pty::pty_fd_tests::)"
+
+
+[gates.audit140-critical-path]
+description = "Audit 140 catalog freshness, connection ownership, bounded evidence acquisition, fork history and durable result publication."
+
+[[gates.audit140-critical-path.steps]]
+target = "core_lib"
+helpers = []
+filter = "test(agents_md::tests::) | test(agents_md_manager::tests::) | test(client::tests::turn_preconnect) | test(client::tests::websocket_fallback_) | test(git_workspace::tests::remote_workspace_evidence_) | test(agent::control::tests::completion_) | test(agent::control::tests::spawn_agent_fork_) | test(agent::control::tests::aggregate_live_subtree_usage_) | test(artifact_durability_barrier) | test(artifact_durability_parallel_failure) | test(artifact_file_sync_) | test(lazy_streaming_artifact_is_registered) | test(empty_artifact_barrier) | test(abandoned_reopen_retires) | test(compact_remote_v2::attempt::tests::) | test(session::turn::tests::request_latency::)"
+
+[[gates.audit140-critical-path.steps]]
+target = "models_manager_lib"
+filter = "test(manager::tests::)"
+
+[[gates.audit140-critical-path.steps]]
+target = "thread_store_lib"
+filter = "test(in_memory::tests::) | test(local::tests::live_thread_) | test(local::tests::ordered_live_append) | test(local::tests::persisted_fork_snapshot)"
+
+[[gates.audit140-critical-path.steps]]
+target = "core_transport_telemetry"
+helpers = []
+filter = "test(suite::client_websockets::responses_websocket_owned_preconnect_preserves_zero_retry_recovery) | test(suite::client_websockets::responses_websocket_turn_preconnect_is_owned_and_reused) | test(suite::client_websockets::responses_websocket_forbidden_handshake_uses_http)"

@@ -322,6 +322,15 @@ impl CodexThread {
         self.codex.session.flush_rollout().await
     }
 
+    pub(crate) async fn fork_history_snapshot(
+        &self,
+    ) -> ThreadStoreResult<Option<Arc<StoredThreadHistory>>> {
+        let Some(live_thread) = self.codex.session.live_thread() else {
+            return Ok(None);
+        };
+        live_thread.fork_history_snapshot().await.map(Some)
+    }
+
     pub async fn submit_with_trace(
         &self,
         op: Op,

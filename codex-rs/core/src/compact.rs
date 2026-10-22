@@ -649,6 +649,7 @@ async fn run_compact_task_inner_impl(
                 let workspace_identity = workspace_identity_for_compaction(
                     sess.as_ref(),
                     turn_context.as_ref(),
+                    &history,
                     prefetched_workspace_identity,
                 )
                 .await;
@@ -925,19 +926,24 @@ async fn run_compact_task_inner_impl(
 async fn workspace_identity_for_compaction(
     sess: &Session,
     turn_context: &TurnContext,
+    history: &crate::context_manager::ContextManager,
     prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
 ) -> Option<crate::git_workspace::WorkspaceEvidenceIdentity> {
     match prefetched_workspace_identity {
         // `Some(None)` is an authoritative capture of a non-Git workspace and must suppress a
         // second repository probe just as an ordinary identity does.
         Some(workspace_identity) => workspace_identity.clone(),
-        None => {
+        None if history.requires_workspace_evidence_validation() => {
             sess.services
                 .git_workspace
                 .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
                 .await
                 .identity
         }
+        // Inspect the actual summarizer history after replacement. Unknown and
+        // legacy tool provenance require validation through the same predicate
+        // used by ordinary sampling; plain conversation has no consumer.
+        None => None,
     }
 }
 

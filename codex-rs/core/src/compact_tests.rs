@@ -710,8 +710,13 @@ async fn compaction_reuses_a_generation_workspace_identity_without_recapturing_g
         .git_workspace
         .workspace_evidence_capture_count();
 
-    let resolved =
-        workspace_identity_for_compaction(&session, &turn_context, Some(&prefetched)).await;
+    let resolved = workspace_identity_for_compaction(
+        &session,
+        &turn_context,
+        &crate::context_manager::ContextManager::default(),
+        Some(&prefetched),
+    )
+    .await;
 
     assert_eq!(resolved, prefetched);
     assert_eq!(
@@ -722,6 +727,66 @@ async fn compaction_reuses_a_generation_workspace_identity_without_recapturing_g
         captures_before,
         "mid-turn compaction must reuse the generation-boundary identity"
     );
+}
+
+#[tokio::test]
+async fn compaction_captures_only_when_the_replacement_history_needs_freshness() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    for (name, needs_capture) in [
+        (None, false),
+        (Some("read_file"), true),
+        (Some("exec_command"), true),
+        (Some("exec"), false),
+    ] {
+        let mut history = crate::context_manager::ContextManager::default();
+        if let Some(name) = name {
+            history.record_items(
+                &[ResponseItem::FunctionCall {
+                    id: None,
+                    name: name.into(),
+                    namespace: None,
+                    arguments: if name == "read_file" {
+                        r#"{"path":"consumer.rs"}"#.into()
+                    } else {
+                        r#"{"code":"opaque_recovered_call()"}"#.into()
+                    },
+                    call_id: "unregistered-evidence".into(),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                turn_context.model_info.truncation_policy.into(),
+            );
+        }
+        let before = session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_sequence();
+        workspace_identity_for_compaction(&session, &turn_context, &history, None).await;
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_sequence()
+                - before,
+            u64::from(needs_capture),
+            "workspace readers need capture; an empty Code Mode carrier does not: {name:?}",
+        );
+        let before = session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_sequence();
+        assert!(
+            workspace_identity_for_compaction(&session, &turn_context, &history, Some(&None),)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .workspace_evidence_capture_sequence(),
+            before
+        );
+    }
 }
 
 #[test]

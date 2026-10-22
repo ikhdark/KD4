@@ -3059,6 +3059,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_MAX_LANE_BYTES": "not-a-number",
                 "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": "not-a-number",
                 "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "not-a-number",
+                "CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE": "not-a-number",
             },
             maintenance=True,
         )
@@ -3070,11 +3071,12 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         )
         calls = args_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(calls), 1)
+        # Maintenance keeps as many warm lanes per family as may build at once.
         self.assertTrue(
             calls[0]
             .rstrip()
             .endswith(
-                "prune --skip-disk-report --keep-warm-per-base 1 --max-age-days 7"
+                "prune --skip-disk-report --keep-warm-per-base 2 --max-age-days 7"
             ),
             calls[0],
         )

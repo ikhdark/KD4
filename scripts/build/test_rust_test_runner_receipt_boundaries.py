@@ -14,6 +14,130 @@ from scripts.build.test_rust_test_runner import nextest_run_payload
 
 
 class NextestReceiptBoundariesTest(RunnerTestCase):
+    def test_gate_binds_grouped_ignored_starts_to_its_exact_selection(self):
+        # Native Code Mode reporter shape: multiple ignored starts in one
+        # fragment, then a separately framed selected completion.
+        metadata = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+        start = {"type": "suite", "event": "started", "test_count": 3, "nextest": metadata}
+        terminal = {"type": "suite", "event": "ok", "passed": 0, "failed": 0,
+                    "ignored": 2, "measured": 0, "filtered_out": 10, "nextest": metadata}
+
+        def event(kind, name):
+            return {"type": "test", "event": kind, "name": "codex-core::codex_core$" + name}
+
+        native = [start, event("started", "skip_one"), event("started", "skip_two"),
+                  terminal, start, event("started", "alpha"), event("ok", "alpha"),
+                  {**terminal, "passed": 1}]
+        for case in ("native", "missing_completion", "duplicate_start", "selected_skip"):
+            with self.subTest(case=case):
+                events = json.loads(json.dumps(native))
+                if case == "missing_completion":
+                    del events[6]
+                elif case == "duplicate_start":
+                    events[2] = event("started", "skip_one")
+                elif case == "selected_skip":
+                    events[1] = event("started", "alpha")
+                manifest = self.manifest(gates={"proof": {"steps": [
+                    {"target": "core_lib", "tests": ["alpha"], "helpers": []}
+                ]}})
+                runner, _ = self.runner(manifest=manifest)
+                calls = []
+
+                def execute(args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args, 0, "\n".join(map(json.dumps, events)), "")
+
+                runner.executor = execute
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    if case == "native":
+                        result = runner.run_gates(["proof"], quiet=True)
+                        self.assertEqual(result.completed_tests(), {"codex-core": ["alpha"]})
+                    else:
+                        with self.assertRaises(rust_test_runner.RunnerError):
+                            runner.run_gates(["proof"], quiet=True)
+                self.assertEqual(len(calls), 1, "report reconciliation never replays tests")
+
+    def test_exact_selection_reconciles_mixed_execution_and_anonymous_skips(self):
+        from dataclasses import replace
+
+        # Native stream from validation 68ed8e37-c715-4621-aee4-fc98c21b871e:
+        # ignored starts can share a terminal with completed selected tests,
+        # without a corresponding per-test ignored event.
+        metadata = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+
+        def event(kind, name):
+            return {
+                "type": "test",
+                "event": kind,
+                "name": "codex-core::codex_core$" + name,
+            }
+
+        native = [
+            {"type": "suite", "event": "started", "test_count": 4, "nextest": metadata},
+            event("started", "skip_one"),
+            event("started", "alpha"),
+            event("started", "skip_two"),
+            event("ok", "alpha"),
+            {"type": "suite", "event": "ok", "passed": 1, "failed": 0,
+                "ignored": 3, "measured": 0, "filtered_out": 20, "nextest": metadata},
+        ]
+        for case in (
+            "native", "inflight_selected", "unbound", "missing_completion", "missing_terminal",
+            "wrong_count", "too_many_skips", "duplicate_start", "unexpected_pass",
+        ):
+            with self.subTest(case=case):
+                events = json.loads(json.dumps(native))
+                if case == "inflight_selected":
+                    events[0]["test_count"] = 5
+                    events.insert(4, event("started", "beta"))
+                    events.extend([
+                        dict(events[0]), event("ok", "beta"), dict(events[-1]),
+                    ])
+                elif case == "missing_completion":
+                    del events[4]
+                    events[-1]["passed"] = 0
+                elif case == "missing_terminal":
+                    events.pop()
+                elif case == "wrong_count":
+                    events[0]["test_count"] = 5
+                elif case == "too_many_skips":
+                    events[-1]["ignored"] = 1
+                elif case == "duplicate_start":
+                    events[3] = event("started", "skip_one")
+                elif case == "unexpected_pass":
+                    events.insert(-1, event("ok", "skip_one"))
+                    events[-1]["passed"] = 2
+                manifest = self.manifest()
+                manifest.targets["core_lib"] = replace(
+                    manifest.targets["core_lib"], helpers=(), helpers_by_test_prefix={}
+                )
+                runner, _ = self.runner(manifest=manifest)
+                calls = []
+
+                def execute(args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(
+                        args, 0, "\n".join(map(json.dumps, events)), ""
+                    )
+
+                runner.executor = execute
+                selection = "test(alpha)" if case == "unbound" else "test(=alpha)"
+                if case == "inflight_selected":
+                    selection += " | test(=beta)"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    if case in ("native", "inflight_selected"):
+                        self.assertEqual(
+                            runner.run_target("core_lib", ["-E", selection]),
+                            {"codex-core": ["alpha", "beta"] if case == "inflight_selected" else ["alpha"]},
+                        )
+                    else:
+                        with self.assertRaises(rust_test_runner.RunnerError):
+                            runner.run_target("core_lib", ["-E", selection])
+                self.assertEqual(len(calls), 1, "reconciliation must not rerun tests")
+
     def test_exact_selection_reconciles_multiple_anonymous_skips_in_one_fragment(self):
         from dataclasses import replace
 
@@ -725,7 +849,11 @@ class NextestReceiptBoundariesTest(RunnerTestCase):
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
-                    if case in ("complete", "ignored_without_start"):
+                    # Validation 68ed8e37 also establishes that a native mixed
+                    # fragment can omit an unselected test's ignored event.
+                    # Exact selected IDs and the repeated ignored count bind
+                    # that omission; missing selected completions still fail.
+                    if case in ("complete", "ignored_without_start", "missing_ignored"):
                         self.assertEqual(
                             runner.run_target(
                                 "core_lib", ["-E", "test(=alpha) | test(=beta)"]

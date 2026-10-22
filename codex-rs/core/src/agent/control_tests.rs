@@ -252,6 +252,7 @@ struct FailingAgentGraphStore {
     fail_upsert: bool,
     fail_list: bool,
     attempted_child: std::sync::Mutex<Option<ThreadId>>,
+    reconcile_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl FailingAgentGraphStore {
@@ -260,6 +261,7 @@ impl FailingAgentGraphStore {
             fail_upsert: true,
             fail_list: false,
             attempted_child: std::sync::Mutex::new(None),
+            reconcile_gate: None,
         }
     }
 
@@ -268,6 +270,7 @@ impl FailingAgentGraphStore {
             fail_upsert: false,
             fail_list: true,
             attempted_child: std::sync::Mutex::new(None),
+            reconcile_gate: None,
         }
     }
 
@@ -289,7 +292,13 @@ impl AgentGraphStore for FailingAgentGraphStore {
         } else {
             Ok(live_edges)
         };
-        Box::pin(std::future::ready(result))
+        Box::pin(async move {
+            if let Some((started, release)) = self.reconcile_gate.as_ref() {
+                started.notify_one();
+                release.notified().await;
+            }
+            result
+        })
     }
 
     fn upsert_thread_spawn_edge(
@@ -343,6 +352,92 @@ impl AgentGraphStore for FailingAgentGraphStore {
         };
         Box::pin(std::future::ready(result))
     }
+}
+
+#[tokio::test]
+async fn completion_publication_does_not_wait_for_owned_subtree_accounting() {
+    let (home, config) = test_config().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let graph = FailingAgentGraphStore {
+        fail_upsert: false,
+        fail_list: false,
+        attempted_child: std::sync::Mutex::new(None),
+        reconcile_gate: Some((started.clone(), release.clone())),
+    };
+    let harness = AgentControlHarness::new_with_config_and_agent_graph_store(
+        home,
+        config,
+        Some(Arc::new(graph)),
+    )
+    .await;
+    let (parent_id, parent) = harness.start_thread().await;
+    let (child_id, child) = harness.start_thread().await;
+    let watcher = harness
+        .control
+        .maybe_start_completion_watcher(
+            child_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            child_id.to_string(),
+            None,
+        )
+        .unwrap();
+    let turn = child.codex.session.new_default_turn().await;
+    child
+        .codex
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("done".into()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            }),
+        )
+        .await;
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("accounting must reach the graph gate");
+    assert!(
+        wait_for_subagent_notification(&parent).await,
+        "finished result must publish before accounting is released"
+    );
+    assert!(
+        !watcher.is_finished(),
+        "the watcher must still own accounting"
+    );
+    child.codex.session.terminal_tasks.close();
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            child.codex.session.terminal_tasks.wait()
+        )
+        .await
+        .is_err(),
+        "child teardown must retain the accounting barrier"
+    );
+    release.notify_one();
+    timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher must join accounting")
+        .unwrap();
+    timeout(
+        Duration::from_secs(5),
+        child.codex.session.terminal_tasks.wait(),
+    )
+    .await
+    .expect("accounting must retire its shutdown ownership");
 }
 
 async fn persisted_originator(thread: &CodexThread) -> String {
@@ -5552,11 +5647,28 @@ fn aggregate_live_subtree_usage_preserves_missing_components() {
                     .iter()
                     .all(|(_, value)| value.is_none())
             );
+            let captured = harness
+                .control
+                .upgrade()
+                .unwrap()
+                .loaded_agent_subtree_snapshot(parent_id, harness.control.state.known_spawn_edges())
+                .await
+                .unwrap();
             harness
                 .control
                 .shutdown_live_agent(parent_id)
                 .await
                 .expect("stop subtree");
+            let retained_usage = harness
+                .control
+                .aggregate_live_subtree_usage_from_snapshot(parent_id, &captured)
+                .await
+                .unwrap();
+            assert_eq!(
+                retained_usage.combined(),
+                combined,
+                "publication-triggered teardown must not lose captured usage owners"
+            );
         },
     );
 }

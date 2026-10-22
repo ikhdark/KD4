@@ -861,6 +861,15 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
     ) -> CodexResult<SubtreeUsage> {
+        self.aggregate_live_subtree_usage_from_snapshot(agent_id, &HashMap::new())
+            .await
+    }
+
+    async fn aggregate_live_subtree_usage_from_snapshot(
+        &self,
+        agent_id: ThreadId,
+        captured_threads: &HashMap<ThreadId, Arc<crate::CodexThread>>,
+    ) -> CodexResult<SubtreeUsage> {
         let state = self.upgrade()?;
         let mut usage = SubtreeUsage::default();
         let thread_ids = state
@@ -872,7 +881,11 @@ impl AgentControl {
             if thread_id != agent_id {
                 usage.descendant_threads = usage.descendant_threads.saturating_add(1);
             }
-            let Ok(thread) = state.get_thread(thread_id).await else {
+            let thread = match captured_threads.get(&thread_id) {
+                Some(thread) => Some(Arc::clone(thread)),
+                None => state.get_thread(thread_id).await.ok(),
+            };
+            let Some(thread) = thread else {
                 usage.threads_missing_usage = usage.threads_missing_usage.saturating_add(1);
                 continue;
             };
@@ -1292,114 +1305,144 @@ impl AgentControl {
                 Some(state) => state.get_thread(child_thread_id).await.ok(),
                 None => None,
             };
-            // Record aggregate cost for this delegation while its subtree is still
-            // readable. Per-thread accounting alone would report the child's tokens
-            // without the descendants it spawned, making deep delegation look cheap.
-            if let Some(child_thread) = child_thread.as_ref() {
-                match control.aggregate_live_subtree_usage(child_thread_id).await {
-                    Ok(usage) => {
-                        crate::agent::task_metrics::emit_subtree_usage(
-                            &child_thread.session_telemetry(),
-                            &usage,
-                        );
-                    }
-                    Err(error) => warn!(
-                        child_thread_id = %child_thread_id,
-                        %error,
-                        "failed to aggregate delegation subtree usage"
-                    ),
-                }
-            }
-            let mut protected_host_summary = None;
-            if let (Some(child_agent_path), Some(binding)) =
-                (child_agent_path.as_ref(), watched_binding.as_ref())
-            {
-                let task_coordinator = control.task_coordinator();
-                let assignment_id = Some(binding.assignment_id);
-                match task_coordinator
-                    .seal_missing_receipt_for_attempt(
-                        child_agent_path,
+            let usage_threads = match state.as_ref() {
+                Some(state) => state
+                    .loaded_agent_subtree_snapshot(
                         child_thread_id,
-                        &status,
-                        binding.attempt_id,
+                        control.state.known_spawn_edges(),
                     )
                     .await
-                {
-                    Ok(Some(receipt)) => {
-                        if let Some(child_thread) = child_thread.as_ref() {
-                            let session_telemetry = child_thread.session_telemetry();
-                            task_coordinator
-                                .maybe_emit_terminal_metrics(
-                                    receipt.assignment_id,
-                                    &session_telemetry,
-                                )
-                                .await;
-                        } else {
-                            warn!(
-                                agent_path = %child_agent_path,
-                                "could not emit missing-receipt typed-task metrics because the child thread was unavailable"
+                    .unwrap_or_else(|error| {
+                        warn!(%child_thread_id, %error, "failed to retain delegation usage owners");
+                        HashMap::new()
+                    }),
+                None => HashMap::new(),
+            };
+            // Keep accounting owned by this watcher while publishing the result
+            // independently. Both branches finish before the watcher retires.
+            let accounting_state = state.clone();
+            let accounting_barrier = child_thread
+                .as_ref()
+                .map(|thread| thread.codex.session.terminal_tasks.token());
+            let accounting = async {
+                // Publication can also release the manager's last external
+                // owner. Keep graph services alive through metrics emission.
+                let _state_owner = accounting_state;
+                let _terminal_owner = accounting_barrier;
+                // Record aggregate cost for this delegation while its subtree is still
+                // readable. Per-thread accounting alone would report the child's tokens
+                // without the descendants it spawned, making deep delegation look cheap.
+                if let Some(child_thread) = child_thread.as_ref() {
+                    match control
+                        .aggregate_live_subtree_usage_from_snapshot(child_thread_id, &usage_threads)
+                        .await
+                    {
+                        Ok(usage) => {
+                            crate::agent::task_metrics::emit_subtree_usage(
+                                &child_thread.session_telemetry(),
+                                &usage,
                             );
                         }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!(
-                            agent_path = %child_agent_path,
-                            %error,
-                            "failed to seal missing typed-agent receipt"
-                        );
-                    }
-                }
-                if let Some(assignment_id) = assignment_id {
-                    match task_coordinator.get_agent_task(assignment_id, None).await {
-                        Ok(task) => {
-                            if watched_binding.as_ref().is_some_and(|binding| {
-                                binding.attempt_id != task.current_attempt.attempt_id
-                            }) {
-                                return;
-                            }
-                            protected_host_summary =
-                                crate::agent::status::completion_diagnostics_from_task(&task);
-                            if let Some(durable_status) =
-                                agent_status_from_task(&task, Some((binding.attempt_id, &status)))
-                            {
-                                status = durable_status;
-                            }
-                        }
                         Err(error) => warn!(
-                            %assignment_id,
+                            child_thread_id = %child_thread_id,
                             %error,
-                            "failed to load durable typed-agent outcome for completion watcher"
+                            "failed to aggregate delegation subtree usage"
                         ),
                     }
                 }
-            }
-
-            let Some(state) = state else {
-                return;
             };
-            let child_uses_multi_agent_v2 = match child_thread.as_ref() {
-                Some(child_thread) => {
-                    child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            let notification = async {
+                let mut protected_host_summary = None;
+                if let (Some(child_agent_path), Some(binding)) =
+                    (child_agent_path.as_ref(), watched_binding.as_ref())
+                {
+                    let task_coordinator = control.task_coordinator();
+                    let assignment_id = Some(binding.assignment_id);
+                    match task_coordinator
+                        .seal_missing_receipt_for_attempt(
+                            child_agent_path,
+                            child_thread_id,
+                            &status,
+                            binding.attempt_id,
+                        )
+                        .await
+                    {
+                        Ok(Some(receipt)) => {
+                            if let Some(child_thread) = child_thread.as_ref() {
+                                let session_telemetry = child_thread.session_telemetry();
+                                task_coordinator
+                                    .maybe_emit_terminal_metrics(
+                                        receipt.assignment_id,
+                                        &session_telemetry,
+                                    )
+                                    .await;
+                            } else {
+                                warn!(
+                                    agent_path = %child_agent_path,
+                                    "could not emit missing-receipt typed-task metrics because the child thread was unavailable"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(
+                                agent_path = %child_agent_path,
+                                %error,
+                                "failed to seal missing typed-agent receipt"
+                            );
+                        }
+                    }
+                    if let Some(assignment_id) = assignment_id {
+                        match task_coordinator.get_agent_task(assignment_id, None).await {
+                            Ok(task) => {
+                                if watched_binding.as_ref().is_some_and(|binding| {
+                                    binding.attempt_id != task.current_attempt.attempt_id
+                                }) {
+                                    return;
+                                }
+                                protected_host_summary =
+                                    crate::agent::status::completion_diagnostics_from_task(&task);
+                                if let Some(durable_status) = agent_status_from_task(
+                                    &task,
+                                    Some((binding.attempt_id, &status)),
+                                ) {
+                                    status = durable_status;
+                                }
+                            }
+                            Err(error) => warn!(
+                                %assignment_id,
+                                %error,
+                                "failed to load durable typed-agent outcome for completion watcher"
+                            ),
+                        }
+                    }
                 }
-                None => true,
-            };
-            if child_agent_path.is_some() && child_uses_multi_agent_v2 {
-                let Some(child_agent_path) = child_agent_path.clone() else {
+
+                let Some(state) = state else {
                     return;
                 };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
-                    return;
+                let child_uses_multi_agent_v2 = match child_thread.as_ref() {
+                    Some(child_thread) => {
+                        child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                    }
+                    None => true,
                 };
-                let receipt = watched_binding.as_ref().map(|binding| format!(
+                if child_agent_path.is_some() && child_uses_multi_agent_v2 {
+                    let Some(child_agent_path) = child_agent_path.clone() else {
+                        return;
+                    };
+                    let Some(parent_agent_path) = child_agent_path
+                        .as_str()
+                        .rsplit_once('/')
+                        .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+                    else {
+                        return;
+                    };
+                    let receipt = watched_binding.as_ref().map(|binding| format!(
                     "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
                     binding.assignment_id, binding.attempt_id,
                 ));
-                let Some(communication) =
+                    let Some(communication) =
                     crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
                         parent_agent_path,
                         child_agent_path,
@@ -1411,20 +1454,25 @@ impl AgentControl {
                 else {
                     return;
                 };
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(parent_thread_id, communication, context)
+                    let context = AgentCommunicationContext::new(
+                        AgentCommunicationKind::Result,
+                        child_thread_id,
+                    );
+                    let _ = control
+                        .send_inter_agent_communication(parent_thread_id, communication, context)
+                        .await;
+                    return;
+                }
+                let message =
+                    format_subagent_notification_message(child_reference.as_str(), &status);
+                let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
+                    return;
+                };
+                parent_thread
+                    .inject_user_message_without_turn(message)
                     .await;
-                return;
-            }
-            let message = format_subagent_notification_message(child_reference.as_str(), &status);
-            let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
-                return;
             };
-            parent_thread
-                .inject_user_message_without_turn(message)
-                .await;
+            tokio::join!(notification, accounting);
         }))
     }
 
