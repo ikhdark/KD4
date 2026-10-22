@@ -203,10 +203,11 @@ class Evidence:
             "nextest_executable_sha256": file_hash(tools / "cargo-nextest.exe"),
             "toolchain": toolchain,
         }
-        self.run("msvc-environment", ["pwsh", "-NoProfile", "-Command",
-            "$ErrorActionPreference='Stop'; & '${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe' "
-            "-latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json; "
-            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"])
+        vswhere = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
+        installations = self.run("msvc-environment", [str(vswhere), "-latest", "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-format", "json"])
+        if not json.loads(installations):
+            raise RuntimeError("Visual C++ x64 tools are not installed")
         self.save()
 
     def build(self):
