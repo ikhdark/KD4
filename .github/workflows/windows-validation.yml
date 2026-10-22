@@ -24,7 +24,7 @@ jobs:
     env:
       # Dedicated ephemeral target: the public runner owns its admission lock.
       KD4_CI_TARGET: ${{ github.workspace }}/target/windows-ci
-      KD4_CI_EVIDENCE: ${{ runner.temp }}/kd4-windows-evidence
+      KD4_CI_EVIDENCE: ${{ github.workspace }}/.scratch/windows-evidence
       KD4_EXPECTED_SHA: ${{ github.sha }}
       KD4_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       KD4_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -90,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-validation-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kd4-windows-evidence/
+          path: ${{ env.KD4_CI_EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
